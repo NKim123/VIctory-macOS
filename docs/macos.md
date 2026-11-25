@@ -204,3 +204,34 @@ So every submission now ends with a small list that copies the submission's numb
 ## The clwb write-back loops
 
 The title has eight loops that write cache lines back with `clwb`, which faults under Rosetta and costs an exception each time (#135). Under Rosetta, the same check that decides fault tracking, `victory` turns the `clwb` of each loop into a NOP when it loads the image. It patches only when it finds exactly eight loops and logs the number it found otherwise. `VICTORY_NOP_CLWB=0` leaves the loops alone and `VICTORY_NOP_CLWB=1` patches them where Rosetta is not detected.
+
+## Experimental command recording and submission
+
+By default, command recording is immediate and ready submissions run
+synchronously. Each switch below is opt-in for Windows builds, including
+those running on macOS under Wine.
+
+- `VICTORY_THIN=1` records fixed-function state, root arguments, and
+  color clears in a bounded stream. A recording worker translates chunks
+  of 32 commands and finishes short streams when the list closes. If the
+  worker queue is full, the calling thread translates the chunk. Color
+  clears keep the host texture and copy the view description, color, and
+  rectangles at the call. Draws, dispatches and other operations that need
+  live descriptors or title memory flush the stream first. Submission
+  waits until the list has closed.
+- `VICTORY_ASYNC_SUBMIT=1` lets title threads continue recording while one
+  submission worker builds host state transitions, submits and waits for
+  self-contained work. The worker holds up to four host lists including
+  those on the GPU. It retains only committed color targets up to 16 MiB
+  total or 1% of the texture budget when that is lower. The budget comes
+  from `VICTORY_GPU_BUDGET_MB` or the local DXGI budget. Lists with uploads,
+  live descriptors, title memory work, or readbacks stay synchronous.
+  Guest heap sync, texture eviction, copy-back, and retirement also stay
+  on the synchronous path. Queue signals, waits, mapping changes, and
+  presents drain the worker in order.
+- `VICTORY_JOIN_PARTS=2` through `4` enables the submission worker and
+  runs adjacent eligible submissions on the same queue under one hold
+  of the host submission lock. Each keeps its own host submission and
+  fence. Larger limits are clamped to four.
+
+The switches add no allocator, staging, or snapshot pools.

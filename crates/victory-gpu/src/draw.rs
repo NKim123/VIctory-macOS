@@ -372,6 +372,19 @@ impl State {
         set(self.roots(compute), slot, Root::View(address));
     }
 
+    /// A held list may still use these views after the title resets it.
+    pub(crate) fn owns_submission_storage(&self) -> bool {
+        !self.dynamic.is_empty() || self.memory.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn compute_constants_for_test(&self, slot: usize) -> &[u32] {
+        match self.compute.get(slot) {
+            Some(Root::Constants(values)) => values,
+            _ => &[],
+        }
+    }
+
     pub(crate) fn set_constants(&mut self, compute: bool, slot: u32, values: &[u32], offset: u32) {
         let roots = self.roots(compute);
         let s = slot as usize;

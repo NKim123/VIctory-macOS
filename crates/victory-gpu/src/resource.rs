@@ -853,6 +853,17 @@ pub(crate) struct HostTexture {
 
 #[cfg(windows)]
 impl HostTexture {
+    /// Only committed color targets have a bounded standalone allocation.
+    /// Placed textures can hold a 64 MiB heap and depth textures can acquire
+    /// twins after recording.
+    pub(crate) fn submission_retained_bytes(&self) -> Option<u64> {
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        // SAFETY: this host copy owns the resource.
+        let flags = unsafe { self.texture.GetDesc() }.Flags;
+        (self.placement.is_none() && flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET))
+            .then_some(self.bytes)
+    }
+
     /// A host texture made outside the title's resources (twins).
     pub(crate) fn new(
         texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
@@ -1683,7 +1694,7 @@ pub(crate) fn evict_unused() {
 /// the process for its next resources: on a Mac with 8 GB, unused textures
 /// filled memory into swap long before the pass would start (#135).
 #[cfg(windows)]
-fn budget_mb(device: f64) -> f64 {
+pub(crate) fn budget_mb(device: f64) -> f64 {
     static SET: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
     let set = SET.get_or_init(|| {
         let mb = budget_setting(std::env::var("VICTORY_GPU_BUDGET_MB").ok().as_deref());
@@ -2881,6 +2892,135 @@ mod tests {
             assert_eq!(sizes, [64, 32, 64, 32, 16, 8, 16, 8], "format {format}");
             assert_eq!(total, 24_072, "format {format}");
             assert!(subresource(&desc, 8).is_none(), "format {format}");
+        }
+    }
+
+    /// Mutating the descriptor and argument storage after a clear must not
+    /// affect deferred translation. A following CPU readback must see both
+    /// clears, including when the first submission went to the worker.
+    #[cfg(windows)]
+    #[test]
+    fn recorded_clears_keep_their_views_and_reach_a_following_readback() {
+        use crate::list::CopyLocation;
+        use windows::Win32::Foundation::RECT;
+
+        if crate::host::host().is_none() {
+            return;
+        }
+        let null: This = std::ptr::null();
+        let rgba = ResourceDesc {
+            flags: 1,
+            ..texture(4, 4, 28, 1)
+        };
+        let mut image = null;
+        let mut back = null;
+        // An optimized clear value forces a committed host texture, so the
+        // first submission fits the normal async texture budget.
+        let clear = [28, 0, 0, 0, 1.0f32.to_bits()];
+        for (desc, clear, out) in [
+            (&rgba, clear.as_ptr().cast(), &mut image),
+            (&buffer(1024), null.cast(), &mut back),
+        ] {
+            assert_eq!(
+                create_committed(null, &PROPERTIES, 0, desc, 0, clear, &RESOURCE_IIDS[0], out),
+                S_OK
+            );
+        }
+
+        let queue_iid = guid(
+            0x0ec870a6,
+            0x5d7e,
+            0x4c22,
+            [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+        );
+        let allocator_iid = guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = guid(
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        let (mut queue, mut allocator, mut draw, mut readback) = (null, null, null, null);
+        let queue_desc = [0u32; 4];
+        assert_eq!(
+            crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator),
+            S_OK
+        );
+        for out in [&mut draw, &mut readback] {
+            assert_eq!(
+                crate::list::create_list(null, 0, 0, allocator, null, &list_iid, out),
+                S_OK
+            );
+        }
+
+        let mut record = [0u64; 14];
+        let handle = record.as_mut_ptr() as u64;
+        crate::descriptor::create_rtv(null, image, null.cast(), handle);
+        let clear =
+            slot::<extern "system" fn(This, u64, *const [f32; 4], u32, *const RECT)>(draw, 0x1a0);
+        clear(draw, handle, &[1.0, 0.0, 0.0, 1.0], 0, null.cast());
+        let mut color = [0.0, 1.0, 0.0, 1.0];
+        let mut rect = RECT {
+            left: 2,
+            top: 0,
+            right: 4,
+            bottom: 4,
+        };
+        clear(draw, handle, &raw const color, 1, &raw const rect);
+        crate::descriptor::create_rtv(null, null, null.cast(), handle);
+        color.fill(0.0);
+        rect.left = 0;
+        std::hint::black_box((color, rect, record));
+
+        assert_eq!(
+            slot::<extern "system" fn(This) -> HRESULT>(draw, 0x48)(draw),
+            S_OK
+        );
+        assert!(
+            host_copy(image)
+                .unwrap()
+                .submission_retained_bytes()
+                .is_some()
+        );
+        let execute = slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50);
+        execute(queue, 1, &draw);
+        slot::<extern "system" fn(This) -> u32>(draw, 0x10)(draw);
+
+        let from = CopyLocation::whole(image);
+        let to = CopyLocation::placed(back, PlacedFootprint::new(0, 28, 4, 4, 256));
+        crate::list::read_back(
+            crate::list::host_list(readback).unwrap(),
+            &to,
+            [0; 3],
+            &from,
+            null.cast(),
+        );
+        assert_eq!(
+            slot::<extern "system" fn(This) -> HRESULT>(readback, 0x48)(readback),
+            S_OK
+        );
+        execute(queue, 1, &readback);
+        let (data, _) = buffer_bytes(back).unwrap();
+        // SAFETY: the readback completed and the destination has 1024 bytes.
+        let pixels = unsafe { std::slice::from_raw_parts(data, 16) };
+        assert_eq!(
+            pixels,
+            [
+                255, 0, 0, 255, 255, 0, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255
+            ]
+        );
+
+        for this in [readback, allocator, queue, image, back] {
+            slot::<extern "system" fn(This) -> u32>(this, 0x10)(this);
         }
     }
 

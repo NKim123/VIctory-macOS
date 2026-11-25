@@ -117,6 +117,8 @@ pub(crate) struct World<'a, S> {
     pub(crate) run: &'a mut dyn FnMut(usize, Vec<S>),
     /// Signals a fence.
     pub(crate) signal: &'a mut dyn FnMut(usize, u64),
+    /// Releases the fence reference held by a completed Wait.
+    pub(crate) release_wait: &'a mut dyn FnMut(usize),
 }
 
 impl<S> Held<S> {
@@ -183,7 +185,8 @@ impl<S> Held<S> {
                             done.segments += 1;
                         }
                         Some(Item::Signal(fence, value)) => (w.signal)(fence, value),
-                        Some(Item::FenceWait(..)) | None => {}
+                        Some(Item::FenceWait(fence, _)) => (w.release_wait)(fence),
+                        None => {}
                     }
                 }
                 if !piece.is_empty() {
@@ -280,7 +283,13 @@ mod tests {
             f.fences.insert(fence, value);
             f.log.push(format!("signal {fence} {value}"));
         };
-        held.pump(&mut World { read: &read, fence: &fence, run: &mut run, signal: &mut signal })
+        held.pump(&mut World {
+            read: &read,
+            fence: &fence,
+            run: &mut run,
+            signal: &mut signal,
+            release_wait: &mut |_| {},
+        })
     }
 
     #[test]
