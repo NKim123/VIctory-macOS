@@ -730,6 +730,15 @@ impl HostHeap {
         }
     }
 
+    /// The texture and exact descriptor emitted together by `make`.
+    pub(crate) fn ambient_view(&self, index: u32) -> Option<(ID3D12Resource, TextureView)> {
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        let (resource, Some(HeldSource::Ambient(view))) = kept.get(index as usize)? else {
+            return None;
+        };
+        Some((resource.clone(), **view))
+    }
+
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: self.cpu + index as usize * self.step as usize,
@@ -958,7 +967,7 @@ impl HostHeap {
             kept.iter()
                 .filter(|&(i, k)| {
                     i < self.count as usize
-                        && k.1.is_none()
+                        && matches!(k.1, None | Some(HeldSource::Ambient(_)))
                         && textures.contains(&(windows::core::Interface::as_raw(&k.0) as usize))
                 })
                 .map(|(i, _)| i as u32)
@@ -1002,7 +1011,10 @@ impl HostHeap {
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         slots
             .iter()
-            .filter_map(|&i| kept.get(i as usize).filter(|k| k.1.is_none()))
+            .filter_map(|&i| {
+                kept.get(i as usize)
+                    .filter(|k| matches!(k.1, None | Some(HeldSource::Ambient(_))))
+            })
             .map(|k| windows::core::Interface::as_raw(&k.0) as usize)
             .collect()
     }
@@ -1343,12 +1355,52 @@ type Held = (ID3D12Resource, Option<HeldSource>);
 /// slot shows them.
 #[allow(dead_code)]
 enum HeldSource {
+    /// The effective host descriptor for an eligible ambient pass.
+    Ambient(Box<TextureView>),
     Shadow(std::sync::Arc<crate::shadow::Shadow>),
     /// A widened three-channel view and the normal shadow it reads.
     Widened(
         std::sync::Arc<crate::shadow::Widened>,
         std::sync::Arc<crate::shadow::Shadow>,
     ),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum TextureView {
+    Srv(Option<D3D12_SHADER_RESOURCE_VIEW_DESC>),
+    Uav(Option<D3D12_UNORDERED_ACCESS_VIEW_DESC>),
+}
+
+impl TextureView {
+    fn for_ambient(self) -> Option<HeldSource> {
+        if !crate::ambient::enabled() {
+            return None;
+        }
+        let eligible = match self {
+            Self::Srv(Some(d)) => {
+                d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D
+                    && matches!(
+                        d.Format,
+                        DXGI_FORMAT_UNKNOWN
+                            | DXGI_FORMAT_R32_FLOAT
+                            | DXGI_FORMAT_R16_UNORM
+                            | DXGI_FORMAT_R24_UNORM_X8_TYPELESS
+                            | DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS
+                    )
+            }
+            Self::Uav(Some(d)) => {
+                matches!(
+                    d.ViewDimension,
+                    D3D12_UAV_DIMENSION_TEXTURE2D | D3D12_UAV_DIMENSION_TEXTURE3D
+                ) && matches!(
+                    d.Format,
+                    DXGI_FORMAT_UNKNOWN | DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R11G11B10_FLOAT
+                )
+            }
+            Self::Srv(None) | Self::Uav(None) => true,
+        };
+        eligible.then(|| HeldSource::Ambient(Box::new(self)))
+    }
 }
 
 /// What a slot made by [`make`] holds, if anything.
@@ -1715,7 +1767,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                         at,
                     )
                 };
-                Some(Some((texture.clone(), None)))
+                Some(Some((
+                    texture.clone(),
+                    TextureView::Srv(desc).for_ambient(),
+                )))
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
             {
@@ -1724,7 +1779,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 None
             }
         }
-        View::Unordered(resource, _counter, desc) => {
+        View::Unordered(resource, counter, desc) => {
             let resource = *resource as crate::object::This;
             let Some(copy) = crate::resource::host_copy(resource) else {
                 return match (crate::resource::buffer_bytes(resource), desc) {
@@ -1773,7 +1828,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     at,
                 )
             };
-            Some(Some((texture.clone(), None)))
+            let source = (*counter == 0)
+                .then(|| TextureView::Uav(desc).for_ambient())
+                .flatten();
+            Some(Some((texture.clone(), source)))
         }
         View::Sampler(words) => {
             // SAFETY: 13 words in the host's layout.

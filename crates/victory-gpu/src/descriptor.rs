@@ -116,6 +116,17 @@ impl Heap {
             .as_ref()
     }
 
+    /// Exercises the remapped-table path on a host that can fit the title heap.
+    #[cfg(all(test, windows))]
+    pub(crate) fn test_cap_host_views(&self, count: u32) {
+        assert!(count < self.desc.count);
+        assert!(
+            self.host
+                .set(Some(host::HostHeap::new(false, count).unwrap()))
+                .is_ok()
+        );
+    }
+
     /// The descriptor index of `handle` in this heap, if it lies in it.
     pub(crate) fn index(&self, handle: u64) -> Option<u32> {
         let step = u64::from(increment(self.desc.kind)?);

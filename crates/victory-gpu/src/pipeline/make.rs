@@ -421,6 +421,7 @@ mod tests {
             container: std::sync::Mutex::new(Vec::new()),
             translated: OnceLock::new(),
             spilled: OnceLock::new(),
+            ambient: None,
         });
         let cold = Arc::new(Pending::new(vec![shader.clone()], None, &hashes));
         let warm = Arc::new(Pending::new(vec![shader.clone()], None, &hashes));

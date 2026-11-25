@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use victory_shader::{ResourceType, RootType, UsedResource};
 
+use crate::ambient::{self, CheckedViews, Role};
 use crate::descriptor::View;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
@@ -81,6 +82,8 @@ pub(crate) struct State {
     dynamic: Vec<(usize, u32, u32)>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
+    /// The exact host views the bound indirect-light dispatch uses.
+    ambient: Option<(Role, CheckedViews)>,
     /// The title-memory page table made for this list (`crate::memory`)
     /// and its view heap.
     memory: Option<(usize, crate::memory::Map)>,
@@ -619,6 +622,7 @@ impl State {
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        self.ambient = None;
         // What its shaders write is withheld only if the program uses title
         // memory and a list using it misses (`crate::memory::withholding`).
         let _writer = list.writer_uses_memory(p.stages.iter().any(|s| s.memory.is_some()));
@@ -748,6 +752,11 @@ impl State {
                 }
                 not_run("no dynamic slots for its tables");
                 return false;
+            }
+            if compute && let Some(role) = stage.shader.ambient {
+                self.ambient = self
+                    .ambient_views(role, &t.used, &made)
+                    .map(|views| (role, views));
             }
             // Root views a shader reads as title memory: the copies holding
             // their addresses go into the page table.
@@ -1143,6 +1152,60 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        if x != 0
+            && y != 0
+            && z != 0
+            && let Some((role, views)) = self.ambient.take()
+            && let Some(views) = list.ambient_views(&views)
+        {
+            ambient::after(list, role, &views);
+            self.host_state_lost();
+        }
+    }
+
+    /// Interpret only the expected full-size views in list-owned tables.
+    fn ambient_views(
+        &self,
+        role: Role,
+        used: &[UsedResource],
+        made: &[(u8, u32)],
+    ) -> Option<CheckedViews> {
+        let heap = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This))?;
+        let host = heap.host()?;
+        let entry = |kind, (slot, offset): (u8, u32)| {
+            used.iter().find(|u| {
+                u.kind == kind
+                    && u.root == RootType::Table
+                    && (u.slot, u.table_offset_dwords) == (slot, offset)
+            })?;
+            // The title keeps late binding for shared slots. Capturing one
+            // of those here could pick a resource that the producer never
+            // accesses. Only use a table the producer already binds in
+            // list-owned dynamic slots.
+            let &(_, base) = made.iter().find(|m| m.0 == slot)?;
+            let Root::Table(table) = self.compute.get(usize::from(slot))? else {
+                return None;
+            };
+            heap.index(*table)?;
+            heap.index(table.checked_add(u64::from(offset) * 4)?)?;
+            // Placed views already went through ordinary table resolution.
+            host.ambient_view((base / 4 + offset) / 8)
+        };
+        let image = entry(ResourceType::Uav, role.image())?;
+        // SAFETY: the heap made a view of this live host resource.
+        let size = role.extent(image.1, unsafe { image.0.GetDesc() })?;
+        let depth = if role == Role::Resolve {
+            let depth = entry(ResourceType::Srv, Role::DEPTH)?;
+            // SAFETY: the heap made a view of this live host resource.
+            let desc = unsafe { depth.0.GetDesc() };
+            if depth.0 == image.0 || !ambient::depth_matches(depth.1, desc, size) {
+                return None;
+            }
+            Some(depth)
+        } else {
+            None
+        };
+        Some(CheckedViews { image, depth, size })
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -2194,6 +2257,12 @@ void main() {
         &'static crate::descriptor::Heap,
         &'static crate::descriptor::host::HostHeap,
     ) {
+        let (heap, title_heap) = title_view_heap(count);
+        let heap_host = title_heap.host().expect("a host view heap");
+        (heap, title_heap, heap_host)
+    }
+
+    fn title_view_heap(count: u32) -> (This, &'static crate::descriptor::Heap) {
         let null = std::ptr::null();
         let heap_desc: [u32; 8] = [0, count, 1, 0, 0, 0, 0, 0];
         let mut heap = null;
@@ -2207,9 +2276,7 @@ void main() {
             crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap),
             S_OK
         );
-        let title_heap = crate::descriptor::heap(heap);
-        let heap_host = title_heap.host().expect("a host view heap");
-        (heap, title_heap, heap_host)
+        (heap, crate::descriptor::heap(heap))
     }
 
     fn dispatch_marked_uav(
@@ -2891,6 +2958,225 @@ void main(uint3 id : SV_DispatchThreadID) {{
             user_data: 0,
             slot: 0,
         }
+    }
+
+    #[test]
+    fn ambient_dispatch_preserves_late_binding_of_shared_slots() {
+        check_ambient_dispatch(false);
+    }
+
+    #[test]
+    fn ambient_dispatch_uses_the_producers_list_owned_views() {
+        check_ambient_dispatch(true);
+    }
+
+    fn check_ambient_dispatch(capped: bool) {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        ambient::test_constant();
+        let (heap, title_heap) = title_view_heap(64);
+        if capped {
+            title_heap.test_cap_host_views(8);
+        }
+        let host_heap = title_heap.host().unwrap();
+        let null = std::ptr::null();
+        let depth_slot = title_heap.start + u64::from(Role::DEPTH.1) * 4;
+        let output_slot = title_heap.start + u64::from(Role::Resolve.image().1) * 4;
+        let depth_words = texture_words(16, 16, 41, 0x100, 0);
+        let output_words = texture_words(16, 16, 42, 0x100, 4);
+        let output = title_memory(1 << 16);
+        let replacement = title_memory(1 << 16);
+        let depth_at = title_memory(1 << 16);
+        let replace_depth_at = title_memory(1 << 16);
+        let set_depth = |address| {
+            let View::Placed(_, _, desc) = placed_view(address, depth_words) else {
+                unreachable!()
+            };
+            crate::descriptor::create_placed_srv(null, &depth_words, &desc, depth_slot);
+        };
+        let set_output = |address: u64| {
+            let mut desc = [0u32; 16];
+            desc[..2].copy_from_slice(&[42, 4]);
+            (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+            crate::descriptor::create_placed_uav(null, &output_words, &desc, output_slot);
+        };
+
+        use victory_shader::native::{ComputeIo, StageIo};
+        use victory_shader::{
+            Container, HwStage, NativeProgram, RootParam, emit, io, ir, resource, structure,
+        };
+
+        const SENTINEL: u32 = 27;
+        let (slot, offset) = Role::Resolve.image();
+        let words = [
+            0xBE85_0380, // s_mov_b32 s5, 0: high word of the table address
+            0xF40C_0202,
+            0xFA00_0000 | (offset * 4), // s_load_dwordx8 s[8:15], s[4:5], output offset
+            0x7E02_0200,                // v_mov_b32 v1, s0: sentinel from root constants
+            0x7E0A_0280,
+            0x7E0C_0280, // v_mov_b32 v5/v6, 0: texel coordinates
+            0xF03C_1108,
+            0x0002_0105, // image_atomic_swap v1, v[5:6], s[8:15], dim:2D, dmask:1
+            0xBF81_0000, // s_endpgm
+        ];
+        let mut depth = used(ResourceType::Srv);
+        depth.table_offset_dwords = Role::DEPTH.1;
+        let mut light = used(ResourceType::Uav);
+        (light.slot, light.table_offset_dwords, light.user_data) = (slot, offset, 4);
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 2,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot,
+                },
+            ],
+            used: vec![depth, light],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
+        };
+        let container = Container {
+            version: (1, 0),
+            digest: [0; 16],
+            parts: Vec::new(),
+        };
+        let program = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let lanes = structure::structure(&program).unwrap();
+        let resources =
+            resource::track(&program, &native.layout, native.stage, Some(&lanes)).unwrap();
+        let io = io::raise(&program, &native).unwrap();
+        let compiled = emit::emit(&container, &native, &program, &lanes, &io, &resources).unwrap();
+        let mut shader = crate::pipeline::Shader::for_test(
+            "compute",
+            crate::pipeline::Translated {
+                host: compiled,
+                used: native.used,
+            },
+        );
+        std::sync::Arc::get_mut(&mut shader).unwrap().ambient = Some(Role::Resolve);
+        let pipeline = crate::pipeline::test_compute(shader);
+        let init = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[heap]);
+        set_output(replacement);
+        state.clear_unordered(&init, output_slot, [0; 4], false, &[]);
+        set_output(output);
+        state.clear_unordered(&init, output_slot, [0; 4], false, &[]);
+        init.close();
+        host.execute(&[&init]);
+        drop(state);
+
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[heap]);
+        state.set_pipeline(pipeline);
+        state.set_table(true, 0, title_heap.start);
+        state.set_table(true, slot.into(), title_heap.start);
+        state.set_constants(true, 2, &[SENTINEL], 0);
+        set_depth(depth_at);
+        state.dispatch(&list, 1, 1, 1);
+
+        let original = crate::resource::texture_at(output, &output_words).unwrap();
+        let new_output = crate::resource::texture_at(replacement, &output_words).unwrap();
+        let old_depth = crate::resource::texture_at(depth_at, &depth_words).unwrap();
+        let new_depth = crate::resource::texture_at(replace_depth_at, &depth_words).unwrap();
+        assert_ne!(original, new_output);
+        assert_ne!(old_depth, new_depth);
+        set_output(replacement);
+        set_depth(replace_depth_at);
+        if !capped {
+            // Resolve the late writes to both shared host slots before execution.
+            let indices = [
+                title_heap.index(output_slot).unwrap(),
+                title_heap.index(depth_slot).unwrap(),
+            ];
+            host_heap.mirror(indices[0], output_slot, true).unwrap();
+            host_heap.mirror(indices[1], depth_slot, true).unwrap();
+            let actual = host_heap.textures_at(&indices);
+            assert_eq!(
+                actual,
+                [new_output, new_depth]
+                    .map(|r| crate::resource::host_resource(r).unwrap().as_raw() as usize)
+            );
+        }
+
+        let read = |address| {
+            let object = crate::resource::texture_at(address, &output_words).unwrap();
+            let texture = crate::resource::host_resource(object).unwrap();
+            let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            let mut total = 0;
+            // SAFETY: outputs for one subresource of a live texture.
+            unsafe {
+                host.device.GetCopyableFootprints(
+                    &texture.GetDesc(),
+                    0,
+                    1,
+                    0,
+                    Some(&mut footprint),
+                    None,
+                    None,
+                    Some(&mut total),
+                );
+            }
+            let (readback, data) = host.shared_buffer(total).unwrap();
+            crate::list::ensure_state(&list, object, 0x800);
+            // SAFETY: the open list and both resources live through execution.
+            unsafe {
+                let to = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&readback),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: footprint,
+                    },
+                };
+                let from = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&texture),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        SubresourceIndex: 0,
+                    },
+                };
+                list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            }
+            (readback, data)
+        };
+        let (_original, original_data) = read(output);
+        let (_replacement, replacement_data) = read(replacement);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: both mapped readback buffers hold a complete texture.
+        unsafe {
+            let packed = (14 << 27) | (241 << 18) | (251 << 9) | 256;
+            let expected = if capped { (packed, 0) } else { (0, SENTINEL) };
+            assert_eq!(
+                (
+                    original_data.cast::<u32>().read(),
+                    replacement_data.cast::<u32>().read()
+                ),
+                expected
+            );
+        }
+        drop(state);
+        crate::object::slot::<extern "system" fn(This) -> u32>(pipeline, 0x10)(pipeline);
+        crate::object::slot::<extern "system" fn(This) -> u32>(heap, 0x10)(heap);
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]

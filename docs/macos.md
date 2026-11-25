@@ -129,6 +129,14 @@ In the loading freeze from #50 every thread stops logging, and `VICTORY_STACKS` 
 
 On Series S the game presents two planes. Plane 0 is a 1920x1080 overlay and plane 1 is the 3840x2160 picture (#15). The window shows the plane whose first resource has the most pixels, and `VICTORY_PRESENT_PLANE=<n>` picks another one. With `VICTORY_PRESENT_COMPOSITE=1` the other plane is also blended over the shown one by a compute pass (`victory-gpu/src/composite.rs`), scaled to it and using its alpha as straight alpha. The blend is off by default until a run with the game shows that the overlay is clear where the picture should show.
 
+## Indirect light estimate
+
+`VICTORY_AMBIENT=0.8` opts into a screen-space estimate of diffuse indirect light. The number scales the estimate, and `1` uses its full strength. The pass combines the cached light from visible surfaces with scene depth and a slower average, then raises dark pixels and caps unusually bright values in the screen-probe diffuse output. `VICTORY_AMBIENT=constant:<level>` uses a fixed warm light. `VICTORY_AMBIENT_SHADE=<strength>,<radius in metres>` controls shading in creases in either mode and defaults to `1,0.6`.
+
+`VICTORY_AMBIENT_AIR=<multiple>` caps the luminance of the air-scattering volume at a multiple of the estimated light. It requires the numeric ambient mode and a completed estimate. Numeric mode uses typed UAV loads of `R11G11B10_FLOAT`. Both effects default to off. The pass runs only when the producer already uses list-owned tables, as it does when the host has to remap a table that reaches past its heap limit. Shared title heap slots keep their normal late binding, and the auxiliary pass is skipped for them. This means ordinary full-size heaps can run with the option enabled and show no effect.
+
+Numeric mode gathers a 64 × 36 radiance grid at 80 × 45 points. Once the history is ready, each resolve does 8,294,400 fixed source-point iterations, then a full-resolution depth-aware resolve. Crease shading can add 12 depth taps per output texel, and the air cap adds a pass over the volume. The gather grid trades spatial resolution for less work. Frame cost and image quality in the title have not been measured. The pass uses up to 128 private descriptor slots per command list and skips an injection when that space is exhausted.
+
 ## D3DMetal's shader cache needs unique shader hashes
 
 D3DMetal keeps a compiled-shader cache for each executable, in `$(getconf DARWIN_USER_CACHE_DIR)d3dm/<exe name>/shaders.cache`. It finds shaders by the DXIL container's shader hash (the `HASH` part), apparently together with the shader's length: two shaders collided only when their lengths matched. VIctory used to write the same all-zero shader hash into every container. So two different shaders of the same length shared a cache entry, and the one compiled second ran the first one's code. The cache is on disk, so the wrong code also came back on every later run of that executable.

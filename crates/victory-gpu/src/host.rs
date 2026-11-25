@@ -1157,6 +1157,7 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    ambient: crate::ambient::Descriptors,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -2667,6 +2668,13 @@ impl HostList {
             self.keep(&old);
         }
         Some(made)
+    }
+
+    pub(crate) fn ambient_views(
+        &self,
+        views: &crate::ambient::CheckedViews,
+    ) -> Option<crate::ambient::Views> {
+        self.deferred().ambient.bind(self, views)
     }
 
     /// Keeps `object` alive until the list is reset.

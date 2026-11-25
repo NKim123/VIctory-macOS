@@ -74,6 +74,8 @@ pub(crate) struct Shader {
     #[cfg(windows)]
     spilled: OnceLock<[u8; 32]>,
     #[cfg(windows)]
+    pub(crate) ambient: Option<crate::ambient::Role>,
+    #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
 
@@ -174,6 +176,10 @@ impl Shader {
             container: Mutex::new(bytes.to_vec()),
             #[cfg(windows)]
             spilled: OnceLock::new(),
+            #[cfg(windows)]
+            ambient: (stage == "compute")
+                .then(|| crate::ambient::Role::detect(bytes))
+                .flatten(),
             #[cfg(windows)]
             translated: OnceLock::new(),
         }
@@ -356,6 +362,7 @@ impl Shader {
             size: self.size,
             container: Mutex::new(Vec::new()),
             spilled: OnceLock::new(),
+            ambient: self.ambient,
             translated: cell,
         })
     }
@@ -634,6 +641,21 @@ fn hand_out(
         bound: std::sync::atomic::AtomicBool::new(false),
     });
     object::hand_out(PIPELINE, pipeline, iid, &PIPELINE_IIDS, out)
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn test_compute(shader: Arc<Shader>) -> This {
+    let mut pipeline = std::ptr::null();
+    assert_eq!(
+        hand_out(vec![shader], None, &PIPELINE_IIDS[0], &mut pipeline),
+        crate::object::S_OK
+    );
+    let start = std::time::Instant::now();
+    while host_pipeline(pipeline).is_none() {
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        std::thread::yield_now();
+    }
+    pipeline
 }
 
 /// Device method.
