@@ -173,6 +173,22 @@ impl Mark {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static OMIT_NEXT_SUBMISSION_MARK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static MISS_NEXT_SUBMISSION_MARK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Checks the mark for the submitted work. Recovery probes read their mark
+/// directly so a test can simulate a lost submission without stalling a GPU.
+fn submission_ran(mark: &Mark, value: u64) -> bool {
+    #[cfg(test)]
+    if MISS_NEXT_SUBMISSION_MARK.with(|miss| miss.replace(false)) {
+        return false;
+    }
+    mark.saw(value)
+}
+
 /// Submissions that did not run to their mark, and queues made since to
 /// replace one that stopped running work.
 static LOST: [std::sync::atomic::AtomicU64; 2] = [
@@ -1176,6 +1192,9 @@ struct Deferred {
     /// Work done once the list has run, before the bottom-of-pipe writes
     /// (title memory shaders wrote at addresses they computed goes back).
     after: Vec<Box<dyn Fn() + Send>>,
+    texture_writes: crate::texback::Wanted,
+    attempted_texture_writes: Option<crate::texback::Wanted>,
+    texture_backs: Vec<crate::texback::Back>,
     /// Asked once the list has run, before anything goes back: whether its
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
@@ -1330,7 +1349,7 @@ impl Host {
     /// queue was idle), so the wait wakes every second to check the fence
     /// itself. A late event left set by an earlier wait cannot end a later
     /// wait early, as the fence is checked after every wake-up too.
-    fn wait_for(&self, value: u64) {
+    fn wait_for(&self, value: u64) -> bool {
         use std::sync::atomic::AtomicU64;
         static MISSED: AtomicU64 = AtomicU64::new(0);
         let mut seconds = 0u32;
@@ -1339,6 +1358,9 @@ impl Host {
             let woke = unsafe { WaitForSingleObject(self.event, 1000) };
             // SAFETY: as above.
             let completed = unsafe { self.fence.GetCompletedValue() };
+            if completed == u64::MAX {
+                return false;
+            }
             if completed >= value {
                 if woke != windows::Win32::Foundation::WAIT_OBJECT_0 {
                     let n = MISSED.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1346,7 +1368,7 @@ impl Host {
                         tracing::warn!(n, value, completed, "a host submission finished without setting its event; went on after checking the fence");
                     }
                 }
-                return;
+                return true;
             }
             if woke != windows::Win32::Foundation::WAIT_OBJECT_0 {
                 seconds += 1;
@@ -1418,17 +1440,27 @@ impl Host {
         mark.arm(*submitted);
         let queue = self.queue();
         // SAFETY: a closed list; the fence and event are ours.
+        unsafe { queue.ExecuteCommandLists(&[mark.list()]) };
+        self.wait_for_submission(&queue, *submitted) && mark.saw(*submitted)
+    }
+
+    /// A signal must be queued before any submission resources can be
+    /// recycled. The event only wakes the waiter; its registration may fail
+    /// even when the fence can still be polled.
+    fn wait_for_submission(&self, queue: &ID3D12CommandQueue, value: u64) -> bool {
+        // SAFETY: the queue, fence and event are live under the submission lock.
         unsafe {
-            queue.ExecuteCommandLists(&[mark.list()]);
-            let waited = queue
-                .Signal(&self.fence, *submitted)
-                .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-            match waited {
-                Ok(()) => self.wait_for(*submitted),
-                Err(e) => tracing::warn!(error = %e, "host check not waited for"),
+            if let Err(e) = queue.Signal(&self.fence, value) {
+                if self.device.GetDeviceRemovedReason().is_err() {
+                    return false;
+                }
+                fail(format_args!("could not signal host submission fence ({e})"));
+            }
+            if let Err(e) = self.fence.SetEventOnCompletion(value, self.event) {
+                tracing::warn!(error = %e, "host fence event unavailable; polling the fence");
             }
         }
-        mark.saw(*submitted)
+        self.wait_for(value)
     }
 
     /// A new direct queue in place of the current one. Under the submission
@@ -1583,6 +1615,10 @@ impl Host {
         let groups = [&lists[..]];
         let mut removed_in = None;
         let mark = self.mark();
+        #[cfg(test)]
+        let mark = mark.filter(|_| !OMIT_NEXT_SUBMISSION_MARK.with(|omit| omit.replace(false)));
+        let verified = mark.is_some() || !crate::shader_cache::under_wine();
+        let mut incomplete = Vec::new();
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -1596,28 +1632,17 @@ impl Host {
             }
             let queue = self.queue();
             // SAFETY: closed lists; the fence and event are ours.
-            let waited = unsafe {
-                queue.ExecuteCommandLists(&group);
-                let waited = queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        self.wait_for(*submitted);
-                        true
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "host submission not waited for");
-                        false
-                    }
-                }
-            };
-            if waited
-                && let Some(mark) = mark
-                && !mark.saw(*submitted)
+            unsafe { queue.ExecuteCommandLists(&group) };
+            if !self.wait_for_submission(&queue, *submitted) {
+                removed_in = Some(i);
+                break;
+            }
+            if let Some(mark) = mark
+                && !submission_ran(mark, *submitted)
                 // SAFETY: a plain query.
                 && unsafe { self.device.GetDeviceRemovedReason() }.is_ok()
             {
+                incomplete.push(i);
                 self.lost(&mut submitted, mark);
             }
             #[cfg(feature = "diagnostics")]
@@ -1689,7 +1714,7 @@ impl Host {
             );
         }
         // SAFETY: a plain query.
-        if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+        if removed_in.is_some() || unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
             fail(format_args!(
                 "host GPU device removed after a submission of {} lists{}{}{}",
                 runs.len(),
@@ -1698,6 +1723,9 @@ impl Host {
                 removed_during(runs, removed_in)
             ));
         }
+        let ran = |list: usize| {
+            verified && !incomplete.contains(&if groups.len() == 1 { 0 } else { list })
+        };
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
         // submission, however many dispatches declared it (the world's
@@ -1777,8 +1805,14 @@ impl Host {
                 crate::memory::drop_withheld(address, len);
             }
         }
-        for list in runs {
-            for work in &list.deferred().after {
+        for (i, (list, &missed)) in runs.iter().zip(&missed).enumerate() {
+            let deferred = list.deferred();
+            if ran(i) && !(missed || withholding && !deferred.missed.is_empty()) {
+                for back in &deferred.texture_backs {
+                    back.land();
+                }
+            }
+            for work in &deferred.after {
                 work();
             }
         }
@@ -2028,6 +2062,24 @@ impl Host {
     }
 }
 
+/// Discards prepared writes unless the caller records the shader command.
+pub(crate) struct TextureWrites<'a>(&'a HostList);
+
+impl TextureWrites<'_> {
+    pub(crate) fn commit(self) {
+        let mut deferred = self.0.deferred();
+        if let Some(writes) = deferred.attempted_texture_writes.take() {
+            deferred.texture_writes.commit(writes);
+        }
+    }
+}
+
+impl Drop for TextureWrites<'_> {
+    fn drop(&mut self) {
+        self.0.deferred().attempted_texture_writes = None;
+    }
+}
+
 impl HostList {
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
@@ -2149,6 +2201,11 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        let textures = std::mem::take(&mut self.deferred().texture_writes);
+        let backs = textures.record(self);
+        if !backs.is_empty() {
+            self.deferred().texture_backs = backs;
+        }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count =
@@ -2443,6 +2500,29 @@ impl HostList {
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Capture potential texture writes while preparing one draw or dispatch.
+    pub(crate) fn capture_texture_writes(&self) -> Option<TextureWrites<'_>> {
+        if !crate::texback::enabled() {
+            return None;
+        }
+        self.deferred().attempted_texture_writes = Some(Default::default());
+        Some(TextureWrites(self))
+    }
+
+    /// A shader being prepared names a texture UAV.
+    pub(crate) fn texture_written(
+        &self,
+        resource: crate::object::This,
+        words: Option<&[u32; 10]>,
+        slot: Option<crate::texback::SharedSlot<'_>>,
+    ) {
+        if crate::texback::enabled()
+            && let Some(writes) = &mut self.deferred().attempted_texture_writes
+        {
+            writes.mark(resource, words, slot);
+        }
     }
 
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
@@ -3325,6 +3405,24 @@ impl Host {
     /// A mapped buffer of `size` bytes: upload memory, or (`readback`)
     /// readback memory in the copy-destination state.
     fn mapped_buffer(&self, size: u64, readback: bool) -> Option<(ID3D12Resource, *mut u8)> {
+        let buffer = self.heap_buffer(size, readback)?;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: a live upload or read-back buffer, with a valid output pointer.
+        match unsafe { buffer.Map(0, None, Some(&mut data)) } {
+            Ok(()) => Some((buffer, data.cast())),
+            Err(e) => {
+                tracing::warn!(error = %e, size, readback, "no mapped buffer");
+                None
+            }
+        }
+    }
+
+    /// An unmapped read-back buffer for CPU access after the submission fence.
+    pub(crate) fn readback_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        self.heap_buffer(size, true)
+    }
+
+    fn heap_buffer(&self, size: u64, readback: bool) -> Option<ID3D12Resource> {
         let heap = D3D12_HEAP_PROPERTIES {
             Type: if readback { D3D12_HEAP_TYPE_READBACK } else { D3D12_HEAP_TYPE_UPLOAD },
             ..Default::default()
@@ -3343,8 +3441,7 @@ impl Host {
             ..Default::default()
         };
         let mut buffer: Option<ID3D12Resource> = None;
-        let mut data = std::ptr::null_mut();
-        // SAFETY: plain creation and mapping of an upload buffer.
+        // SAFETY: plain creation of a buffer in a CPU-visible heap.
         let made = unsafe {
             self.device
                 .CreateCommittedResource(
@@ -3355,15 +3452,11 @@ impl Host {
                     None,
                     &mut buffer,
                 )
-                .and_then(|()| {
-                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    b.Map(0, None, Some(&mut data))
-                })
         };
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => buffer,
             Err(e) => {
-                tracing::warn!(error = %e, size, readback, "no mapped buffer");
+                tracing::warn!(error = %e, size, readback, "no CPU-visible buffer");
                 None
             }
         }

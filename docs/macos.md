@@ -152,6 +152,12 @@ The merge of VIctory's changes up to 70564ae on 25 November 2026 brought new sha
 
 Run-time compute shaders are built with explicit root signatures (`compute.rs`, PR #6), which Wine's compiler can build. The one exception is the memory test's shader, which needs shader model 5.1 resource arrays, so that test skips under Wine.
 
+## Shader texture write-back
+
+`VICTORY_TEXTURE_BACK=1` enables write-back for the ocean texture kinds identified on the Windows fork. Set a comma-separated list of `<width>x<height>f<DXGI format number>` entries to choose other kinds. The setting defaults to off. Under Wine, write-back also requires the submission marker. Creating another resource over any of the recorded allocation’s bytes cancels its pending write-back.
+
+The host copies the mip and array slices named by texture UAVs in shared descriptor slots used by direct shader commands. Rewriting a shared slot cancels write-back from its recorded binding, even if the slot is later restored. Indirect commands and list-owned tables are outside this path. It retiles single-sample, single-plane 2D colour textures into console memory after the host fence and before the title's completion writes. It skips recycled allocations and limits reads to 8 MiB per texture and 32 MiB of live GPU read-back buffers across lists. This copy samples each selected subresource at the end of the command list.
+
 ## Host view heaps are filled with other threads' submissions held off
 
 Under Wine on D3DMetal, a list that one thread submits while another thread fills a new host view heap can lose its views: its shaders' writes are dropped and its reads give zeros, whatever heap the list binds (issue #31). Each host view heap has 2,359,296 slots, and `HostHeap::fill_null` makes every one null with 36 copies of 65,536 null views. On an M5 Pro with D3DMetal 4.0 beta 3 that takes 30 to 50 ms, and the victory-gpu tests fill several at once when they start.

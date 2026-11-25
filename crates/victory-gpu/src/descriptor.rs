@@ -662,6 +662,8 @@ pub(crate) fn forget(resource: usize) {
 #[cfg(any(windows, test))]
 pub(crate) struct ViewPin {
     view: View,
+    #[cfg(windows)]
+    key: u64,
     held: [usize; 2],
 }
 
@@ -721,7 +723,12 @@ fn view_at(i: u32, generation: u32) -> Option<ViewPin> {
     drop(views);
     // Dropped here, with the lock released, if a resource was already gone:
     // the references taken on the others may be their last.
-    let pin = ViewPin { view, held };
+    let pin = ViewPin {
+        view,
+        #[cfg(windows)]
+        key: (u64::from(generation) << 32) | u64::from(i),
+        held,
+    };
     all.then_some(pin)
 }
 

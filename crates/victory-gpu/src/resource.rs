@@ -1493,6 +1493,13 @@ pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     (r.desc.dimension != BUFFER).then(|| (r.data().cast_const(), r.desc))
 }
 
+/// A single-sample 2D colour texture eligible for shader write-back.
+#[cfg(windows)]
+pub(crate) fn texture_back_kind(desc: &ResourceDesc) -> Option<(u64, u32, u32)> {
+    (desc.dimension == 3 && desc.sample_count <= 1 && desc.flags & (DEPTH | UNORDERED) == UNORDERED)
+        .then_some((desc.width, desc.height, desc.format))
+}
+
 /// A texture's description as words (the layout of placed views'
 /// resource descriptions); `None` for buffers.
 pub(crate) fn texture_desc(this: This) -> Option<[u32; 14]> {
@@ -1867,6 +1874,18 @@ fn hand_out_resource(
         made_with: (state, (!clear.is_null()).then(|| unsafe { clear.cast::<[u32; 5]>().read_unaligned() })),
     });
     #[cfg(windows)]
+    if crate::texback::enabled() && !out.is_null() && object::is(iid, &RESOURCE_IIDS) {
+        let size = if desc.dimension == BUFFER {
+            desc.width
+        } else {
+            // An unrecognized allocation at a title address can still
+            // alias tracked resources. If even its footprint is unknown,
+            // conservatively invalidate tickets extending past its start.
+            footprint(&desc).map_or(u64::MAX, |info| info.size)
+        };
+        crate::texback::remapped(resource.data() as usize, size as usize);
+    }
+    #[cfg(windows)]
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
@@ -1948,6 +1967,7 @@ impl Drop for Resource {
         }
         crate::bindless::forget(std::ptr::from_ref::<Resource>(self) as usize);
         if self.desc.dimension != BUFFER {
+            crate::texback::released(std::ptr::from_ref::<Resource>(self) as usize);
             let mut map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
             let at = self.data() as u64;
             if let Some(list) = map.get_mut(&at) {
@@ -2243,7 +2263,7 @@ extern "system" fn resource_query(this: This, iid: *const Iid, out: *mut This) -
         out,
     )
 }
-extern "system" fn resource_release(this: This) -> u32 {
+pub(crate) extern "system" fn resource_release(this: This) -> u32 {
     object::release_boxed::<Resource>(this)
 }
 /// Memory is always mapped (subresources are not told apart yet); a null

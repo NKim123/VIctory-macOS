@@ -1128,6 +1128,7 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        let texture_writes = list.capture_texture_writes();
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -1140,6 +1141,13 @@ impl State {
         self.probe_small(list, true);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        if x != 0
+            && y != 0
+            && z != 0
+            && let Some(writes) = texture_writes
+        {
+            writes.commit();
+        }
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -1215,6 +1223,7 @@ impl State {
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
+        let texture_writes = list.capture_texture_writes();
         let ran = self.prepare_for(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
@@ -1222,6 +1231,11 @@ impl State {
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
+                    if x != 0
+                        && let Some(writes) = texture_writes
+                    {
+                        writes.commit();
+                    }
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
@@ -1255,6 +1269,16 @@ impl State {
         };
         if let Some(view) = host.mirror(index, handle, true) {
             readable(list, u, &view, true);
+            if u.kind == ResourceType::Uav && crate::texback::enabled() {
+                let placed = crate::descriptor::host::placed_texture(&view);
+                if let View::Unordered(resource, _, words) = placed.as_ref().unwrap_or(&view) {
+                    list.texture_written(
+                        *resource as This,
+                        words.as_ref(),
+                        Some((host, index, &view)),
+                    );
+                }
+            }
         }
         if !heap.samplers() {
             list.defer_slot(&host.viewed, index);
@@ -1587,6 +1611,7 @@ impl State {
         // Rectangles: completed by the pipeline's geometry shader, else
         // expanded into vertex buffers of their own.
         let rects = self.topology == RECTANGLES && !self.completes_rectangles();
+        let texture_writes = list.capture_texture_writes();
         let ran = self.prepare(list, false)
             && (!rects || self.rectangles(list, vertices, first) || {
                 not_run("rectangle vertices outside their buffer");
@@ -1608,6 +1633,12 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            if count != 0
+                && instances != 0
+                && let Some(writes) = texture_writes
+            {
+                writes.commit();
+            }
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -1693,6 +1724,7 @@ impl State {
             once!("indexed rectangles not drawn");
             not_run("indexed rectangles");
         }
+        let texture_writes = list.capture_texture_writes();
         let ran = !rects && self.prepare(list, true);
         if ran {
             #[cfg(feature = "diagnostics")]
@@ -1702,6 +1734,12 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            if indices != 0
+                && instances != 0
+                && let Some(writes) = texture_writes
+            {
+                writes.commit();
+            }
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -1794,6 +1832,8 @@ impl State {
         };
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
+        // The GPU controls the effective count and dimensions. Even a
+        // nonzero max cannot prove any shader writes this texture.
         let ran = match kind {
             DRAW | INDEXED => {
                 (self.topology != RECTANGLES || self.completes_rectangles() || {
@@ -4002,6 +4042,257 @@ void main(uint3 id : SV_DispatchThreadID) {
         // SAFETY: inside the buffer: texel (7, 2) at a 256-byte pitch.
         let got = unsafe { (bytes.add(2 * 256 + 7 * 4) as *const f32).read() };
         assert_eq!(got, (7 + 2 * 64) as f32);
+    }
+
+    #[test]
+    fn texture_write_back_retiles_only_the_uav_mips_and_slices() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("skipping texture write-back test without a D3D12 device");
+            return;
+        };
+        let address = title_memory(1 << 20);
+        // R32G32_TYPELESS storage, viewed and copied as R32G32_FLOAT.
+        let mut words = texture_words(128, 64, 15, 0, 4);
+        words[7] = 2 | 4 << 16;
+        let texture = texture_at_address(address, &words);
+        let (_, desc) = crate::resource::texture_memory(texture).unwrap();
+        let layout = crate::resource::texture_layout(&desc)
+            .unwrap()
+            .planes
+            .remove(0)
+            .layout;
+        let mut expected = vec![0xa5; layout.size as usize];
+        // SAFETY: the backing allocation spans the whole console layout.
+        unsafe { std::ptr::write_bytes(address as *mut u8, 0xa5, expected.len()) };
+        let slots = Slots::new(2);
+        let write = compile_cs(
+            "RWTexture2DArray<float2> o : register(u0);\n[numthreads(8, 8, 1)]\nvoid main(uint3 id : SV_DispatchThreadID) { o[id] = float2(id.x + 1, id.y + 2); }",
+            WRITES,
+        );
+        let list = host.new_list().unwrap();
+        for (slot, (mip, slice)) in [(2, 1), (1, 0)].into_iter().enumerate() {
+            let view = View::Unordered(
+                texture as usize,
+                0,
+                Some([16, 5, mip, slice, 1, 0, 0, 0, 0, 0]),
+            );
+            slots.make(slot as u32, &view);
+            crate::texback::TEST_KINDS.set(&[(128, 64, 15)]);
+            let writes = list.capture_texture_writes().unwrap();
+            readable(&list, &used(ResourceType::Uav), &view, false);
+            let View::Unordered(resource, _, words) = &view else {
+                unreachable!()
+            };
+            list.texture_written(*resource as This, words.as_ref(), None);
+            crate::texback::TEST_KINDS.set(&[]);
+            let level = &layout.mips[mip as usize];
+            run(
+                &list,
+                &slots,
+                &write,
+                slot as u32,
+                None,
+                (level.width / 8, level.height / 8),
+            );
+            writes.commit();
+            let linear: Vec<_> = (0..level.height)
+                .flat_map(|y| (0..level.width).flat_map(move |x| [(x + 1) as f32, (y + 2) as f32]))
+                .flat_map(f32::to_le_bytes)
+                .collect();
+            layout
+                .tile(
+                    &mut expected,
+                    mip,
+                    slice,
+                    &linear,
+                    level.width as usize * 8,
+                    linear.len(),
+                )
+                .unwrap();
+        }
+        list.close();
+        // SAFETY: none of the recorded commands have run yet.
+        let before = unsafe { std::slice::from_raw_parts(address as *const u8, expected.len()) };
+        assert!(before.iter().all(|&byte| byte == 0xa5));
+        if crate::shader_cache::under_wine() {
+            crate::host::OMIT_NEXT_SUBMISSION_MARK.set(true);
+            host.execute(&[&list]);
+            // SAFETY: the title allocation is live and the host fence completed.
+            let bytes = unsafe { std::slice::from_raw_parts(address as *const u8, expected.len()) };
+            assert!(bytes.iter().all(|&byte| byte == 0xa5));
+        }
+        crate::host::MISS_NEXT_SUBMISSION_MARK.set(true);
+        host.execute(&[&list]);
+        // SAFETY: the title allocation is live and the host fence completed.
+        let after_lost =
+            unsafe { std::slice::from_raw_parts(address as *const u8, expected.len()) };
+        assert!(after_lost.iter().all(|&byte| byte == 0xa5));
+
+        host.execute(&[&list]);
+        // SAFETY: execution and the CPU write-back have finished.
+        let after = unsafe { std::slice::from_raw_parts(address as *const u8, expected.len()) };
+        assert!(
+            after == expected,
+            "only the texels covered by the two UAVs should change"
+        );
+        crate::resource::resource_release(texture);
+    }
+
+    #[test]
+    fn texture_write_back_skips_rebound_shared_uavs() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 1, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        assert_eq!(
+            crate::descriptor::create_heap(
+                null,
+                heap_desc.as_ptr().cast(),
+                &crate::object::IUNKNOWN,
+                &mut heap
+            ),
+            S_OK
+        );
+        let title = crate::descriptor::heap(heap);
+        let slots = Slots(title.host().unwrap().heap.clone(), 0);
+        let address = title_memory(1 << 16);
+        let words = texture_words(64, 64, 41, 1, 4);
+        let a = texture_at_address(address, &words);
+        let b = texture_at_address(title_memory(1 << 16), &words);
+        let mut state = State::default();
+        state.set_heaps(&[heap]);
+        state.set_table(true, 0, title.start);
+        let write = compile_cs(
+            "RWTexture2D<float> o : register(u0);
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) { o[id.xy] = 13.5; }",
+            WRITES,
+        );
+        let descriptor = [41u32, 4, 0, 0, 0, 0, 0, 0, 0, 0];
+        let bind = |resource| {
+            crate::descriptor::create_uav(null, resource, null, &descriptor, title.start);
+        };
+        let record = || {
+            let list = host.new_list().unwrap();
+            crate::list::ensure_state(&list, b, D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32);
+            crate::texback::TEST_KINDS.set(&[(64, 64, 41)]);
+            let writes = list.capture_texture_writes().unwrap();
+            state.table_entry(&list, &used(ResourceType::Uav), true);
+            crate::texback::TEST_KINDS.set(&[]);
+            run(&list, &slots, &write, 0, None, (8, 8));
+            writes.commit();
+            list.close();
+            list
+        };
+        bind(a);
+        host.execute(&[&record()]);
+        // SAFETY: first word of the live title texture.
+        let texel = || unsafe { (address as *const f32).read() };
+        assert_eq!(texel(), 13.5, "the original shared binding writes back");
+
+        for restore in [false, true] {
+            // SAFETY: the test owns this title allocation.
+            unsafe { (address as *mut f32).write(9.0) };
+            bind(a);
+            let list = record();
+            bind(b);
+            if restore {
+                bind(a);
+            }
+            host.execute(&[&list]);
+            assert_eq!(texel(), 9.0, "any shared slot rewrite retires its binding");
+        }
+        for object in [heap, a, b] {
+            assert_eq!(crate::object::release_ref(object), 0);
+        }
+    }
+
+    #[test]
+    fn texture_write_back_skips_remapped_and_released_allocations() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("skipping texture write-back test without a D3D12 device");
+            return;
+        };
+        let address = title_memory(1 << 16);
+        let texture = texture_at_address(address, &texture_words(64, 64, 41, 1, 4));
+        let view = View::Unordered(texture as usize, 0, None);
+        let slots = Slots::new(1);
+        slots.make(0, &view);
+        let write = compile_cs(
+            "RWTexture2D<float> o : register(u0);\n[numthreads(8, 8, 1)]\nvoid main(uint3 id : SV_DispatchThreadID) { o[id.xy] = 13.5; }",
+            WRITES,
+        );
+        let record = || {
+            let list = host.new_list().unwrap();
+            crate::texback::TEST_KINDS.set(&[(64, 64, 41)]);
+            let writes = list.capture_texture_writes().unwrap();
+            readable(&list, &used(ResourceType::Uav), &view, false);
+            list.texture_written(texture, None, None);
+            crate::texback::TEST_KINDS.set(&[]);
+            run(&list, &slots, &write, 0, None, (8, 8));
+            writes.commit();
+            list.close();
+            list
+        };
+        let list = record();
+
+        // An adjacent remap leaves the ticket live. Check that it lands
+        // before a completion write to the same word.
+        crate::watch::title_memory_remapped(address as usize + 65536, 65536);
+        list.defer_after(move || {
+            // SAFETY: the first word of the live title texture.
+            assert_eq!(unsafe { (address as *const f32).read() }, 13.5);
+        });
+        list.defer_write(address as *mut u8, crate::queue::Written::Value(0), 4);
+        host.execute(&[&list]);
+        // SAFETY: the first word of the live title texture.
+        assert_eq!(unsafe { (address as *const u32).read() }, 0);
+
+        // Submit another recording after its mapping is invalidated.
+        let stale = record();
+        crate::watch::title_memory_remapped(address as usize + 4096, 4096);
+        host.execute(&[&stale]);
+        // SAFETY: the test's memory stays allocated across the notification.
+        assert_eq!(unsafe { (address as *const u32).read() }, 0);
+        // A command may prepare its table, then be dropped. Its UAV must
+        // not write back bytes already in the host texture.
+        let abandoned = host.new_list().unwrap();
+        crate::texback::TEST_KINDS.set(&[(64, 64, 41)]);
+        {
+            let _writes = abandoned.capture_texture_writes().unwrap();
+            readable(&abandoned, &used(ResourceType::Uav), &view, false);
+            abandoned.texture_written(texture, None, None);
+        }
+        crate::texback::TEST_KINDS.set(&[]);
+        abandoned.close();
+        host.execute(&[&abandoned]);
+        // SAFETY: the title allocation is live.
+        assert_eq!(unsafe { (address as *const u32).read() }, 0);
+
+        // New title resources can replace interior bytes before submission.
+        let mut buffer = texture_words(16, 1, 0, 1, 0);
+        buffer[0] = 1;
+        let unrecognized_layout = texture_words(16, 1, 41, u32::MAX, 0);
+        for words in [buffer, unrecognized_layout] {
+            let overlap = record();
+            crate::texback::TEST_KINDS.set(&[(64, 64, 41)]);
+            let replacement = texture_at_address(address + 4096, &words);
+            crate::texback::TEST_KINDS.set(&[]);
+            host.execute(&[&overlap]);
+            // SAFETY: the test owns the memory underneath both objects.
+            assert_eq!(unsafe { (address as *const u32).read() }, 0);
+            assert_eq!(crate::resource::resource_release(replacement), 0);
+        }
+
+        // The host texture outlives the title object so the recorded GPU
+        // commands still finish safely, while the title bytes stay put.
+        let released = record();
+        assert_eq!(crate::resource::resource_release(texture), 0);
+        host.execute(&[&released]);
+        // SAFETY: the test still owns the memory behind the title object.
+        assert_eq!(unsafe { (address as *const u32).read() }, 0);
     }
 
     /// A structured view the title places off its buffer's elements (the

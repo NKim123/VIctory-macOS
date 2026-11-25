@@ -41,6 +41,10 @@ pub(crate) struct HostHeap {
     /// the title views through a fraction of the slots, and a dense table
     /// of them all was 37.7 MB, written when the heap was made.
     kept: Mutex<Paged<Held>>,
+    /// Write-back observers of shared slots. A descriptor rewrite retires
+    /// its observer before changing the GPU-visible descriptor.
+    texture_bindings:
+        Mutex<std::collections::HashMap<u32, std::sync::Weak<crate::texback::Binding>>>,
     /// Unordered views of textures left null by [`HostHeap::evict`]
     /// (`VICTORY_EVICT_HEAP_UAV`), made again by
     /// [`HostHeap::remake_unordered`] once shaders write through heaps.
@@ -224,6 +228,7 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             ready: (0..count).map(|_| AtomicU64::new(0)).collect(),
             kept: Mutex::new(Paged::new((count + extra) as usize)),
+            texture_bindings: Mutex::default(),
             nulled_unordered: Mutex::new(Vec::new()),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
@@ -525,6 +530,7 @@ impl HostHeap {
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
+        self.invalidate_texture_binding(index);
         if self.sampler {
             self.null_sampler(index);
         } else {
@@ -582,6 +588,52 @@ impl HostHeap {
     /// The view-mark table, for the root SRV of shaders marking their writes.
     pub(crate) fn marks(&self) -> Option<&ID3D12Resource> {
         self.marks.as_ref().map(|(buffer, _)| buffer)
+    }
+
+    /// Watches the exact shared slot and host texture used by a recorded
+    /// UAV. The mirror lock serializes the snapshot with descriptor writes.
+    pub(crate) fn watch_texture_binding(
+        &self,
+        index: u32,
+        view: &ViewPin,
+        texture: &ID3D12Resource,
+    ) -> Option<std::sync::Arc<crate::texback::Binding>> {
+        let _made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        if self.ready.get(index as usize)?.load(Ordering::Acquire) != view.key {
+            return None;
+        }
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        if !kept
+            .get(index as usize)
+            .is_some_and(|(res, _)| res == texture)
+        {
+            return None;
+        }
+        let mut bindings = self
+            .texture_bindings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(binding) = bindings.get(&index).and_then(std::sync::Weak::upgrade) {
+            return Some(binding);
+        }
+        bindings.retain(|_, binding| binding.strong_count() != 0);
+        let binding = std::sync::Arc::new(crate::texback::Binding::default());
+        bindings.insert(index, std::sync::Arc::downgrade(&binding));
+        Some(binding)
+    }
+
+    fn invalidate_texture_binding(&self, index: u32) {
+        if index < self.count
+            && crate::texback::tracking_bindings()
+            && let Some(binding) = self
+                .texture_bindings
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&index)
+                .and_then(|binding| binding.upgrade())
+        {
+            binding.invalidate();
+        }
     }
 
     /// Slot `index` now views `resource` (or nothing of the host's).
@@ -887,6 +939,7 @@ impl HostHeap {
         }
         {
             self.ready[index as usize].store(0, Ordering::Relaxed);
+            self.invalidate_texture_binding(index);
             self.set_stride(index, Some(&view));
             self.note_address(index, Some(&view));
             if later {
@@ -970,6 +1023,7 @@ impl HostHeap {
             }
             let key = made.get(index as usize).copied().unwrap_or(0);
             let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
+            self.invalidate_texture_binding(index);
             match &view {
                 Some(v) => null_for(v, self.cpu(index)),
                 None => null_view(self.cpu(index)),
@@ -1661,6 +1715,34 @@ pub(crate) fn make_view(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<
     make(view, at).flatten().map(|k| k.0)
 }
 
+/// The UAV description the host actually uses, after format fallback.
+/// `Some(None)` means the host infers it from the resource.
+pub(crate) fn color_uav(
+    resource: crate::object::This,
+    copy: &crate::resource::HostTexture,
+    words: Option<&[u32; 10]>,
+) -> Option<Option<D3D12_UNORDERED_ACCESS_VIEW_DESC>> {
+    let mut desc = words.map(uav_desc);
+    if desc.is_none() && !default_view(resource) {
+        return None;
+    }
+    if let Some(desc) = desc.as_mut()
+        && desc.Format.0 == 0
+        && let Some(format) = crate::resource::view_format(resource)
+    {
+        desc.Format = DXGI_FORMAT(format as i32);
+    }
+    if !fits(
+        &copy.texture,
+        &copy.castable,
+        desc.as_mut().map(|d| &mut d.Format),
+        true,
+    ) {
+        return None;
+    }
+    Some(desc)
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -1751,19 +1833,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 return crate::twin::uav(resource, &copy, desc.as_ref(), at)
                     .map(|twin| Some((twin, None)));
             }
-            let mut desc = desc.as_ref().map(uav_desc);
-            if desc.is_none() && !default_view(resource) {
-                return None;
-            }
-            if let Some(desc) = desc.as_mut()
-                && desc.Format.0 == 0
-                && let Some(format) = crate::resource::view_format(resource)
-            {
-                desc.Format = DXGI_FORMAT(format as i32);
-            }
-            if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), true) {
-                return None;
-            }
+            let desc = color_uav(resource, &copy, desc.as_ref())?;
             // SAFETY: a live texture and a slot of our heap.
             unsafe {
                 device.CreateUnorderedAccessView(
