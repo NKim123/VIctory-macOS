@@ -1162,6 +1162,12 @@ struct Deferred {
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
     /// Table slots asked for since the last title write (heap, index).
     slots: std::collections::HashSet<(usize, u32)>,
+    /// GPU write steps recorded since the last title write: host copy,
+    /// byte range, write marks and title-memory access.
+    declared: std::collections::HashSet<(usize, usize, usize, bool, bool)>,
+    /// Upload addresses for unaligned root CBs filled since that write,
+    /// keyed by the source address and byte count.
+    filled: std::collections::HashMap<(usize, u64), u64>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -1180,6 +1186,19 @@ struct Deferred {
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
     missed: Vec<Box<dyn Fn() -> bool + Send>>,
+}
+
+/// Bound the extra bookkeeping per recording. After this many distinct
+/// entries in either cache, new ranges take the ordinary recording path.
+const DEFERRED_CACHE_ENTRIES: usize = 1024;
+
+impl Deferred {
+    fn title_written(&mut self) {
+        self.refreshed.clear();
+        self.slots.clear();
+        self.declared.clear();
+        self.filled.clear();
+    }
 }
 
 impl Host {
@@ -2451,8 +2470,7 @@ impl HostList {
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
-        deferred.refreshed.clear();
-        deferred.slots.clear();
+        deferred.title_written();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -2497,7 +2515,8 @@ impl HostList {
 
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run
-    /// (`marked`: the pages they mark).
+    /// (`marked`: the pages they mark). Record each declaration once
+    /// until a step that may write title memory intervenes.
     pub(crate) fn defer_gpu_write(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
@@ -2506,9 +2525,24 @@ impl HostList {
         marked: bool,
     ) {
         let memory = self.memory_writer.load(Ordering::Relaxed);
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len, marked, memory));
+        let mut deferred = self.deferred();
+        let key = (
+            std::sync::Arc::as_ptr(shadow) as usize,
+            address,
+            len,
+            marked,
+            memory,
+        );
+        let repeated = if deferred.declared.len() < DEFERRED_CACHE_ENTRIES {
+            !deferred.declared.insert(key)
+        } else {
+            deferred.declared.contains(&key)
+        };
+        if !repeated {
+            deferred
+                .copies
+                .push(Step::GpuWrite(shadow.clone(), address, len, marked, memory));
+        }
     }
 
     /// Shaders of the list take views from the heap itself
@@ -2592,17 +2626,21 @@ impl HostList {
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
-        let host = host()?;
-        let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).checked_next_multiple_of(256)?;
         if len > SCRATCH_CHUNK {
-            let (buffer, data) = host.upload_buffer(len)?;
+            let (buffer, data) = host()?.upload_buffer(len)?;
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
             self.deferred().uploads.push(buffer);
             return Some((gpu, data));
         }
+        let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        self.scratch_range(&mut s, len)
+    }
+
+    /// Takes a pre-aligned range small enough for a shared scratch chunk.
+    fn scratch_range(&self, s: &mut Scratch, len: u64) -> Option<(u64, *mut u8)> {
         while let Some(chunk) = s.chunks.get(s.current) {
             if len <= chunk.capacity - s.used {
                 break;
@@ -2612,7 +2650,7 @@ impl HostList {
         if s.current == s.chunks.len() {
             let next = s.chunks.last().map_or(FIRST_SCRATCH_CHUNK, |c| 2 * c.capacity);
             let capacity = len.next_multiple_of(FIRST_SCRATCH_CHUNK).max(next).min(SCRATCH_CHUNK);
-            let (buffer, data) = host.upload_buffer(capacity)?;
+            let (buffer, data) = host()?.upload_buffer(capacity)?;
             name(&buffer, || format!("list scratch {capacity:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -2627,6 +2665,26 @@ impl HostList {
         let result = (chunk.gpu + at, (chunk.mapped + at as usize) as *mut u8);
         s.used += len;
         Some(result)
+    }
+
+    /// A 256-byte-aligned upload address for an unaligned root CB. The
+    /// fill is done at submission, in order with the list's title writes.
+    pub(crate) fn fill_root_cb(&self, src: u64, len: u64) -> Option<u64> {
+        debug_assert!(len <= FIRST_SCRATCH_CHUNK);
+        let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        let mut deferred = self.deferred();
+        let key = (src as usize, len);
+        if let Some(&gpu) = deferred.filled.get(&key) {
+            return Some(gpu);
+        }
+        let (gpu, to) = self.scratch_range(&mut scratch, len.max(1).next_multiple_of(256))?;
+        deferred
+            .copies
+            .push(Step::Fill(to as usize, src as usize, len as usize));
+        if deferred.filled.len() < DEFERRED_CACHE_ENTRIES {
+            deferred.filled.insert(key, gpu);
+        }
+        Some(gpu)
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
@@ -2687,8 +2745,7 @@ impl HostList {
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
         let mut deferred = self.deferred();
         deferred.copies.push(Step::Run(Box::new(work)));
-        deferred.refreshed.clear();
-        deferred.slots.clear();
+        deferred.title_written();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -4276,11 +4333,89 @@ fn pump() {
 #[cfg(test)]
 mod batch {
     // `mod tests` is already taken at the top of this file
-    use super::Batch;
+    use super::{Batch, Step};
     use crate::shadow::Shadow;
     use crate::watch::PAGE;
     use std::sync::Arc;
 
+    #[test]
+    fn write_declarations_retain_flags_and_restart_after_title_writes() {
+        let Some(host) = super::host() else { return };
+        let (address, shadow) = plain(1).expect("a host shadow");
+        let list = host.new_list().unwrap();
+        let write = |marked| list.defer_gpu_write(&shadow, address, 256, marked);
+        write(false);
+        write(false);
+        write(true);
+        {
+            let _writer = list.writer_uses_memory(true);
+            write(true);
+            write(true);
+        }
+        list.defer_copy(address as *mut u8, address as *const u8, 4);
+        write(false);
+        list.defer(|| {});
+        write(false);
+        assert!(matches!(
+            list.deferred().copies.as_slice(),
+            [
+                Step::GpuWrite(_, _, _, false, false),
+                Step::GpuWrite(_, _, _, true, false),
+                Step::GpuWrite(_, _, _, true, true),
+                Step::Copy(..),
+                Step::GpuWrite(_, _, _, false, false),
+                Step::Run(_),
+                Step::GpuWrite(_, _, _, false, false),
+            ]
+        ));
+        list.close();
+        drop(list);
+        done(address, Some(shadow));
+    }
+
+    #[test]
+    fn root_cb_scratch_reuses_fills_until_title_memory_changes() {
+        let Some(host) = super::host() else { return };
+        let list = host.new_list().unwrap();
+        let mut title = [11u8; 32];
+        let src = title.as_mut_ptr();
+        let changed = [22u8; 32];
+        let first = list.fill_root_cb(src as u64, 16).unwrap();
+        assert_eq!(list.fill_root_cb(src as u64, 16), Some(first));
+        let longer = list.fill_root_cb(src as u64, 32).unwrap();
+        assert_ne!(first, longer);
+        list.defer_copy(src, changed.as_ptr(), changed.len());
+        let second = list.fill_root_cb(src as u64, 16).unwrap();
+        assert_ne!(first, second);
+        let addr = src as usize;
+        list.defer(move || fill(addr, 32, 33));
+        let third = list.fill_root_cb(src as u64, 16).unwrap();
+        assert_ne!(second, third);
+        list.run_deferred(&mut Batch::default());
+        let deferred = list.deferred();
+        let filled: Vec<_> = deferred
+            .copies
+            .iter()
+            .filter_map(|step| {
+                if let Step::Fill(to, _, len) = *step {
+                    // SAFETY: upload memory held by this list after the fills.
+                    Some(unsafe { std::slice::from_raw_parts(to as *const u8, len) }.to_vec())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            filled,
+            [vec![11; 16], vec![11; 32], vec![22; 16], vec![33; 16]]
+        );
+        drop(deferred);
+        list.close();
+        list.reset();
+        assert_eq!(list.fill_root_cb(src as u64, 16), Some(first));
+        assert_eq!(list.deferred().copies.len(), 1, "a fresh fill after reset");
+        list.close();
+    }
 
     /// A host copy of tracked title memory: a submission whose lists all ask
     /// for it whole copies the one page the title wrote, once, and again
