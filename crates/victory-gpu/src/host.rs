@@ -4283,7 +4283,7 @@ mod batch {
 
 
     /// A host copy of tracked title memory: a submission whose lists all ask
-    /// for it whole copies the one page the title wrote, once, and again
+    /// for it whole copies the written parts once, and again
     /// only after a step that writes title memory.
     #[test]
     fn a_copy_is_refreshed_once_per_submission_by_the_pages_written() {
@@ -4297,13 +4297,25 @@ mod batch {
         let mut batch = Batch::default();
         batch.add(&copy, p, len);
         assert_eq!(batch.flush(), len, "all of it at first");
+        let expected_bytes = |page| {
+            crate::watch::tests::expected_write_watch(page)
+                .into_iter()
+                .map(|(a, b)| b - a)
+                .sum::<usize>()
+        };
         // SAFETY: our pool, guarded since the copy took it.
         unsafe { ((p + PAGE + 8) as *mut u8).write_volatile(7) };
+        let expected = expected_bytes(p + PAGE);
         // The next submission: two lists ask for the copy.
         let mut batch = Batch::default();
         batch.add(&copy, p, len);
         batch.add(&copy, p + 100, 200);
-        assert_eq!(batch.flush(), PAGE, "the page written");
+        let copied = batch.flush();
+        assert_eq!(
+            copied, expected,
+            "only the parts reported by the write watch"
+        );
+        eprintln!("one-byte store: refreshed {copied} bytes of a {PAGE}-byte page");
         assert_eq!(copy.read_host((p + PAGE + 8) as u64, 1)[0], 7);
         // SAFETY: as above.
         unsafe { (p as *mut u8).write_volatile(1) };
@@ -4311,7 +4323,8 @@ mod batch {
         assert_eq!(batch.flush(), 0, "nothing again in the submission");
         batch.title_written();
         batch.add(&copy, p, len);
-        assert_eq!(batch.flush(), PAGE, "after a title write, what changed");
+        let expected = expected_bytes(p);
+        assert_eq!(batch.flush(), expected, "after a title write, what changed");
         crate::shadow::unregister(p, p as u64);
         drop(copy);
         crate::watch::tests::free(p);

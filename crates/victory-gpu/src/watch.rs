@@ -106,15 +106,62 @@ pub fn rosetta() -> bool {
     }
 }
 
-/// The unit tracked and copied: 64 KiB, the console's page. Finer units
-/// made the checks of the world's big buffers cost more than the copies
-/// they saved.
+/// The unit tracked and guarded: 64 KiB, the console's page.
 pub(crate) const PAGE: usize = 64 << 10;
+
+const PART: usize = 4 << 10;
+const WHOLE: u16 = u16::MAX;
+
+fn page_parts() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("VICTORY_PAGE_PARTS").is_none_or(|v| v != "0"));
+    *ON
+}
+
+/// Known dirty 4 KiB parts and whether the open guard has let through writes
+/// still to be collected from the write watch. Unknown writes set every bit.
+#[derive(Clone, Copy)]
+struct DirtyPage {
+    parts: u16,
+    pending: bool,
+}
+
+impl DirtyPage {
+    const WHOLE: Self = Self {
+        parts: WHOLE,
+        pending: false,
+    };
+    const WATCH: Self = Self {
+        parts: 0,
+        pending: true,
+    };
+
+    fn merge(&mut self, other: Self) {
+        self.parts |= other.parts;
+        self.pending = self.parts != WHOLE && (self.pending || other.pending);
+    }
+
+    fn resolve(&mut self, parts: u16) {
+        if self.pending {
+            self.parts |= parts;
+            self.pending = false;
+        }
+    }
+
+    fn mask(self) -> u16 {
+        if self.pending { WHOLE } else { self.parts }
+    }
+}
 
 /// The pages a tracker has not taken since they changed, what it saves of
 /// pages it armed, its bit in [`DIRTY`] (none: always taken as dirty), and
 /// whether it is a host buffer copy's (the only trackers [`retake`] marks).
-struct Changed(Mutex<BTreeSet<usize>>, Mutex<Saved>, Option<u32>, bool);
+struct Changed(
+    Mutex<BTreeMap<usize, DirtyPage>>,
+    Mutex<Saved>,
+    Option<u32>,
+    bool,
+);
 
 /// A bit per tracker, set while it holds changed pages: set and cleared
 /// under the tracker's lock, read without one ([`Tracked::clean`]). Dense,
@@ -472,7 +519,8 @@ fn track_as(start: usize, len: usize, views: bool, copy: bool) -> Option<Tracked
     // A tracker with untracked parts is never clean: no bit.
     let bit = if untracked.is_empty() { dirty_bit() } else { None };
     set_dirty(bit, true);
-    let changed = Arc::new(Changed(Mutex::new(pages.iter().copied().collect()), Mutex::default(), bit, copy));
+    let dirty = pages.iter().map(|&page| (page, DirtyPage::WHOLE)).collect();
+    let changed = Arc::new(Changed(Mutex::new(dirty), Mutex::default(), bit, copy));
     let mut g = guards();
     for &page in &pages {
         g.holders.entry(page).or_default().push(changed.clone());
@@ -493,6 +541,41 @@ fn write_watched(at: usize) -> bool {
     let (mut found, mut count, mut granularity) = (0usize, 1usize, 0u32);
     // SAFETY: room for one answer; no reset, so nothing changes.
     unsafe { GetWriteWatch(0, page as *const _, 4096, (&raw mut found).cast(), &mut count, &mut granularity) == 0 }
+}
+
+const WRITE_WATCH_RESET: u32 = 1;
+
+/// Take one block's write watch after making the block read-only again.
+/// The guard lock serializes resets and publication to the block's holders.
+/// Old kernel bits from before the first take may add parts to the answer.
+fn watched_parts(page: usize, flags: u32) -> u16 {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    let start = page * PAGE;
+    let mut addresses = [std::ptr::null_mut(); PAGE / PART];
+    let (mut count, mut granularity) = (addresses.len(), 0);
+    // SAFETY: the kernel receives space for every 4 KiB address in the block.
+    let status = unsafe {
+        GetWriteWatch(
+            flags,
+            start as *const _,
+            PAGE,
+            addresses.as_mut_ptr(),
+            &mut count,
+            &mut granularity,
+        )
+    };
+    if status != 0 || granularity as usize != PART || count == 0 || count > addresses.len() {
+        return WHOLE;
+    }
+    let mut parts = 0;
+    for &address in &addresses[..count] {
+        let offset = (address as usize).wrapping_sub(start);
+        if offset >= PAGE || !offset.is_multiple_of(PART) {
+            return WHOLE;
+        }
+        parts |= 1 << (offset / PART);
+    }
+    parts
 }
 
 /// The pages of `[start, end)` that are the runtime's GPU memory: a
@@ -608,8 +691,9 @@ fn open_run(g: &mut Guards, first: usize, last: usize) {
 impl Tracked {
     /// Takes the changed pages of `[from, to)`: guards them (writes from
     /// now on mark them again) and returns the byte ranges to copy, cut to
-    /// `[from, to)`, in order. A page whose part in the tracked memory lies
-    /// only partly in `[from, to)` is copied in part and stays changed.
+    /// `[from, to)`, in order. The write watch can narrow those ranges to
+    /// 4 KiB parts. A page whose tracked bytes lie only partly in
+    /// `[from, to)` stays changed.
     pub(crate) fn take(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
         let (copy, zero) = self.take_split(from, to);
         let mut runs: Vec<(usize, usize)> = copy.into_iter().chain(zero).collect();
@@ -632,20 +716,23 @@ impl Tracked {
         if from >= to {
             return (Vec::new(), Vec::new());
         }
-        let pages: Vec<usize> = {
+        let mut pages: Vec<(usize, u16)> = {
             #[cfg(feature = "diagnostics")]
             let waited = Timed(std::time::Instant::now(), crate::copystat::C::GuardWaitUs);
             let changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
             #[cfg(feature = "diagnostics")]
             drop(waited);
-            changed.range(from / PAGE..to.div_ceil(PAGE)).copied().collect()
+            changed
+                .range(from / PAGE..to.div_ceil(PAGE))
+                .map(|(&page, _)| (page, WHOLE))
+                .collect()
         };
         if pages.is_empty() {
             return (Vec::new(), Vec::new());
         }
         let mut whole: Vec<usize> = pages
             .iter()
-            .copied()
+            .map(|&(page, _)| page)
             .filter(|&p| (p * PAGE).max(self.start) >= from && ((p + 1) * PAGE).min(self.end) <= to)
             .collect();
         // Every address showing the same pages is guarded too. A write in
@@ -664,7 +751,36 @@ impl Tracked {
         drop(asked);
         whole.retain(|p| !unguarded.contains(p));
         let mut unmapped = Vec::new();
-        for page in protect_noting(&mut g, &whole, &mut unmapped) {
+        let taken = protect_noting(&mut g, &whole, &mut unmapped);
+        for &page in &taken {
+            if let Some(dirty) = changed.get_mut(&page)
+                && dirty.pending
+            {
+                let parts = if g.protected.contains(&page) && !g.alias_of.contains_key(&page) {
+                    watched_parts(page, WRITE_WATCH_RESET)
+                } else {
+                    WHOLE
+                };
+                dirty.resolve(parts);
+                // A reset consumes a shared answer. Even holders refreshing
+                // later must see these parts, along with their earlier dirties.
+                for holder in &g.holders[&page] {
+                    if !Arc::ptr_eq(holder, &self.changed)
+                        && let Some(dirty) = holder
+                            .0
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get_mut(&page)
+                    {
+                        dirty.resolve(parts);
+                    }
+                }
+            }
+        }
+        for (page, mask) in &mut pages {
+            *mask = changed.get(page).map_or(WHOLE, |dirty| dirty.mask());
+        }
+        for page in taken {
             changed.remove(&page);
             self.changed.taken(page);
         }
@@ -672,12 +788,11 @@ impl Tracked {
         drop(changed);
         drop(g);
         let (mut copy, mut zero): (Runs, Runs) = (Vec::new(), Vec::new());
-        for p in pages {
-            let (a, b) = ((p * PAGE).max(from), ((p + 1) * PAGE).min(to));
-            let runs = if unmapped.contains(&p) { &mut zero } else { &mut copy };
-            match runs.last_mut() {
-                Some((_, end)) if *end == a => *end = b,
-                _ => runs.push((a, b)),
+        for (page, mask) in pages {
+            if unmapped.contains(&page) {
+                append_parts(&mut zero, page, WHOLE, from, to);
+            } else {
+                append_parts(&mut copy, page, mask, from, to);
             }
         }
         (copy, zero)
@@ -689,7 +804,7 @@ impl Tracked {
             .0
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains(&page)
+            .contains_key(&page)
     }
 
     /// The caller made pages (page numbers) of its copy equal to title
@@ -785,6 +900,24 @@ impl Tracked {
                 let (a, b) = (from.max(page * PAGE), to.min((page + 1) * PAGE));
                 before[a - page * PAGE..b - page * PAGE]
                     .copy_from_slice(&bytes[a - from..b - from]);
+            }
+        }
+    }
+}
+
+/// Append dirty parts, joining consecutive ones across block boundaries.
+fn append_parts(runs: &mut Runs, page: usize, mut mask: u16, from: usize, to: usize) {
+    while mask != 0 {
+        let first = mask.trailing_zeros();
+        let count = (mask >> first).trailing_ones();
+        let end = first + count;
+        mask &= (u32::MAX << end) as u16;
+        let a = (page * PAGE + first as usize * PART).max(from);
+        let b = (page * PAGE + end as usize * PART).min(to);
+        if a < b {
+            match runs.last_mut() {
+                Some((_, last)) if *last == a => *last = b,
+                _ => runs.push((a, b)),
             }
         }
     }
@@ -935,6 +1068,10 @@ impl RuntimeRegions {
 /// in every tracker holding them. True if one of `[first, last)` was
 /// guarded.
 fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
+    changed_with(g, first, last, save, DirtyPage::WHOLE)
+}
+
+fn changed_with(g: &mut Guards, first: usize, last: usize, save: bool, dirty: DirtyPage) -> bool {
     let guarded = g.protected.range(first..last).next().is_some();
     let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
     #[cfg(feature = "diagnostics")]
@@ -945,7 +1082,7 @@ fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
     // Every page's bytes are saved before any is opened: once a page is
     // open, a write by another thread lands without a fault, and a save
     // after it would keep that write as the page's old bytes.
-    mark_changed(g, first, last, save);
+    mark_changed_with(g, first, last, save, dirty);
     // The pages showing the same memory are marked, not opened: nothing
     // writes through them now, and opening them only made the next take
     // guard them again, one Wine call each (two thirds of all protection
@@ -977,12 +1114,25 @@ fn open_guarded(g: &mut Guards, first: usize, last: usize) {
 /// leaving their protection as it is. With `save`, before the write lands:
 /// trackers armed for a page they had taken keep its bytes.
 fn mark_changed(g: &mut Guards, first: usize, last: usize, save: bool) {
+    mark_changed_with(g, first, last, save, DirtyPage::WHOLE);
+}
+
+fn mark_changed_with(g: &mut Guards, first: usize, last: usize, save: bool, dirty: DirtyPage) {
     for (&page, holders) in g.holders.range(first..last) {
         for c in holders {
             let first_write = {
                 let mut set = c.0.lock().unwrap_or_else(|e| e.into_inner());
                 set_dirty(c.2, true);
-                set.insert(page)
+                match set.entry(page) {
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        entry.get_mut().merge(dirty);
+                        false
+                    }
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(dirty);
+                        true
+                    }
+                }
             };
             if first_write && save {
                 c.save(page);
@@ -1086,7 +1236,7 @@ fn mark_copies(g: &Guards, first: usize, last: usize) {
         for c in holders.iter().filter(|c| c.3) {
             let mut set = c.0.lock().unwrap_or_else(|e| e.into_inner());
             set_dirty(c.2, true);
-            set.insert(page);
+            set.insert(page, DirtyPage::WHOLE);
         }
     }
 }
@@ -1158,7 +1308,14 @@ fn install() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let mut g = guards();
-        if changed(&mut g, at / PAGE, at / PAGE + 1, true) {
+        let page = at / PAGE;
+        let dirty =
+            if page_parts() && g.protected.contains(&page) && !g.alias_of.contains_key(&page) {
+                DirtyPage::WATCH
+            } else {
+                DirtyPage::WHOLE
+            };
+        if changed_with(&mut g, page, page + 1, true, dirty) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             return EXCEPTION_CONTINUE_EXECUTION;
@@ -1291,6 +1448,20 @@ pub(crate) mod tests {
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
+    /// Wine can report all constituent 4 KiB parts of a larger host page.
+    /// Inspect the kernel answer without consuming it.
+    pub(crate) fn expected_write_watch(start: usize) -> Runs {
+        let page = start / PAGE;
+        let parts = if page_parts() {
+            watched_parts(page, 0)
+        } else {
+            WHOLE
+        };
+        let mut runs = Vec::new();
+        append_parts(&mut runs, page, parts, start, start + PAGE);
+        runs
+    }
+
     /// Everything is changed at first; after taking, only what is written
     /// (by faults, or reported) is, and every tracker of a page sees it.
     /// A tracked range that starts in reserved memory and runs into plain
@@ -1344,21 +1515,84 @@ pub(crate) mod tests {
             ((p + PAGE + 9) as *mut u8).write_volatile(2);
         }
         assert!(!a.clean() && !b.clean(), "a write is seen by every tracker");
-        assert_eq!(a.take(p, p + 4 * PAGE), [(p + PAGE, p + 2 * PAGE)]);
+        let expected = expected_write_watch(p + PAGE);
+        assert_eq!(a.take(p, p + 4 * PAGE), expected);
         assert!(a.clean());
         // `a` guarded it again; `b` still has it changed.
         assert!(b.changed(p / PAGE + 1));
-        assert_eq!(b.take(p, p + 4 * PAGE), [(p + PAGE, p + 2 * PAGE)]);
+        assert_eq!(b.take(p, p + 4 * PAGE), expected);
         // SAFETY: as above: a fault again, for both.
         unsafe { ((p + PAGE + 10) as *mut u8).write_volatile(3) };
         assert!(a.changed(p / PAGE + 1) && b.changed(p / PAGE + 1));
-        assert_eq!(a.take(p, p + 4 * PAGE), [(p + PAGE, p + 2 * PAGE)]);
+        let expected = expected_write_watch(p + PAGE);
+        assert_eq!(a.take(p, p + 4 * PAGE), expected);
         drop(writing(p + 3 * PAGE + 5, 1));
         assert_eq!(a.take(p, p + 4 * PAGE), [(p + 3 * PAGE, p + 4 * PAGE)]);
         title_memory_remapped(p, PAGE);
         assert!(a.changed(p / PAGE) && !a.changed(p / PAGE + 1));
         drop((a, b));
         free(p);
+    }
+
+    #[test]
+    fn racing_takes_keep_each_watch_answer_for_slower_trackers() {
+        let p = pool(1);
+        let [a, b, slow] =
+            std::array::from_fn(|_| track(p, PAGE, true).expect("pool memory is tracked"));
+        for tracker in [&a, &b, &slow] {
+            assert_eq!(tracker.take(p, p + PAGE), [(p, p + PAGE)]);
+        }
+        let write = |offset| {
+            // SAFETY: a byte of our live allocation; the handler opens the guard.
+            unsafe { ((p + offset) as *mut u8).write_volatile(1) };
+        };
+        let contains =
+            |runs: &Runs, offset| runs.iter().any(|&(a, b)| (a..b).contains(&(p + offset)));
+        write(8);
+        write(6 * PART + 8); // A second store after the 64 KiB guard is open.
+        assert_eq!(a.take(p, p + PART), [(p, p + PART)]);
+        assert!(!a.clean(), "the other parts are still due");
+        let expected = expected_write_watch(p);
+        assert!(contains(&expected, 8) && contains(&expected, 6 * PART + 8));
+        let ready = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let taking = scope.spawn(|| {
+                ready.wait();
+                a.take(p, p + PAGE)
+            });
+            ready.wait();
+            assert_eq!(b.take(p, p + PAGE), expected);
+            assert_eq!(taking.join().unwrap(), expected);
+        });
+        write(15 * PART + 8);
+        let latest = expected_write_watch(p);
+        assert!(contains(&latest, 15 * PART + 8));
+        assert_eq!(a.take(p, p + PAGE), latest);
+        let runs = slow.take(p, p + PAGE);
+        for offset in [8, 6 * PART + 8, 15 * PART + 8] {
+            assert!(
+                contains(&runs, offset),
+                "missing offset {offset:#x}: {runs:x?}"
+            );
+        }
+        assert!(slow.clean());
+        drop((a, b, slow));
+        free(p);
+    }
+
+    #[test]
+    fn parts_are_clipped_and_adjacent_parts_share_a_run() {
+        let mut runs = Vec::new();
+        append_parts(&mut runs, 1, 0x8001, PAGE + 7, 3 * PAGE);
+        append_parts(&mut runs, 2, 0b101, PAGE + 7, 2 * PAGE + 2 * PART + 1);
+        assert_eq!(
+            runs,
+            [
+                (PAGE + 7, PAGE + PART),
+                (2 * PAGE - PART, 2 * PAGE + PART),
+                (2 * PAGE + 2 * PART, 2 * PAGE + 2 * PART + 1),
+            ]
+        );
     }
 
     /// A range running from free memory over another allocation into a pool
