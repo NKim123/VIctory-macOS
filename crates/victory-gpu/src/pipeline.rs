@@ -822,6 +822,8 @@ static FUNCTIONS: Table<24> = {
 #[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
+mod known;
+#[cfg(windows)]
 mod library;
 #[cfg(windows)]
 mod make;
@@ -842,10 +844,34 @@ pub fn use_pipeline_cache(dir: std::path::PathBuf) {
     library::use_pipeline_cache(dir);
 }
 
+/// Saves title pipeline descriptions and shader containers for offline replay.
+#[cfg(windows)]
+pub fn record_pipelines(dir: std::path::PathBuf) {
+    known::enable(dir);
+}
+
+/// Whether a name identifies a recorded pipeline.
+#[cfg(windows)]
+pub fn is_pipeline_key(key: &str) -> bool {
+    known::valid_key(key)
+}
+
 /// Saves the pipeline cache now if anything was added (at the end of a run).
 #[cfg(windows)]
 pub fn save_pipeline_cache() {
     library::save(true);
+}
+
+/// Opens the host library before starting an offline build batch.
+#[cfg(windows)]
+pub fn require_pipeline_cache() -> std::io::Result<()> {
+    library::require_library()
+}
+
+/// Saves a batch and reports any publication error to offline callers.
+#[cfg(windows)]
+pub fn flush_pipeline_cache() -> std::io::Result<()> {
+    library::save_result(true)
 }
 
 /// The pre-build: a title pipeline made ahead of a run into the pipeline
@@ -890,6 +916,11 @@ impl Prebuild {
         }
     }
 
+    /// Loads one title pipeline previously recorded by a run.
+    pub fn recorded(dir: &std::path::Path, key: &str) -> std::io::Result<Prebuild> {
+        known::load(dir, key)
+    }
+
     /// What a run lists the pipeline by (its early list).
     pub fn key(&self) -> String {
         make::key(&self.shaders, self.graphics.as_deref())
@@ -904,28 +935,50 @@ impl Prebuild {
     /// Makes the host pipeline, or finds it in the library; why not if it
     /// gets none.
     pub fn make(&self) -> Result<(), String> {
+        let result = self.build();
+        library::save(false);
+        result.map(|_| ())
+    }
+
+    /// Warms a recorded pipeline. Returns true for a library load and false
+    /// for a newly compiled and stored pipeline.
+    pub fn make_cached(&self) -> Result<bool, String> {
+        match self.build()? {
+            library::CacheStatus::Loaded => Ok(true),
+            library::CacheStatus::Stored => Ok(false),
+            library::CacheStatus::Uncached => {
+                Err("the host library refused to store the pipeline".into())
+            }
+        }
+    }
+
+    fn build(&self) -> Result<library::CacheStatus, String> {
         let key = self.key();
         library::keep_early_list();
         // Without the run's log lines per shader and pipeline: tens of
         // thousands of them would bury the pre-build's own report.
         let quiet = tracing::Dispatch::none();
+        let started = std::time::Instant::now();
         let made = tracing::dispatcher::with_default(&quiet, || {
             host::HostPipeline::new(&self.shaders, self.graphics.as_deref())
         });
+        library::note_time(&key, started.elapsed());
         #[cfg(feature = "diagnostics")]
         make::log_built(&key);
-        if made.is_some() {
-            // shortcut: a pipeline the library refused to store is listed
-            // too; a run then makes it at first use.
+        if made
+            .as_ref()
+            .is_some_and(|pipeline| pipeline.cache_status != library::CacheStatus::Uncached)
+        {
             library::note_prebuilt(key);
         }
-        library::save(false);
         match made {
-            Some(_) => Ok(()),
-            None => Err(match self.shaders.iter().find(|s| s.translated().is_none()) {
-                Some(s) => format!("{} shader does not translate", s.stage),
-                None => "the host refuses it".into(),
-            }),
+            Some(pipeline) => Ok(pipeline.cache_status),
+            None => Err(
+                match self.shaders.iter().find(|s| s.translated().is_none()) {
+                    Some(s) => format!("{} shader does not translate", s.stage),
+                    None => "the host refuses it".into(),
+                },
+            ),
         }
     }
 }

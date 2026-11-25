@@ -99,7 +99,11 @@ pub fn run(
     let original = patching.is_some().then_some(original);
 
     let images = cfg.cache_subdir("images")?;
+    cfg.cache_subdir("pipelines")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+    if execute && std::env::var_os("VICTORY_PIPELINE_BOOK").is_some_and(|v| v == "1") {
+        victory_gpu::pipeline::record_pipelines(cfg.cache_subdir(crate::warm::RECORDS)?);
+    }
     let image = victory_loader::load(&prepared, &images)?;
     // Mapped: the patched bytes (the exe's size, 114 MB) are not needed.
     drop(prepared);

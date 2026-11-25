@@ -111,6 +111,27 @@ tools/macos/victory.sh run --execute <the game's executable>
 
 For now this gets as far as VIctory does on Windows, as the note at the top explains.
 
+## Warming the pipeline cache
+
+Set `VICTORY_PIPELINE_BOOK=1` for a title run to record the PSOs it creates.
+Then run `victory warm` on the same Windows or CrossOver setup, with the title
+closed. It replays the recorded PSOs in batches of up to 40 in a separate
+process, building into the cache that `victory run` reads. If a compile crashes
+or stalls for three minutes, warm reports the affected PSO, tries the rest of
+the batch, and exits with a failure status. A later invocation retries failed
+PSOs and reports a cache hit when the host loads the PSO from its library.
+
+The records live in `pipelines/known-v1` under the configured cache directory
+and contain shader data from the title. Recording adds disk I/O during title
+loading. Keep that directory local. With shader-pack and shader-database paths,
+`victory warm <paths>` runs the existing pack prebuild
+(`victory translate <paths> --cache --pipelines`) with two workers by default.
+
+The runtime uses up to a quarter of its pipeline workers (at least one) for
+early starts previously measured at one second or longer. A draw request
+can promote a queued PSO to the regular priority queue. Set
+`VICTORY_PIPELINE_SLOW=0` to use the usual queue order for every early start.
+
 ## Running the tests
 
 These commands are useful for anyone who works on the code. The first runs the tests natively on the Mac, and the second runs them as Windows programs on Wine with D3DMetal, which includes the GPU tests.

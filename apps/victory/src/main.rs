@@ -11,6 +11,8 @@ mod run;
 mod shader;
 #[cfg(windows)]
 mod translate;
+#[cfg(windows)]
+mod warm;
 
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -108,6 +110,17 @@ enum Command {
         #[arg(long, conflicts_with_all = ["validate", "list"])]
         cache: bool,
     },
+    /// Build recorded title pipelines offline, or prebuild from shader pack paths.
+    Warm {
+        /// Warm from these shader pack and shader database paths instead.
+        paths: Vec<PathBuf>,
+        /// Worker threads for shader pack input (default: 2).
+        #[arg(long, value_parser = positive_jobs)]
+        jobs: Option<usize>,
+    },
+    #[cfg(windows)]
+    #[command(hide = true)]
+    WarmBatch { keys: Vec<String> },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -213,6 +226,19 @@ fn main() -> Result<()> {
                 anyhow::bail!("translate needs a Windows host for now")
             }
         }
+        Command::Warm { paths, jobs } => {
+            #[cfg(windows)]
+            {
+                warm::run(paths, jobs)
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = (paths, jobs);
+                anyhow::bail!("warm needs a Windows host for now")
+            }
+        }
+        #[cfg(windows)]
+        Command::WarmBatch { keys } => warm::batch(keys),
         Command::Run {
             exe,
             unimplemented,
@@ -230,6 +256,14 @@ fn main() -> Result<()> {
         }
         Command::Config => show_config(),
     }
+}
+
+fn positive_jobs(value: &str) -> Result<usize, &'static str> {
+    value
+        .parse()
+        .ok()
+        .filter(|&n| n > 0)
+        .ok_or("expected a positive worker count")
 }
 
 fn show_config() -> Result<()> {
