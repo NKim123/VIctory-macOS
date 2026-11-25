@@ -3109,6 +3109,385 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// The write shaders' root signature: a table of one unordered view.
     const WRITES: &[Param] = &[Param::Table(&[uav(0, 1)])];
 
+    #[test]
+    #[ignore = "run with VICTORY_SHOW_AFTER=1 on a D3D12 host"]
+    fn shared_texture_slot_waits_for_the_initial_upload_fence() {
+        assert!(crate::descriptor::host::show_after());
+        let host = crate::host::host().expect("D3D12 host");
+        let null = std::ptr::null();
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        let heap_desc: [u32; 8] = [0, 6, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        assert_eq!(
+            crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap),
+            S_OK
+        );
+        let title = crate::descriptor::heap(heap);
+        let h = title.host().unwrap();
+        let slots = Slots(h.heap.clone(), 0);
+        let words = texture_words(64, 64, 28, 0x100, 0);
+        let address = title_memory(1 << 16);
+        // SAFETY: the allocated title bytes, with 256-byte rows.
+        unsafe { std::ptr::write_bytes(address as *mut u8, 0x80, 64 * 64 * 4) };
+        let object = texture_at_address(address, &words);
+        let view = [28, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0];
+        // A dropped host copy cannot suppress the title-memory upload.
+        // Submit it before creating the pending slot, so its group is the
+        // first one even when diagnostics time lists individually.
+        let copy = crate::resource::host_copy(object).unwrap();
+        let source = texture_at_address(title_memory(1 << 16), &words);
+        let source_copy = crate::resource::host_copy(source).unwrap();
+        let copying = host.new_list().unwrap();
+        crate::list::ensure_state(&copying, source, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        crate::list::ensure_state(&copying, object, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
+        // SAFETY: the list holds both matching textures in their copy states.
+        unsafe {
+            copying
+                .list
+                .CopyResource(&copy.texture, &source_copy.texture)
+        };
+        crate::texture::host_writes(&copying, object, &copy.texture, || {
+            crate::texture::CopyCoverage::Whole
+        });
+        copying.close();
+        crate::host::MISS_NEXT_SUBMISSION_MARK.set(true);
+        host.execute(&[&copying]);
+        assert!(!copy.initialized.load(Ordering::Acquire));
+        assert!(!copy.host_written.load(Ordering::Relaxed));
+        crate::descriptor::create_srv(null, object, &view, title.start);
+
+        // Abandon a table read before submitting it. Reset must not turn
+        // a recorded upload request into completed work.
+        let list = host.new_list().unwrap();
+        let v = h.mirror(0, title.start, true).unwrap();
+        readable(&list, &used(ResourceType::Srv), &v, true);
+        drop(v);
+        list.close();
+        list.reset();
+        assert!(!h.kept(0));
+        assert_eq!(crate::texture::uploads(object), 0);
+        assert!(!copy.initialized.load(Ordering::Acquire));
+
+        // Another pending slot is overwritten during CPU preparation,
+        // after its upload has already been collected.
+        let replaced = title.start + 32;
+        let other = texture_at_address(title_memory(1 << 16), &words);
+        crate::descriptor::create_srv(null, other, &view, replaced);
+        let untouched = texture_at_address(title_memory(1 << 16), &words);
+        crate::descriptor::create_srv(null, untouched, &view, title.start + 128);
+        let untouched_copy = crate::resource::made_copy(untouched).unwrap();
+        let release = |object| {
+            let release: extern "system" fn(This) -> u32 = crate::object::slot(object, 0x10);
+            assert_eq!(release(object), 0);
+        };
+        let released = texture_at_address(title_memory(1 << 16), &words);
+        crate::descriptor::create_srv(null, released, &view, title.start + 64);
+        let released_copy = crate::resource::made_copy(released).unwrap();
+        release(released);
+        list.defer_host(move || {
+            assert!(!copy.initialized.load(Ordering::Acquire));
+            // SAFETY: the live title heap's second record.
+            unsafe { (replaced as *mut [u32; 3]).write_unaligned([0; 3]) };
+        });
+        list.defer_slot(&h.viewed, 0);
+        list.defer_slot(&h.viewed, 1);
+        let read = compile_cs(READ, READS);
+        let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
+        let texel = || {
+            // SAFETY: the mapped output, read after the submission's fence.
+            unsafe { (data as *const f32).read_volatile() }
+        };
+        run(&list, &slots, &read, 0, Some(&out), (1, 1));
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(texel(), 0.0, "the uploading submission sees the null SRV");
+        assert_eq!(crate::texture::uploads(object), 1);
+        assert!(h.kept(0), "the completed upload publishes the slot");
+        assert!(!h.kept(1), "the superseded slot stays null");
+        assert!(!released_copy.initialized.load(Ordering::Acquire));
+        assert!(!h.kept(2), "the released resource stays null");
+        assert!(untouched_copy.staging.lock().unwrap().is_none());
+        assert!(!h.kept(4), "pending SRVs without demand stay null");
+
+        list.reset();
+        list.defer_slot(&h.viewed, 0);
+        run(&list, &slots, &read, 0, Some(&out), (1, 1));
+        list.close();
+        host.execute(&[&list]);
+        assert!((texel() - 128.0 / 255.0).abs() < 1e-6);
+
+        // Keep a reference as a previously recorded list could. Reuse of
+        // the descriptor record must still gate on the replacement copy.
+        let old = crate::resource::made_copy(object).unwrap();
+        assert!(crate::resource::give_up_now(object));
+        assert!(h.mirror(0, title.start, true).is_some());
+        let new = crate::resource::made_copy(object).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&old, &new));
+        assert!(!h.kept(0));
+        if crate::shader_cache::under_wine() {
+            crate::host::OMIT_NEXT_SUBMISSION_MARK.set(true);
+            host.execute(&[&list]);
+            assert!(!new.initialized.load(Ordering::Acquire));
+            assert!(
+                !h.kept(0),
+                "a fence alone does not confirm execution under Wine"
+            );
+        }
+        crate::host::MISS_NEXT_SUBMISSION_MARK.set(true);
+        host.execute(&[&list]);
+        assert_eq!(texel(), 0.0);
+        assert!(!new.initialized.load(Ordering::Acquire));
+        assert!(
+            !h.kept(0),
+            "a lost submission cannot publish the replacement"
+        );
+
+        host.execute(&[&list]);
+        assert_eq!(texel(), 0.0);
+        assert!(h.kept(0), "the unchanged bytes are retried and published");
+        host.execute(&[&list]);
+        assert!((texel() - 128.0 / 255.0).abs() < 1e-6);
+
+        // Heap-indexed read marks make the same demand as real shaders.
+        // A one-texture budget serves the next slot on the next submission.
+        let later = texture_at_address(title_memory(1 << 16), &words);
+        crate::descriptor::create_srv(null, later, &view, title.start + 160);
+        h.stamp_read(4);
+        h.stamp_read(5);
+        let limit = crate::descriptor::TEST_PENDING_STAGING_BYTES.replace(64 * 256);
+        host.execute(&[&list]);
+        assert!(h.kept(4));
+        assert!(!h.kept(5));
+        host.execute(&[&list]);
+        assert!(h.kept(5));
+        crate::descriptor::TEST_PENDING_STAGING_BYTES.set(limit);
+
+        // Release the title's reference at publication. The pin keeps the
+        // object live through registration, then its drop removes it again.
+        let publishing = texture_at_address(title_memory(1 << 16), &words);
+        let handle = title.start + 96;
+        crate::descriptor::create_srv(null, publishing, &view, handle);
+        h.stamp_read(3);
+        crate::descriptor::host::RELEASE_BEFORE_PENDING_PUBLICATION.set(Some(publishing as usize));
+        host.execute(&[&list]);
+        assert!(
+            crate::descriptor::host::RELEASE_BEFORE_PENDING_PUBLICATION
+                .get()
+                .is_none()
+        );
+        assert!(crate::descriptor::view(handle).is_none());
+        assert!(!h.viewed.tracks_texture(publishing));
+
+        // Release after collecting a pending upload. Its title allocation
+        // must stay alive through the detile, even without other references.
+        let uploading = texture_at_address(title_memory(1 << 16), &words);
+        crate::descriptor::create_srv(null, uploading, &view, handle);
+        let uploaded_copy = crate::resource::made_copy(uploading).unwrap();
+        h.stamp_read(3);
+        crate::descriptor::RELEASE_AFTER_PENDING_COLLECTION.set(Some(uploading as usize));
+        host.execute(&[&list]);
+        assert!(uploaded_copy.initialized.load(Ordering::Acquire));
+        assert!(crate::descriptor::view(handle).is_none());
+        assert!(!h.viewed.tracks_texture(uploading));
+
+        let dropped = texture_at_address(title_memory(1 << 16), &words);
+        crate::descriptor::create_srv(null, dropped, &view, title.start + 96);
+        release(heap);
+        list.reset();
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(
+            crate::texture::uploads(dropped),
+            0,
+            "the dropped heap has no pending work"
+        );
+        for resource in [object, source, other, dropped, untouched, later] {
+            release(resource);
+        }
+    }
+
+    #[test]
+    #[ignore = "run with VICTORY_SHOW_AFTER=1 on a D3D12 host"]
+    fn shared_texture_slot_partial_copy_preserves_untouched_texels() {
+        assert!(crate::descriptor::host::show_after());
+        let host = crate::host::host().expect("D3D12 host");
+        let null = std::ptr::null();
+        let iid = &crate::object::IUNKNOWN;
+        let heap_desc: [u32; 8] = [0, 1, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        assert_eq!(
+            crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), iid, &mut heap),
+            S_OK
+        );
+        let title = crate::descriptor::heap(heap);
+        let h = title.host().unwrap();
+        let slots = Slots(h.heap.clone(), 0);
+
+        let address = title_memory(1 << 16);
+        // SAFETY: the allocated title bytes, with 256-byte rows.
+        unsafe { std::ptr::write_bytes(address as *mut u8, 0x80, 64 * 64 * 4) };
+        let dst = texture_at_address(address, &texture_words(64, 64, 28, 1, 0));
+        let srv = [28, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0];
+        crate::descriptor::create_srv(null, dst, &srv, title.start);
+        let copy = crate::resource::made_copy(dst).unwrap();
+        assert!(!h.kept(0));
+
+        let src = buffer(8 * 256);
+        let (src_data, _) = crate::resource::buffer_bytes(src).unwrap();
+        // SAFETY: the title buffer has eight padded rows.
+        unsafe { std::ptr::write_bytes(src_data, 0x40, 8 * 256) };
+        let from = crate::list::CopyLocation::placed(
+            src,
+            crate::resource::PlacedFootprint::new(0, 28, 8, 8, 256),
+        );
+        let to = crate::list::CopyLocation::whole(dst);
+        let mut allocator = null;
+        let mut list = null;
+        assert_eq!(
+            crate::list::create_allocator(null, 0, iid, &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, allocator, null, iid, &mut list),
+            S_OK
+        );
+        type Copy = extern "system" fn(
+            This,
+            *const crate::list::CopyLocation,
+            u32,
+            u32,
+            u32,
+            *const crate::list::CopyLocation,
+            *const [u32; 6],
+        );
+        crate::object::slot::<Copy>(list, 0x80)(list, &to, 4, 4, 0, &from, null.cast());
+        let recorded = crate::list::host_list(list).unwrap();
+        recorded.close();
+        copy.staging
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .fail_detile
+            .store(true, Ordering::Relaxed);
+        host.execute(&[recorded]);
+        assert!(!copy.initialized.load(Ordering::Acquire));
+        assert!(!copy.host_written.load(Ordering::Relaxed));
+        assert_eq!(copy.partial_writes.lock().unwrap().len(), 1);
+        assert!(!crate::resource::give_up_now(dst));
+        assert!(!h.kept(0));
+
+        // The verified partial write must survive an independent retry,
+        // even after the copy and its input buffer are gone.
+        for object in [list, allocator, src] {
+            assert_eq!(crate::object::release_ref(object), 0);
+        }
+        let out = host.shared_buffer(64 * 64 * 16).unwrap();
+        let read = compile_cs(READ, READS);
+        let reading = host.new_list().unwrap();
+        reading.defer_slot(&h.viewed, 0);
+        let v = h.mirror(0, title.start, true).unwrap();
+        readable(&reading, &used(ResourceType::Srv), &v, true);
+        drop(v);
+        run(&reading, &slots, &read, 0, Some(&out.0), (8, 8));
+        reading.close();
+        host.execute(&[&reading]);
+        assert!(copy.initialized.load(Ordering::Acquire));
+        assert!(copy.host_written.load(Ordering::Relaxed));
+        assert!(copy.partial_writes.lock().unwrap().is_empty());
+        assert!(h.kept(0));
+        host.execute(&[&reading]);
+        for (x, y, expected) in [(0, 0, 0x80u8), (4, 4, 0x40), (11, 11, 0x40), (12, 11, 0x80)] {
+            // SAFETY: within the mapped output, after the read submission.
+            let got = unsafe { (out.1.add((y * 64 + x) * 16) as *const f32).read() };
+            assert!((got - f32::from(expected) / 255.0).abs() < 1e-6);
+        }
+        for object in [heap, dst] {
+            assert_eq!(crate::object::release_ref(object), 0);
+        }
+    }
+
+    #[test]
+    #[ignore = "run with VICTORY_SHOW_AFTER=1 on a D3D12 host"]
+    fn shared_texture_slot_waits_for_a_large_heap_upload() {
+        assert!(crate::descriptor::host::show_after());
+        let host = crate::host::host().expect("D3D12 host");
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 1, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        assert_eq!(
+            crate::descriptor::create_heap(
+                null,
+                heap_desc.as_ptr().cast(),
+                &crate::object::IUNKNOWN,
+                &mut heap
+            ),
+            S_OK
+        );
+        let title = crate::descriptor::heap(heap);
+        let h = title.host().unwrap();
+        let slots = Slots(h.heap.clone(), 0);
+
+        let (width, height) = (4096u32, 2049u32);
+        let bytes = (width * height * 4) as usize;
+        assert!(bytes > crate::descriptor::PENDING_STAGING_BYTES as usize);
+        let address = title_memory(bytes.next_multiple_of(1 << 16));
+        // SAFETY: both bytes lie in the live title allocation.
+        unsafe {
+            (address as *mut u8).write(0x40);
+            (address as *mut u8).add(bytes - 4).write(0x80);
+        }
+        let texture = texture_at_address(address, &texture_words(width, height, 28, 1, 0));
+        let srv = [28, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0];
+        crate::descriptor::create_srv(null, texture, &srv, title.start);
+        let copy = crate::resource::made_copy(texture).unwrap();
+        assert!(!h.kept(0));
+
+        let out = host.shared_buffer(16).unwrap();
+        let read = compile_cs(
+            "Texture2D<float4> t : register(t0); RWByteAddressBuffer o : register(u1);
+[numthreads(1, 1, 1)]
+void main() { o.Store(0, asuint(t.Load(int3(0, 0, 0)).x)); o.Store(4, asuint(t.Load(int3(4095, 2048, 0)).x)); }",
+            READS,
+        );
+        let list = host.new_list().unwrap();
+        list.defer_heap(&h.viewed);
+        run(&list, &slots, &read, 0, Some(&out.0), (1, 1));
+        list.close();
+        host.execute(&[&list]);
+        assert!(
+            copy.staging.lock().unwrap().is_none(),
+            "no upload without a shader read"
+        );
+        // The shader's normal heap-read feedback, supplied by the fixture
+        // since its hand-written HLSL has no translator instrumentation.
+        h.stamp_read(0);
+        let budget = crate::descriptor::TEST_PENDING_STAGING_BYTES.replace(0);
+
+        crate::host::MISS_NEXT_SUBMISSION_MARK.set(true);
+        host.execute(&[&list]);
+        assert_eq!(crate::texture::uploads(texture), 1);
+        assert!(!h.kept(0));
+        assert!(!copy.initialized.load(Ordering::Acquire));
+        host.execute(&[&list]);
+        assert_eq!(crate::texture::uploads(texture), 2);
+        assert!(h.kept(0));
+
+        host.execute(&[&list]);
+        // SAFETY: the shader wrote both words in this mapped output.
+        let actual = unsafe { (out.1 as *const [f32; 2]).read() };
+        assert_eq!(actual, [64.0 / 255.0, 128.0 / 255.0]);
+        crate::descriptor::TEST_PENDING_STAGING_BYTES.set(budget);
+        for object in [heap, texture] {
+            assert_eq!(crate::object::release_ref(object), 0);
+        }
+    }
+
     /// One texture memory written through an unordered view of a resource
     /// object in one format and read through a placed view in another: a
     /// castable pair shares one host texture (no copy), a pair of other
@@ -3271,7 +3650,12 @@ void main(uint3 id : SV_DispatchThreadID) {
         // A list recorded after it, holding a host copy into the texture
         // (its mark; what it copies is the host's business), runs first.
         let copying = host.new_list().unwrap();
-        crate::texture::host_writes(&copying, object);
+        crate::texture::host_writes(
+            &copying,
+            object,
+            &crate::resource::host_resource(object).unwrap(),
+            || crate::texture::CopyCoverage::Whole,
+        );
         copying.close();
         host.execute(&[&copying]);
         host.execute(&[&late]);

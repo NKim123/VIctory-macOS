@@ -280,6 +280,88 @@ pub(crate) fn sync_heaps() {
     }
 }
 
+#[cfg(windows)]
+pub(crate) const PENDING_STAGING_BYTES: u64 = 32 << 20;
+
+#[cfg(all(windows, test))]
+thread_local! {
+    pub(crate) static RELEASE_AFTER_PENDING_COLLECTION: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    pub(crate) static TEST_PENDING_STAGING_BYTES: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(PENDING_STAGING_BYTES) };
+}
+
+/// Collects uploads for pending SRVs, or publishes those whose copy has
+/// finished. Only Host::execute calls this, with submissions held off.
+#[cfg(windows)]
+pub(crate) fn service_pending(
+    demand: &std::collections::HashSet<(usize, u32)>,
+    pins: &mut Vec<ViewPin>,
+    mut uploads: Option<&mut Vec<crate::texture::UploadSource>>,
+) {
+    #[cfg(not(test))]
+    let mut budget = PENDING_STAGING_BYTES;
+    #[cfg(test)]
+    let mut budget = TEST_PENDING_STAGING_BYTES.with(std::cell::Cell::get);
+    let mut seen = std::collections::HashSet::new();
+    if let Some(uploads) = &uploads {
+        seen.extend(
+            uploads
+                .iter()
+                .map(|(staging, _)| std::sync::Arc::as_ptr(staging)),
+        );
+    }
+    let collecting = uploads.is_some();
+    let mut upload = |source: crate::texture::UploadSource| {
+        let key = std::sync::Arc::as_ptr(&source.0);
+        let bytes = crate::texture::staging_bytes(&source.0);
+        if bytes <= budget
+            && seen.insert(key)
+            && let Some(uploads) = &mut uploads
+        {
+            budget -= bytes;
+            uploads.push(source);
+        }
+    };
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    for &(start, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live while the registry is locked.
+        let heap = unsafe { &*(at as *const Heap) };
+        if heap.desc.kind == VIEWS_KIND
+            && let Some(Some(host)) = heap.host.get()
+        {
+            host.service_pending(
+                start,
+                u64::from(increment(VIEWS_KIND).unwrap()),
+                demand,
+                pins,
+                collecting.then_some(&mut upload as &mut dyn FnMut(_)),
+            );
+        }
+    }
+}
+
+/// Validates a pending slot without dereferencing its title resource.
+/// Serializes publication with record() and forget(), which take VIEWS.
+#[cfg(windows)]
+fn with_current_record(handle: u64, record: [u32; 3], f: impl FnOnce()) -> bool {
+    let views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
+    let [_, i, generation] = record;
+    let mut bytes = [0; 12];
+    if views
+        .list
+        .get(i as usize)
+        .is_some_and(|(_, current)| *current == generation)
+        && crate::host::read_into(handle as *const u8, &mut bytes)
+        && bytes == record.map(u32::to_le_bytes).as_flattened()
+    {
+        f();
+        true
+    } else {
+        false
+    }
+}
+
 /// Makes the views of slots `slots` that were left null (textures the title
 /// placed itself, textures given up) in every shader-visible view heap, now
 /// that shaders read them (`crate::shadow::take_reads`), and stamps what

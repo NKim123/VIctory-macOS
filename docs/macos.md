@@ -164,6 +164,12 @@ A standalone D3D12 program did not reproduce it: 16 threads writing and reading 
 
 Buffers are another matter, still open. `root_views_reach_their_copy_and_read_zeros_past_it` and the two `heap_views_` tests still fail in a few runs in a hundred, with or without the change. In a failed `root_views` run the source's host copy held the title's values while the output stayed zero, when run again at once, 100 ms later and with its view written again, so it does not come back by itself as the textures do.
 
+## Texture SRV publication after upload
+
+`VICTORY_SHOW_AFTER=1` is an opt-in experiment for title-memory textures in shared shader-visible slots. While the host texture is waiting for its first upload, table reads and heap-indexed reads through the slot see a null SRV of the same dimension and format. The upload runs on the normal submission queue. The slot begins showing the texture after the submission fence confirms completion, so a draw in the uploading submission can still read zeros. Superseded slots are checked against the current title descriptor before publication.
+
+The option defaults to off. Registration covers single-sample, single-plane title-fed textures with a supported console layout and host copy footprint. Other textures and list-owned descriptors follow their usual paths. A first partial host copy requests a full initial upload. If staging fails, a later upload fills the untouched regions and preserves verified partial copies. Only pending slots requested by a submitted table or marked by a heap-indexed read add uploads. Those additional uploads use up to 32 MiB per submission. Larger textures stay pending until a whole host copy or an ordinary texture upload completes. The ordinary heap path admits one new large fill per submission after a shader marks the slot as read. Under Wine, publication requires the submission marker as well as the fence. The synthetic GPU regression runs with `VICTORY_SHOW_AFTER=1` and the test filter `shared_texture_slot -- --ignored`.
+
 ## Masked stores into protected pages hang Rosetta
 
 On macOS 27.3 (M3 Max) the game stops at start-up with `rosetta error: unexpectedly need to EmulateForward on a synchronous exception` and the process hangs (issue #1). The faulting instruction is `vpmaskmovd [rax], ymm6, ymm4`, an AVX2 masked store in a loop that steps 32 bytes at a time.

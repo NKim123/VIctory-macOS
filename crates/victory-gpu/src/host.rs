@@ -173,6 +173,22 @@ impl Mark {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static OMIT_NEXT_SUBMISSION_MARK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static MISS_NEXT_SUBMISSION_MARK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Checks the mark for the submitted work. Recovery probes read their mark
+/// directly so a test can simulate a lost submission without stalling a GPU.
+fn submission_ran(mark: &Mark, value: u64) -> bool {
+    #[cfg(test)]
+    if MISS_NEXT_SUBMISSION_MARK.with(|miss| miss.replace(false)) {
+        return false;
+    }
+    mark.saw(value)
+}
+
 /// Submissions that did not run to their mark, and queues made since to
 /// replace one that stopped running work.
 static LOST: [std::sync::atomic::AtomicU64; 2] = [
@@ -1180,6 +1196,8 @@ struct Deferred {
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
     missed: Vec<Box<dyn Fn() -> bool + Send>>,
+    /// Host copies filled by this list, available once its submission ran.
+    texture_fills: Vec<crate::texture::Fill>,
 }
 
 impl Host {
@@ -1330,7 +1348,7 @@ impl Host {
     /// queue was idle), so the wait wakes every second to check the fence
     /// itself. A late event left set by an earlier wait cannot end a later
     /// wait early, as the fence is checked after every wake-up too.
-    fn wait_for(&self, value: u64) {
+    fn wait_for(&self, value: u64) -> bool {
         use std::sync::atomic::AtomicU64;
         static MISSED: AtomicU64 = AtomicU64::new(0);
         let mut seconds = 0u32;
@@ -1339,6 +1357,9 @@ impl Host {
             let woke = unsafe { WaitForSingleObject(self.event, 1000) };
             // SAFETY: as above.
             let completed = unsafe { self.fence.GetCompletedValue() };
+            if completed == u64::MAX {
+                return false;
+            }
             if completed >= value {
                 if woke != windows::Win32::Foundation::WAIT_OBJECT_0 {
                     let n = MISSED.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1346,7 +1367,7 @@ impl Host {
                         tracing::warn!(n, value, completed, "a host submission finished without setting its event; went on after checking the fence");
                     }
                 }
-                return;
+                return true;
             }
             if woke != windows::Win32::Foundation::WAIT_OBJECT_0 {
                 seconds += 1;
@@ -1418,17 +1439,27 @@ impl Host {
         mark.arm(*submitted);
         let queue = self.queue();
         // SAFETY: a closed list; the fence and event are ours.
+        unsafe { queue.ExecuteCommandLists(&[mark.list()]) };
+        self.wait_for_submission(&queue, *submitted) && mark.saw(*submitted)
+    }
+
+    /// A signal must be queued before any submission resources can be
+    /// recycled. The event only wakes the waiter; its registration may fail
+    /// even when the fence can still be polled.
+    fn wait_for_submission(&self, queue: &ID3D12CommandQueue, value: u64) -> bool {
+        // SAFETY: the queue, fence and event are live under the submission lock.
         unsafe {
-            queue.ExecuteCommandLists(&[mark.list()]);
-            let waited = queue
-                .Signal(&self.fence, *submitted)
-                .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-            match waited {
-                Ok(()) => self.wait_for(*submitted),
-                Err(e) => tracing::warn!(error = %e, "host check not waited for"),
+            if let Err(e) = queue.Signal(&self.fence, value) {
+                if self.device.GetDeviceRemovedReason().is_err() {
+                    return false;
+                }
+                fail(format_args!("could not signal host submission fence ({e})"));
+            }
+            if let Err(e) = self.fence.SetEventOnCompletion(value, self.event) {
+                tracing::warn!(error = %e, "host fence event unavailable; polling the fence");
             }
         }
-        mark.saw(*submitted)
+        self.wait_for(value)
     }
 
     /// A new direct queue in place of the current one. Under the submission
@@ -1464,6 +1495,10 @@ impl Host {
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
+        // Staging uses the title backing even after pending-slot collection.
+        // A last pin can run resource cleanup, so keep it through both
+        // preparation and publication, outside the lifetime of our locks.
+        let mut pending_pins = Vec::new();
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let _holding = Holding::enter();
         let started = std::time::Instant::now();
@@ -1502,7 +1537,7 @@ impl Host {
             })
             .collect();
         // And textures read through tables, uploaded by the same list.
-        let textures: Vec<_> = runs
+        let mut textures: Vec<_> = runs
             .iter()
             .flat_map(|l| {
                 l.deferred()
@@ -1515,6 +1550,25 @@ impl Host {
                     .collect::<Vec<_>>()
             })
             .collect();
+        let show_after = crate::descriptor::host::show_after();
+        if show_after {
+            let mut demand = std::collections::HashSet::new();
+            for list in runs {
+                for step in &list.deferred().copies {
+                    if let Step::Slot(viewed, index) = step {
+                        demand.insert((std::sync::Arc::as_ptr(viewed) as usize, *index));
+                    }
+                }
+            }
+            crate::descriptor::service_pending(&demand, &mut pending_pins, Some(&mut textures));
+        }
+        #[cfg(test)]
+        if let Some(resource) = crate::descriptor::RELEASE_AFTER_PENDING_COLLECTION.replace(None) {
+            assert_eq!(
+                crate::object::release_ref(resource as crate::object::This),
+                1
+            );
+        }
         #[cfg(feature = "diagnostics")]
         let uploading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
         let uploads = (!heaps.is_empty() || !textures.is_empty())
@@ -1583,6 +1637,10 @@ impl Host {
         let groups = [&lists[..]];
         let mut removed_in = None;
         let mark = self.mark();
+        #[cfg(test)]
+        let mark = mark.filter(|_| !OMIT_NEXT_SUBMISSION_MARK.with(|omit| omit.replace(false)));
+        let verified = mark.is_some() || !crate::shader_cache::under_wine();
+        let mut incomplete = Vec::new();
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -1596,28 +1654,17 @@ impl Host {
             }
             let queue = self.queue();
             // SAFETY: closed lists; the fence and event are ours.
-            let waited = unsafe {
-                queue.ExecuteCommandLists(&group);
-                let waited = queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        self.wait_for(*submitted);
-                        true
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "host submission not waited for");
-                        false
-                    }
-                }
-            };
-            if waited
-                && let Some(mark) = mark
-                && !mark.saw(*submitted)
+            unsafe { queue.ExecuteCommandLists(&group) };
+            if !self.wait_for_submission(&queue, *submitted) {
+                removed_in = Some(i);
+                break;
+            }
+            if let Some(mark) = mark
+                && !submission_ran(mark, *submitted)
                 // SAFETY: a plain query.
                 && unsafe { self.device.GetDeviceRemovedReason() }.is_ok()
             {
+                incomplete.push(i);
                 self.lost(&mut submitted, mark);
             }
             #[cfg(feature = "diagnostics")]
@@ -1689,7 +1736,7 @@ impl Host {
             );
         }
         // SAFETY: a plain query.
-        if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+        if removed_in.is_some() || unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
             fail(format_args!(
                 "host GPU device removed after a submission of {} lists{}{}{}",
                 runs.len(),
@@ -1698,6 +1745,9 @@ impl Host {
                 removed_during(runs, removed_in)
             ));
         }
+        let ran = |list: usize| {
+            verified && !incomplete.contains(&if groups.len() == 1 { 0 } else { list })
+        };
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
         // submission, however many dispatches declared it (the world's
@@ -1781,6 +1831,16 @@ impl Host {
             for work in &list.deferred().after {
                 work();
             }
+        }
+        if show_after {
+            for (i, list) in runs.iter().enumerate() {
+                if ran(i) {
+                    for fill in &list.deferred().texture_fills {
+                        fill.completed();
+                    }
+                }
+            }
+            crate::descriptor::service_pending(&Default::default(), &mut pending_pins, None);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
@@ -2532,6 +2592,11 @@ impl HostList {
     /// whether its shaders read title memory with no copy.
     pub(crate) fn defer_missed(&self, check: impl Fn() -> bool + Send + 'static) {
         self.deferred().missed.push(Box::new(check));
+    }
+
+    /// Records an upload or copy that initializes the host texture if the list runs.
+    pub(crate) fn defer_texture_fill(&self, fill: crate::texture::Fill) {
+        self.deferred().texture_fills.push(fill);
     }
 
     /// Runs `work` once the list has run (each submission), before its

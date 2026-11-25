@@ -657,7 +657,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             }
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
-            crate::texture::host_writes(list, dst);
+            crate::texture::host_writes(list, dst, &to, || crate::texture::CopyCoverage::Whole);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
@@ -719,10 +719,12 @@ extern "system" fn copy_texture_region(
             return;
         };
         let mut from = src;
+        let source_texture;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
         let mut read = None;
         if src.kind == FOOTPRINT {
+            source_texture = None;
             let (Some(host), Some(bytes)) = (crate::host::host(), src.footprint.bytes()) else {
                 return;
             };
@@ -752,12 +754,40 @@ extern "system" fn copy_texture_region(
             }
             ensure_state(list, src.resource, COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();
+            source_texture = Some(texture);
         }
         ensure_state(list, dst.resource, COPY_DEST);
-        crate::texture::host_writes(list, dst.resource);
+        let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
+        crate::texture::host_writes(list, dst.resource, &to, || {
+            crate::texture::CopyCoverage::Region {
+                subresource: dst.footprint.offset as u32,
+                origin: [x, y, z],
+                // SAFETY: this is the source box passed by the title.
+                extent: unsafe { host_box.and_then(|b| b.as_ref()) }.map_or_else(
+                    || match &source_texture {
+                        // SAFETY: the source texture is alive.
+                        Some(texture) => crate::texture::subresource_extent(
+                            &unsafe { texture.GetDesc() },
+                            src.footprint.offset as u32,
+                        ),
+                        None => [
+                            src.footprint.width,
+                            src.footprint.height,
+                            src.footprint.depth,
+                        ],
+                    },
+                    |b| {
+                        [
+                            b.right.saturating_sub(b.left),
+                            b.bottom.saturating_sub(b.top),
+                            b.back.saturating_sub(b.front),
+                        ]
+                    },
+                ),
+            }
+        });
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
-        let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
         #[cfg(feature = "diagnostics")]
         {
             let text = || {
@@ -962,14 +992,16 @@ extern "system" fn resolve(
         const RESOLVE_SOURCE: u32 = 0x2000;
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
-        crate::texture::host_writes(list, dst);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
+        let extent;
         // SAFETY: an open list and live textures; the region is inside both.
         unsafe {
             let (a, b) = (to.GetDesc(), from.GetDesc());
             let format = DXGI_FORMAT(format as i32);
+            let [width, height, _] = crate::texture::subresource_extent(&a, dst_sub);
             if (a.Width, a.Height) == (b.Width, b.Height) {
+                extent = [width, height, 1];
                 list.list
                     .ResolveSubresource(&to, dst_sub, &from, src_sub, format);
             } else if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
@@ -980,6 +1012,11 @@ extern "system" fn resolve(
                     right: a.Width.min(b.Width) as i32,
                     bottom: a.Height.min(b.Height) as i32,
                 };
+                extent = [
+                    width.min(rect.right as u32),
+                    height.min(rect.bottom as u32),
+                    1,
+                ];
                 list1.ResolveSubresourceRegion(
                     &to,
                     dst_sub,
@@ -991,8 +1028,15 @@ extern "system" fn resolve(
                     format,
                     D3D12_RESOLVE_MODE_AVERAGE,
                 );
+            } else {
+                return;
             }
         }
+        crate::texture::host_writes(list, dst, &to, || crate::texture::CopyCoverage::Region {
+            subresource: dst_sub,
+            origin: [0; 3],
+            extent,
+        });
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_sub, src, src_sub, format);

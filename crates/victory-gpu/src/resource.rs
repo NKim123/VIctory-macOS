@@ -830,6 +830,13 @@ pub(crate) struct HostTexture {
     /// A heap slot views it for unordered access (`VICTORY_EVICT_HEAP_UAV`):
     /// written by the GPU once shaders write through heaps.
     heap_writable: std::sync::atomic::AtomicBool,
+    /// Its first upload or host copy has passed the submission fence.
+    pub(crate) initialized: std::sync::atomic::AtomicBool,
+    pub(crate) gated: std::sync::OnceLock<bool>,
+    /// Verified host writes awaiting the first complete title-memory seed.
+    pub(crate) partial_writes: std::sync::Mutex<Vec<crate::texture::CopyCoverage>>,
+    /// Eviction has started. Pending SRVs must give this copy up.
+    pub(crate) evicted: std::sync::atomic::AtomicBool,
     /// Its uploads from title memory (`crate::texture`), made on first use.
     pub(crate) staging: std::sync::Mutex<Option<std::sync::Arc<crate::texture::Staging>>>,
     /// A depth texture's writable twin (`crate::twin`), made with its first
@@ -872,6 +879,10 @@ impl HostTexture {
             host_written: false.into(),
             gpu_written: false.into(),
             heap_writable: false.into(),
+            initialized: false.into(),
+            gated: std::sync::OnceLock::new(),
+            partial_writes: std::sync::Mutex::default(),
+            evicted: false.into(),
             staging: std::sync::Mutex::new(None),
             twin: std::sync::OnceLock::new(),
             bytes,
@@ -881,6 +892,17 @@ impl HostTexture {
             placement: None,
             last: [crate::queue::presented().into(), now_ms().into()],
         }
+    }
+
+    /// Whether a placed view can still publish this copy for its memory.
+    pub(crate) fn current_for_placement(&self) -> bool {
+        let Some(key) = self.key else { return true };
+        MEMORY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|map| map.get(&key)?.upgrade())
+            .is_none_or(|live| std::ptr::eq(self, live.as_ref()))
     }
 
     /// The title used it now: a list of the title's names it, or a shader
@@ -1264,7 +1286,9 @@ fn shared_texture(
     let key = memory_key(address, desc);
     let mut map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(Default::default);
-    let live = key.and_then(|k| map.get(&k)?.upgrade());
+    let live = key
+        .and_then(|k| map.get(&k)?.upgrade())
+        .filter(|copy| !copy.evicted.load(std::sync::atomic::Ordering::Acquire));
     if let Some(t) = &live
         && takes(t, &d)
     {
@@ -1524,7 +1548,17 @@ impl Resource {
     /// textures made on first use").
     #[cfg(windows)]
     fn host(&self) -> Option<std::sync::Arc<HostTexture>> {
-        if let Some(made) = self.host.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        let evicted = |made: &Option<std::sync::Arc<HostTexture>>| {
+            made.as_ref()
+                .is_some_and(|copy| copy.evicted.load(std::sync::atomic::Ordering::Acquire))
+        };
+        if let Some(made) = self
+            .host
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .filter(|made| !evicted(made))
+        {
             return made;
         }
         // Made without the lock held (`shared_texture` takes the memory
@@ -1533,7 +1567,11 @@ impl Resource {
         let clear = clear.as_ref().map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast());
         let made = shared_texture(self.data() as u64, &self.desc, state, clear);
         // A texture made meanwhile by another thread is the memory's too.
-        self.host.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(made).clone()
+        let mut cached = self.host.lock().unwrap_or_else(|e| e.into_inner());
+        if cached.as_ref().is_some_and(evicted) {
+            *cached = None;
+        }
+        cached.get_or_insert(made).clone()
     }
 
     fn data(&self) -> *mut u8 {
@@ -1643,6 +1681,11 @@ fn evictable(t: &HostTexture) -> bool {
         && !t.host_written.load(Relaxed)
         && !t.gpu_written.load(Relaxed)
         && !(t.heap_writable.load(Relaxed) && crate::bindless::heap_written())
+        && (t.gated.get() != Some(&true)
+            || t.partial_writes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty())
 }
 
 /// `VICTORY_EVICT_HEAP_UAV=1`: textures viewed for unordered access in
@@ -1798,6 +1841,12 @@ fn give_up(gone: &[Owned], frame: u64) -> (u64, u64) {
     }
     {
         use windows::core::Interface;
+        if crate::descriptor::host::show_after() {
+            for (copy, _) in gone {
+                copy.evicted
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
         let raws = gone.iter().map(|(t, _)| t.texture.as_raw() as usize).collect();
         crate::descriptor::evict(&raws);
     }
