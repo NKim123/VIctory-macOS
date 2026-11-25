@@ -741,20 +741,42 @@ impl HostHeap {
     /// differs from what the slot holds, the rest passed by as `mirror`
     /// would, with one lock of each kind for them all instead of two per slot
     /// (a world frame looks at ~700,000 slots, run perf3: ~75 ms).
-    pub(crate) fn sync_slots(&self, first: u32, last: u32, start: u64, step: u64) {
+    pub(crate) fn sync_slots(
+        &self,
+        first: u32,
+        last: u32,
+        start: u64,
+        step: u64,
+        bytes: &mut Vec<u8>,
+    ) {
+        let last = last.min(self.count);
+        if first >= last {
+            return;
+        }
         let at = |i: u32| start + u64::from(i) * step;
-        // SAFETY: records in title heap memory the caller found mapped.
-        let records: Vec<[u32; 3]> =
-            (first..last).map(|i| unsafe { (at(i) as *const [u32; 3]).read_unaligned() }).collect();
-        let current = views_current(&records);
+        // Snapshot the record headers through the kernel. The title can
+        // unmap placed heap pages, and a slot can straddle a tracked page.
+        bytes.resize((at(last - 1) - at(first)) as usize + 12, 0);
+        if !crate::host::read_into(at(first) as *const u8, bytes) {
+            return;
+        }
+        let records = bytes.chunks(step as usize).map(|record| {
+            std::array::from_fn(|i| {
+                u32::from_le_bytes(record[4 * i..4 * i + 4].try_into().unwrap())
+            })
+        });
+        let current = views_current(records.clone());
         let stale: Vec<u32> = {
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             (first..last)
-                .zip(records.iter().zip(current))
-                .filter(|&(i, (&[_, view, generation], current))| match made.get(i as usize) {
-                    Some(&m) if current => m != u64::from(generation) << 32 | u64::from(view),
-                    Some(&m) => m != 0,
-                    None => true,
+                .zip(records.zip(current))
+                .filter(|&(i, ([_, view, generation], current))| {
+                    let wanted = if current {
+                        u64::from(generation) << 32 | u64::from(view)
+                    } else {
+                        0
+                    };
+                    made[i as usize] != wanted
                 })
                 .map(|(i, _)| i)
                 .collect()
@@ -2495,12 +2517,15 @@ mod tests {
         // SAFETY: slots 0 and 1 of the heap's memory, 32 bytes each.
         unsafe { std::ptr::copy_nonoverlapping(start as *const u8, (start + 32) as *mut u8, 32) };
         assert!(!host.made(1), "copied as bytes: not seen yet");
-        host.sync_slots(0, 4, start, 32);
+        let mut bytes = Vec::new();
+        host.sync_slots(0, 4, start, 32, &mut bytes);
         assert!(host.made(0) && host.made(1) && !host.made(2));
         // SAFETY: as above.
         unsafe { std::ptr::write_bytes((start + 32) as *mut u8, 0, 32) };
-        host.sync_slots(0, 4, start, 32);
+        host.sync_slots(0, u32::MAX, start, 32, &mut bytes);
         assert!(host.made(0) && !host.made(1), "a cleared record leaves its slot");
+        host.sync_slots(0, 4, 1, 32, &mut bytes);
+        assert!(host.made(0), "an inaccessible scan leaves the slot alone");
     }
 
     /// The world's 16-byte view of 0 elements removed the device.

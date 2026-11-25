@@ -224,12 +224,15 @@ pub(crate) fn sync_heaps() {
                 let heap = unsafe { &*(at as *const Heap) };
                 // As before: ranges are taken only once the heap has its
                 // host heap, so writes before that are not lost.
-                let (Some(Some(_)), Some(written), Some(_)) =
+                let (Some(Some(host)), Some(written), Some(step)) =
                     (heap.host.get(), &heap.written, increment(heap.desc.kind))
                 else {
                     return None;
                 };
-                Some((start, at, written.take(start as usize, usize::MAX)))
+                // The remaining title slots have no direct host index.
+                // Draw recording supplies those entries in dynamic tables.
+                let end = start + u64::from(host.count()) * u64::from(step);
+                Some((start, at, written.take(start as usize, end as usize)))
             })
             .collect()
     };
@@ -240,6 +243,7 @@ pub(crate) fn sync_heaps() {
     // while its page is made: `Heap::drop` takes the write lock to leave the
     // list, so a heap still listed under the lock is alive.
     let page_size = crate::watch::PAGE;
+    let mut page_bytes = Vec::new();
     for (start, at, ranges) in work {
         for (from, to) in ranges {
             for page in (from & !(page_size - 1)..to).step_by(page_size) {
@@ -255,11 +259,6 @@ pub(crate) fn sync_heaps() {
                 };
                 let step = u64::from(step);
                 let (page, end) = (page.max(from), (page + page_size).min(to));
-                // By page: one with nothing mapped (the title unmaps heap
-                // pages too) holds no records.
-                if !crate::host::read_into(page as *const u8, &mut [0u8; 4]) {
-                    continue;
-                }
                 let (first, last) = (
                     (page as u64 - start) / step,
                     (end as u64 - start).div_ceil(step),
@@ -274,6 +273,7 @@ pub(crate) fn sync_heaps() {
                     last.min(u64::from(heap.desc.count)) as u32,
                     start,
                     step,
+                    &mut page_bytes,
                 );
             }
         }
@@ -727,11 +727,11 @@ fn view_at(i: u32, generation: u32) -> Option<ViewPin> {
 
 /// For each record (tag, index, generation): whether it names a view that
 /// is current, as [`view_at`] would find it (one lock for them all).
-fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
+#[cfg(windows)]
+fn views_current(records: impl Iterator<Item = [u32; 3]>) -> Vec<bool> {
     let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
     records
-        .iter()
-        .map(|&[tag, i, generation]| {
+        .map(|[tag, i, generation]| {
             tag == VIEW_TAG && views.list.get(i as usize).is_some_and(|(_, current)| *current == generation)
         })
         .collect()
