@@ -43,6 +43,8 @@ mod hold;
 mod host;
 #[cfg(windows)]
 mod indirect;
+#[cfg(windows)]
+mod land;
 pub mod list;
 #[cfg(all(windows, test))]
 mod list_bench;
@@ -86,9 +88,12 @@ pub use copystat::CountingAlloc;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
+pub use land::{LandingPage, enabled as landing_enabled, next_mapping_epoch, use_landing_pages};
+#[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, fault_tracking, rosetta, stores_need_patching, title_memory_aliased,
-    title_memory_remapped, writing as kernel_will_write,
+    title_memory_moving, title_memory_remapped, writing as kernel_will_write,
+    writing_beside as kernel_will_write_beside,
 };
 
 /// A whole file, read without asking for its size or other metadata.

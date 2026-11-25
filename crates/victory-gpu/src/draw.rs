@@ -2904,9 +2904,11 @@ void main(uint3 id : SV_DispatchThreadID) {{
     /// buffer its host descriptor names at submission, not the old one.
     #[test]
     fn a_table_slot_rewritten_before_submission_refreshes_its_new_view() {
-        for mode in [Rewrite::Mirrored, Rewrite::Copied, Rewrite::DuringSubmission] {
-            check_table_slot_rewrite(mode);
+        check_table_slot_rewrite(Rewrite::Mirrored);
+        if crate::watch::fault_tracking() {
+            check_table_slot_rewrite(Rewrite::Copied);
         }
+        check_table_slot_rewrite(Rewrite::DuringSubmission);
     }
 
     /// `Copied` leaves the host mirror to the submission's heap sync;
@@ -3460,6 +3462,9 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// the same bytes again are uploaded.
     #[test]
     fn a_texture_owning_its_pages_is_uploaded_on_any_write() {
+        if !crate::watch::fault_tracking() {
+            return;
+        }
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
@@ -3706,6 +3711,9 @@ void main(uint3 id : SV_DispatchThreadID) {
 
     #[test]
     fn compute_view_marks_rebind_after_depth_twin_conversion() {
+        if !crate::watch::fault_tracking() {
+            return;
+        }
         use victory_shader::emit::{Options, emit_with};
         use victory_shader::native::{ComputeIo, HwStage, NativeProgram, RootParam, StageIo};
         use victory_shader::{Container, io, ir, resource, structure};

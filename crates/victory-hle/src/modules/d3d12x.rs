@@ -21,6 +21,11 @@ extern "system" fn create_device(
     victory_gpu::resource::use_allocator(super::xmem::XMemAlloc, super::xmem::XMemFree);
     #[cfg(windows)]
     victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
+    // SAFETY: xmem pins the mapped section until the landing callback returns.
+    #[cfg(windows)]
+    unsafe {
+        victory_gpu::use_landing_pages(super::xmem::landing_page)
+    };
     #[cfg(windows)]
     victory_gpu::on_failure(host_gpu_failed);
     device::create(adapter, parameters, iid, out)

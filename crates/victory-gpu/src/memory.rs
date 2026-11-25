@@ -481,6 +481,139 @@ fn layout(key: usize) -> Arc<Layout> {
         .unwrap_or_default()
 }
 
+/// Maximum CPU snapshot bytes for computed writes in one submission.
+const COMPUTED_BASELINE_CAP: usize = 64 << 20;
+
+/// Pre-submit shadow bytes for computed writes that cannot rely on fault
+/// tracking. Any named page can be written, so the copies share a bounded
+/// budget and a marked page needs its full baseline before it can land.
+#[derive(Default)]
+pub(crate) struct ComputedBaselines {
+    heaps: HashMap<usize, Arc<Layout>>,
+    copies: HashMap<usize, Box<[u8]>>,
+    tracked_copies: HashSet<usize>,
+    declared: HashMap<usize, Vec<(usize, usize)>>,
+    declared_pages: HashMap<(usize, usize), Box<[u8]>>,
+    owned: HashSet<(usize, usize)>,
+    compared: HashSet<(usize, usize)>,
+    bytes: usize,
+}
+
+impl ComputedBaselines {
+    /// Capture after the last refresh and before executing the GPU lists.
+    pub(crate) fn capture(&mut self, heap: usize) {
+        if self.heaps.contains_key(&heap) {
+            return;
+        }
+        let layout = layout(heap);
+        self.heaps.insert(heap, layout.clone());
+        if self.bytes == COMPUTED_BASELINE_CAP {
+            return;
+        }
+        for copy in &layout.copies {
+            let key = Arc::as_ptr(copy) as usize;
+            if copy.dirty_bit().is_some() {
+                self.tracked_copies.insert(key);
+                continue;
+            }
+            self.copies.entry(key).or_insert_with(|| {
+                let bytes = (copy.range().1 as usize).min(COMPUTED_BASELINE_CAP - self.bytes);
+                self.bytes += bytes;
+                copy.computed_baseline(0, bytes)
+            });
+            if self.bytes == COMPUTED_BASELINE_CAP {
+                break;
+            }
+        }
+    }
+
+    /// The computed bitmap can name a page also written through a declared
+    /// range. Track those ranges for the safe fallback, and keep a complete
+    /// page baseline even for tracked copies when there is room.
+    pub(crate) fn declare(&mut self, copy: &Arc<Shadow>, address: usize, len: usize) {
+        if self.heaps.is_empty() || len == 0 {
+            return;
+        }
+        use crate::watch::PAGE;
+        let key = Arc::as_ptr(copy) as usize;
+        let (start, size) = copy.range();
+        let (start, end) = (start as usize, (start + size) as usize);
+        let (from, to) = (address.max(start), (address + len).min(end));
+        if from >= to {
+            return;
+        }
+        self.declared.entry(key).or_default().push((from, to));
+        if !self.tracked_copies.contains(&key) {
+            return;
+        }
+        for page in (from / PAGE..to.div_ceil(PAGE)).map(|p| p * PAGE) {
+            let (first, last) = (page.max(start), (page + PAGE).min(end));
+            let bytes = last - first;
+            if bytes > COMPUTED_BASELINE_CAP - self.bytes {
+                break;
+            }
+            self.declared_pages.entry((key, page)).or_insert_with(|| {
+                self.bytes += bytes;
+                copy.computed_baseline(first - start, bytes)
+            });
+        }
+    }
+
+    fn overlaps_declared(&self, copy: &Arc<Shadow>, page: usize) -> bool {
+        self.declared
+            .get(&(Arc::as_ptr(copy) as usize))
+            .is_some_and(|ranges| {
+                ranges
+                    .iter()
+                    .any(|&(a, b)| a < page + crate::watch::PAGE && page < b)
+            })
+    }
+
+    /// Both post-fence passes use the layout that named the GPU writes,
+    /// even if the title releases the corresponding view heap meanwhile.
+    fn layout(&self, heap: usize) -> Arc<Layout> {
+        self.heaps
+            .get(&heap)
+            .cloned()
+            .unwrap_or_else(|| layout(heap))
+    }
+
+    pub(crate) fn has_snapshots(&self) -> bool {
+        self.bytes != 0
+    }
+
+    /// A computed mark with a full baseline owns the entire shadow page.
+    /// The post-submit callback will merge it after the declared passes.
+    fn plan(&mut self, copy: &Arc<Shadow>, page: usize) {
+        if self.page(copy, page).is_some() {
+            self.owned.insert((Arc::as_ptr(copy) as usize, page));
+        }
+    }
+
+    pub(crate) fn owns(&self, copy: &Shadow, page: usize) -> bool {
+        self.owned
+            .contains(&(std::ptr::from_ref(copy) as usize, page))
+    }
+
+    /// Another list can mark the same page. Consume the baseline once, so
+    /// bytes merged from the CPU are not mistaken for later GPU writes.
+    pub(crate) fn claim(&mut self, copy: &Arc<Shadow>, page: usize) -> bool {
+        self.compared.insert((Arc::as_ptr(copy) as usize, page))
+    }
+
+    pub(crate) fn page(&self, copy: &Shadow, page: usize) -> Option<&[u8]> {
+        let key = std::ptr::from_ref(copy) as usize;
+        if let Some(before) = self.declared_pages.get(&(key, page)) {
+            return Some(before);
+        }
+        let (start, len) = copy.range();
+        let (start, len) = (start as usize, len as usize);
+        let from = page.max(start) - start;
+        let to = (page + crate::watch::PAGE).min(start + len) - start;
+        self.copies.get(&key)?.get(from..to)
+    }
+}
+
 /// At submission, for a list using title memory with view heap `key`
 /// bound: the heap's page table names every host copy there is, each
 /// brought up to date (`add` takes a copy's range, once per submission
@@ -562,8 +695,33 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
             unsafe { std::slice::from_raw_parts(missed_bitmap.data() as *const u32, BITMAP_WORDS) };
         has_missed(marks, &l)
     });
-    list.defer_after(move || {
-        let Layout { copies, blocks, owner, .. } = &*layout(key);
+    if crate::land::enabled() {
+        let landing_bitmap = Arc::clone(&pooled);
+        list.defer_computed_ownership(move |baselines| {
+            let l = baselines.layout(key);
+            // SAFETY: the GPU fence has completed and the bitmap is still live.
+            let marks = unsafe {
+                std::slice::from_raw_parts(landing_bitmap.data() as *const u32, BITMAP_WORDS)
+            };
+            for (word, &mark) in marks.iter().enumerate() {
+                let mut bits = mark;
+                while bits != 0 {
+                    let entry = word * 32 + bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    let Some(&block) = l.blocks.get(entry / BLOCK).filter(|_| entry >= BLOCK)
+                    else {
+                        continue;
+                    };
+                    if let Some(&Some(k)) = l.owner.get(entry) {
+                        let page = block << 28 | (entry % BLOCK) << 16;
+                        baselines.plan(&l.copies[k], page);
+                    }
+                }
+            }
+        });
+    }
+    list.defer_after_with_baselines(move |baselines| {
+        let Layout { copies, blocks, owner, .. } = &*baselines.layout(key);
         let precise = byte_for_byte.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the bitmap is mapped and the list's run is over.
         let marks =
@@ -587,8 +745,12 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                     continue;
                 };
                 let at = (l1 << 28 | page << 16) as u64;
-                match owner.get(entry) {
-                    Some(_) if precise.iter().any(|&(a, n)| a < at + (1 << 16) && at < a + n) => {}
+                let entry_owner = owner.get(entry);
+                let owned = entry_owner
+                    .and_then(|&k| k)
+                    .is_some_and(|k| baselines.owns(&copies[k], at as usize));
+                match entry_owner {
+                    Some(_) if !owned && precise.iter().any(|&(a, n)| a < at + (1 << 16) && at < a + n) => {}
                     Some(&Some(k)) => writes.push((k, at)),
                     _ => {
                         pages += 1;
@@ -601,15 +763,37 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         // not the console's: it does not go into title memory, where it broke
         // the title's own data (garbage pointers in title threads, run c1),
         // nor while any list using title memory misses ([`withholding`]).
-        let withheld = if pages + regions > 0 || withholding() { writes.len() as u64 } else { 0 };
+        let mut withheld = if pages + regions > 0 || withholding() { writes.len() as u64 } else { 0 };
         if withheld > 0 {
             for &(_, at) in &writes {
                 drop_withheld(at as usize, 1 << 16);
             }
         }
         let mut written = 0;
-        for &(k, at) in writes.iter().take_while(|_| withheld == 0) {
-            let n = copies[k].copy_back_page(at as usize);
+        let goes_back = withheld == 0;
+        for &(k, at) in writes.iter().take_while(|_| goes_back) {
+            let (copy, page) = (&copies[k], at as usize);
+            let baseline = if crate::land::active() {
+                if !baselines.claim(copy, page) {
+                    continue;
+                }
+                if baselines.owns(copy, page) {
+                    baselines.page(copy, page)
+                } else if !copy.tracks_page(page) || baselines.overlaps_declared(copy, page) {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| tracing::warn!(
+                        "computed GPU writes without a pre-submit baseline were withheld (64 MiB budget)"
+                    ));
+                    crate::watch::retake(page, crate::watch::PAGE);
+                    withheld += 1;
+                    continue;
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let n = copy.copy_back_page(page, baseline);
             tracing::debug!(
                 page = format_args!("{at:#x}"),
                 copy = format_args!("{:#x?}", copies[k].range()),
@@ -1122,6 +1306,140 @@ void main() {
         }
         crate::shadow::unregister(p, p as u64);
         drop(copy);
+    }
+
+    #[test]
+    fn computed_write_keeps_a_section_write_without_fault_tracking() {
+        if !crate::watch::fault_tracking() {
+            computed_section_write(false);
+        }
+    }
+
+    #[test]
+    fn declared_and_computed_writes_land_a_shared_page_once() {
+        computed_section_write(true);
+    }
+
+    /// Two disjoint GPU words share a page with a CPU word inside the
+    /// declared range. A second CPU write happens after declared write-back
+    /// and before the computed callback.
+    fn computed_section_write(overlap: bool) {
+        if !crate::land::enabled() {
+            return;
+        }
+        use crate::compute::Param;
+        use crate::watch::PAGE;
+        use windows::core::s;
+        let _guard = gpu_test_lock();
+        // An earlier test's missing page can withhold the next frame's
+        // writes globally. Advance past that frame before this submission.
+        if withholding() {
+            log_frame();
+            log_frame();
+        }
+        let host = crate::host::host().expect("the computed landing fixture needs a GPU");
+        let p = pool(1);
+        crate::shadow::register(p, p as u64, PAGE as u64);
+        let copy = crate::shadow::find(p as u64, PAGE as u64).unwrap();
+        assert_eq!(copy.dirty_bit().is_some(), crate::watch::fault_tracking());
+
+        let cpu_write = move |value| {
+            let _writing = crate::watch::writing(p + 8, 4);
+            // SAFETY: the fixture owns the page and the write report opens it.
+            unsafe { ((p + 8) as *mut u32).write_volatile(value) };
+        };
+        let declared = overlap.then(|| {
+            let list = host.new_list().unwrap();
+            copy.refresh(&list, p as u64, PAGE as u64);
+            copy.gpu_writes(&list, (p + 4) as u64, 8, false);
+            let shared = copy.clone();
+            list.defer_after(move || {
+                assert_eq!(shared.read_host((p + 8) as u64, 1), [0]);
+                cpu_write(2);
+            });
+            let shader = "RWByteAddressBuffer data : register(u0);
+                [numthreads(1,1,1)] void main() { data.Store(4, 0x11223344); }";
+            let (root, pso) = crate::compute::pipeline(
+                shader,
+                s!("declared overlap"),
+                0,
+                &[Param::Uav { register: 0 }],
+            )
+            .unwrap();
+            // SAFETY: pipeline, root and shadow are live. Keep the pipeline
+            // and root with the list until the dispatch completes.
+            unsafe {
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetPipelineState(&pso);
+                list.list
+                    .SetComputeRootUnorderedAccessView(0, copy.gpu(p as u64));
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.keep(&root);
+            list.keep(&pso);
+            list.close();
+            list
+        });
+        let shader = format!(
+            "StructuredBuffer<uint> table : register(t0);
+             RWByteAddressBuffer data : register(u0);
+             RWByteAddressBuffer dirty : register(u1);
+             [numthreads(1,1,1)] void main() {{
+                 uint entry = (table[{}] << 12) | {};
+                 data.Store(12, 0x55667788);
+                 dirty.Store((entry >> 5) * 4, 1u << (entry & 31));
+             }}",
+            p >> 28,
+            (p >> 16) & 0xfff,
+        );
+        let params = [
+            Param::Srv {
+                register: 0,
+                space: 0,
+            },
+            Param::Uav { register: 0 },
+            Param::Uav { register: 1 },
+        ];
+        let (root, pso) =
+            crate::compute::pipeline(&shader, s!("computed landing"), 0, &params).unwrap();
+        let list = host.new_list().unwrap();
+        let map = bind(&list, OURS).expect("a computed-address page table");
+        list.defer_missed(move || {
+            cpu_write(1);
+            false
+        });
+        // SAFETY: these are the live shadow, table and bitmap of an open list.
+        unsafe {
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pso);
+            list.list.SetComputeRootShaderResourceView(0, map.table);
+            list.list
+                .SetComputeRootUnorderedAccessView(1, copy.gpu(p as u64));
+            list.list.SetComputeRootUnorderedAccessView(2, map.dirty);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        let runs: Vec<_> = declared.iter().chain(std::iter::once(&list)).collect();
+        host.execute(&runs);
+        // SAFETY: aligned words in the fixture's live pool.
+        let word = |offset| unsafe { ((p + offset) as *const u32).read_volatile() };
+        let expected = [
+            if overlap { 0x11223344 } else { 0 },
+            if overlap { 2 } else { 1 },
+            0x55667788,
+        ];
+        assert_eq!([word(4), word(8), word(12)], expected);
+        assert_eq!(copy.read_host((p + 4) as u64, 3), expected);
+        eprintln!(
+            "same page, {} lists, tracking {}: title and shadow words {:08x?}",
+            runs.len(),
+            crate::watch::fault_tracking(),
+            expected
+        );
+
+        crate::shadow::unregister(p, p as u64);
+        drop((declared, list, copy));
+        crate::watch::tests::free(p);
     }
 
     /// A copy unregistered between submissions: the next rewrite drops its

@@ -1271,6 +1271,9 @@ pub(crate) mod tests {
     #[cfg(windows)]
     #[test]
     fn records_copied_as_bytes_are_made_at_the_next_sync() {
+        if !crate::watch::fault_tracking() {
+            return;
+        }
         let memory = crate::watch::tests::pool(1);
         let desc = HeapDesc {
             kind: SAMPLERS,

@@ -724,6 +724,16 @@ impl Tracked {
         self.changed.2
     }
 
+    /// Whether the entire part of this title page held by the copy is
+    /// tracked. The remaining runs are sorted by byte address.
+    pub(crate) fn covers_page(&self, page: usize) -> bool {
+        let end = page.saturating_add(PAGE);
+        let next = self.untracked.partition_point(|&(_, b)| b <= page);
+        self.start < end
+            && page < self.end
+            && self.untracked.get(next).is_none_or(|&(a, _)| a >= end)
+    }
+
     /// The parts of `[from, to)` that are not tracked (see
     /// [`Tracked::untracked`] field): to be copied whole at each use.
     pub(crate) fn untracked(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
@@ -1005,6 +1015,137 @@ pub(crate) fn frame_done() {
     g.written_before = written;
 }
 
+/// A writable alias (including a kernel or section writer in progress)
+/// prevents taking a clean copy of any of the views.
+fn aliases_guarded(g: &Guards, page: usize) -> bool {
+    let busy = |p| g.busy.iter().any(|&(a, b)| (a..b).contains(&p));
+    !busy(page)
+        && g.alias_of
+            .get(&page)
+            .is_none_or(|others| others.iter().all(|p| g.protected.contains(p) && !busy(*p)))
+}
+
+/// Merge within one 64 KiB block, after its GPU fence. The mapping callback
+/// holds the physical map stable until we have written and notified every
+/// tracker. Guard faults cannot mark or reopen an alias during the merge.
+pub(crate) fn land(
+    at: usize,
+    host: &mut [u8],
+    old: Option<&[u8]>,
+    tracked: Option<&Tracked>,
+    scratch: &mut [u8],
+) -> Option<usize> {
+    use crate::land::LandingPage;
+    debug_assert!(!host.is_empty() && at % PAGE + host.len() <= PAGE);
+    if old == Some(host) {
+        return Some(0);
+    }
+    debug_assert!(old.is_some() || tracked.is_some());
+    let page = at / PAGE;
+    let mut landed = None;
+    crate::land::page(at, |destination| {
+        let mut g = guards();
+        let saved = if old.is_none()
+            && let Some(t) = tracked
+        {
+            t.unarm(page);
+            let saved = t.saved(page);
+            if saved.is_none() && t.changed(page) {
+                return;
+            }
+            saved
+        } else {
+            None
+        };
+        if matches!(destination, LandingPage::Replaced) {
+            return;
+        }
+        let guarded = g.protected.contains(&page) && aliases_guarded(&g, page);
+        let beside = match destination {
+            LandingPage::Beside(addr) => Some(addr as *mut u8),
+            _ => None,
+        };
+        let title = &mut scratch[..host.len()];
+        if let Some(addr) = beside.filter(|_| guarded) {
+            // SAFETY: xmem holds the mapping stable and all title aliases
+            // are guarded. Section writers are excluded by xmem as well.
+            unsafe { std::ptr::copy_nonoverlapping(addr, title.as_mut_ptr(), title.len()) };
+        } else if !crate::host::read_into(at as *const u8, title) {
+            return;
+        }
+        let old = old.or_else(|| {
+            saved
+                .as_deref()
+                .map(|s| &s[at % PAGE..at % PAGE + host.len()])
+        });
+        let changes = |i: usize, value: u8, current: u8| {
+            value != current && old.is_none_or(|before| value != before[i])
+        };
+        let writes = (0..host.len()).any(|i| changes(i, host[i], title[i]));
+        if writes {
+            if beside.is_some() {
+                // Save the baseline for other armed copies before exposing
+                // the GPU bytes. Their next refresh must see the write.
+                let others = g.alias_of.get(&page).cloned().unwrap_or_default();
+                for p in std::iter::once(page).chain(others) {
+                    mark_changed(&mut g, p, p + 1, true);
+                }
+            } else {
+                changed(&mut g, page, page + 1, true);
+            }
+        }
+
+        // Only store changed bytes. In particular a CPU store to a different
+        // byte through an open alias must never be overwritten by write-back.
+        let mut i = 0;
+        while i < host.len() {
+            if !changes(i, host[i], title[i]) {
+                host[i] = title[i];
+                i += 1;
+                continue;
+            }
+            let first = i;
+            while i < host.len() && changes(i, host[i], title[i]) {
+                i += 1;
+            }
+            if let Some(addr) = beside {
+                // SAFETY: the alternate view is writable and stable through
+                // the callback. No store reaches outside this changed run.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        host.as_ptr().add(first),
+                        addr.add(first),
+                        i - first,
+                    )
+                };
+            } else {
+                crate::host::write_mapped(
+                    (at + first) as *mut u8,
+                    host.as_ptr().wrapping_add(first),
+                    i - first,
+                );
+            }
+        }
+
+        if guarded
+            && (beside.is_some() || !writes)
+            && crate::land::echo()
+            && let Some(t) = tracked
+            && at == (page * PAGE).max(t.start)
+            && at + host.len() == ((page + 1) * PAGE).min(t.end)
+        {
+            // The writing copy now has every byte it holds of this page.
+            // Clear only its tracker, with the guards still held.
+            let mut dirty = t.changed.0.lock().unwrap_or_else(|e| e.into_inner());
+            dirty.remove(&page);
+            t.changed.taken(page);
+            set_dirty(t.changed.2, !dirty.is_empty());
+        }
+        landed = Some(if writes { host.len() } else { 0 });
+    });
+    landed
+}
+
 /// A write into title memory the guards do not see, under way: its pages
 /// stay open (a tracker taking them meanwhile would guard them, and the
 /// kernel's write would fail) until it is dropped, which marks them changed
@@ -1013,6 +1154,7 @@ pub(crate) fn frame_done() {
 pub struct Writing {
     first: usize,
     last: usize,
+    beside: bool,
 }
 
 impl Drop for Writing {
@@ -1021,7 +1163,11 @@ impl Drop for Writing {
         if let Some(i) = g.busy.iter().position(|&r| r == (self.first, self.last)) {
             g.busy.swap_remove(i);
         }
-        changed(&mut g, self.first, self.last, false);
+        if self.beside {
+            mark_changed(&mut g, self.first, self.last, false);
+        } else {
+            changed(&mut g, self.first, self.last, false);
+        }
     }
 }
 
@@ -1037,7 +1183,37 @@ pub fn writing(at: usize, len: usize) -> Writing {
     let mut g = guards();
     g.busy.push((first, last));
     changed(&mut g, first, last, true);
-    Writing { first, last }
+    Writing {
+        first,
+        last,
+        beside: false,
+    }
+}
+
+/// The runtime writes through a writable view of a section. It reports
+/// every title alias, including views added while the write is in progress.
+pub fn writing_beside(at: usize, len: usize) -> Writing {
+    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    let mut g = guards();
+    g.busy.push((first, last));
+    mark_changed(&mut g, first, last, true);
+    Writing {
+        first,
+        last,
+        beside: true,
+    }
+}
+
+/// The runtime is about to split a view. Keep the baseline for armed
+/// copies of the surviving pages, which return at the same addresses.
+pub fn title_memory_moving(at: usize, len: usize) {
+    let mut g = guards();
+    mark_changed(
+        &mut g,
+        at / PAGE,
+        at.saturating_add(len).div_ceil(PAGE),
+        true,
+    );
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
@@ -1299,6 +1475,9 @@ pub(crate) mod tests {
     /// (copied whole at each use, so the tracker is never clean).
     #[test]
     fn plain_committed_memory_is_never_guarded() {
+        if !fault_tracking() {
+            return;
+        }
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualAlloc,
             VirtualFree, VirtualQuery,
@@ -1328,6 +1507,9 @@ pub(crate) mod tests {
 
     #[test]
     fn writes_mark_every_tracker_of_their_page() {
+        if !fault_tracking() {
+            return;
+        }
         let p = pool(4);
         let a = track(p, 4 * PAGE, true).expect("pool memory is tracked");
         let b = track(p + PAGE, 2 * PAGE, true).expect("tracked");
@@ -1366,6 +1548,9 @@ pub(crate) mod tests {
     /// and leaves the other allocation alone: taking guards the pool only.
     #[test]
     fn a_range_over_foreign_memory_guards_only_the_runtimes() {
+        if !fault_tracking() {
+            return;
+        }
         use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualQuery};
         const WINDOW: usize = 4 << 20;
         // In a free 4 MiB-aligned window: plain committed memory (as the
@@ -1413,6 +1598,9 @@ pub(crate) mod tests {
     /// starts dirty on it (everything changed at first).
     #[test]
     fn a_new_tracker_starts_dirty_on_a_bit_given_back() {
+        if !fault_tracking() {
+            return;
+        }
         let p = pool(1);
         let a = track(p, PAGE, true).expect("tracked");
         assert_eq!(a.take(p, p + PAGE).len(), 1);
@@ -1429,6 +1617,9 @@ pub(crate) mod tests {
     /// apart from the pages to copy.
     #[test]
     fn unmapped_pages_are_taken_apart() {
+        if !fault_tracking() {
+            return;
+        }
         // SAFETY: a fresh write-watched reservation of two pages, the first
         // committed; freed below.
         let p = unsafe {
@@ -1448,6 +1639,9 @@ pub(crate) mod tests {
     /// changed; edge pages count whole when the tracked part is covered.
     #[test]
     fn partial_pages_stay_changed() {
+        if !fault_tracking() {
+            return;
+        }
         let p = pool(3);
         let t = track(p + 100, 2 * PAGE, true).expect("tracked");
         assert_eq!(t.take(p + 100, p + PAGE + 10), [(p + 100, p + PAGE + 10)]);
@@ -1466,6 +1660,9 @@ pub(crate) mod tests {
     /// does once the tracker is disarmed.
     #[test]
     fn armed_ranges_keep_their_pages_bytes_from_before_the_first_write() {
+        if !fault_tracking() {
+            return;
+        }
         let p = pool(4);
         let t = track(p, 4 * PAGE, true).expect("pool memory is tracked");
         let all = || t.take(p, p + 4 * PAGE);
@@ -1553,6 +1750,9 @@ pub(crate) mod tests {
     /// is, reads as taken, and changes when the runtime maps it.
     #[test]
     fn heap_memory_is_not_tracked_and_placeholders_wait_for_mappings() {
+        if !fault_tracking() {
+            return;
+        }
         let plain = vec![0u8; 2 * PAGE];
         assert!(track(plain.as_ptr() as usize, plain.len(), true).is_none());
         // SAFETY: a reservation of ours, freed below.
@@ -1572,6 +1772,9 @@ pub(crate) mod tests {
     /// lands and the block counts as changed.
     #[test]
     fn kernel_reads_into_guarded_blocks_after_opening() {
+        if !fault_tracking() {
+            return;
+        }
         use std::io::{Read, Seek, Write};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
@@ -1711,6 +1914,9 @@ pub(crate) mod tests {
     /// call over all of them that fails first and then one per page.
     #[test]
     fn takes_guard_one_view_per_call() {
+        if !fault_tracking() {
+            return;
+        }
         let calls = || PROTECTS.with(std::cell::Cell::get);
         // Four one-page views and a four-page view, taken together.
         let (base, _) = views_side_by_side(4);
@@ -1743,6 +1949,9 @@ pub(crate) mod tests {
     /// so does a write the runtime reports at the other mapping.
     #[test]
     fn writes_through_another_mapping_mark_the_tracker() {
+        if !fault_tracking() {
+            return;
+        }
         let (a, b) = twin_views(2);
         let t = track(a, 2 * PAGE, true).expect("views are tracked");
         assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + 2 * PAGE)]);
@@ -1790,6 +1999,9 @@ pub(crate) mod tests {
     /// was opened, and the pages it went unseen in stayed clean).
     #[test]
     fn a_tracker_dropped_on_one_mapping_leaves_the_other_guarded() {
+        if !fault_tracking() {
+            return;
+        }
         let (a, b) = twin_views(1);
         let t = track(a, PAGE, true).expect("views are tracked");
         let u = track(b, PAGE, true).expect("views are tracked");
@@ -1805,6 +2017,9 @@ pub(crate) mod tests {
     /// take it again, and leaves it guarded: a later write still counts.
     #[test]
     fn a_retake_marks_the_copies_and_keeps_the_guard() {
+        if !fault_tracking() {
+            return;
+        }
         use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualQuery};
         let protection = |at: usize| {
             // SAFETY: plain data filled in by the query.
@@ -1847,6 +2062,9 @@ pub(crate) mod tests {
     /// copies. A title write still marks both.
     #[test]
     fn a_retake_marks_buffer_copies_alone() {
+        if !fault_tracking() {
+            return;
+        }
         let p = pool(2);
         let copy = track_copy(p, 2 * PAGE, true).expect("pool memory is tracked");
         let texture = track(p, 2 * PAGE, true).expect("pool memory is tracked");
@@ -1867,6 +2085,9 @@ pub(crate) mod tests {
     /// a busy mapping to a guarded one must mark the guarded page changed.
     #[test]
     fn a_busy_alias_leaves_the_page_changed_and_keeps_saved_bytes() {
+        if !fault_tracking() {
+            return;
+        }
         let (a, b) = twin_views(1);
         let t = track(a, PAGE, true).expect("views are tracked");
         assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);

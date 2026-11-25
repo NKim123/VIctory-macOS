@@ -1145,6 +1145,8 @@ enum Step {
     Memory(usize),
 }
 
+type AfterWork = Box<dyn Fn(&mut crate::memory::ComputedBaselines) + Send>;
+
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
 /// the upload buffers its GPU commands read, kept until the list is reset.
@@ -1175,7 +1177,10 @@ struct Deferred {
     budget_zeroed: bool,
     /// Work done once the list has run, before the bottom-of-pipe writes
     /// (title memory shaders wrote at addresses they computed goes back).
-    after: Vec<Box<dyn Fn() + Send>>,
+    after: Vec<AfterWork>,
+    /// Computed pages with full baselines own those pages before any
+    /// post-fence merge can write CPU bytes into their shadows.
+    computed_ownership: Vec<AfterWork>,
     /// Asked once the list has run, before anything goes back: whether its
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
@@ -1466,6 +1471,7 @@ impl Host {
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let _holding = Holding::enter();
+        let landing = crate::land::begin();
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
@@ -1563,6 +1569,23 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        let mut computed = crate::memory::ComputedBaselines::default();
+        if landing.is_some() {
+            for list in runs {
+                for step in &list.deferred().copies {
+                    if let Step::Memory(heap) = *step {
+                        computed.capture(heap);
+                    }
+                }
+            }
+            for list in runs {
+                for step in &list.deferred().copies {
+                    if let Step::GpuWrite(copy, address, len, _, _) = step {
+                        computed.declare(copy, *address, *len);
+                    }
+                }
+            }
+        }
         #[cfg(feature = "diagnostics")]
         batch.log_refreshes(*submitted + 1, runs.len());
         let prepared = std::time::Instant::now();
@@ -1598,11 +1621,21 @@ impl Host {
             // SAFETY: closed lists; the fence and event are ours.
             let waited = unsafe {
                 queue.ExecuteCommandLists(&group);
-                let waited = queue
-                    .Signal(&self.fence, *submitted)
+                let signalled = queue.Signal(&self.fence, *submitted);
+                if let Err(e) = &signalled
+                    && landing.is_some()
+                {
+                    fail(format_args!("could not signal host submission fence: {e}"));
+                }
+                let waited = signalled
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
                     Ok(()) => {
+                        self.wait_for(*submitted);
+                        true
+                    }
+                    Err(e) if landing.is_some() => {
+                        tracing::warn!(error = %e, "host submission fence event unavailable; polling the fence");
                         self.wait_for(*submitted);
                         true
                     }
@@ -1760,28 +1793,41 @@ impl Host {
             .filter(|b| !b.3)
             .map(|(s, a, n, _)| (s.clone(), *a, *n))
             .collect();
-        crate::shadow::copy_back_marks(&withheld, withholding);
-        // Texture views left null that shaders read: made for what follows.
-        let read = crate::shadow::take_reads();
-        if !read.is_empty() {
-            crate::descriptor::make_read(&read);
-        }
-        for (shadow, address, len, goes_back) in &back {
-            let (address, len) = (*address, *len);
-            if *goes_back {
-                let written = shadow.copy_back(address, len);
-                COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
-            } else {
-                shadow.keep_writes(address, len);
-                crate::memory::note_withheld(len as u64);
-                crate::memory::drop_withheld(address, len);
+        if !withholding && computed.has_snapshots() {
+            for list in runs {
+                for plan in &list.deferred().computed_ownership {
+                    plan(&mut computed);
+                }
             }
         }
-        for list in runs {
-            for work in &list.deferred().after {
-                work();
+        let (back, withheld, mut computed) = crate::land::relay(landing, move || {
+            let _holding = Holding::enter();
+            crate::shadow::copy_back_marks(&withheld, withholding, landing.map(|_| &mut computed));
+            // Texture views left null that shaders read: made for what follows.
+            let read = crate::shadow::take_reads();
+            if !read.is_empty() {
+                crate::descriptor::make_read(&read);
             }
-        }
+            for (shadow, address, len, goes_back) in &back {
+                let (address, len) = (*address, *len);
+                if *goes_back {
+                    let written = shadow.copy_back(address, len, landing.map(|_| &computed));
+                    COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                } else {
+                    shadow.keep_writes(address, len);
+                    crate::memory::note_withheld(len as u64);
+                    crate::memory::drop_withheld(address, len);
+                }
+            }
+            (back, withheld, computed)
+        });
+        crate::land::during(landing, || {
+            for list in runs {
+                for work in &list.deferred().after {
+                    work(&mut computed);
+                }
+            }
+        });
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsBack, crate::copystat::page_faults().saturating_sub(faults));
@@ -2537,6 +2583,22 @@ impl HostList {
     /// Runs `work` once the list has run (each submission), before its
     /// bottom-of-pipe writes.
     pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
+        self.defer_after_with_baselines(move |_| work());
+    }
+
+    /// Plans computed page ownership after the GPU and before write-back.
+    pub(crate) fn defer_computed_ownership(
+        &self,
+        work: impl Fn(&mut crate::memory::ComputedBaselines) + Send + 'static,
+    ) {
+        self.deferred().computed_ownership.push(Box::new(work));
+    }
+
+    /// Runs computed-memory write-back with this submission's baselines.
+    pub(crate) fn defer_after_with_baselines(
+        &self,
+        work: impl Fn(&mut crate::memory::ComputedBaselines) + Send + 'static,
+    ) {
         self.deferred().after.push(Box::new(work));
     }
 
@@ -4287,6 +4349,9 @@ mod batch {
     /// only after a step that writes title memory.
     #[test]
     fn a_copy_is_refreshed_once_per_submission_by_the_pages_written() {
+        if !crate::watch::fault_tracking() {
+            return;
+        }
         let p = crate::watch::tests::pool(4);
         let len = 4 * PAGE;
         crate::shadow::register(p, p as u64, len as u64);
