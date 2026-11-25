@@ -21,6 +21,8 @@
 //!    point on a thread with the stack size the image asks for; from then
 //!    on, pass every thread start and end on to the attached images.
 
+#[cfg(any(windows, test))]
+pub mod amd_patch;
 #[cfg(windows)]
 mod crash;
 pub mod masked;
@@ -31,6 +33,8 @@ pub(crate) mod publish;
 pub mod resolve;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod stacks;
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod startup_patch;
 #[cfg(windows)]
 mod threads;
 #[cfg(windows)]

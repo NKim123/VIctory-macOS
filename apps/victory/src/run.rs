@@ -100,6 +100,7 @@ pub fn run(
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+    let amd_patches = execute.then(|| victory_loader::amd_patch::Patches::from_env(&prepared));
     let image = victory_loader::load(&prepared, &images)?;
     // Mapped: the patched bytes (the exe's size, 114 MB) are not needed.
     drop(prepared);
@@ -160,6 +161,10 @@ pub fn run(
     } else {
         HostPolicy::default()
     });
+    if let Some(patches) = amd_patches {
+        // SAFETY: this is the main image, and no title code has run.
+        unsafe { patches.apply(&image) }?;
+    }
     let wanted = |dll: &str| title_dll(&resolver.host, dll);
     // A missing manifest leaves id 0 and no storage quota.
     let manifest =

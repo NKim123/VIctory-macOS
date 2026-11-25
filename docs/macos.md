@@ -121,6 +121,34 @@ On an M5 Pro with 20,000 live views, the `wine_views` benchmark from #159 took 1
 
 On 25 November 2026 two testers ran the same Series X executable (one SHA-256) with the same profile. With CrossOver 26.3's bundled D3DMetal 3.0 on an M5 Pro, the game stopped about seven seconds in at its own assert at `+0x1dac734`, a subsystem checked during start-up (#24). With D3DMetal 4.0 beta 3 on an M3 Max it never hit that assert and reached the game world (#50). D3DMetal 3.0 also names the adapter `VirtualApple @ 2.50GHz` and refuses an empty pipeline library blob (#30). Since #74 asks for an empty library with a null pointer, host pipelines are kept across runs on 3.0 too: mikebuckets171 saw a library written on a first run and loaded back on the second. Use 4.0 beta 3 or newer for the game. It is not the only cause of that assert, though: later the same day us3r40456 hit `+0x1dac734` with D3DMetal 4.0 beta 3 too, on both the Series X and Series S profiles, so something else in their setup also decides it (#24).
 
+## Opt-in AMD instruction patches
+
+`VICTORY_PATCH_CLZERO` and `VICTORY_PATCH_WAITS` each take a full BLAKE3 hash of the
+original executable followed by a colon and comma-separated hex RVAs. Use the hash
+printed on the `build` line. For `CLZERO`, supply the RVA of the `clzero` instruction
+in either of the two loop forms below. For waits, supply the RVAs of the individual
+`monitorx` and `mwaitx` instructions. Verify the instruction boundaries in a local
+disassembly, including any prefix bytes, and verify that control enters the replaced
+span only at its first instruction. Choose loop sites outside function prologues
+and epilogues. Unset either switch or set it to `0` to use normal exception emulation.
+
+```text
+clzero; add rax,64; cmp rax,limit; jb back to clzero
+mov rax,cursor; add cursor,64; clzero; cmp cursor,limit; jb back to mov
+```
+
+The loader checks the opcode, loop shape and mapped bytes and applies the patches
+after the other startup rewrites, including the CLWB and store workarounds below,
+before title threads run. It skips candidates
+with overlapping instructions, changed neighboring bytes or unsupported mappings.
+`monitorx` becomes a NOP and `mwaitx` becomes a spin hint, so the title still relies
+on its enclosing wait loop. The CLZERO stub aligns the address down to a
+64-byte line and uses eight scalar 8-byte stores, so Rosetta can resume a
+store if write tracking protects the destination. The stub restores the
+original address and flags before continuing the loop. For a data fault
+that reaches title exception dispatch, the handler restores the title's
+stack and register context at the original instruction.
+
 ## Stacks during a freeze
 
 In the loading freeze from #50 every thread stops logging, and `VICTORY_STACKS` printed nothing, not even its first line. Printing takes the stderr lock and allocates, and the thread snapshot goes through Wine, so a thread stuck while it holds one of those locks stops the dump too. With `VICTORY_STACKS_FILE=<path>` as well (in a build with `VICTORY_DIAGNOSTICS=1`), the dumps go to that file instead. The module table is written at start-up, and each dump writes a marker line before each step and raw addresses for each frame, with no allocation and no stderr lock. Where the file stops shows which step blocked.
