@@ -838,9 +838,19 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
         return;
     };
     let len = u64::from(count) * step;
-    if dst != 0 && src != 0 {
-        // SAFETY: both ranges are descriptor slots the title owns.
-        unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
+    if len != 0 && dst != 0 && src != 0 {
+        // SAFETY: both ranges are initialized descriptor heap memory the
+        // title owns. Compare before writing, including for overlapping copies.
+        let same = dst == src || unsafe {
+            std::slice::from_raw_parts(src as *const u8, len as usize)
+                == std::slice::from_raw_parts(dst as *const u8, len as usize)
+        };
+        if !same {
+            // SAFETY: the same ranges; copy also handles overlap.
+            unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
+        }
+        // An equal record may still have arrived as bytes and be new to the
+        // host heap, or be from a resource since released.
         #[cfg(windows)]
         for i in 0..u64::from(count) {
             mirror(dst + i * step);
@@ -1379,6 +1389,44 @@ pub(crate) mod tests {
         }
         create_cbv(std::ptr::null(), &[0x3000, 1, 256, 0], address);
         assert_eq!(heap(existing.0).pending.lock().unwrap().as_slice(), [0]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_equal_copy_mirrors_the_slot_without_dirtying_its_page() {
+        let memory = crate::watch::tests::pool(1);
+        let desc = HeapDesc { kind: SAMPLERS, count: 64, flags: SHADER_VISIBLE, nodes: 1 };
+        let mut h = std::ptr::null();
+        let placement = Placement { address: memory as u64, size: 64 * 16 };
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        let heap = heap(h);
+        if let Some(host) = heap.host() {
+            let mut record = [0u64; 2];
+            let src = record.as_mut_ptr() as u64;
+            let dst = heap.start + 5 * 16;
+            create_sampler(std::ptr::null(), &[21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0], src);
+            // SAFETY: 16 bytes at each of our descriptor slots.
+            unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, 16) };
+            let written = heap.written.as_ref().expect("a tracked heap");
+            let end = memory + crate::watch::PAGE;
+            written.take(memory, end);
+            assert!(!host.made(5));
+            copy_simple(std::ptr::null(), 1, dst, src, SAMPLERS);
+            assert!(host.made(5), "the raw write was still new to the host");
+            assert!(written.take(memory, end).is_empty(), "the equal copy did not write");
+        }
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        crate::watch::tests::free(memory);
+    }
+
+    #[test]
+    fn descriptor_copies_preserve_overlap_and_the_full_record() {
+        let mut records = [[1u8; 32], [2; 32], [3; 32]];
+        let start = records.as_mut_ptr() as u64;
+        copy_simple(std::ptr::null(), 2, start + 32, start, VIEWS_KIND);
+        assert_eq!(records, [[1; 32], [1; 32], [2; 32]]);
+        copy_simple(std::ptr::null(), 2, start, start + 32, VIEWS_KIND);
+        assert_eq!(records, [[1; 32], [2; 32], [2; 32]]);
     }
 
     /// Grand Theft Auto VI places its shader-visible heap in its own memory
