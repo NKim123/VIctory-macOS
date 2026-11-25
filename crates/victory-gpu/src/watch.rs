@@ -111,6 +111,68 @@ pub fn rosetta() -> bool {
 /// they saved.
 pub(crate) const PAGE: usize = 64 << 10;
 
+#[cfg(target_arch = "x86_64")]
+mod write_sites {
+    use std::ops::Range;
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, EXCEPTION_POINTERS};
+
+    use super::PAGE;
+
+    const SLOTS: usize = 4096;
+    static GUARDED: [AtomicUsize; SLOTS] = [const { AtomicUsize::new(0) }; SLOTS];
+    static OBSERVER: OnceLock<fn(&CONTEXT, usize)> = OnceLock::new();
+
+    /// Guarded, write-watched page bases, indexed by the low bits of the
+    /// page number. Collisions drop an entry and can only miss a fast path.
+    pub fn write_site_guards() -> (&'static [AtomicUsize], u8) {
+        (&GUARDED, PAGE.trailing_zeros() as u8)
+    }
+
+    /// Observe faults on guards of ordinary write-watched RAM, before the
+    /// guard opens. The callback runs under the guard lock.
+    pub fn observe_write_sites(observer: fn(&CONTEXT, usize)) {
+        let _ = OBSERVER.set(observer);
+    }
+
+    pub(super) fn publish(pages: &[usize], ends: &[usize]) {
+        if OBSERVER.get().is_none() {
+            return;
+        }
+        for (&page, &end) in pages.iter().zip(ends) {
+            // RuntimeRegions returns MAX only for a write-watched pool.
+            if end == usize::MAX {
+                GUARDED[page % SLOTS].store(page * PAGE, Relaxed);
+            }
+        }
+    }
+
+    pub(super) fn forget(pages: Range<usize>) {
+        if OBSERVER.get().is_none() {
+            return;
+        }
+        for page in pages {
+            let _ = GUARDED[page % SLOTS].compare_exchange(page * PAGE, 0, Relaxed, Relaxed);
+        }
+    }
+
+    /// The caller holds the guard lock and received `info` from the OS.
+    pub(super) unsafe fn observe(info: *mut EXCEPTION_POINTERS, at: usize) {
+        let page = at / PAGE;
+        if page != 0
+            && let Some(observer) = OBSERVER.get()
+            && GUARDED[page % SLOTS].load(Relaxed) == page * PAGE
+        {
+            // SAFETY: the system provides the faulting thread's context.
+            observer(unsafe { &*(*info).ContextRecord }, at);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+pub use write_sites::{observe_write_sites, write_site_guards};
+
 /// The pages a tracker has not taken since they changed, what it saves of
 /// pages it armed, its bit in [`DIRTY`] (none: always taken as dirty), and
 /// whether it is a host buffer copy's (the only trackers [`retake`] marks).
@@ -310,6 +372,8 @@ fn open_under_lock(page: usize) {
     use std::sync::atomic::Ordering::{AcqRel, Relaxed, Release};
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let mut old = 0;
+    #[cfg(target_arch = "x86_64")]
+    write_sites::forget(page..page + 1);
     // SAFETY: a block of this process; fails harmlessly if it is gone.
     unsafe { VirtualProtect((page * PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old) };
     if OPENED_UNDER_LOCK.iter().any(|s| s.compare_exchange(0, page, AcqRel, Relaxed).is_ok()) {
@@ -575,6 +639,8 @@ fn open(g: &mut Guards, page: usize) -> bool {
     if !g.protected.remove(&page) {
         return false;
     }
+    #[cfg(target_arch = "x86_64")]
+    write_sites::forget(page..page + 1);
     let mut old = 0;
     // SAFETY: a block we made read-only (failing harmlessly if it is gone).
     unsafe { VirtualProtect((page * PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old) };
@@ -591,6 +657,8 @@ fn open_run(g: &mut Guards, first: usize, last: usize) {
         return;
     }
     let mut old = 0;
+    #[cfg(target_arch = "x86_64")]
+    write_sites::forget(first..last);
     // SAFETY: blocks we made read-only.
     if unsafe { VirtualProtect((first * PAGE) as *const _, (last - first) * PAGE, PAGE_READWRITE, &mut old) } == 0 {
         for page in first..last {
@@ -868,12 +936,17 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
         let run = &pages[first..=i];
         i += 1;
         if set(run[0], run[run.len() - 1] + 1) {
+            #[cfg(target_arch = "x86_64")]
+            // An allocation under the lock can fault and open a page again.
+            write_sites::publish(run, &ends[first..i]);
             g.protected.extend(run);
             taken.extend(run);
             continue;
         }
-        for &page in run {
+        for (&page, _end) in run.iter().zip(&ends[first..i]) {
             if set(page, page + 1) {
+                #[cfg(target_arch = "x86_64")]
+                write_sites::publish(&[page], std::slice::from_ref(_end));
                 g.protected.insert(page);
                 taken.push(page);
             } else if unmapped(page) {
@@ -1158,6 +1231,11 @@ fn install() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let mut g = guards();
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: the system is dispatching this exception; we hold the guard lock.
+        unsafe {
+            write_sites::observe(info, at)
+        };
         if changed(&mut g, at / PAGE, at / PAGE + 1, true) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
@@ -1289,6 +1367,27 @@ pub(crate) mod tests {
     pub(crate) fn free(p: usize) {
         // SAFETY: an allocation of ours.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn write_site_lookup_is_limited_to_closed_write_watched_guards() {
+        observe_write_sites(|_, _| {});
+        let base = pool(2);
+        {
+            let page = base / PAGE;
+            let (slots, _) = write_site_guards();
+            let first = &slots[page % slots.len()];
+            let second = &slots[(page + 1) % slots.len()];
+            let mut g = guards();
+            assert_eq!(protect(&mut g, &[page, page + 1]), [page, page + 1]);
+            assert_eq!(first.load(Ordering::Relaxed), base);
+            assert_eq!(second.load(Ordering::Relaxed), base + PAGE);
+            open_run(&mut g, page, page + 2);
+            assert_eq!(first.load(Ordering::Relaxed), 0);
+            assert_eq!(second.load(Ordering::Relaxed), 0);
+        }
+        free(base);
     }
 
     /// Everything is changed at first; after taking, only what is written

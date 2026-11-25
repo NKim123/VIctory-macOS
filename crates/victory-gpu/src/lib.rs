@@ -90,6 +90,8 @@ pub use watch::{
     Writing as KernelWrite, fault_tracking, rosetta, stores_need_patching, title_memory_aliased,
     title_memory_remapped, writing as kernel_will_write,
 };
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub use watch::{observe_write_sites, write_site_guards};
 
 /// A whole file, read without asking for its size or other metadata.
 /// `std::fs::read` and `read_to_end` call `File::metadata()`, which Wine
