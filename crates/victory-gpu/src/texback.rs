@@ -140,8 +140,29 @@ struct Target {
     copy: Arc<HostTexture>,
     layout: Layout,
     ticket: Arc<Ticket>,
-    subresources: BTreeMap<u32, DXGI_FORMAT>,
+    subresources: BTreeMap<u32, Subresource>,
+}
+
+/// Only shared slots that could write this mip and array slice.
+struct Subresource {
+    format: DXGI_FORMAT,
     bindings: Vec<Arc<Binding>>,
+}
+
+impl Subresource {
+    fn watch(&mut self, binding: Arc<Binding>) {
+        if !self
+            .bindings
+            .iter()
+            .any(|other| Arc::ptr_eq(other, &binding))
+        {
+            self.bindings.push(binding);
+        }
+    }
+}
+
+fn bindings_live(bindings: &[Arc<Binding>]) -> bool {
+    !bindings.iter().any(|binding| binding.invalid())
 }
 
 const MAX_TARGETS: usize = 64;
@@ -218,24 +239,19 @@ impl Wanted {
                     layout: plane.layout.clone(),
                     ticket,
                     subresources: BTreeMap::new(),
-                    bindings: Vec::new(),
                 })
             }
         };
-        if let Some((heap, index, view)) = slot {
+        let binding = if let Some((heap, index, view)) = slot {
             let Some(binding) = heap.watch_texture_binding(index, view, &target.copy.texture)
             else {
                 return;
             };
-            if !target
-                .bindings
-                .iter()
-                .any(|other| Arc::ptr_eq(other, &binding))
-            {
-                target.bindings.push(binding);
-            }
-        }
-        target.mark(resource, words);
+            Some(binding)
+        } else {
+            None
+        };
+        target.mark(resource, words, binding.as_ref());
     }
 
     pub(crate) fn commit(&mut self, attempted: Self) {
@@ -244,14 +260,18 @@ impl Wanted {
                 && current.ticket.valid.load(Ordering::Relaxed)
                 && Arc::ptr_eq(&current.copy, &target.copy)
             {
-                current.subresources.extend(target.subresources);
-                for binding in target.bindings {
-                    if !current
-                        .bindings
-                        .iter()
-                        .any(|other| Arc::ptr_eq(other, &binding))
-                    {
-                        current.bindings.push(binding);
+                for (index, subresource) in target.subresources {
+                    match current.subresources.entry(index) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(subresource);
+                        }
+                        std::collections::btree_map::Entry::Occupied(mut entry) => {
+                            let current = entry.get_mut();
+                            current.format = subresource.format;
+                            for binding in subresource.bindings {
+                                current.watch(binding);
+                            }
+                        }
                     }
                 }
             } else if self.0.len() < MAX_TARGETS || self.0.contains_key(&owner) {
@@ -269,7 +289,7 @@ impl Wanted {
 }
 
 impl Target {
-    fn mark(&mut self, resource: This, words: Option<&[u32; 10]>) {
+    fn mark(&mut self, resource: This, words: Option<&[u32; 10]>, binding: Option<&Arc<Binding>>) {
         let Some(view) = crate::descriptor::host::color_uav(resource, &self.copy, words) else {
             return;
         };
@@ -330,15 +350,22 @@ impl Target {
             return;
         }
         for slice in first..end {
-            self.subresources.insert(slice * mips + mip, format);
+            let subresource = self
+                .subresources
+                .entry(slice * mips + mip)
+                .or_insert_with(|| Subresource {
+                    format,
+                    bindings: Vec::new(),
+                });
+            subresource.format = format;
+            if let Some(binding) = binding {
+                subresource.watch(binding.clone());
+            }
         }
     }
 
     fn record(self, list: &HostList) -> Option<Back> {
-        if self.subresources.is_empty()
-            || !self.ticket.valid.load(Ordering::Relaxed)
-            || self.bindings.iter().any(|binding| binding.invalid())
-        {
+        if self.subresources.is_empty() || !self.ticket.valid.load(Ordering::Relaxed) {
             return None;
         }
         let host = host()?;
@@ -348,7 +375,10 @@ impl Target {
         let mips = u32::from(desc.MipLevels);
         let mut total = 0u64;
         let mut copies = Vec::with_capacity(self.subresources.len());
-        for (index, format) in self.subresources {
+        for (index, Subresource { format, bindings }) in self.subresources {
+            if !bindings_live(&bindings) {
+                continue;
+            }
             let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
             let mut pitch_end = 0;
             let mut rows = 0;
@@ -398,7 +428,11 @@ impl Target {
                 slice,
                 footprint,
                 len: len as usize,
+                bindings,
             });
+        }
+        if copies.is_empty() {
+            return None;
         }
         let Some(budget) = Budget::reserve(total) else {
             tracing::debug!(
@@ -439,7 +473,6 @@ impl Target {
             copies,
             layout: self.layout,
             ticket: self.ticket,
-            bindings: self.bindings,
             _budget: budget,
         })
     }
@@ -451,6 +484,7 @@ struct Copy {
     slice: u32,
     footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
     len: usize,
+    bindings: Vec<Arc<Binding>>,
 }
 
 pub(crate) struct Back {
@@ -458,14 +492,16 @@ pub(crate) struct Back {
     copies: Vec<Copy>,
     layout: Layout,
     ticket: Arc<Ticket>,
-    bindings: Vec<Arc<Binding>>,
     _budget: Budget,
 }
 
 impl Back {
     pub(crate) fn land(&self) {
         if !self.ticket.valid.load(Ordering::Relaxed)
-            || self.bindings.iter().any(|binding| binding.invalid())
+            || self
+                .copies
+                .iter()
+                .all(|copy| !bindings_live(&copy.bindings))
         {
             return;
         }
@@ -489,6 +525,9 @@ impl Back {
         let mut tiled = vec![0; self.layout.size as usize];
         let mut texels = crate::ranges::Ranges::default();
         for copy in &self.copies {
+            if !bindings_live(&copy.bindings) {
+                continue;
+            }
             // SAFETY: the recorded copy and allocation include these rows.
             let linear = unsafe {
                 std::slice::from_raw_parts(data.add(copy.footprint.Offset as usize), copy.len)
@@ -517,7 +556,7 @@ impl Back {
                 return;
             }
         }
-        // Invalidation and landing share this lock. Release and unmap
+        // Allocation invalidation and landing share this lock. Release and unmap
         // invalidate before giving up the allocation.
         let _tickets = tickets();
         if !self.ticket.valid.load(Ordering::Relaxed) {

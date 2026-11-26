@@ -4144,7 +4144,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             return;
         };
         let null = std::ptr::null();
-        let heap_desc: [u32; 8] = [0, 1, 1, 0, 0, 0, 0, 0];
+        let heap_desc: [u32; 8] = [0, 2, 1, 0, 0, 0, 0, 0];
         let mut heap = null;
         assert_eq!(
             crate::descriptor::create_heap(
@@ -4156,53 +4156,111 @@ void main(uint3 id : SV_DispatchThreadID) {
             S_OK
         );
         let title = crate::descriptor::heap(heap);
-        let slots = Slots(title.host().unwrap().heap.clone(), 0);
+        // SAFETY: a plain descriptor-size query on a live device.
+        let step = unsafe {
+            host.device
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+        };
+        let slots = Slots(title.host().unwrap().heap.clone(), step);
         let address = title_memory(1 << 16);
-        let words = texture_words(64, 64, 41, 1, 4);
+        let mut words = texture_words(64, 64, 41, 1, 4);
+        words[7] = 1 | 2 << 16;
         let a = texture_at_address(address, &words);
         let b = texture_at_address(title_memory(1 << 16), &words);
+        let (_, desc) = crate::resource::texture_memory(a).unwrap();
+        let layout = crate::resource::texture_layout(&desc)
+            .unwrap()
+            .planes
+            .remove(0)
+            .layout;
+        let expected = |mips: &[u32]| {
+            let mut expected = vec![0xa5; layout.size as usize];
+            for &mip in mips {
+                let level = &layout.mips[mip as usize];
+                let linear: Vec<_> = (0..level.width * level.height)
+                    .flat_map(|_| 13.5f32.to_le_bytes())
+                    .collect();
+                layout
+                    .tile(
+                        &mut expected,
+                        mip,
+                        0,
+                        &linear,
+                        level.width as usize * 4,
+                        linear.len(),
+                    )
+                    .unwrap();
+            }
+            expected
+        };
+        let reset = || {
+            // SAFETY: the test owns this entire title allocation.
+            unsafe { std::ptr::write_bytes(address as *mut u8, 0xa5, layout.size as usize) }
+        };
+        let check = |expected: &[u8]| {
+            // SAFETY: the allocation is live, and execution and CPU write-back are finished.
+            let bytes = unsafe { std::slice::from_raw_parts(address as *const u8, expected.len()) };
+            let mismatch = bytes
+                .iter()
+                .zip(expected)
+                .position(|(got, want)| got != want);
+            assert_eq!(
+                mismatch, None,
+                "only valid recorded subresources should land"
+            );
+        };
         let mut state = State::default();
         state.set_heaps(&[heap]);
-        state.set_table(true, 0, title.start);
         let write = compile_cs(
             "RWTexture2D<float> o : register(u0);
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) { o[id.xy] = 13.5; }",
             WRITES,
         );
-        let descriptor = [41u32, 4, 0, 0, 0, 0, 0, 0, 0, 0];
-        let bind = |resource| {
-            crate::descriptor::create_uav(null, resource, null, &descriptor, title.start);
+        let title_step = u64::from(crate::descriptor::increment_size(null, 0));
+        let handle = |slot| title.start + u64::from(slot) * title_step;
+        let bind = |slot, resource| {
+            let descriptor = [41u32, 4, slot, 0, 0, 0, 0, 0, 0, 0];
+            crate::descriptor::create_uav(null, resource, null, &descriptor, handle(slot));
         };
-        let record = || {
+        let mut record = || {
             let list = host.new_list().unwrap();
             crate::list::ensure_state(&list, b, D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32);
             crate::texback::TEST_KINDS.set(&[(64, 64, 41)]);
-            let writes = list.capture_texture_writes().unwrap();
-            state.table_entry(&list, &used(ResourceType::Uav), true);
+            for (slot, groups) in [(0, 8), (1, 4)] {
+                let writes = list.capture_texture_writes().unwrap();
+                state.set_table(true, 0, handle(slot));
+                state.table_entry(&list, &used(ResourceType::Uav), true);
+                run(&list, &slots, &write, slot, None, (groups, groups));
+                writes.commit();
+            }
             crate::texback::TEST_KINDS.set(&[]);
-            run(&list, &slots, &write, 0, None, (8, 8));
-            writes.commit();
-            list.close();
             list
         };
-        bind(a);
-        host.execute(&[&record()]);
-        // SAFETY: first word of the live title texture.
-        let texel = || unsafe { (address as *const f32).read() };
-        assert_eq!(texel(), 13.5, "the original shared binding writes back");
+        bind(0, a);
+        bind(1, a);
+        reset();
+        let both = record();
+        both.close();
+        host.execute(&[&both]);
+        check(&expected(&[0, 1]));
 
-        for restore in [false, true] {
-            // SAFETY: the test owns this title allocation.
-            unsafe { (address as *mut f32).write(9.0) };
-            bind(a);
+        for after_close in [false, true] {
+            reset();
+            bind(0, a);
             let list = record();
-            bind(b);
-            if restore {
-                bind(a);
+            if after_close {
+                list.close();
+            }
+            bind(0, b);
+            if after_close {
+                // Restoring the same view does not revive its old binding.
+                bind(0, a);
+            } else {
+                list.close();
             }
             host.execute(&[&list]);
-            assert_eq!(texel(), 9.0, "any shared slot rewrite retires its binding");
+            check(&expected(&[1]));
         }
         for object in [heap, a, b] {
             assert_eq!(crate::object::release_ref(object), 0);
