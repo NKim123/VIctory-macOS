@@ -556,7 +556,18 @@ impl HostHeap {
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = (at + n).min(self.dynamic) as usize;
         if let Some(slots) = guard.1.get_mut(at as usize..end) {
+            // Detach the backing before exposing slots to another recorder.
+            // Drop it outside both locks because a shadow may return resources
+            // to the allocator as it is destroyed.
+            let released: Vec<_> = {
+                let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+                (first as usize..self.count as usize + end)
+                    .filter_map(|index| kept.slot(index, false)?.as_mut()?.1.take())
+                    .collect()
+            };
             slots.fill(false);
+            drop(guard);
+            drop(released);
         }
     }
 
@@ -1518,12 +1529,23 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
     ))
 }
 
-/// The host copy a buffer view's bytes are in (the one its host view
-/// reads, [`crate::shadow::for_view`]) and the view's title range.
-pub(crate) fn view_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
+/// The enclosing buffer and the view's title range, independent of any
+/// temporary copy required by the view's element alignment.
+type BufferView = (std::sync::Arc<crate::shadow::Shadow>, u64, u64);
+
+pub(crate) fn view_owner(view: &View) -> Option<BufferView> {
     let (address, len) = buffer_range(view)?;
-    let (shadow, _) = crate::shadow::for_view(address, len, u64::from(view_stride(view)))?;
+    Some((crate::shadow::find(address, len)?, address, len))
+}
+
+/// The exact copy the host view reads, including an alignment copy when needed.
+pub(crate) fn align_view_copy(view: &View, (owner, address, len): BufferView) -> Option<BufferView> {
+    let (shadow, _) = crate::shadow::view_in(owner, address, len, u64::from(view_stride(view)))?;
     Some((shadow, address, len))
+}
+
+pub(crate) fn view_copy(view: &View) -> Option<BufferView> {
+    align_view_copy(view, view_owner(view)?)
 }
 
 /// [`buffer_range`] of an unordered access view of memory at `base`.

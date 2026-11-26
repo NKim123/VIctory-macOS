@@ -1442,7 +1442,16 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
 /// address (`true` with it), which lives while a heap slot made from the
 /// view or a list holds it.
 pub(crate) fn for_view(address: u64, len: u64, element: u64) -> Option<(Arc<Shadow>, bool)> {
-    let shadow = find(address, len)?;
+    view_in(find(address, len)?, address, len, element)
+}
+
+/// Chooses the aligned view copy within an already resolved buffer owner.
+pub(crate) fn view_in(
+    shadow: Arc<Shadow>,
+    address: u64,
+    len: u64,
+    element: u64,
+) -> Option<(Arc<Shadow>, bool)> {
     if element == 0 || shadow.offset(address).is_multiple_of(element) {
         return Some((shadow, false));
     }

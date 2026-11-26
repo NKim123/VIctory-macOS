@@ -74,7 +74,7 @@ pub(crate) struct State {
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
     /// Tables made afresh in this list, and their first dynamic slots.
-    fresh_tables: std::collections::HashMap<TableRecords, (u32, u64)>,
+    fresh_tables: std::collections::HashMap<TableRecords, FreshTable>,
     #[cfg(test)]
     force_fresh_tables: bool,
     /// CPU-only templates for buffer views shared by otherwise distinct tables.
@@ -99,9 +99,17 @@ pub(crate) struct State {
     fixed: Fixed,
 }
 
-/// Fixed-function state the title set, as it set it.
 type TableRecords = (u64, Vec<[u32; 3]>);
 
+struct FreshTable {
+    first: u32,
+    layout: u64,
+    // Keep the enclosing buffer identity even when the materialized view
+    // is null or uses a short-lived alignment copy.
+    backings: Vec<Option<std::sync::Weak<crate::shadow::Shadow>>>,
+}
+
+/// Fixed-function state the title set, as it set it.
 #[derive(Default)]
 struct Fixed {
     viewports: Option<Vec<D3D12_VIEWPORT>>,
@@ -1335,33 +1343,32 @@ impl State {
                 .collect::<Vec<_>>();
             let key = (table, records);
             let layout = crate::shadow::buffer_layout();
-            let reused = self
-                .fresh_tables
-                .get_mut(&key)
-                .and_then(|(first, checked)| {
-                    if *checked != layout
-                        && key.1.iter().enumerate().any(|(offset, &record)| {
-                            use crate::descriptor::host::{ListViews, view_copy};
-                            let Some(view) = crate::descriptor::recorded_view(record) else {
-                                return false;
-                            };
-                            if heap.samplers() || !ListViews::can_cache(&view) {
-                                return false;
+            let reused = self.fresh_tables.get_mut(&key).and_then(|table| {
+                if table.layout != layout
+                    && key.1.iter().enumerate().any(|(offset, &record)| {
+                        use crate::descriptor::host::{ListViews, view_owner};
+                        let Some(view) = crate::descriptor::recorded_view(record) else {
+                            return false;
+                        };
+                        if heap.samplers() || !ListViews::can_cache(&view) {
+                            return false;
+                        }
+                        let old = table.backings[offset].as_ref();
+                        let new = view_owner(&view);
+                        match (old, new) {
+                            (Some(old), Some((new, _, _))) => {
+                                old.as_ptr() != std::sync::Arc::as_ptr(&new)
                             }
-                            let old = host.table_backing(*first + offset as u32);
-                            let new = view_copy(&view).map(|(shadow, _, _)| shadow);
-                            match (old, new) {
-                                (Some(old), Some(new)) => !std::sync::Arc::ptr_eq(&old, &new),
-                                (None, None) => false,
-                                _ => true,
-                            }
-                        })
-                    {
-                        return None;
-                    }
-                    *checked = layout;
-                    Some(*first)
-                });
+                            (None, None) => false,
+                            _ => true,
+                        }
+                    })
+                {
+                    return None;
+                }
+                table.layout = layout;
+                Some(table.first)
+            });
             if let Some(first) = reused {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let offset = u.table_offset_dwords / 8;
@@ -1390,16 +1397,21 @@ impl State {
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
+            let mut backings = vec![None; key.1.len()];
             for (k, &record) in key.1.iter().enumerate() {
                 let k = k as u32;
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::recorded_view(record) {
                     Some(view) => {
-                        use crate::descriptor::host::ListViews;
-                        let range = (!heap.samplers() && ListViews::can_cache(&view))
-                            .then(|| crate::descriptor::host::view_copy(&view))
+                        use crate::descriptor::host::{ListViews, align_view_copy, view_owner};
+                        let owner = (!heap.samplers() && ListViews::can_cache(&view))
+                            .then(|| view_owner(&view))
                             .flatten();
+                        backings[k as usize] = owner
+                            .as_ref()
+                            .map(|(shadow, _, _)| std::sync::Arc::downgrade(shadow));
+                        let range = owner.and_then(|owner| align_view_copy(&view, owner));
                         let backing = range.as_ref().map(|(shadow, _, _)| shadow);
                         let copied = backing.is_some_and(|backing| {
                             self.list_views
@@ -1424,7 +1436,14 @@ impl State {
                     }
                 }
             }
-            self.fresh_tables.insert(key, (first, layout));
+            self.fresh_tables.insert(
+                key,
+                FreshTable {
+                    first,
+                    layout,
+                    backings,
+                },
+            );
             made.push((slot, first * 32));
         }
         made
@@ -2959,9 +2978,111 @@ void main(uint3 id : SV_DispatchThreadID) {{
         // the one whose title buffer was released before submission.
         assert_eq!(original.read_host(start, 1), [0xCAFEBABE]);
         assert_eq!(inside.read_host(start, 1), [0xCAFEBABE]);
+        let released = Arc::downgrade(&inside);
+        drop(inside);
         drop(state);
+        drop(list);
+        assert!(
+            released.upgrade().is_none(),
+            "released table slots cannot retain the inner shadow"
+        );
+        assert!(
+            slots.table_backing(second).is_none(),
+            "the heap is still live"
+        );
         drop(view);
         crate::object::release_ref(heap);
+        crate::object::release_ref(src);
+    }
+
+    #[test]
+    fn unsupported_fresh_view_reuses_its_null_slot_after_unrelated_buffer_changes() {
+        if !crate::shader_cache::under_wine() {
+            return; // Wine deliberately refuses three-channel typed UAVs.
+        }
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        use crate::descriptor::{
+            self,
+            host::{view_copy, view_owner},
+        };
+
+        let null = std::ptr::null();
+        let src = buffer(4096);
+        let mut heap = null;
+        let heap_desc: [u32; 8] = [0, 4, 1, 0, 0, 0, 0, 0];
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(
+            descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap),
+            S_OK
+        );
+        let title = descriptor::heap(heap);
+        let slots = title.host().unwrap();
+        let (src_bytes, _) = crate::resource::buffer_bytes(src).unwrap();
+        let memory = src_bytes as u64 + 4;
+        let desc: [u32; 14] = [1, 0, 0, 0, 1024, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+        let buffer_iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let mut overlap = null;
+        assert_eq!(
+            crate::resource::create_at_address(
+                null,
+                memory,
+                desc.as_ptr().cast(),
+                0,
+                std::ptr::null(),
+                &buffer_iid,
+                &mut overlap
+            ),
+            S_OK
+        );
+        // Slot 0 is a gap in the used-resource list. Its UAV would need an
+        // alignment copy, but the host refuses the format and never holds it.
+        let desc = [7, 1, 1, 0, 32, 0, 0, 0, 0, 0];
+        descriptor::create_uav(null, src, null, &desc, title.start);
+        let srv = [39, 1, 0x1688, 0, 0, 0, 256, 0, 1, 0];
+        descriptor::create_srv(null, src, &srv, title.start + 32);
+        let view = descriptor::view(title.start).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(
+            &view_copy(&view).unwrap().0,
+            &view_owner(&view).unwrap().0
+        ));
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[heap]);
+        state.force_fresh_tables = true;
+        state.set_table(true, 0, title.start);
+        let used = [UsedResource {
+            table_offset_dwords: 8,
+            ..used(ResourceType::Srv)
+        }];
+        let first = state.tables(&list, &used, true);
+        assert_eq!(first.len(), 1);
+        assert!(
+            !slots.kept(first[0].1 / 32),
+            "the unsupported view leaves a null slot"
+        );
+        let unrelated = buffer(256);
+        assert_eq!(state.tables(&list, &used, true), first);
+        crate::object::release_ref(unrelated);
+        assert_eq!(state.tables(&list, &used, true), first);
+        assert_eq!(state.dynamic.len(), 1);
+        list.close();
+        drop(state);
+        drop(list);
+        drop(view);
+        crate::object::release_ref(heap);
+        crate::object::release_ref(overlap);
         crate::object::release_ref(src);
     }
 
