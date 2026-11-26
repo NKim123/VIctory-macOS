@@ -129,6 +129,7 @@ enum Publication {
 enum Binding {
     Buffer(BufferView, bool),
     Texture(Option<usize>),
+    DeferredTexture((usize, u64, u64)),
     Sampler,
 }
 
@@ -182,6 +183,19 @@ impl ViewStaging {
         let at = D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: self.cpu + slot * self.step,
         };
+        if is_placed_texture(&view) {
+            // Heap sync leaves these null until a table or a shader
+            // reads the slot. Stage the exact null view once per key.
+            null_for(&view, at);
+            let kind = crate::bindless::left_kind(&view);
+            return Some(StagedView {
+                view,
+                at,
+                held: None,
+                mark: None,
+                source: StagedSource::DeferredTexture(kind),
+            });
+        }
         let epoch = crate::shadow::lookup_epoch();
         let (held, mark, source) =
             if matches!(*view, View::Constant(..)) || buffer_range(&view).is_some() {
@@ -267,6 +281,7 @@ impl ViewStaging {
 enum StagedSource {
     Buffer(u64, BufferView),
     Texture(Arc<HostTexture>, bool),
+    DeferredTexture((usize, u64, u64)),
 }
 
 struct StagedView {
@@ -296,6 +311,7 @@ impl StagedView {
                 }
                 Binding::Texture((*srv && copy.title_written()).then_some(resource))
             }
+            StagedSource::DeferredTexture(kind) => Binding::DeferredTexture(*kind),
             _ => return None,
         };
         Some(TemplateHit {
@@ -2068,14 +2084,19 @@ impl HostHeap {
                     if let Some(old) = old.take() {
                         crate::host::retire(old);
                     }
+                    let mut ready = *key;
                     match std::mem::replace(binding, Binding::Sampler) {
                         Binding::Buffer(backing, widened) => {
                             bindings.buffer(*index, backing, *uav, widened);
                         }
                         Binding::Texture(resource) => bindings.texture(*index, resource),
+                        Binding::DeferredTexture(kind) => {
+                            bindings.left(*index, kind);
+                            ready = 0;
+                        }
                         Binding::Sampler => {}
                     }
-                    self.ready[*index as usize].store(*key, Ordering::Release);
+                    self.ready[*index as usize].store(ready, Ordering::Release);
                     hits += 1;
                 }
             }
@@ -2101,6 +2122,9 @@ impl HostHeap {
         published: &mut Vec<Publication>,
     ) {
         self.begin_record(made, index, view.key, view);
+        if matches!(hit.binding, Binding::DeferredTexture(_)) {
+            crate::shadow::forget_read(index);
+        }
         made.pending.remove(&index);
         self.set_mark(index, hit.mark);
         copies.push(self.cpu(index), hit.at, self.step as usize);
@@ -5163,6 +5187,43 @@ mod tests {
         drop(heap);
         crate::host::release_retired();
         crate::watch::tests::free(allocation);
+    }
+
+    #[test]
+    fn staged_placed_texture_slots_remain_lazy() {
+        if !templates::enabled() {
+            return;
+        }
+        let count = MIN_STAGED_RECORDS as u32;
+        let Some(heap) = HostHeap::new(false, count) else {
+            return;
+        };
+        let memory = crate::watch::tests::pool(1);
+        let mut slots = vec![[0u64; 4]; count as usize];
+        let start = slots.as_mut_ptr() as u64;
+        let mut words = [0; 16];
+        words[..10].copy_from_slice(&[42, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0]);
+        words[10] = memory as u32;
+        words[11] = ((memory as u64) >> 32) as u32;
+        let view = View::Placed(
+            false,
+            placed_tex_desc(4, 4, DXGI_FORMAT_R32_UINT.0 as u32, 4),
+            words,
+        );
+        super::super::record(start, view);
+        let record = slots[0];
+        slots.fill(record);
+        std::hint::black_box(&slots);
+
+        let before = STAGED_BATCHES.with(std::cell::Cell::get);
+        heap.sync_slots(0, count, start, 32, &mut Vec::new());
+        assert_eq!(STAGED_BATCHES.with(std::cell::Cell::get) - before, 1);
+        for index in 0..count {
+            assert!(heap.unmade_placed(index).is_some());
+            assert_eq!(heap.ready[index as usize].load(Ordering::Acquire), 0);
+        }
+        drop(heap);
+        crate::watch::tests::free(memory);
     }
 
     fn publication_texture(address: u64) -> crate::object::This {

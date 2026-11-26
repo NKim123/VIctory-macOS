@@ -314,6 +314,10 @@ impl Updates<'_> {
         self.set(index, resource.map(Seen::Texture));
     }
 
+    pub(crate) fn left(&mut self, index: u32, kind: (usize, u64, u64)) {
+        self.set(index, Some(Seen::Left(kind)));
+    }
+
     fn set(&mut self, index: u32, seen: Option<Seen>) {
         let Some(word) = self.viewed.occupied.get(index as usize / 64) else {
             return;
@@ -389,7 +393,7 @@ fn seen_buffer((shadow, address, len): BufferView, uav: bool, widened: bool) -> 
     (len != 0).then_some(Seen::Buffer(shadow, address, len, uav))
 }
 
-fn left_kind(view: &View) -> (usize, u64, u64) {
+pub(crate) fn left_kind(view: &View) -> (usize, u64, u64) {
     match view {
         View::Placed(_, resource, desc) if resource[0] != 1 => {
             let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
