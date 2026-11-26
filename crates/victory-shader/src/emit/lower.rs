@@ -3558,11 +3558,44 @@ impl<'a> Lower<'a> {
         )
     }
 
-    /// `x` of lane `src` (in this lane's quad) through quad reads, whose
-    /// lane must be a constant.
-    fn quad_pick(&mut self, x: V, src: V) -> V {
+    /// `x` of lane `src` in this lane's quad. DXIL's quad operations
+    /// require constant selectors. Broadcasts and axis swaps need only one
+    /// quad operation. Other permutations select among four broadcasts.
+    fn quad_pick(&mut self, x: V, src: V, pattern: Option<u8>) -> V {
         self.s.flags |= flags::WAVE_OPS;
         let c = self.cur;
+        if let Some(pattern) = pattern {
+            let lane = u32::from(pattern & 3);
+            if u32::from(pattern) == lane * 0x55 {
+                let lane = self.s.m.i32(lane);
+                return self.s.op(
+                    c,
+                    "quadReadLaneAt.i32",
+                    Attr::NoUnwind,
+                    self.s.t.i32,
+                    122,
+                    &[x, lane],
+                );
+            }
+            let direction = match pattern {
+                0xE4 => return x, // [0, 1, 2, 3]
+                0xB1 => Some(0),  // [1, 0, 3, 2]
+                0x4E => Some(1),  // [2, 3, 0, 1]
+                0x1B => Some(2),  // [3, 2, 1, 0]
+                _ => None,
+            };
+            if let Some(direction) = direction {
+                let direction = self.s.m.i8(direction);
+                return self.s.op(
+                    c,
+                    "quadOp.i32",
+                    Attr::NoUnwind,
+                    self.s.t.i32,
+                    123,
+                    &[x, direction],
+                );
+            }
+        }
         let three = self.s.m.i32(3);
         let q = self.s.m.bin(c, Bin::And, src, three);
         let mut r = x;
@@ -3653,13 +3686,14 @@ impl<'a> Lower<'a> {
         src: V,
         guard: Option<V>,
         mesh_quad: bool,
+        pattern: Option<u8>,
     ) -> Option<V> {
         let c = self.cur;
         if self.s.pixel {
             let g = guard?;
             let (one, zero) = (self.s.m.i32(1), self.s.m.i32(0));
             let active_i32 = self.s.m.select(c, g, one, zero);
-            let picked = self.quad_pick(active_i32, src);
+            let picked = self.quad_pick(active_i32, src, pattern);
             return Some(self.s.m.cmp(c, pred::NE, picked, zero));
         }
         if !mesh_quad
@@ -3774,9 +3808,10 @@ impl<'a> Lower<'a> {
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
             let use_quad = mesh_quad || self.helpers_read(quad);
-            let src_ok = self.src_lane_active(inst, src, guard, mesh_quad);
+            let pattern = (offset & 0x8000 != 0).then_some(offset as u8);
+            let src_ok = self.src_lane_active(inst, src, guard, mesh_quad, pattern);
             let mut r = if use_quad {
-                self.quad_pick(x, src)
+                self.quad_pick(x, src, pattern)
             } else {
                 let safe_src = match src_ok {
                     Some(ok) => self.s.m.select(c, ok, src, lane),
@@ -6719,17 +6754,24 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl, fi)
             }
         };
+        let pattern = match dpp {
+            Dpp::Row {
+                ctrl: ctrl @ 0..=0xFF,
+                ..
+            } => Some(ctrl as u8),
+            _ => None,
+        };
         let src_active = if fi {
             None
         } else {
-            self.src_lane_active(inst, src, guard, mesh_quad)
+            self.src_lane_active(inst, src, guard, mesh_quad, pattern)
         };
         let valid = match (inside, src_active) {
             (Some(in_b), Some(act)) => Some(self.s.m.bin(c, Bin::And, in_b, act)),
             (a, b) => a.or(b),
         };
         let mut r = if use_quad {
-            self.quad_pick(x, src)
+            self.quad_pick(x, src, pattern)
         } else {
             let safe_src = match valid {
                 Some(ok) => self.s.m.select(c, ok, src, lane),
