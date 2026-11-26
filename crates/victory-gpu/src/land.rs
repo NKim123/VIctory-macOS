@@ -16,13 +16,14 @@ pub enum LandingPage {
     Beside(usize),
 }
 
-type Lookup = fn(usize, u64, bool, &mut dyn FnMut(LandingPage));
+type Lookup = fn(usize, usize, u64, bool, &mut dyn FnMut(LandingPage, usize));
 static LOOKUP: OnceLock<Lookup> = OnceLock::new();
 
 /// Installs the physical page lookup used while write-back lands. The lookup
-/// must call its callback once with a page that covers the remainder of the
-/// 64 KiB block at the requested address. Mapping changes must advance the
-/// epoch before publishing the new mapping.
+/// must call its callback once with the destination and length of a stable
+/// prefix of the requested range. The prefix ends at the requested end or
+/// a 64 KiB boundary and must cover at least the first requested block.
+/// Mapping changes must advance the epoch before publishing the new mapping.
 ///
 /// # Safety
 /// Any address returned as `Beside` must be committed and writable and
@@ -68,14 +69,14 @@ pub(crate) fn active() -> bool {
     SUBMISSION.get().is_some()
 }
 
-pub(crate) fn page(at: usize, mut apply: impl FnMut(LandingPage)) {
+pub(crate) fn prefix(at: usize, len: usize, mut apply: impl FnMut(LandingPage, usize)) {
     static BESIDE: OnceLock<bool> = OnceLock::new();
     if let (Some(epoch), Some(lookup)) = (SUBMISSION.get(), LOOKUP.get()) {
         let beside = *BESIDE
             .get_or_init(|| std::env::var_os("VICTORY_LAND_BESIDE").is_none_or(|v| v != "0"));
-        lookup(at, epoch, beside, &mut apply);
+        lookup(at, len, epoch, beside, &mut apply);
     } else {
-        apply(LandingPage::Direct);
+        apply(LandingPage::Direct, len);
     }
 }
 
@@ -213,13 +214,38 @@ mod tests {
     static LOOKUPS: AtomicUsize = AtomicUsize::new(0);
     static ON_WORKER: AtomicUsize = AtomicUsize::new(0);
 
-    fn physical_test_page(at: usize, epoch: u64, beside: bool, apply: &mut dyn FnMut(LandingPage)) {
+    thread_local! {
+        static BATCH_VIEWS: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
+        static BATCH_LOOKUPS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn physical_test_page(
+        at: usize,
+        len: usize,
+        epoch: u64,
+        beside: bool,
+        apply: &mut dyn FnMut(LandingPage, usize),
+    ) {
+        if let Some((base, writable)) = BATCH_VIEWS.get()
+            && (base..base + 5 * PAGE).contains(&at)
+        {
+            BATCH_LOOKUPS.set(BATCH_LOOKUPS.get() + 1);
+            let page = (at - base) / PAGE;
+            let (destination, end) = match page {
+                0..=1 if beside => (LandingPage::Beside(writable + at - base), 2),
+                0..=1 => (LandingPage::Direct, 2),
+                2..=3 => (LandingPage::Direct, 4),
+                _ => (LandingPage::Replaced, 5),
+            };
+            apply(destination, len.min(base + end * PAGE - at));
+            return;
+        }
         if REPLACEMENT
             .lock()
             .unwrap()
             .is_some_and(|(base, mapped)| (base..base + PAGE).contains(&at) && mapped > epoch)
         {
-            apply(LandingPage::Replaced);
+            apply(LandingPage::Replaced, len.min(PAGE - at % PAGE));
             return;
         }
         let views = VIEWS.lock().unwrap();
@@ -231,11 +257,14 @@ mod tests {
                 ON_WORKER.fetch_add(1, Ordering::Relaxed);
             }
             if beside {
-                apply(LandingPage::Beside(writable + at - a));
+                apply(
+                    LandingPage::Beside(writable + at - a),
+                    len.min(a + 2 * PAGE - at),
+                );
                 return;
             }
         }
-        apply(LandingPage::Direct);
+        apply(LandingPage::Direct, len);
     }
 
     fn protection(at: usize) -> u32 {
@@ -408,6 +437,97 @@ mod tests {
         drop(shadow);
         crate::shadow::unregister(at, at as u64);
         crate::watch::tests::free(at);
+    }
+
+    #[test]
+    fn marked_shadow_coalesces_beside_and_direct_and_skips_replaced_pages() {
+        use crate::watch::{self, tests::PROTECTS};
+        if !watch::fault_tracking() {
+            return;
+        }
+
+        const LEN: usize = 5 * PAGE;
+        // SAFETY: a fresh section mapped at three addresses. This test owns
+        // the views until the shadow and its trackers are dropped.
+        let views = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                LEN as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let views = [(); 3].map(|()| MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, LEN));
+            assert!(views.iter().all(|v| !v.Value.is_null()));
+            CloseHandle(section);
+            views
+        };
+        let [a, b, writable] = views.map(|v| v.Value as usize);
+        let pages = std::array::from_fn::<_, 5, _>(|p| a + p * PAGE);
+        for at in pages {
+            watch::title_memory_aliased(b + at - a, &[at]);
+        }
+        let other = watch::track_copy(b, LEN, true).unwrap();
+        assert_eq!(other.take(b, b + LEN), [(b, b + LEN)]);
+        crate::shadow::register(a, a as u64, LEN as u64);
+        let copy = crate::shadow::find(a as u64, LEN as u64).expect("a host shadow");
+        assert_eq!(copy.update(a, LEN), LEN);
+        for (i, at) in pages.into_iter().enumerate() {
+            copy.write_host((at + 31) as u64, &[i as u8 + 1, 0, 42]);
+        }
+        // SAFETY: this thread exposes the writable view only while the
+        // fixture owns it and no section writer is active.
+        unsafe { use_landing_pages(physical_test_page) };
+        BATCH_VIEWS.set(Some((a, writable)));
+        BATCH_LOOKUPS.set(0);
+        let protects = PROTECTS.get();
+        assert_eq!(
+            during(Some(0), || copy.copy_back_marked(&pages, None)),
+            4 * PAGE
+        );
+        assert_eq!(BATCH_LOOKUPS.get(), 3);
+        let beside = std::env::var_os("VICTORY_LAND_BESIDE").is_none_or(|v| v != "0");
+        if beside {
+            for at in [a, a + PAGE, b, b + PAGE] {
+                assert_eq!(protection(at), PAGE_READONLY);
+            }
+            assert_eq!(PROTECTS.get() - protects, if echo() { 2 } else { 0 });
+        }
+        for i in 0..5 {
+            let expected = if i < 4 { [i as u8 + 1, 0, 42] } else { [0; 3] };
+            for at in [a, b, writable] {
+                // SAFETY: a view owned by the test with the landing joined.
+                let bytes =
+                    unsafe { std::slice::from_raw_parts((at + i * PAGE + 31) as *const u8, 3) };
+                assert_eq!(bytes, expected);
+            }
+        }
+        assert_eq!(other.take(b, b + LEN), [(b, b + 4 * PAGE)]);
+
+        // An explicit unchanged baseline skips the physical lookup entirely.
+        let mut same = [0; 32];
+        assert_eq!(
+            during(Some(0), || watch::land(
+                a,
+                &mut same,
+                Some(&[0; 32]),
+                None,
+                &mut []
+            )),
+            Some(0)
+        );
+        assert_eq!(BATCH_LOOKUPS.get(), 3);
+        BATCH_VIEWS.set(None);
+        drop((copy, other));
+        crate::shadow::unregister(a, a as u64);
+        watch::title_memory_remapped(a, LEN);
+        watch::title_memory_remapped(b, LEN);
+        for view in views {
+            // SAFETY: this fixture owns the view and its trackers are done.
+            assert_ne!(unsafe { UnmapViewOfFile(view) }, 0);
+        }
     }
 
     /// Run on Wine with VICTORY_FAULT_TRACKING=1, once for each switch

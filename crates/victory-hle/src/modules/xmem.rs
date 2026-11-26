@@ -771,46 +771,76 @@ impl Drop for PhysicalWrite {
 /// may occur during that wait, so check the mapping again afterwards.
 pub(crate) fn landing_page(
     at: usize,
+    len: usize,
     epoch: u64,
     beside: bool,
-    apply: &mut dyn FnMut(victory_gpu::LandingPage),
+    apply: &mut dyn FnMut(victory_gpu::LandingPage, usize),
 ) {
     use victory_gpu::LandingPage;
     let mut physical = physical();
+    let end = at + len;
     loop {
-        let Some((&base, (_, slice, mapped))) = physical
+        let following = || physical.views.range(at + 1..end);
+        let Some((&base, (size, slice, mapped))) = physical
             .views
             .range(..=at)
             .next_back()
             .filter(|(base, (size, _, _))| at < *base + size)
         else {
-            apply(LandingPage::Direct);
+            let stop = following().next().map_or(end, |(&base, _)| base);
+            apply(LandingPage::Direct, stop - at);
             return;
         };
+        let mut stop = end.min(base + size);
         if *mapped > epoch {
-            apply(LandingPage::Replaced);
+            apply(LandingPage::Replaced, stop - at);
             return;
         }
+        // XMem alias operations often produce consecutive single-page views.
+        // They can share the pin when their slices are contiguous and all
+        // still belong to this submission. Their title protections are separate.
+        for (&next, (size, adjacent, mapped)) in following() {
+            if next != stop
+                || *mapped > epoch
+                || !Arc::ptr_eq(&slice.section, &adjacent.section)
+                || adjacent.index != slice.index + (next - base) / PAGE
+            {
+                break;
+            }
+            stop = end.min(next + size);
+        }
         let within = at - base;
-        let slice = Slice {
-            section: slice.section.clone(),
-            index: slice.index + within / PAGE,
-        };
-        if physical.writes.values().any(|w| w.overlaps(&slice, 1)) {
+        let first = slice.index + within / PAGE;
+        let last = slice.index + (stop - base).div_ceil(PAGE);
+        let busy = physical
+            .writes
+            .values()
+            .filter_map(|w| {
+                let index = w.slice.index.max(first);
+                (index < last && w.covers(&slice.section, index)).then_some(index)
+            })
+            .min();
+        if busy == Some(first) {
             physical = PHYSICAL_WRITTEN
                 .wait(physical)
                 .unwrap_or_else(|e| e.into_inner());
             continue;
         }
+        if let Some(index) = busy {
+            stop = base + (index - slice.index) * PAGE;
+        }
         let page = if beside {
             slice
                 .section
                 .whole()
-                .map(|base| base + slice.index * PAGE + within % PAGE)
+                .map(|base| base + slice.index * PAGE + within)
         } else {
             None
         };
-        apply(page.map_or(LandingPage::Direct, LandingPage::Beside));
+        apply(
+            page.map_or(LandingPage::Direct, LandingPage::Beside),
+            stop - at,
+        );
         return;
     }
 }
@@ -2527,7 +2557,7 @@ mod tests {
             let protected = unsafe { VirtualProtect(view, PAGE, PAGE_READONLY, &mut old) };
             assert_ne!(protected, 0);
         }
-        landing_page(at + 19, epoch, true, &mut |page| {
+        landing_page(at + 19, 1, epoch, true, &mut |page, _| {
             let LandingPage::Beside(address) = page else {
                 panic!("missing writable section alias")
             };
@@ -2539,9 +2569,20 @@ mod tests {
             // SAFETY: the views remain readable.
             assert_eq!(unsafe { view.cast::<u8>().add(19).read_volatile() }, 0xb1);
         }
-        landing_page(at, epoch, false, &mut |p| {
+        landing_page(at, 1, epoch, false, &mut |p, _| {
             assert!(matches!(p, LandingPage::Direct))
         });
+        landing_page(at + 19, 3 * PAGE - 19, epoch, true, &mut |p, len| {
+            assert!(matches!(p, LandingPage::Beside(_)));
+            assert_eq!(len, 3 * PAGE - 19);
+        });
+        let last = physical().pages[&pages[2]].clone();
+        let writing_last = PhysicalWrite::begin(&last, 1);
+        landing_page(at, 3 * PAGE, epoch, true, &mut |p, len| {
+            assert!(matches!(p, LandingPage::Beside(_)));
+            assert_eq!(len, 2 * PAGE, "stop before the busy section slice");
+        });
+        drop(writing_last);
 
         // The section view may also be the target of a DirectStorage
         // decode. A landing against that slice waits for the bytes.
@@ -2550,7 +2591,7 @@ mod tests {
         let writing = PhysicalWrite::begin(&slice, 1);
         let (send, recv) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
-            landing_page(at + 19, epoch, true, &mut |page| {
+            landing_page(at + 19, 1, epoch, true, &mut |page, _| {
                 let LandingPage::Beside(address) = page else {
                     panic!("missing writable section alias");
                 };
@@ -2575,17 +2616,31 @@ mod tests {
         // show their original section slices and take the in-flight writes.
         let middle = a.wrapping_byte_add(PAGE);
         assert_eq!(XMemMapPhysicalPages(middle, 1, pages[3..].as_ptr()), middle);
+        landing_page(at, 3 * PAGE, epoch, true, &mut |p, len| {
+            assert!(matches!(p, LandingPage::Beside(_)));
+            assert_eq!(len, PAGE, "stop before the replacement");
+        });
         for beside in [true, false] {
-            landing_page(at + PAGE, epoch, beside, &mut |p| {
+            landing_page(at + PAGE, 1, epoch, beside, &mut |p, _| {
                 assert!(matches!(p, LandingPage::Replaced))
             });
         }
         let after_replacement = victory_gpu::next_mapping_epoch();
-        landing_page(at + PAGE, after_replacement, false, &mut |p| {
+        landing_page(at + PAGE, 1, after_replacement, false, &mut |p, _| {
             assert!(matches!(p, LandingPage::Direct))
         });
-        landing_page(at + 2 * PAGE, epoch, true, &mut |p| {
+        landing_page(at + 2 * PAGE, 1, epoch, true, &mut |p, _| {
             assert!(matches!(p, LandingPage::Beside(_)))
+        });
+        assert_eq!(XMemMapPhysicalPages(middle, 1, pages[1..].as_ptr()), middle);
+        let remapped = victory_gpu::next_mapping_epoch();
+        landing_page(at, 3 * PAGE, remapped, true, &mut |p, len| {
+            assert!(matches!(p, LandingPage::Beside(_)));
+            assert_eq!(
+                len,
+                3 * PAGE,
+                "contiguous slices in separate views share a pin"
+            );
         });
         assert_eq!(XMemMapPhysicalPages(a, 3, std::ptr::null()), a);
         assert_eq!(XMemMapPhysicalPages(b, 1, std::ptr::null()), b);

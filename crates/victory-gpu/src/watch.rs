@@ -1537,9 +1537,14 @@ fn rearm_direct(g: &Guards, page: usize, at: usize, host: &mut [u8]) -> bool {
         && crate::host::read_into(at as *const u8, host)
 }
 
-/// Merge within one 64 KiB block, after its GPU fence. The mapping callback
-/// holds the physical map stable until we have written and notified every
-/// tracker. Guard faults cannot mark or reopen an alias during the merge.
+pub(crate) struct LandPage<'a> {
+    pub(crate) at: usize,
+    pub(crate) host: &'a mut [u8],
+    pub(crate) old: Option<&'a [u8]>,
+    pub(crate) tracked: Option<&'a Tracked>,
+    pub(crate) written: Option<usize>,
+}
+
 pub(crate) fn land(
     at: usize,
     host: &mut [u8],
@@ -1547,112 +1552,223 @@ pub(crate) fn land(
     tracked: Option<&Tracked>,
     scratch: &mut [u8],
 ) -> Option<usize> {
-    use crate::land::LandingPage;
-    debug_assert!(!host.is_empty() && at % PAGE + host.len() <= PAGE);
-    if old == Some(host) {
-        return Some(0);
-    }
-    debug_assert!(old.is_some() || tracked.is_some());
-    let page = at / PAGE;
-    let mut landed = None;
-    crate::land::page(at, |destination| {
-        let g = guards();
-        let saved = if old.is_none()
-            && let Some(t) = tracked
-        {
-            t.unarm(page);
-            let saved = t.saved(page);
-            if saved.is_none() && t.changed(page) {
-                return;
-            }
-            saved
-        } else {
-            None
-        };
-        if matches!(destination, LandingPage::Replaced) {
-            return;
-        }
-        let guarded = g.protected.contains(&page) && aliases_guarded(&g, page);
-        let beside = match destination {
-            LandingPage::Beside(addr) => Some(addr as *mut u8),
-            _ => None,
-        };
-        let title = &mut scratch[..host.len()];
-        if let Some(addr) = beside.filter(|_| guarded) {
-            // SAFETY: xmem holds the mapping stable and all title aliases
-            // are guarded. Section writers are excluded by xmem as well.
-            unsafe { std::ptr::copy_nonoverlapping(addr, title.as_mut_ptr(), title.len()) };
-        } else if !crate::host::read_into(at as *const u8, title) {
-            return;
-        }
-        let old = old.or_else(|| {
-            saved
-                .as_deref()
-                .map(|s| &s[at % PAGE..at % PAGE + host.len()])
-        });
-        let changes = |i: usize, value: u8, current: u8| {
-            value != current && old.is_none_or(|before| value != before[i])
-        };
-        let writes = (0..host.len()).any(|i| changes(i, host[i], title[i]));
-        if writes {
-            if beside.is_some() {
-                // Save the baseline for other armed copies before exposing
-                // the GPU bytes. Their next refresh must see the write.
-                let others = g.alias_of.get(&page).cloned().unwrap_or_default();
-                for p in std::iter::once(page).chain(others) {
-                    mark_changed(&g, p, p + 1, true);
-                }
-            } else {
-                changed(&g, page, page + 1, true);
-            }
-        }
+    let mut page = LandPage {
+        at,
+        host,
+        old,
+        tracked,
+        written: None,
+    };
+    land_batch(std::slice::from_mut(&mut page), scratch);
+    page.written
+}
 
-        // Only store changed bytes. In particular a CPU store to a different
-        // byte through an open alias must never be overwritten by write-back.
-        let mut i = 0;
-        while i < host.len() {
-            if !changes(i, host[i], title[i]) {
-                host[i] = title[i];
-                i += 1;
-                continue;
+pub(crate) const LAND_BATCH: usize = CLAIM_BATCH;
+
+/// Land consecutive pages in order under one pin per stable mapping span.
+/// Explicit baselines can reject unchanged pages before looking up the map.
+pub(crate) fn land_batch(pages: &mut [LandPage<'_>], scratch: &mut [u8]) {
+    use crate::land::LandingPage;
+    assert!(pages.len() <= LAND_BATCH);
+    for p in &mut *pages {
+        debug_assert!(!p.host.is_empty() && p.at % PAGE + p.host.len() <= PAGE);
+        debug_assert!(p.old.is_some() || p.tracked.is_some());
+        if p.old == Some(p.host) {
+            p.written = Some(0);
+        }
+    }
+    let mut runs = Vec::new();
+    let mut pages = pages;
+    while let Some(first) = pages.first() {
+        if first.written.is_some() {
+            pages = &mut pages[1..];
+            continue;
+        }
+        let mut count = 1;
+        let mut end = first.at + first.host.len();
+        for p in &pages[1..] {
+            if p.at != end || p.written.is_some() {
+                break;
             }
-            let first = i;
-            while i < host.len() && changes(i, host[i], title[i]) {
-                i += 1;
+            end += p.host.len();
+            count += 1;
+        }
+        let (mut run, rest) = pages.split_at_mut(count);
+        while let Some(first) = run.first() {
+            let at = first.at;
+            let mut consumed = 0;
+            crate::land::prefix(at, end - at, |destination, len| {
+                consumed = run.partition_point(|p| p.at < at + len);
+                let group = &mut run[..consumed];
+                let mut apply = |g: &Guards, group: &mut [LandPage<'_>], runs: &mut Runs| {
+                    for p in group {
+                        let destination = match destination {
+                            LandingPage::Beside(addr) => LandingPage::Beside(addr + p.at - at),
+                            LandingPage::Direct => LandingPage::Direct,
+                            LandingPage::Replaced => LandingPage::Replaced,
+                        };
+                        land_claimed(g, p, destination, scratch, runs);
+                    }
+                };
+                if port_guard() {
+                    let g = guards_shared();
+                    let mut blocks = [0; LAND_BATCH];
+                    for (block, p) in blocks.iter_mut().zip(group.iter()) {
+                        *block = p.at / PAGE;
+                    }
+                    let _claims = claim_blocks(&g, &blocks[..consumed]);
+                    apply(&g, group, &mut runs);
+                } else {
+                    let g = guards();
+                    apply(&g, group, &mut runs);
+                }
+            });
+            assert_ne!(consumed, 0);
+            run = &mut run[consumed..];
+        }
+        pages = rest;
+    }
+}
+
+/// Collect exact stores and merge the current title bytes into the shadow.
+/// A whole equal chunk needs no per-byte work. Runs may touch across chunks,
+/// but a gap can hold a concurrent CPU write through an already open alias.
+fn merge_landing(host: &mut [u8], title: &[u8], old: Option<&[u8]>, runs: &mut Runs) {
+    const CHUNK: usize = 32;
+    runs.clear();
+    if host == title {
+        return;
+    }
+    let (host, tail) = host.as_chunks_mut::<CHUNK>();
+    let (title, title_tail) = title.as_chunks::<CHUNK>();
+    let before = old.map(|slice| slice.as_chunks::<CHUNK>());
+    for (i, (gpu, title)) in host.iter_mut().zip(title).enumerate() {
+        if gpu == title {
+            continue;
+        }
+        let old = before.map(|(chunks, _)| &chunks[i]);
+        if old == Some(gpu) {
+            *gpu = *title;
+            continue;
+        }
+        merge_landing_chunk(i * CHUNK, gpu, title, old.map(|b| b.as_slice()), runs);
+    }
+    merge_landing_chunk(
+        host.len() * CHUNK,
+        tail,
+        title_tail,
+        before.map(|(_, tail)| tail),
+        runs,
+    );
+}
+
+fn merge_landing_chunk(
+    base: usize,
+    host: &mut [u8],
+    title: &[u8],
+    old: Option<&[u8]>,
+    runs: &mut Runs,
+) {
+    for (i, (gpu, &current)) in host.iter_mut().zip(title).enumerate() {
+        if *gpu == current || old.is_some_and(|before| *gpu == before[i]) {
+            *gpu = current;
+            continue;
+        }
+        let at = base + i;
+        match runs.last_mut() {
+            Some((_, end)) if *end == at => *end += 1,
+            _ => runs.push((at, at + 1)),
+        }
+    }
+}
+
+/// The physical mapping is pinned, and faults cannot change any alias's
+/// protection or dirty state until the guard lock or claims are released.
+fn land_claimed(
+    g: &Guards,
+    entry: &mut LandPage<'_>,
+    destination: crate::land::LandingPage,
+    scratch: &mut [u8],
+    runs: &mut Runs,
+) {
+    let LandPage {
+        at,
+        host,
+        old,
+        tracked,
+        written,
+    } = entry;
+    let at = *at;
+    let page = at / PAGE;
+    let saved = if old.is_none()
+        && let Some(t) = tracked
+    {
+        t.unarm(page);
+        let saved = t.saved(page);
+        if saved.is_none() && t.changed(page) {
+            return;
+        }
+        saved
+    } else {
+        None
+    };
+    let beside = match destination {
+        crate::land::LandingPage::Beside(addr) => Some(addr),
+        crate::land::LandingPage::Direct => None,
+        crate::land::LandingPage::Replaced => return,
+    };
+    let old = old.or_else(|| {
+        saved
+            .as_deref()
+            .map(|s| &s[at % PAGE..at % PAGE + host.len()])
+    });
+    let guarded = g.protected.contains(&page) && aliases_guarded(g, page);
+    let title = &mut scratch[..host.len()];
+    if let Some(addr) = beside.filter(|_| guarded) {
+        // SAFETY: xmem holds the mapping stable and all title aliases
+        // are guarded. Section writers are excluded by xmem as well.
+        unsafe {
+            std::ptr::copy_nonoverlapping(addr as *const u8, title.as_mut_ptr(), title.len())
+        };
+    } else if !crate::host::read_into(at as *const u8, title) {
+        return;
+    }
+    merge_landing(host, title, old, runs);
+    let writes = !runs.is_empty();
+    if writes {
+        if beside.is_some() {
+            // Save other armed shadows before any GPU byte is visible.
+            let others = g.alias_of.get(&page).into_iter().flatten().copied();
+            for p in std::iter::once(page).chain(others) {
+                mark_changed(g, p, p + 1, true);
             }
+        } else {
+            changed(g, page, page + 1, true);
+        }
+        for &(first, end) in runs.iter() {
+            let src = host.as_ptr().wrapping_add(first);
             if let Some(addr) = beside {
-                // SAFETY: the alternate view is writable and stable through
-                // the callback. No store reaches outside this changed run.
+                // SAFETY: the writable view is stable through the lookup
+                // callback and the store is confined to the changed run.
                 unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        host.as_ptr().add(first),
-                        addr.add(first),
-                        i - first,
-                    )
+                    std::ptr::copy_nonoverlapping(src, (addr + first) as *mut u8, end - first)
                 };
             } else {
-                crate::host::write_mapped(
-                    (at + first) as *mut u8,
-                    host.as_ptr().wrapping_add(first),
-                    i - first,
-                );
+                crate::host::write_mapped((at + first) as *mut u8, src, end - first);
             }
         }
+    }
 
-        if guarded
-            && crate::land::echo()
-            && let Some(t) = tracked
-            && at == (page * PAGE).max(t.start)
-            && at + host.len() == ((page + 1) * PAGE).min(t.end)
-            && (beside.is_some() || !writes || rearm_direct(&g, page, at, host))
-        {
-            // The writing copy now has every byte it holds of this page.
-            // Clear only its tracker, with the guards still held.
-            t.changed.clear_page(page);
-        }
-        landed = Some(if writes { host.len() } else { 0 });
-    });
-    landed
+    if guarded
+        && crate::land::echo()
+        && let Some(t) = tracked
+        && at == (page * PAGE).max(t.start)
+        && at + host.len() == ((page + 1) * PAGE).min(t.end)
+        && (beside.is_some() || !writes || rearm_direct(g, page, at, host))
+    {
+        t.changed.clear_page(page);
+    }
+    *written = Some(if writes { host.len() } else { 0 });
 }
 
 /// A write into title memory the guards do not see, under way: its pages
@@ -1970,6 +2086,153 @@ impl Drop for Timed {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn landing_merge_matches_exact_byte_stores() {
+        let mut runs = Vec::new();
+        for len in [1, 31, 32, 33, 64, 65, PAGE] {
+            let old = vec![7; len];
+            let mut title = old.clone();
+            let mut gpu = old.clone();
+            for i in (0..len).step_by(5) {
+                title[i] = 9;
+            }
+            for i in (0..len).filter(|i| i % 29 < 6) {
+                gpu[i] = if i % 2 == 0 { 9 } else { 11 };
+            }
+            for old in [None, Some(old.as_slice())] {
+                let mut merged = gpu.clone();
+                merge_landing(&mut merged, &title, old, &mut runs);
+                let mut written = title.clone();
+                for &(start, end) in &runs {
+                    assert!((start..end).all(|i| title[i] != gpu[i]));
+                    written[start..end].copy_from_slice(&gpu[start..end]);
+                }
+                assert!(runs.windows(2).all(|pair| pair[0].1 < pair[1].0));
+                for i in 0..len {
+                    let expected = if old.is_some_and(|old| old[i] == gpu[i]) {
+                        title[i]
+                    } else {
+                        gpu[i]
+                    };
+                    assert_eq!((merged[i], written[i]), (expected, expected));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn landing_claims_hold_alias_faults_and_allow_unrelated_faults() {
+        if !fault_tracking() || !port_guard() {
+            return;
+        }
+        use std::sync::mpsc::{RecvTimeoutError, channel};
+        use std::time::{Duration, Instant};
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+
+        let (a, b) = twin_views(1);
+        let pool_base = pool(3);
+        let alias_stripes = [a / PAGE % CLAIM_COUNT, b / PAGE % CLAIM_COUNT];
+        let other = (0..3)
+            .map(|i| pool_base + i * PAGE)
+            .find(|p| !alias_stripes.contains(&(p / PAGE % CLAIM_COUNT)))
+            .unwrap();
+        let t = track_copy(a, PAGE, true).unwrap();
+        let u = track_copy(b, PAGE, true).unwrap();
+        let unrelated = track(other, PAGE, false).unwrap();
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        assert_eq!(u.take(b, b + PAGE), [(b, b + PAGE)]);
+        assert_eq!(unrelated.take(other, other + PAGE), [(other, other + PAGE)]);
+        t.arm(a, a + PAGE);
+        let write = |at, byte| {
+            // SAFETY: the test calls this only for its own live title views.
+            unsafe { (at as *mut u8).write_volatile(byte) };
+        };
+        write(a + 17, 4);
+        write(a + 31, 5);
+        assert!(!writable(b));
+
+        let limit = Duration::from_secs(5);
+        std::thread::scope(|scope| {
+            let saved = t.changed.1.lock().unwrap();
+            let landing = scope.spawn(|| {
+                let mut gpu = vec![0; PAGE];
+                gpu[31..33].copy_from_slice(&[7, 8]);
+                let bytes = land(a, &mut gpu, None, Some(&t), &mut vec![0; PAGE]);
+                (bytes, gpu)
+            });
+            // Landing is paused at the saved baseline, after claiming the
+            // aliases. A fault in a different stripe can still complete.
+            let stripe = &CLAIMS[alias_stripes[1]];
+            let deadline = Instant::now() + limit;
+            let claimed = loop {
+                if stripe.try_lock().is_err() {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            let (attempted, attempt) = channel();
+            let (done, finished) = channel();
+            scope.spawn(move || {
+                attempted.send(()).unwrap();
+                write(b + 34, 6);
+                done.send(()).unwrap();
+            });
+            let (opened, open) = channel();
+            scope.spawn(move || {
+                write(other, 1);
+                opened.send(()).unwrap();
+            });
+            let attempted = attempt.recv_timeout(limit);
+            let independent = open.recv_timeout(limit);
+            let blocked = finished.recv_timeout(Duration::from_millis(20));
+            drop(saved);
+            let (bytes, gpu) = landing.join().unwrap();
+            let finished = finished.recv_timeout(limit);
+            assert!(claimed);
+            assert_eq!(attempted, Ok(()));
+            assert_eq!(independent, Ok(()));
+            assert_eq!(blocked, Err(RecvTimeoutError::Timeout));
+            assert_eq!(finished, Ok(()));
+            assert_eq!(bytes, Some(PAGE));
+            assert_eq!((gpu[17], &gpu[31..35]), (4, &[7, 8, 0, 0][..]));
+        });
+        for view in [a, b] {
+            // SAFETY: both mapped views are live and the writers have joined.
+            let bytes = unsafe { std::slice::from_raw_parts(view as *const u8, PAGE) };
+            assert_eq!((bytes[17], &bytes[31..35]), (4, &[7, 8, 0, 6][..]));
+        }
+        assert!(!t.clean() && !u.clean() && !unrelated.clean());
+        drop((t, u, unrelated));
+        for view in [a, b] {
+            title_memory_remapped(view, PAGE);
+            let address = MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view as *mut _,
+            };
+            // SAFETY: the fixture owns the view and all writers are done.
+            assert_ne!(unsafe { UnmapViewOfFile(address) }, 0);
+        }
+        free(pool_base);
+    }
+
+    #[test]
+    fn landing_equal_baseline_needs_no_guard() {
+        let guard = guards();
+        let (send, recv) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut gpu = [17; 512];
+            let written = land(PAGE, &mut gpu, Some(&[17; 512]), None, &mut []);
+            send.send((written, PROTECTS.with(std::cell::Cell::get)))
+                .unwrap();
+        });
+        let result = recv.recv_timeout(std::time::Duration::from_secs(3));
+        drop(guard);
+        worker.join().unwrap();
+        assert_eq!(result, Ok((Some(0), 0)));
+    }
 
     #[test]
     fn a_fault_under_the_guard_lock_does_not_hang() {
@@ -2646,7 +2909,7 @@ pub(crate) mod tests {
 
     thread_local! {
         /// `VirtualProtect` calls this thread made in `protect`.
-        pub(super) static PROTECTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        pub(crate) static PROTECTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         pub(super) static PART_WATCH_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 

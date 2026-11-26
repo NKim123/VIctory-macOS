@@ -1121,29 +1121,48 @@ impl Shadow {
         let has_snapshot = !snapshot.0.is_empty();
         let mut scratch = vec![0; PAGE];
         let mut written = 0;
-        for &page in pages {
-            let (from, to) = (page.max(start), (page + PAGE).min(end));
-            if from >= to || snapshot.1.contains(&page) {
-                continue;
-            }
-            let before = baseline(page);
-            let tracked = self.tracked.as_ref().filter(|t| t.covers_page(page));
-            if before.is_none() && tracked.is_none() {
-                continue;
-            }
-            // SAFETY: inside the mapping and the GPU fence has completed.
-            let host =
-                unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), to - from) };
-            if let Some(bytes) = crate::watch::land(from, host, before, tracked, &mut scratch) {
-                written += bytes;
-                // The whole part of this page in the copy landed, including
-                // any ranges also declared for snapshot-based copy-back.
-                if has_snapshot {
-                    snapshot.1.insert(page);
+        debug_assert!(pages.is_sorted());
+        let widened = self.has_widened.load(Ordering::Acquire);
+        let mut batch = Vec::with_capacity(pages.len().min(crate::watch::LAND_BATCH));
+        for group in pages.chunks(crate::watch::LAND_BATCH) {
+            let mut next = start;
+            for &page in group {
+                let (from, to) = (page.max(start), (page + PAGE).min(end));
+                if from >= to || from < next || snapshot.1.contains(&page) {
+                    continue;
                 }
+                let before = baseline(page);
+                let tracked = self.tracked.as_ref().filter(|t| t.covers_page(page));
+                if before.is_none() && tracked.is_none() {
+                    continue;
+                }
+                next = to;
+                // SAFETY: the mapping is fenced and widened_source is held.
+                // Each entry borrows a distinct part of the mapped shadow.
+                let host = unsafe {
+                    std::slice::from_raw_parts_mut(self.data.add(from - start), to - from)
+                };
+                batch.push(crate::watch::LandPage {
+                    at: from,
+                    host,
+                    old: before,
+                    tracked,
+                    written: None,
+                });
             }
-            if self.has_widened.load(Ordering::Acquire) {
-                self.refresh_widened(from, to);
+            crate::watch::land_batch(&mut batch, &mut scratch);
+            for entry in batch.drain(..) {
+                let to = entry.at + entry.host.len();
+                if let Some(bytes) = entry.written {
+                    written += bytes;
+                    // This includes any overlapping snapshot declarations.
+                    if has_snapshot {
+                        snapshot.1.insert(entry.at / PAGE * PAGE);
+                    }
+                }
+                if widened {
+                    self.refresh_widened(entry.at, to);
+                }
             }
         }
         written
