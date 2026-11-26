@@ -3660,7 +3660,7 @@ void main() { o.Store(0, asuint(t.Load(int3(0, 0, 0)).x)); o.Store(4, asuint(t.L
             let level = &layout.mips[mip as usize];
             let row = level.width as usize * 8;
             let mut blocks = vec![0; row * level.height as usize];
-            for block in blocks.chunks_exact_mut(8) {
+            for block in blocks.as_chunks_mut::<8>().0 {
                 block[..2].copy_from_slice(&color.to_le_bytes());
             }
             layout
