@@ -1482,8 +1482,12 @@ mod tests {
         assert_eq!(keys(target), [first, first, second, last]);
 
         // The established overlapping-copy path reads successive source pages in order.
-        assert!(map_alias(middle as u64, target as u64, (2 * PAGE) as u64));
-        assert_eq!(keys(target), [first, first, first, last]);
+        assert!(map_alias(
+            at(target, 2) as u64,
+            middle as u64,
+            (2 * PAGE) as u64
+        ));
+        assert_eq!(keys(target), [first; N]);
         for base in [source, target] {
             assert!(map_alias(base as u64, 0, (N * PAGE) as u64));
             release_placeholders(base, N);
