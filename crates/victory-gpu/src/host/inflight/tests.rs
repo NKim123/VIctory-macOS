@@ -254,6 +254,139 @@ fn a_title_event_and_raw_fence_value_follow_gpu_writes() {
 }
 
 #[test]
+fn bottom_of_pipe_labels_and_title_signals_retire_without_another_submit() {
+    let Some(host) = host_for_ring() else { return };
+    host.present_boundary();
+    let (out, _) = host.mapped_buffer(8, true).unwrap();
+    let first = AtomicU64::new(0);
+    let second = AtomicU32::new(0);
+    let mut fence = std::ptr::null();
+    assert_eq!(
+        crate::fence::create(
+            std::ptr::null(),
+            0,
+            0,
+            &crate::fence::FENCE_IIDS[0],
+            &mut fence
+        ),
+        S_OK
+    );
+    let raw = slot::<extern "system" fn(This) -> u64>(fence, 0x60)(fence);
+    // SAFETY: the emulated fence exposes its value for its entire lifetime.
+    let raw = unsafe { &*(raw as *const AtomicU64) };
+    let prior_overlaps = OVERLAPPED.load(Ordering::Relaxed);
+    let prior_fallbacks = FALLBACKS[Boundary::BottomOfPipe as usize].load(Ordering::Relaxed);
+    let mut gate = Gate::new(host);
+    let list = record_copy(host, &out, 4, 1);
+    list.defer_write(
+        first.as_ptr().cast(),
+        crate::queue::Written::Value(0xfedc_ba98_7654_3210),
+        8,
+    );
+    assert!(host.execute_title(&[list]));
+    host.signal_title(fence, 1);
+    let mut second_gate = Gate::new(host);
+    let list = record_copy(host, &out, 4, 2);
+    list.defer_write(
+        second.as_ptr().cast(),
+        crate::queue::Written::Value(0xfedc_ba98),
+        4,
+    );
+    assert!(host.execute_title(&[list]));
+    host.signal_title(fence, 2);
+    assert!(OVERLAPPED.load(Ordering::Relaxed) > prior_overlaps);
+    assert_eq!(
+        FALLBACKS[Boundary::BottomOfPipe as usize].load(Ordering::Relaxed),
+        prior_fallbacks
+    );
+    assert_eq!(first.load(Ordering::Acquire), 0);
+    assert_eq!(raw.load(Ordering::Acquire), 0);
+
+    let spin_for = |value| {
+        let until = Instant::now() + Duration::from_secs(3);
+        while raw.load(Ordering::Acquire) != value {
+            assert!(
+                Instant::now() < until,
+                "the completion worker must publish flight {value}"
+            );
+            std::hint::spin_loop();
+        }
+    };
+    gate.open();
+    spin_for(1);
+    assert_eq!(first.load(Ordering::Acquire), 0xfedc_ba98_7654_3210);
+    assert_eq!(second.load(Ordering::Acquire), 0);
+    second_gate.open();
+    spin_for(2);
+    assert_eq!(second.load(Ordering::Acquire), 0xfedc_ba98);
+    crate::fence::let_go(fence);
+}
+
+#[test]
+fn a_deferred_upload_reads_the_earlier_label() {
+    let Some(host) = host_for_ring() else { return };
+    host.present_boundary();
+    let (out, data) = host.mapped_buffer(8, true).unwrap();
+    let label = AtomicU32::new(0);
+    let gate = Gate::new(host);
+    let first = record_copy(host, &out, 4, 1);
+    first.defer_write(label.as_ptr().cast(), crate::queue::Written::Value(73), 4);
+    assert!(host.execute_title(&[first]));
+
+    let next = host.new_list().unwrap();
+    let (upload, at, dst) = next.upload(4).unwrap();
+    next.defer_fill(dst, label.as_ptr().cast(), 4);
+    // SAFETY: the closed recording owns the upload; the test owns the readback.
+    unsafe { next.list.CopyBufferRegion(&out, 4, &upload, at, 4) };
+    next.close();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(20));
+        drop(gate);
+    });
+    host.execute_title(&[Arc::new(next)]);
+    release.join().unwrap();
+    host.present_boundary();
+    // SAFETY: the native copy and its flight have finished.
+    assert_eq!(unsafe { data.cast::<u32>().add(1).read() }, 73);
+}
+
+#[test]
+fn a_native_copy_sees_an_earlier_label_through_a_zero_copy_buffer() {
+    let Some(host) = host_for_ring() else { return };
+    host.present_boundary();
+    let (source, src) = host.shared_buffer(64 << 10).unwrap();
+    let (out, dst) = host.mapped_buffer(8, true).unwrap();
+    // SAFETY: an idle mapped resource and the address of that resource.
+    let gpu = unsafe {
+        src.cast::<u32>().write(0);
+        source.GetGPUVirtualAddress()
+    };
+    let shadow = crate::shadow::Shadow::new_aliased(source.clone(), src, gpu, src as u64, 64 << 10);
+    crate::shadow::register_aliased(shadow.clone());
+
+    let gate = Gate::new(host);
+    let first = record_copy(host, &out, 4, 1);
+    first.defer_gpu_write(&shadow, src as usize, 4, false);
+    first.defer_write(src, crate::queue::Written::Value(91), 4);
+    assert_eq!(first.inflight_barrier(true), None);
+    assert!(host.execute_title(&[first]));
+    let next = host.new_list().unwrap();
+    // SAFETY: both buffers are retained through the submission's fence.
+    unsafe { next.list.CopyBufferRegion(&out, 4, &source, 0, 4) };
+    next.close();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(20));
+        drop(gate);
+    });
+    host.execute_title(&[Arc::new(next)]);
+    release.join().unwrap();
+    host.present_boundary();
+    crate::shadow::unregister_aliased(src as u64);
+    // SAFETY: the GPU has completed the readback.
+    assert_eq!(unsafe { dst.cast::<u32>().add(1).read() }, 91);
+}
+
+#[test]
 fn ambient_versions_stay_frozen_through_the_native_fence() {
     use crate::ambient::{Binding, Candidate, CheckedViews, Watch};
     use crate::descriptor::host::TextureView;
@@ -409,6 +542,7 @@ fn omitted_mark_recovers_after_all_old_work_and_reuses_the_ring() {
             false,
             &mut pins,
             Some(std::slice::from_ref(&list)),
+            Boundary::Synchronous,
         );
     }
     assert_eq!(s.flights.len(), 2);
@@ -424,6 +558,7 @@ fn omitted_mark_recovers_after_all_old_work_and_reuses_the_ring() {
         false,
         &mut pins,
         Some(std::slice::from_ref(&list)),
+        Boundary::Synchronous,
     );
     assert!(s.busy());
     host.drain_inflight(&mut s, Boundary::Synchronous);

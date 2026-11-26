@@ -10,7 +10,7 @@ mod submission_profile;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use inflight::{Boundary, Submission};
+use inflight::{BottomWrite, Boundary, Submission};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -241,6 +241,9 @@ static COPY_BACK: [std::sync::atomic::AtomicU64; 2] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
 ];
+// Waiting before recording, submitting the swap-chain copy, and DXGI.
+static PRESENT_US: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Of the preparing: title memory copies (microseconds, bytes) and texture
 /// refreshes (microseconds, bytes hashed), since the last frame-rate line.
@@ -1638,6 +1641,22 @@ enum Step {
 }
 
 impl Step {
+    fn touches_bottom_write(&self, write: &BottomWrite, may_alias: bool) -> bool {
+        let touches = |at, len| may_alias || write.overlaps(at, len);
+        match *self {
+            Self::Copy(dst, src, len) | Self::Move(dst, src, len) => {
+                touches(dst, len) || touches(src, len)
+            }
+            Self::Fill(_, src, len) => touches(src, len),
+            Self::Refresh(_, at, len) | Self::GpuWrite(_, at, len, ..) => touches(at, len),
+            Self::Slot(..) | Self::Heap(_) | Self::Host(_) | Self::Memory(_) => true,
+            #[cfg(test)]
+            Self::Run(_) => true,
+            // Upload reads are ordered before their staging work starts.
+            Self::Private(_) | Self::Texture(..) | Self::TextureSlot(..) => false,
+        }
+    }
+
     fn flushes_refreshes(&self) -> bool {
         matches!(
             self,
@@ -1702,7 +1721,7 @@ struct Deferred {
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
-    writes: Vec<(usize, crate::queue::Written, usize)>,
+    writes: Vec<BottomWrite>,
     /// The memory values the list waits for before it starts (a list the
     /// title records with a wait after commands is cut there,
     /// `crate::list`).
@@ -1961,7 +1980,7 @@ impl Host {
     /// (#50: the title's main thread slept for good in this wait while the
     /// queue was idle), so the wait periodically checks the fence itself. A late event left set by an earlier wait cannot end a later
     /// wait early, as the fence is checked after every wake-up too.
-    fn wait_for(&self, value: u64) -> bool {
+    fn wait_for(&self, value: u64, event: HANDLE) -> bool {
         use std::sync::atomic::AtomicU64;
         static MISSED: AtomicU64 = AtomicU64::new(0);
         let started = Instant::now();
@@ -1969,7 +1988,10 @@ impl Host {
         let mut seconds = 0;
         loop {
             // SAFETY: our event and fence.
-            let woke = unsafe { WaitForSingleObject(self.event, interval) };
+            let woke = unsafe { WaitForSingleObject(event, interval) };
+            if woke == windows::Win32::Foundation::WAIT_FAILED {
+                return poll_fence(&self.fence, value);
+            }
             // SAFETY: as above.
             let completed = unsafe { self.fence.GetCompletedValue() };
             if completed == u64::MAX {
@@ -2106,19 +2128,24 @@ impl Host {
     }
 
     fn wait_for_submission(&self, value: u64) -> bool {
+        self.wait_for_submission_event(value, self.event)
+    }
+
+    fn wait_for_submission_event(&self, value: u64, event: HANDLE) -> bool {
         // SAFETY: a plain query on our fence.
         let completed = unsafe { self.fence.GetCompletedValue() };
         if completed >= value {
             return completed != u64::MAX;
         }
-        // SAFETY: a live fence and event under the submission lock.
+        // SAFETY: a live fence and the caller's own event. The synchronous
+        // path serializes use of its event with the submission lock.
         unsafe {
-            if let Err(e) = self.fence.SetEventOnCompletion(value, self.event) {
+            if let Err(e) = self.fence.SetEventOnCompletion(value, event) {
                 tracing::warn!(error = %e, "host fence event unavailable; polling the fence");
                 return poll_fence(&self.fence, value);
             }
         }
-        self.wait_for(value)
+        self.wait_for(value, event)
     }
 
     #[cfg(feature = "diagnostics")]
@@ -2175,31 +2202,50 @@ impl Host {
 
     pub(crate) fn present_boundary(&self) {
         if inflight_enabled() {
+            let started = Instant::now();
             let _quiet = self.quiet_for(Boundary::Present);
+            PRESENT_US[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
     }
 
     /// Runs borrowed closed lists synchronously (including internal lists
     /// whose caller consumes their readback immediately after this call).
+    #[cfg(any(test, feature = "diagnostics"))]
     pub(crate) fn execute(&self, runs: &[&HostList]) {
-        self.execute_lists(runs, None);
+        self.execute_lists(runs, None, Boundary::Synchronous);
     }
 
     pub(crate) fn execute_title(&'static self, owned: &[Arc<HostList>]) -> bool {
         let runs: Vec<_> = owned.iter().map(AsRef::as_ref).collect();
-        let queued = self.execute_lists(&runs, inflight_enabled().then_some(owned));
+        let queued = self.execute_lists(
+            &runs,
+            inflight_enabled().then_some(owned),
+            Boundary::Synchronous,
+        );
         if queued {
             self.wake_reaper();
         }
         queued
     }
 
-    fn execute_lists(&self, runs: &[&HostList], owned: Option<&[Arc<HostList>]>) -> bool {
+    fn execute_lists(
+        &self,
+        runs: &[&HostList],
+        owned: Option<&[Arc<HostList>]>,
+        boundary: Boundary,
+    ) -> bool {
         // A last title pin can destroy a resource. Drop it outside the lock.
         let mut pending_pins = Vec::new();
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let holding = Holding::enter();
-        let capture = self.execute_part(runs, &mut submitted, false, &mut pending_pins, owned);
+        let capture = self.execute_part(
+            runs,
+            &mut submitted,
+            boundary == Boundary::Present,
+            &mut pending_pins,
+            owned,
+            boundary,
+        );
         let busy = submitted.busy();
         drop((holding, submitted));
         #[cfg(feature = "diagnostics")]
@@ -2226,7 +2272,14 @@ impl Host {
             return;
         }
         for runs in parts {
-            self.execute_part(runs, &mut submitted, true, &mut pending_pins, None);
+            self.execute_part(
+                runs,
+                &mut submitted,
+                true,
+                &mut pending_pins,
+                None,
+                Boundary::Synchronous,
+            );
         }
     }
 
@@ -2349,6 +2402,7 @@ impl Host {
         host_only: bool,
         pending_pins: &mut Vec<crate::descriptor::ViewPin>,
         owned: Option<&[Arc<HostList>]>,
+        synchronous: Boundary,
     ) -> Option<(u64, Vec<(usize, String)>)> {
         let landing = if host_only {
             None
@@ -2367,11 +2421,14 @@ impl Host {
         let fallback = if gpu_timing || traced || submission_profile::enabled() {
             Some(Boundary::Diagnostics)
         } else if owned.is_none() {
-            Some(Boundary::Synchronous)
+            Some(synchronous)
         } else if crate::bindless::remake_pending() {
             Some(Boundary::Descriptors)
         } else {
-            runs.iter().find_map(|list| list.inflight_barrier())
+            // The global bitmap can require synchronous completion of this
+            // submission. Previous flights cannot need shadow copy-back,
+            // so preparation can overlap until any real memory dependency.
+            runs.iter().find_map(|list| list.inflight_barrier(false))
         };
         let owned = if let Some(why) = fallback {
             self.note_sync(submission, why);
@@ -2486,6 +2543,9 @@ impl Host {
             .then(|| {
                 let private = owned.and_then(|_| submission.upload_list(self));
                 crate::bindless::uploads_for(&heaps, &textures, private, |sources| {
+                    if !sources.is_empty() {
+                        self.wait_bottom_writes(submission, |_, _| true);
+                    }
                     if submission.busy()
                         && sources.iter().any(|(staging, _)| staging.may_read_alias())
                     {
@@ -2531,7 +2591,8 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
-        let plans = if !host_only && crate::watch::port_guard_plan() {
+        let mut pending_bottom_writes = submission.has_bottom_writes();
+        let plans = if !host_only && crate::watch::port_guard_plan() && !pending_bottom_writes {
             plan_refreshes(runs)
         } else {
             Vec::new()
@@ -2540,6 +2601,13 @@ impl Host {
             if !host_only {
                 let planned = plans.get(i).map_or(&[][..], |plan| &plan.skip);
                 list.run_deferred_planned(&mut batch, planned, |batch, step| {
+                    if pending_bottom_writes
+                        && self.wait_bottom_writes(submission, |write, may_alias| {
+                            step.touches_bottom_write(write, may_alias)
+                        })
+                    {
+                        pending_bottom_writes = submission.has_bottom_writes();
+                    }
                     if submission.busy()
                         && (!batch.refreshes.is_empty() && step.flushes_refreshes()
                             || step.touches_shared_memory())
@@ -2559,6 +2627,7 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
+        self.order_shared_bottom_writes(submission);
         if !batch.refreshes.is_empty() {
             self.drain_inflight(submission, Boundary::CpuAccess);
         }
@@ -2589,7 +2658,7 @@ impl Host {
             crate::copystat::page_faults().saturating_sub(faults),
         );
         let late_fallback =
-            owned.and_then(|_| runs.iter().find_map(|list| list.inflight_barrier()));
+            owned.and_then(|_| runs.iter().find_map(|list| list.inflight_barrier(true)));
         if let Some(owned) = owned
             && late_fallback.is_none()
             && uploads
@@ -3079,8 +3148,8 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsBack, crate::copystat::page_faults().saturating_sub(faults));
         for list in runs {
-            for &(at, what, bytes) in &list.deferred().writes {
-                what.write(at as *mut u8, bytes);
+            for write in &list.deferred().writes {
+                write.publish();
             }
         }
         // The submission has run and the next waits for our lock. Host
@@ -3102,6 +3171,9 @@ impl Host {
                 }
             }
             return Some((sub, targets));
+        }
+        if let Some(upload) = uploads.and_then(crate::bindless::Uploads::into_owned) {
+            submission.recycle_upload(upload.list);
         }
         None
     }
@@ -4200,7 +4272,11 @@ impl HostList {
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
-        self.deferred().writes.push((dst as usize, what, bytes));
+        self.deferred().writes.push(BottomWrite {
+            address: dst as usize,
+            value: what,
+            bytes,
+        });
     }
 
     /// A memory value the list waits for before it starts.
@@ -4217,22 +4293,22 @@ impl HostList {
         self.deferred().synchronous = true;
     }
 
-    fn inflight_barrier(&self) -> Option<Boundary> {
+    fn inflight_barrier(&self, shared_marks: bool) -> Option<Boundary> {
         let d = self.deferred();
-        if !d.writes.is_empty() {
-            Some(Boundary::BottomOfPipe)
-        } else if d.synchronous {
+        if d.synchronous {
             Some(Boundary::Synchronous)
         } else if !d.texture_fills.is_empty() {
             Some(Boundary::Descriptors)
-        } else if !d.texture_backs.is_empty()
-            || !d.after.is_empty()
-            || !d.missed.is_empty()
-            || !d.computed_ownership.is_empty()
-            || d.view_writes && crate::shadow::has_copy_back_marks()
-            || d.copies.iter().any(|step| matches!(step, Step::GpuWrite(copy, ..) if !copy.is_aliased() || !copy.clean()))
-        {
-            Some(Boundary::CopyBack)
+        } else if !d.texture_backs.is_empty() {
+            Some(Boundary::TextureBack)
+        } else if !d.after.is_empty() || !d.missed.is_empty() || !d.computed_ownership.is_empty() {
+            Some(Boundary::ComputedBack)
+        } else if d.copies.iter().any(
+            |step| matches!(step, Step::GpuWrite(copy, ..) if !copy.is_aliased() || !copy.clean()),
+        ) {
+            Some(Boundary::ShadowBack)
+        } else if shared_marks && d.view_writes && crate::shadow::has_copy_back_marks() {
+            Some(Boundary::MarkedBack)
         } else {
             None
         }
@@ -4627,12 +4703,12 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for (i, step) in self.deferred().copies.iter().enumerate() {
+            before(batch, step);
             if let Step::Refresh(shadow, ..) = step
                 && (skip.get(i).copied().unwrap_or(false) || shadow.clean())
             {
                 continue;
             }
-            before(batch, step);
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(
@@ -5622,6 +5698,16 @@ impl Meter {
             });
             submission_profile::log(report_frames);
             inflight::log(report_frames);
+            let [boundary_ms, swap_copy_ms, dxgi_ms] = PRESENT_US
+                .each_ref()
+                .map(|counter| counter.swap(0, Ordering::Relaxed) as f64 / 1000.0 / report_frames);
+            tracing::info!(
+                frames = report_frames,
+                boundary_ms,
+                swap_copy_ms,
+                dxgi_ms,
+                "host present ms/frame"
+            );
             if pipeline_submissions() {
                 let waits = PIPELINE_WAITS_SAVED.swap(0, Ordering::Relaxed);
                 tracing::info!(
@@ -5952,12 +6038,16 @@ impl Host {
                 ),
             ]);
             p.copy.close();
-            self.execute(&[&p.copy]);
+            let copying = Instant::now();
+            self.execute_lists(&[&p.copy], None, Boundary::Present);
+            PRESENT_US[1].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
+            let presenting = Instant::now();
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            PRESENT_US[2].fetch_add(presenting.elapsed().as_micros() as u64, Ordering::Relaxed);
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));

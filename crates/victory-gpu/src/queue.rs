@@ -2,7 +2,7 @@
 //! so fence signals complete at once.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
@@ -240,7 +240,10 @@ fn pump(held: &mut Holding, why: Why) {
         return;
     }
     let Some(host) = crate::host::host() else { return };
-    let read = read_value;
+    let read = |address, bytes| {
+        host.order_bottom_read(address as usize, usize::from(bytes));
+        read_value(address, bytes)
+    };
     for (queue, waits) in held.force_older_than(VALVE) {
         account().forced += 1;
         tracing::warn!(queue = kind(queue), ?waits, "held work runs without its waits after {VALVE:?} (safety valve)");
@@ -523,9 +526,16 @@ impl Written {
             Written::SystemTimestamp => system_timestamp(),
         };
         // SAFETY: the title names writable GPU memory (unified with ours).
+        // Naturally aligned labels are also used as polled completion words.
         unsafe {
             if bytes == 4 {
-                at.cast::<u32>().write_unaligned(value as u32);
+                if at.cast::<AtomicU32>().is_aligned() {
+                    AtomicU32::from_ptr(at.cast()).store(value as u32, Ordering::Release);
+                } else {
+                    at.cast::<u32>().write_unaligned(value as u32);
+                }
+            } else if at.cast::<AtomicU64>().is_aligned() {
+                AtomicU64::from_ptr(at.cast()).store(value, Ordering::Release);
             } else {
                 at.cast::<u64>().write_unaligned(value);
             }

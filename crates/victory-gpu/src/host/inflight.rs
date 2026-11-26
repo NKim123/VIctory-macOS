@@ -50,7 +50,35 @@ pub(super) struct InFlight {
     _pins: Vec<crate::descriptor::ViewPin>,
     _retired: Vec<crate::descriptor::host::Held>,
     bytes: u64,
+    writes: Vec<BottomWrite>,
+    shared_writes: bool,
     signals: Vec<TitleSignal>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct BottomWrite {
+    pub(super) address: usize,
+    pub(super) value: crate::queue::Written,
+    pub(super) bytes: usize,
+}
+
+impl BottomWrite {
+    pub(super) fn publish(self) {
+        self.value.write(self.address as *mut u8, self.bytes);
+    }
+
+    pub(super) fn overlaps(&self, start: usize, len: usize) -> bool {
+        len != 0
+            && self.address < start.saturating_add(len)
+            && start < self.address.saturating_add(self.bytes)
+    }
+
+    fn may_alias(&self) -> bool {
+        crate::shadow::has_aliased_overlap(
+            self.address as u64,
+            self.address.saturating_add(self.bytes) as u64,
+        ) || crate::watch::aliased(self.address, self.bytes)
+    }
 }
 
 struct TitleSignal {
@@ -65,11 +93,14 @@ impl TitleSignal {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Boundary {
     Capacity,
     ReusedList,
-    CopyBack,
+    TextureBack,
+    ComputedBack,
+    MarkedBack,
+    ShadowBack,
     BottomOfPipe,
     CpuAccess,
     Descriptors,
@@ -95,19 +126,31 @@ pub(super) fn log(frames: f64) {
     }
     let count = |why: Boundary| DRAINS[why as usize].swap(0, Ordering::Relaxed);
     let sync = |why: Boundary| FALLBACKS[why as usize].swap(0, Ordering::Relaxed);
+    let back = [
+        Boundary::TextureBack,
+        Boundary::ComputedBack,
+        Boundary::MarkedBack,
+        Boundary::ShadowBack,
+    ];
+    let [texture_back, computed_back, marked_back, shadow_back] = back.map(sync);
     tracing::info!(
         frames,
         queued = QUEUED.swap(0, Ordering::Relaxed),
         overlapped = OVERLAPPED.swap(0, Ordering::Relaxed),
-        synchronous_copy_back = sync(Boundary::CopyBack),
+        synchronous_copy_back = texture_back + computed_back + marked_back + shadow_back,
+        synchronous_texture_back = texture_back,
+        synchronous_computed_back = computed_back,
+        synchronous_marked_back = marked_back,
+        synchronous_shadow_back = shadow_back,
         synchronous_bottom_of_pipe = sync(Boundary::BottomOfPipe),
         synchronous_descriptors = sync(Boundary::Descriptors),
         synchronous_diagnostics = sync(Boundary::Diagnostics),
         synchronous_replay = sync(Boundary::ReusedList),
+        synchronous_present = sync(Boundary::Present),
         synchronous_other = sync(Boundary::Synchronous),
         capacity = count(Boundary::Capacity),
         reused_list = count(Boundary::ReusedList),
-        copy_back = count(Boundary::CopyBack),
+        copy_back = back.into_iter().map(count).sum::<u64>(),
         bottom_of_pipe = count(Boundary::BottomOfPipe),
         diagnostics = count(Boundary::Diagnostics),
         cpu_access = count(Boundary::CpuAccess),
@@ -125,6 +168,10 @@ pub(super) fn log(frames: f64) {
 impl Submission {
     pub(super) fn busy(&self) -> bool {
         !self.flights.is_empty()
+    }
+
+    pub(super) fn has_bottom_writes(&self) -> bool {
+        self.flights.iter().any(|f| !f.writes.is_empty())
     }
 
     pub(super) fn uses(&self, list: &HostList) -> bool {
@@ -154,20 +201,68 @@ impl Submission {
 
 impl Host {
     pub(super) fn drain_inflight(&self, s: &mut Submission, why: Boundary) {
+        self.retire_inflight(s);
         if let Some(last) = s.flights.back() {
             self.wait_inflight(s, last.value, why);
         }
     }
 
+    /// A CPU touch may need the old label value to have landed first.
+    /// Unknown ranges include indirect reads such as computed addresses.
+    pub(super) fn wait_bottom_writes(
+        &self,
+        s: &mut Submission,
+        touches: impl Fn(&BottomWrite, bool) -> bool,
+    ) -> bool {
+        if let Some(flight) = s
+            .flights
+            .iter()
+            .rev()
+            .find(|f| f.writes.iter().any(|write| touches(write, f.shared_writes)))
+        {
+            self.wait_inflight(s, flight.value, Boundary::BottomOfPipe);
+            return true;
+        }
+        false
+    }
+
+    /// A native GPU list can access a CPU label through a directly mapped
+    /// resource. Its CPU preparation can overlap, but queue it only once
+    /// those stores have been published. A raw GPU wait on the CPU label
+    /// here would prevent synchronous callers from retiring the ring.
+    pub(super) fn order_shared_bottom_writes(&self, s: &mut Submission) {
+        if let Some(flight) = s.flights.iter().rev().find(|f| f.shared_writes) {
+            self.wait_inflight(s, flight.value, Boundary::BottomOfPipe);
+        }
+    }
+
+    /// An emulated queue wait must not compare a stale label that still
+    /// satisfies its predicate before the previous flight overwrites it.
+    pub(crate) fn order_bottom_read(&self, address: usize, bytes: usize) {
+        if limit() == 0 || HOLDS_SUBMISSIONS.with(std::cell::Cell::get) {
+            return;
+        }
+        let mut s = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let _holding = Holding::enter();
+        self.wait_bottom_writes(&mut s, |write, may_alias| {
+            may_alias || write.overlaps(address, bytes)
+        });
+    }
+
     fn wait_inflight(&self, s: &mut Submission, value: u64, why: Boundary) {
-        DRAINS[why as usize].fetch_add(1, Ordering::Relaxed);
-        let started = Instant::now();
         // SAFETY: the queue has signalled this fence value.
         let completed = unsafe { self.fence.GetCompletedValue() };
-        if completed == u64::MAX || completed < value && !self.wait_for_submission(value) {
+        if completed == u64::MAX {
             self.flight_device_removed(s);
         }
-        SUBMISSION_US[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        if completed < value {
+            DRAINS[why as usize].fetch_add(1, Ordering::Relaxed);
+            let started = Instant::now();
+            if !self.wait_for_submission(value) {
+                self.flight_device_removed(s);
+            }
+            SUBMISSION_US[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
         self.retire_inflight(s);
     }
 
@@ -197,7 +292,7 @@ impl Host {
             self.flight_device_removed(s);
         }
         let mut recovery_mark = None;
-        let mut signals = Vec::new();
+        let mut completions = Vec::new();
         while s.flights.front().is_some_and(|f| f.value <= completed) {
             let f = s.flights.pop_front().expect("completed flight");
             let ran = f.marks[..f.active_marks]
@@ -244,7 +339,9 @@ impl Host {
             if !f._pins.is_empty() || !f._retired.is_empty() {
                 release_later(Box::new((f._pins, f._retired)));
             }
-            signals.extend(f.signals);
+            if !f.writes.is_empty() || !f.signals.is_empty() {
+                completions.push((f.writes, f.signals));
+            }
             crate::memory::note_submission(false);
         }
         if let Some(marks) = recovery_mark {
@@ -264,8 +361,11 @@ impl Host {
             release_retired();
             self.log_messages();
         }
-        let published = !signals.is_empty();
-        signals.into_iter().for_each(TitleSignal::publish);
+        let published = !completions.is_empty();
+        for (writes, signals) in completions {
+            writes.into_iter().for_each(BottomWrite::publish);
+            signals.into_iter().for_each(TitleSignal::publish);
+        }
         published
     }
 
@@ -317,6 +417,11 @@ impl Host {
         bytes: u64,
     ) {
         let started = Instant::now();
+        let mut writes = Vec::new();
+        for list in lists {
+            writes.extend_from_slice(&list.deferred().writes);
+        }
+        let shared_writes = writes.iter().any(BottomWrite::may_alias);
         s.value += 1;
         let value = s.value;
         let queue = self.queue();
@@ -366,6 +471,8 @@ impl Host {
             _pins: pins,
             _retired: take_retired(),
             bytes,
+            writes,
+            shared_writes,
             signals: Vec::new(),
         });
         if !self.signal_submission(&queue, value) {
@@ -445,22 +552,31 @@ impl Host {
             let worker = std::thread::Builder::new().name("victory GPU completion".into());
             worker
                 .spawn(move || {
+                    // SAFETY: an auto-reset event private to this process-lifetime
+                    // worker. Synchronous waits use the host's separate event.
+                    let event = unsafe { CreateEventW(None, false, false, None) };
                     while receiver.recv().is_ok() {
                         loop {
-                            let mut busy = true;
-                            let mut published = false;
-                            if let Ok(mut s) = self.submitted.try_lock() {
+                            let (published, next) = {
+                                let mut s =
+                                    self.submitted.lock().unwrap_or_else(|e| e.into_inner());
                                 let _holding = Holding::enter();
-                                published = self.retire_inflight(&mut s);
-                                busy = s.busy();
-                            }
+                                let published = self.retire_inflight(&mut s);
+                                (published, s.flights.front().map(|f| f.value))
+                            };
                             if published {
                                 crate::queue::pump_held_if_free(crate::queue::Why::Fence);
                             }
-                            if !busy {
+                            let Some(next) = next else {
                                 break;
+                            };
+                            // Never wait for the native fence with the submission lock.
+                            // Retirement checks for removal after the wait.
+                            if let Ok(event) = event {
+                                self.wait_for_submission_event(next, event);
+                            } else {
+                                poll_fence(&self.fence, next);
                             }
-                            std::thread::sleep(Duration::from_millis(1));
                         }
                     }
                 })
