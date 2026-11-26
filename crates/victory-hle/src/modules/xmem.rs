@@ -1505,6 +1505,16 @@ mod tests {
         assert_eq!(query(at(target, N - 1)).host.State, MEM_RESERVE);
         for base in [source, target] {
             assert!(copy(base, std::ptr::null_mut(), N));
+            // Each formerly mapped view is now a separate placeholder.
+            let mut at = base;
+            let end = base.wrapping_byte_add(N * PAGE);
+            while at < end {
+                let bytes = query(at).host.RegionSize;
+                assert!((1..=end as usize - at as usize).contains(&bytes));
+                // SAFETY: this test owns the entire placeholder at this address.
+                assert_ne!(unsafe { VirtualFree(at, 0, MEM_RELEASE) }, 0);
+                at = at.wrapping_byte_add(bytes);
+            }
         }
         assert_eq!(XMemFreePhysicalPages(N, pages.as_ptr()), 1);
     }
