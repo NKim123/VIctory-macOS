@@ -13,16 +13,18 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::descriptor::View;
+use crate::descriptor::{View, host::Paged};
 use crate::host::HostList;
 use crate::object::This;
 use crate::shadow::Shadow;
 
 /// What a title heap slot views that title memory feeds.
-#[derive(Clone)]
 enum Seen {
     /// `len` bytes at `address` of a buffer's host copy; unordered access.
     Buffer(Arc<Shadow>, u64, u64, bool),
+    /// Zero-copy reads counted only by the diagnostics census.
+    #[cfg(feature = "diagnostics")]
+    DirectBuffer,
     /// A title texture (resource object) whose contents the title writes.
     Texture(usize),
     /// A view left without a host view (textures the title placed itself),
@@ -37,6 +39,8 @@ impl Seen {
             (Self::Buffer(a, start, len, uav), Self::Buffer(b, x, n, write)) => {
                 Arc::ptr_eq(a, b) && (start, len, uav) == (x, n, write)
             }
+            #[cfg(feature = "diagnostics")]
+            (Self::DirectBuffer, Self::DirectBuffer) => true,
             (Self::Texture(a), Self::Texture(b)) => a == b,
             (Self::Left(a), Self::Left(b)) => a == b,
             _ => false,
@@ -50,7 +54,6 @@ const KINDS: [&str; 4] = ["buffer", "unordered buffer", "placed texture", "other
 
 /// A heap's slots that view title memory, and the distinct buffer ranges
 /// and textures among them (with how many slots view each).
-#[derive(Default)]
 pub(crate) struct Viewed {
     inner: Mutex<Inner>,
     occupied: Box<[AtomicU64]>,
@@ -68,37 +71,57 @@ type Range = (usize, u64, u64, bool);
 /// the change tracker (`crate::watch::clean_bit`).
 type Hull = (Arc<Shadow>, u64, u64, bool, Option<u32>);
 
-#[derive(Default)]
 struct Inner {
-    slots: HashMap<u32, Seen>,
+    slots: Paged<Seen>,
     ranges: HashMap<Range, (u32, Arc<Shadow>)>,
     textures: BTreeMap<usize, u32>,
-    /// `ranges` merged per copy and kind ([`Viewed::ranges`]), kept current
-    /// as ranges come and go (each list running heap shaders asks for all
-    /// of them; rebuilt whole after every change, they cost 13-27 ms a frame,
-    /// run perf4).
-    hulls: HashMap<(usize, bool), Hull>,
-    /// Per copy and kind (unordered access): the copy, and how many ranges
-    /// start and end at each offset, so that the hulls are made from the
-    /// copies, not from every range (the title rewrites slots between most
-    /// lists, and remerging the world's 130,000 ranges each time cost 0.15
-    /// s per frame).
-    ends: HashMap<(usize, bool), Ends>,
+    /// A running hull of the refresh ranges per copy and access kind.
+    /// A heap-indexing list asks for these on every submission.
+    spans: HashMap<(usize, bool), Span>,
 }
 
-/// A copy, and the counts of its ranges' starts and ends.
-type Ends = (Arc<Shadow>, BTreeMap<u64, u32>, BTreeMap<u64, u32>);
+struct Span {
+    hull: Hull,
+    starts: BTreeMap<u64, u32>,
+    ends: BTreeMap<u64, u32>,
+}
 
-/// One more (`add`) or one fewer of `at` in `counts`.
+/// One more (`add`) or one fewer range touching this edge.
 fn tally(counts: &mut BTreeMap<u64, u32>, at: u64, add: bool) {
-    let n = counts.entry(at).or_insert(0);
-    *n = if add { *n + 1 } else { n.saturating_sub(1) };
-    if *n == 0 {
-        counts.remove(&at);
+    if add {
+        *counts.entry(at).or_default() += 1;
+    } else if let std::collections::btree_map::Entry::Occupied(mut count) = counts.entry(at) {
+        if *count.get() == 1 {
+            count.remove();
+        } else {
+            *count.get_mut() -= 1;
+        }
     }
 }
 
 impl Inner {
+    fn update(&mut self, index: u32, seen: Option<Seen>) -> Option<bool> {
+        let slot = self.slots.slot(index as usize, seen.is_some())?;
+        if match (slot.as_ref(), seen.as_ref()) {
+            (Some(a), Some(b)) => a.same(b),
+            (None, None) => true,
+            _ => false,
+        } {
+            return None;
+        }
+        let old = slot.take();
+        let was_occupied = old.is_some();
+        let occupied = seen.is_some();
+        if let Some(seen) = seen {
+            self.count(&seen, true);
+            *self.slots.slot(index as usize, true).unwrap() = Some(seen);
+        }
+        if let Some(old) = old {
+            self.count(&old, false);
+        }
+        (occupied != was_occupied).then_some(occupied)
+    }
+
     fn count(&mut self, seen: &Seen, add: bool) {
         let step = |n: &mut u32| {
             if add {
@@ -110,37 +133,56 @@ impl Inner {
         match seen {
             Seen::Buffer(shadow, address, len, uav) => {
                 let key = (Arc::as_ptr(shadow) as usize, *address, address + len, *uav);
-                let e = self
-                    .ranges
-                    .entry(key)
-                    .or_insert_with(|| (0, shadow.clone()));
-                let was = e.0;
-                step(&mut e.0);
-                let now = e.0;
-                if now == 0 {
-                    self.ranges.remove(&key);
+                use std::collections::hash_map::Entry;
+                let changed = match self.ranges.entry(key) {
+                    Entry::Vacant(entry) => {
+                        debug_assert!(add);
+                        entry.insert((1, shadow.clone()));
+                        true
+                    }
+                    Entry::Occupied(mut entry) => {
+                        let n = &mut entry.get_mut().0;
+                        step(n);
+                        if *n == 0 {
+                            entry.remove();
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                };
+                // Aliased UAVs only supply the barrier's write history.
+                // The widened SRV itself supplies any CPU refresh.
+                if !changed || (*uav && shadow.is_aliased()) {
+                    return;
                 }
-                // A range came or went: its copy's hull may change.
-                if (was == 0) != (now == 0) {
-                    let ends = self
-                        .ends
-                        .entry((key.0, key.3))
-                        .or_insert_with(|| (shadow.clone(), BTreeMap::new(), BTreeMap::new()));
-                    tally(&mut ends.1, key.1, now > 0);
-                    tally(&mut ends.2, key.2, now > 0);
-                    let hull = match (ends.1.keys().next(), ends.2.keys().next_back()) {
-                        (Some(&from), Some(&to)) => {
-                            Some((shadow.clone(), from, to - from, key.3, shadow.dirty_bit()))
-                        }
-                        _ => None,
-                    };
-                    match hull {
-                        Some(hull) => {
-                            self.hulls.insert((key.0, key.3), hull);
-                        }
-                        None => {
-                            self.ends.remove(&(key.0, key.3));
-                            self.hulls.remove(&(key.0, key.3));
+                let span = self.spans.entry((key.0, key.3));
+                match span {
+                    Entry::Vacant(entry) => {
+                        debug_assert!(add);
+                        entry.insert(Span {
+                            hull: (
+                                shadow.clone(),
+                                key.1,
+                                key.2 - key.1,
+                                *uav,
+                                shadow.dirty_bit(),
+                            ),
+                            starts: BTreeMap::from([(key.1, 1)]),
+                            ends: BTreeMap::from([(key.2, 1)]),
+                        });
+                    }
+                    Entry::Occupied(mut entry) => {
+                        let span = entry.get_mut();
+                        tally(&mut span.starts, key.1, add);
+                        tally(&mut span.ends, key.2, add);
+                        if let (Some((&from, _)), Some((&to, _))) =
+                            (span.starts.first_key_value(), span.ends.last_key_value())
+                        {
+                            span.hull.1 = from;
+                            span.hull.2 = to - from;
+                        } else {
+                            entry.remove();
                         }
                     }
                 }
@@ -152,6 +194,8 @@ impl Inner {
                     self.textures.remove(r);
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            Seen::DirectBuffer => {}
             Seen::Left(_) => {}
         }
     }
@@ -162,10 +206,22 @@ fn spans_quick() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("VICTORY_SPANS_QUICK").is_none_or(|v| v != "0"))
 }
 
+#[cfg(test)]
+impl Default for Viewed {
+    fn default() -> Self {
+        Self::new(128)
+    }
+}
+
 impl Viewed {
     pub(crate) fn new(slots: u32) -> Self {
         Self {
-            inner: Mutex::default(),
+            inner: Mutex::new(Inner {
+                slots: Paged::new(slots as usize),
+                ranges: HashMap::new(),
+                textures: BTreeMap::new(),
+                spans: HashMap::new(),
+            }),
             occupied: (0..slots.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
         }
     }
@@ -173,7 +229,7 @@ impl Viewed {
     /// Title slot `index` now holds `view` (none: no view), made on the
     /// host (`made`) or left without a host view.
     pub(crate) fn set(&self, index: u32, view: Option<&View>, made: bool) {
-        self.set_with_backing(index, view, made, None);
+        self.set_with_backing(index, view, made, None, false);
     }
 
     /// Record the same exact backing used to make the descriptor, if known.
@@ -182,11 +238,12 @@ impl Viewed {
         index: u32,
         view: Option<&View>,
         made: bool,
-        backing: Option<(Arc<Shadow>, u64, u64)>,
+        backing: Option<BufferView>,
+        widened: bool,
     ) {
         let seen = view.and_then(|v| {
             if made {
-                seen(v, backing)
+                seen(v, backing, widened)
             } else {
                 Some(Seen::Left(left_kind(v)))
             }
@@ -207,7 +264,7 @@ impl Viewed {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .slots
-            .get(&index)
+            .get(index as usize)
         {
             Some(Seen::Texture(resource)) => Some(*resource),
             _ => None,
@@ -230,9 +287,9 @@ impl Viewed {
         self.inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .hulls
+            .spans
             .values()
-            .cloned()
+            .map(|span| span.hull.clone())
             .collect()
     }
 }
@@ -243,52 +300,37 @@ impl Updates<'_> {
     }
 
     /// Install the range already resolved when a buffer descriptor was made.
-    pub(crate) fn buffer(&mut self, index: u32, backing: BufferView, uav: bool) {
-        self.set(index, seen_buffer(backing, uav));
+    pub(crate) fn buffer(&mut self, index: u32, backing: BufferView, uav: bool, widened: bool) {
+        self.set(index, seen_buffer(backing, uav, widened));
+    }
+
+    pub(crate) fn texture(&mut self, index: u32, resource: Option<usize>) {
+        self.set(index, resource.map(Seen::Texture));
     }
 
     fn set(&mut self, index: u32, seen: Option<Seen>) {
-        let word = self.viewed.occupied.get(index as usize / 64);
+        let Some(word) = self.viewed.occupied.get(index as usize / 64) else {
+            return;
+        };
         let bit = 1 << (index % 64);
         // HostHeap serializes changes to a title slot with its made lock.
-        // Outside the bitmap, always use the map.
         if seen.is_none()
             && spans_quick()
-            && word.is_some_and(|word| word.load(std::sync::atomic::Ordering::Acquire) & bit == 0)
+            && word.load(std::sync::atomic::Ordering::Acquire) & bit == 0
         {
             return;
         }
         let inner = self
             .inner
             .get_or_insert_with(|| self.viewed.inner.lock().unwrap_or_else(|e| e.into_inner()));
-        if let Some(seen) = seen {
-            use std::collections::hash_map::Entry;
-            let old = match inner.slots.entry(index) {
-                Entry::Occupied(mut slot) => {
-                    if slot.get().same(&seen) {
-                        return;
-                    }
-                    Some(slot.insert(seen.clone()))
-                }
-                Entry::Vacant(slot) => {
-                    slot.insert(seen.clone());
-                    None
-                }
-            };
-            if let Some(old) = old {
-                inner.count(&old, false);
-            }
-            inner.count(&seen, true);
-            if let Some(word) = word {
+        match inner.update(index, seen) {
+            Some(true) => {
                 word.fetch_or(bit, std::sync::atomic::Ordering::Release);
             }
-        } else {
-            if let Some(old) = inner.slots.remove(&index) {
-                inner.count(&old, false);
-            }
-            if let Some(word) = word {
+            Some(false) => {
                 word.fetch_and(!bit, std::sync::atomic::Ordering::Release);
             }
+            None => {}
         }
     }
 }
@@ -296,10 +338,10 @@ impl Updates<'_> {
 type BufferView = (Arc<Shadow>, u64, u64);
 
 /// What a made view reads that title memory feeds.
-fn seen(view: &View, backing: Option<BufferView>) -> Option<Seen> {
+fn seen(view: &View, backing: Option<BufferView>, widened: bool) -> Option<Seen> {
     let unordered = |v: &View| matches!(v, View::Unordered(..) | View::Placed(true, ..));
     if let Some(backing) = backing {
-        return seen_buffer(backing, unordered(view));
+        return seen_buffer(backing, unordered(view), widened);
     }
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
@@ -322,15 +364,23 @@ fn seen(view: &View, backing: Option<BufferView>) -> Option<Seen> {
         }
         _ => crate::descriptor::host::view_copy(view)?,
     };
-    seen_buffer(backing, unordered(view))
+    seen_buffer(backing, unordered(view), widened)
 }
 
-fn seen_buffer((shadow, address, len): BufferView, uav: bool) -> Option<Seen> {
+fn seen_buffer((shadow, address, len): BufferView, uav: bool, widened: bool) -> Option<Seen> {
     if len == 0 {
         return None;
     }
+    if shadow.is_aliased() && !widened && !(uav && crate::under_wine()) {
+        // Marks and their owners are held by the descriptor and its shadow.
+        // Plain alias reads need no deferred refresh or host copy-back.
+        #[cfg(feature = "diagnostics")]
+        return Some(Seen::DirectBuffer);
+        #[cfg(not(feature = "diagnostics"))]
+        return None;
+    }
     let len = len.min(shadow.left(address));
-    Some(Seen::Buffer(shadow, address, len, uav))
+    (len != 0).then_some(Seen::Buffer(shadow, address, len, uav))
 }
 
 fn left_kind(view: &View) -> (usize, u64, u64) {
@@ -554,7 +604,11 @@ impl Uploads {
 /// world submission's heaps reach ~9,000 copies, a few of them written.
 pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
     let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
-    for (shadow, address, len, uav, bit) in inner.hulls.values() {
+    for Span {
+        hull: (shadow, address, len, uav, bit),
+        ..
+    } in inner.spans.values()
+    {
         if !shadow.clean() && !crate::watch::clean_bit(*bit) {
             let (address, len) = if *uav && shadow.marked() {
                 shadow.page_range(*address, *len)
@@ -574,10 +628,13 @@ pub(crate) fn refresh_slot(
     mut add: impl FnMut(&Arc<Shadow>, usize, usize),
 ) {
     let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(Seen::Buffer(shadow, address, len, _)) = inner.slots.get(&index) else {
+    let Some(Seen::Buffer(shadow, address, len, uav)) = inner.slots.get(index as usize) else {
         return;
     };
-    if !shadow.clean() && !crate::watch::clean_bit(shadow.dirty_bit()) {
+    if !(*uav && shadow.is_aliased())
+        && !shadow.clean()
+        && !crate::watch::clean_bit(shadow.dirty_bit())
+    {
         add(shadow, *address as usize, *len as usize);
     }
 }
@@ -657,9 +714,18 @@ pub(crate) fn forget(resource: usize) {
     for viewed in heaps.iter().filter_map(std::sync::Weak::upgrade) {
         let mut inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.textures.remove(&resource).is_some() {
-            inner
+            let slots: Vec<_> = inner
                 .slots
-                .retain(|_, seen| !matches!(seen, Seen::Texture(r) if *r == resource));
+                .iter()
+                .filter_map(|(i, seen)| {
+                    matches!(seen, Seen::Texture(r) if *r == resource).then_some(i)
+                })
+                .collect();
+            for index in slots {
+                inner.slots.slot(index, false).unwrap().take();
+                viewed.occupied[index / 64]
+                    .fetch_and(!(1 << (index % 64)), std::sync::atomic::Ordering::Release);
+            }
         }
     }
 }
@@ -677,9 +743,9 @@ pub(crate) fn log(frames: f64) {
         let (mut buffers, mut textures) = (0u32, 0u32);
         // Placed textures left null: the largest at each address.
         let mut placed = HashMap::new();
-        for seen in inner.slots.values() {
+        for (_, seen) in inner.slots.iter() {
             match seen {
-                Seen::Buffer(..) => buffers += 1,
+                Seen::Buffer(..) | Seen::DirectBuffer => buffers += 1,
                 Seen::Texture(_) => textures += 1,
                 Seen::Left((k, address, bytes)) => {
                     left[*k] += 1;
@@ -856,16 +922,13 @@ void main(uint3 id : SV_DispatchThreadID) {
             crate::shadow::unregister(at as usize, at);
             return; // no host GPU here
         };
-        let viewed = Viewed::new(1);
-        let set = |slot: u32, range: Option<(u64, u64)>| {
-            let mut inner = viewed.inner.lock().unwrap();
-            if let Some(old) = inner.slots.remove(&slot) {
-                inner.count(&old, false);
-            }
+        let viewed = Viewed::new(3);
+        let set = |slot, range: Option<(u64, u64)>| {
+            let mut batch = viewed.updates();
             if let Some((from, len)) = range {
-                let seen = Seen::Buffer(copy.clone(), at + from, len, false);
-                inner.count(&seen, true);
-                inner.slots.insert(slot, seen);
+                batch.buffer(slot, (copy.clone(), at + from, len), false, false);
+            } else {
+                batch.clear(slot);
             }
         };
         let hull = || {
@@ -886,6 +949,80 @@ void main(uint3 id : SV_DispatchThreadID) {
         set(2, None);
         assert!(hull().is_empty());
         crate::shadow::unregister(at as usize, at);
+    }
+
+    #[test]
+    fn aliased_slots_keep_marks_and_barrier_ranges_without_a_refresh_hull() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let (buffer, data) = host.shared_buffer(PAGE_BYTES as u64).unwrap();
+        let start = data as u64;
+        // SAFETY: the live mapped buffer has room for this element.
+        let gpu = unsafe {
+            data.cast::<[u32; 3]>().write([1, 2, 3]);
+            buffer.GetGPUVirtualAddress()
+        };
+        let alias = Shadow::new_aliased(buffer, data, gpu, start, PAGE_BYTES as u64);
+        let memory = [0u8; 256];
+        let base = memory.as_ptr() as u64;
+        crate::shadow::register(base as usize, base, 256);
+        let copied = crate::shadow::find(base, 256).unwrap();
+
+        let viewed = Viewed::new(3);
+        viewed
+            .updates()
+            .buffer(0, (copied.clone(), base, 24), false, false);
+        assert_eq!(viewed.ranges()[0].1, base);
+        let mut read = Vec::new();
+        refresh_slot(&viewed, 0, |_, address, n| read.push((address, n)));
+        assert_eq!(read, [(base as usize, 24)]);
+
+        // Replacing a copied view with a direct SRV removes the old hull.
+        viewed
+            .updates()
+            .buffer(0, (alias.clone(), start, 24), false, false);
+        assert!(viewed.ranges().is_empty());
+        refresh_slot(&viewed, 0, |_, _, _| panic!("direct SRV requested refresh"));
+
+        let mark = alias.mark_entry(start);
+        viewed
+            .updates()
+            .buffer(1, (alias.clone(), start, 24), true, false);
+        assert!(viewed.ranges().is_empty());
+        assert_eq!(alias.mark_entry(start), mark);
+        let barrier = widened_writes(&viewed);
+        if crate::under_wine() {
+            assert_eq!(barrier.len(), 1);
+            assert!(Arc::ptr_eq(&barrier[0].0, &alias));
+            assert_eq!((barrier[0].1, barrier[0].2), (start as usize, 24));
+        }
+        viewed.set(1, None, false);
+        assert!(widened_writes(&viewed).is_empty());
+
+        // The widened descriptor supplies a refresh even though its
+        // source is an alias. Landing marks also update its widened bytes.
+        let widened = alias.widened(start, 12, 1).unwrap();
+        viewed
+            .updates()
+            .buffer(2, (alias.clone(), start, 12), false, true);
+        assert_eq!(viewed.ranges()[0].1, start);
+        // SAFETY: the same live, idle mapped element.
+        unsafe { data.cast::<[u32; 3]>().write([4, 5, 6]) };
+        refresh(&viewed, |shadow, address, n| {
+            assert_eq!(shadow.update(address, n), 0)
+        });
+        assert_eq!(widened.read_host(4), [4, 5, 6, 1]);
+        // SAFETY: the mapped bytes stand in for a completed UAV write.
+        unsafe { data.cast::<[u32; 3]>().write([7, 8, 9]) };
+        let page = start as usize & !(PAGE_BYTES - 1);
+        assert_eq!(alias.copy_back_marked(&[page, page + PAGE_BYTES], None), 0);
+        assert_eq!(widened.read_host(4), [7, 8, 9, 1]);
+
+        viewed.set(2, None, false);
+        assert!(viewed.ranges().is_empty());
+        crate::shadow::unregister(base as usize, base);
+        std::hint::black_box(memory);
     }
 
     /// The title writes a buffer and a texture, and views of them and of an
@@ -1023,8 +1160,8 @@ fn spans_quick_tracks_insertion_and_removal() {
     }
     viewed.set(65, Some(&View::Constant(0, 0)), false);
     assert_ne!(viewed.occupied[1].load(Relaxed) & 2, 0);
-    assert!(viewed.inner.lock().unwrap().slots.contains_key(&65));
+    assert!(viewed.inner.lock().unwrap().slots.get(65).is_some());
     viewed.set(65, None, false);
     assert_eq!(viewed.occupied[1].load(Relaxed) & 2, 0);
-    assert!(!viewed.inner.lock().unwrap().slots.contains_key(&65));
+    assert!(viewed.inner.lock().unwrap().slots.get(65).is_none());
 }
