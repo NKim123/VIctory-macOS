@@ -678,6 +678,10 @@ impl Shadow {
         self.tiled.is_some()
     }
 
+    pub(crate) fn tiled_ranges(&self) -> Option<Vec<(u64, u64)>> {
+        self.tiled.as_ref().map(|tiled| tiled.ranges())
+    }
+
     /// The view-mark entry (`victory_shader::emit`, "Write marks") of a
     /// view of this copy whose first byte is at title address `start`: the
     /// bit of that byte's page and its offset in the page. None where

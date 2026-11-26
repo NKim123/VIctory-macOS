@@ -315,6 +315,19 @@ impl TiledBuffer {
                 == Some((from, to))
     }
 
+    /// Title VA ranges the computed-address page table can still bind.
+    pub(crate) fn ranges(&self) -> Vec<(u64, u64)> {
+        if !self.partial_release.load(Ordering::Acquire) {
+            return vec![(self.base as u64, self.len as u64)];
+        }
+        self.released
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .missing(self.base, self.base + self.len)
+            .map(|(from, to)| (from as u64, (to - from) as u64))
+            .collect()
+    }
+
     pub(crate) fn bind(&self) {
         self.bound.store(true, Ordering::Relaxed);
     }
