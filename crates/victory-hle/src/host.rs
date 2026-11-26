@@ -74,7 +74,12 @@ impl HostPolicy {
         if !self.allows(dll) {
             return None;
         }
-        imp::resolve(dll, symbol)
+        let address = imp::resolve(dll, symbol)?;
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        if let ImportSymbol::Name { name, .. } = symbol {
+            return Some(victory_gpu::port_descriptors::import(name, address));
+        }
+        Some(address)
     }
 }
 

@@ -58,6 +58,9 @@ pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
 mod placement;
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[doc(hidden)]
+pub mod port_descriptors;
 #[cfg(windows)]
 mod primitive;
 pub mod query;

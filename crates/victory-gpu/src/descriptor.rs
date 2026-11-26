@@ -211,6 +211,8 @@ fn mirror(handle: u64) {
     let Some(index) = heap.index(handle) else {
         return;
     };
+    #[cfg(target_arch = "x86_64")]
+    crate::port_descriptors::mark(handle);
     let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
     match heap.host.get() {
         None => pending.push(index),
@@ -244,15 +246,36 @@ pub(crate) fn sync_heaps() {
                 let heap = unsafe { &*(at as *const Heap) };
                 // As before: ranges are taken only once the heap has its
                 // host heap, so writes before that are not lost.
-                let (Some(Some(host)), Some(written), Some(step)) =
-                    (heap.host.get(), &heap.written, increment(heap.desc.kind))
+                let (Some(Some(host)), Some(step)) = (heap.host.get(), increment(heap.desc.kind))
                 else {
                     return None;
                 };
                 // The remaining title slots have no direct host index.
                 // Draw recording supplies those entries in dynamic tables.
                 let end = start + u64::from(host.count()) * u64::from(step);
-                Some((start, at, written.take(start as usize, end as usize)))
+                #[cfg(target_arch = "x86_64")]
+                if let Some((marks, audit)) = crate::port_descriptors::take(at) {
+                    let mut ranges = Vec::new();
+                    if audit {
+                        ranges = heap.written.as_ref().map_or_else(
+                            || vec![(start as usize, end as usize)],
+                            |written| written.take(start as usize, end as usize),
+                        );
+                    }
+                    let count = host.count() as usize;
+                    ranges.extend(marks.into_iter().filter(|&(first, _)| first < count).map(
+                        |(first, last)| {
+                            let addr = |index| start as usize + index * step as usize;
+                            (addr(first), addr(last.min(count)))
+                        },
+                    ));
+                    return Some((start, at, ranges));
+                }
+                Some((
+                    start,
+                    at,
+                    heap.written.as_ref()?.take(start as usize, end as usize),
+                ))
             })
             .collect()
     };
@@ -574,6 +597,8 @@ impl Drop for Heap {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         unregister_heap(&mut heaps, at);
+        #[cfg(target_arch = "x86_64")]
+        crate::port_descriptors::retire(at);
         // Nothing can find the heap by now. The table's lock is taken
         // inside the heaps' lock (`memory::bind`), never the other way
         // round, so it is taken here after the heaps' lock is let go.
@@ -1210,6 +1235,17 @@ pub(crate) extern "system" fn create_heap(
     #[cfg(windows)]
     if visible && result == crate::object::S_OK {
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
+        #[cfg(target_arch = "x86_64")]
+        {
+            for &(old_start, old_end, old) in heaps.iter() {
+                if start < old_end && old_start < start + size {
+                    crate::port_descriptors::retire(old);
+                }
+            }
+            if placed && desc.kind == VIEWS_KIND {
+                crate::port_descriptors::adopt(at, start, desc.count);
+            }
+        }
         register_heap(&mut heaps, (start, start + size), at);
     }
     result

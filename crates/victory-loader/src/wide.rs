@@ -148,6 +148,18 @@ fn split(c: &mut Vec<u8>, s: &Wide, rip: u64, base_at: u64) -> Option<()> {
     Some(())
 }
 
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) fn split_store(store: &[u8], original: u64, stub: u64) -> Option<Vec<u8>> {
+    let mut code = Vec::new();
+    split(
+        &mut code,
+        &decode(store)?,
+        original + store.len() as u64,
+        stub,
+    )?;
+    Some(code)
+}
+
 #[derive(Debug, Clone)]
 enum Piece {
     Store(usize),
@@ -281,6 +293,15 @@ fn trampoline(
 
 #[cfg(windows)]
 pub fn patch(base: u64, list: &std::path::Path) -> (usize, usize) {
+    patch_except(base, list, &[])
+}
+
+#[cfg(windows)]
+pub fn patch_except(
+    base: u64,
+    list: &std::path::Path,
+    excluded: &[std::ops::Range<u64>],
+) -> (usize, usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_READWRITE,
@@ -321,6 +342,13 @@ pub fn patch(base: u64, list: &std::path::Path) -> (usize, usize) {
     let mut opened: std::collections::BTreeMap<u64, u32> = std::collections::BTreeMap::new();
     for (rva, total, pieces, route) in &sites {
         let site = base + u64::from(*rva);
+        if excluded
+            .iter()
+            .any(|range| site < range.end && range.start < site + *total as u64)
+        {
+            // The descriptor trampoline already split this store.
+            continue;
+        }
         // SAFETY: the site lies in the mapped image (its list was made from it).
         let code = unsafe { std::slice::from_raw_parts(site as *const u8, *total) };
         let at = pool as u64 + used as u64;
