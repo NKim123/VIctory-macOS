@@ -722,6 +722,65 @@ fn whole_group_reads_first_active_lane_under_divergent_masks() {
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
+/// The group exchanges LDS values before a mask selects the first active
+/// lane. With only the upper half active in the branch, the lower half
+/// must still take the branch and receive the value read by that lane.
+#[test]
+fn whole_group_reads_first_lane_after_lds() {
+    use super::{Options, container, emit_with};
+
+    let mut words = PROLOGUE.to_vec();
+    words.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0xD765_0001,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0xD766_0001,
+        0x0002_02C1, // v_mbcnt_hi_u32_b32 v1, -1, v1
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+        0xD834_0000,
+        0x0000_0104, // ds_write_b32 v4, v1
+        S_WAITCNT_LGKM,
+        0x3A08_00A0, // v_xor_b32 v4, 32, v0
+        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+        0xD8D8_0000,
+        0x0300_0004, // ds_read_b32 v3, v4
+        S_WAITCNT_LGKM,
+    ]);
+    words.extend(conditional_scalar(&[0x7E1E_0503], 1 << 45, false));
+    words.push(0x7E02_020F); // v_mov_b32 v1, s15
+    words.extend(store(1, 0));
+    words.push(S_ENDPGM);
+
+    let native = native(&words, true, 64, 256);
+    let bytes = container::build(&[]);
+    let container = crate::Container::parse(&bytes).unwrap();
+    let program = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let structured = structure::structure(&program).unwrap();
+    let resources =
+        resource::track(&program, &native.layout, native.stage, Some(&structured)).unwrap();
+    let io = io::raise(&program, &native).unwrap();
+    let translate = |narrow_waves| {
+        emit_with(
+            &container,
+            &native,
+            &program,
+            &structured,
+            &io,
+            &resources,
+            Options {
+                host_wave32: true,
+                narrow_waves,
+                ..Options::default()
+            },
+        )
+    };
+    let error = translate(false).expect_err("unsynchronized LDS is refused");
+    assert!(error.to_string().contains(lower::LDS_ACROSS));
+    let host = translate(true).expect("the group can synchronize its LDS and vote across halves");
+    let failed = check_differences(&[("LDS and group vote", host)], 64, 1, &[13; 64]);
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
 /// What the console gives [`reduction`] of `f` (folding the inputs of a
 /// console wave's lanes) in lane `l` of a group of `threads`.
 fn console_reduction(

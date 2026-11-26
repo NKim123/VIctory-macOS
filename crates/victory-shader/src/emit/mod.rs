@@ -830,10 +830,12 @@ pub fn emit_with(
         }
         // A full console wave can vote on its mask branches as a group,
         // with a host thread for each bit of EXEC and VCC. Both halves then
-        // reach the exchange for the reduction or first active lane.
+        // reach the exchange for the reduction or first active lane. With
+        // narrow waves, lowering must also be able to synchronize guest LDS.
         if matches!(*what, lower::REDUCTION_ACROSS | lower::FIRST_ACROSS)
             && matches!(native.io, crate::native::StageIo::Cs(cs)
-                if cs.lds_bytes() == 0 && cs.threads.iter().product::<u32>() == 64)
+                if cs.threads.iter().product::<u32>() == 64
+                    && (cs.lds_bytes() == 0 || options.narrow_waves))
             && let Ok(st) = structure::with_group_branches(p)
             && !st.group_branches.is_empty()
             && let Ok(res) = resource::track(p, &native.layout, native.stage, Some(&st))
