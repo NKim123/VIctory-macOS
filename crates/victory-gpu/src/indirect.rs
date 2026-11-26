@@ -25,11 +25,179 @@ use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::host::{HostList, host, transition, uav_barrier};
 
 const SOURCE: &str = include_str!("indirect-clamp.hlsl");
+
+/// Mode 1 batches until a possible buffer write. Mode 2 also batches
+/// independent dispatches until the title synchronizes them or draws.
+pub(crate) fn batch_mode() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("VICTORY_INDIRECT_BATCH").as_deref() {
+            Ok("1") => 1,
+            Ok("2") => 2,
+            _ => 0,
+        },
+    )
+}
+
+pub(crate) fn windows() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| crate::switch::on("VICTORY_INDIRECT_WINDOW"))
+}
+
+pub(crate) fn batching() -> bool {
+    batch_mode() != 0 || windows()
+}
+
+const JOBS: u32 = 64;
+const JOB_BYTES: u64 = 16;
+const SLOT_BYTES: u64 = 32;
+
+static BATCH_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// A clamp shared by executions reading one host backing buffer. Its
+/// mapped job table is finalized by recording, before the list can run.
+/// Based on avatarmanz/VIctory-7900XTX (GPL-3.0).
+pub(crate) struct Batch {
+    source: u64,
+    jobs: usize,
+    records: u32,
+    output: ID3D12Resource,
+}
+
+impl Batch {
+    pub(crate) fn open(list: &HostList, source: u64) -> Option<Self> {
+        static CLAMP: OnceLock<Option<Clamp>> = OnceLock::new();
+        let clamp = CLAMP
+            .get_or_init(|| {
+                use crate::compute::Param;
+                let params = [
+                    Param::Constants {
+                        register: 0,
+                        count: 1,
+                    },
+                    Param::Srv {
+                        register: 0,
+                        space: 0,
+                    },
+                    Param::Srv {
+                        register: 1,
+                        space: 0,
+                    },
+                    Param::Uav { register: 0 },
+                    Param::Uav { register: 1 },
+                    Param::Uav { register: 2 },
+                ];
+                let source = include_str!("compute/indirect_batch.hlsl");
+                match crate::compute::pipeline(source, s!("batch clamp"), 0, &params) {
+                    Ok((root, pso)) => {
+                        tracing::info!("batched argument clamp available");
+                        Some(Clamp {
+                            root,
+                            pso,
+                            words: true,
+                        })
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "batched argument clamp unavailable");
+                        None
+                    }
+                }
+            })
+            .as_ref()?;
+        let budget = list.budget()?;
+        let (table, jobs) = list.scratch((u64::from(JOBS) + 1) * JOB_BYTES)?;
+        let output = list.arguments(u64::from(JOBS) * SLOT_BYTES)?;
+        let before = list.indirect_batch_output(&output);
+        let l = &list.list;
+        // SAFETY: the list owns the table, budget and output. The caller
+        // keeps the source alive. The table's count starts at zero.
+        unsafe {
+            jobs.cast::<u32>().write_volatile(0);
+            l.ResourceBarrier(&[
+                uav_barrier(),
+                transition(&output, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            ]);
+            l.SetComputeRootSignature(&clamp.root);
+            l.SetPipelineState(&clamp.pso);
+            l.SetComputeRoot32BitConstant(0, widest(), 0);
+            l.SetComputeRootShaderResourceView(1, source);
+            l.SetComputeRootShaderResourceView(2, table);
+            l.SetComputeRootUnorderedAccessView(3, output.GetGPUVirtualAddress());
+            l.SetComputeRootUnorderedAccessView(4, budget);
+            l.SetComputeRootUnorderedAccessView(5, budget);
+            l.Dispatch(1, 1, 1);
+            l.ResourceBarrier(&[transition(
+                &output,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            )]);
+        }
+        BATCH_STATS[0].fetch_add(1, Ordering::Relaxed);
+        Some(Self {
+            source,
+            jobs: jobs as usize,
+            records: 0,
+            output,
+        })
+    }
+
+    pub(crate) fn accepts(kind: u32, stride: u32, offset: u64) -> bool {
+        let bytes = match kind {
+            0 => 16,
+            1 => 20,
+            2 | 10 => 12,
+            _ => return false,
+        };
+        (bytes..=SLOT_BYTES as u32).contains(&stride)
+            && stride.is_multiple_of(4)
+            && offset.is_multiple_of(4)
+            && offset <= u64::from(u32::MAX - bytes)
+    }
+
+    /// Appends one validated job, including repeats so budget accounting
+    /// is the same as one clamp per execution.
+    pub(crate) fn place(
+        &mut self,
+        source: u64,
+        offset: u64,
+        kind: u32,
+    ) -> Option<(ID3D12Resource, u64)> {
+        if self.source != source || self.records == JOBS {
+            return None;
+        }
+        let index = self.records;
+        self.records += 1;
+        let table = self.jobs as *mut u32;
+        // SAFETY: live list upload memory; the index is within the table.
+        // Store the record before expanding the count the GPU reads.
+        unsafe {
+            let job = table.add(self.records as usize * (JOB_BYTES as usize / 4));
+            job.write_volatile((offset / 4) as u32);
+            job.add(1).write_volatile(kind);
+            table.write_volatile(self.records);
+        }
+        BATCH_STATS[1].fetch_add(1, Ordering::Relaxed);
+        RECORDS[0].fetch_add(1, Ordering::Relaxed);
+        Some((self.output.clone(), u64::from(index) * SLOT_BYTES))
+    }
+}
+
+pub(crate) fn report_batches(frames: f64) {
+    let [passes, records] = BATCH_STATS.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
+    if passes > 0 {
+        tracing::info!(
+            "indirect batch per frame: {:.0} records in {:.0} passes",
+            records as f64 / frames,
+            passes as f64 / frames
+        );
+    }
+}
 
 /// The most groups in x the clamp lets a dispatch run (2^20 groups in all
 /// still bound it). The title's tile passes are dispatches of one group per
@@ -344,6 +512,75 @@ pub(crate) fn done(list: &HostList, arguments: &ID3D12Resource) {
 
 #[cfg(test)]
 mod tests {
+    use windows::Win32::Graphics::Direct3D12::*;
+
+    #[test]
+    fn batched_clamp_preserves_record_order_and_budget_across_passes() {
+        let Some(host) = super::host() else { return };
+        let (source, data) = host.shared_buffer(256).unwrap();
+        let list = host.new_list().unwrap();
+        let (readback, read) = list.readback(host, 256).unwrap();
+        let jobs: [(u32, &[u32], &[u32]); 8] = [
+            (0, &[12, 3, 5, 7], &[12, 3, 5, 7]),
+            (1, &[15, 2, 4, u32::MAX, 8], &[15, 2, 4, u32::MAX, 8]),
+            (10, &[17, 3, 2], &[17, 1, 1]),
+            (2, &[70_000, 1, 1], &[65_535, 1, 1]),
+            (2, &[u32::MAX, 64, 32], &[0, 0, 0]),
+            (0, &[1 << 24, u32::MAX, 3, 4], &[1 << 24, 4, 3, 4]),
+            (0, &[1 << 24, u32::MAX, 3, 4], &[0, 4, 3, 4]),
+            (10, &[17, 3, 2], &[0, 1, 1]),
+        ];
+        // SAFETY: our mapped source is initialized before submission. Both
+        // copies read live output slots in COPY_SOURCE. Readback is used
+        // only once the GPU finishes.
+        unsafe {
+            let gpu = source.GetGPUVirtualAddress();
+            for (i, (_, words, _)) in jobs.iter().enumerate() {
+                std::ptr::copy_nonoverlapping(words.as_ptr(), data.add(i * 32).cast(), words.len());
+            }
+            let mut first = super::Batch::open(&list, gpu).expect("compile the batched clamp");
+            let mut out = None;
+            for (i, (kind, _, _)) in jobs[..4].iter().enumerate() {
+                let (buffer, at) = first.place(gpu, i as u64 * 32, *kind).unwrap();
+                assert_eq!(at, i as u64 * 32);
+                out = Some(buffer);
+            }
+            let out = out.unwrap();
+            let indirect = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+            let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            let l = &list.list;
+            l.ResourceBarrier(&[super::transition(&out, indirect, copy)]);
+            l.CopyBufferRegion(&readback, 0, &out, 0, 128);
+            l.ResourceBarrier(&[super::transition(&out, copy, indirect)]);
+            let mut second = super::Batch::open(&list, gpu).unwrap();
+            for (i, (kind, _, _)) in jobs[4..].iter().enumerate() {
+                let source_index = if i == 2 { 5 } else { i as u64 + 4 };
+                let (buffer, at) = second.place(gpu, source_index * 32, *kind).unwrap();
+                assert!(buffer == out);
+                assert_eq!(at, i as u64 * 32);
+            }
+            l.ResourceBarrier(&[super::transition(&out, indirect, copy)]);
+            l.CopyBufferRegion(&readback, 128, &out, 0, 128);
+            l.ResourceBarrier(&[super::transition(&out, copy, indirect)]);
+            list.close();
+            host.execute(&[&list]);
+            for (i, (_, _, expected)) in jobs.iter().enumerate() {
+                let actual =
+                    std::slice::from_raw_parts(read.add(i * 32).cast::<u32>(), expected.len());
+                if i == 3 {
+                    let x = jobs[i].1[0];
+                    assert_eq!(
+                        actual[0],
+                        if x <= super::widest() { x } else { expected[0] }
+                    );
+                    assert_eq!(&actual[1..], &expected[1..]);
+                } else {
+                    assert_eq!(actual, *expected, "job {i}");
+                }
+            }
+        }
+    }
+
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
@@ -606,10 +843,16 @@ mod tests {
         assert!(spent.iter().all(|&count| count == 0));
     }
 
+    #[derive(Clone, Copy)]
+    enum ArgumentSource {
+        Original,
+        Clamped,
+        Batched,
+    }
+
     /// The groups of one indirect dispatch of `groups` x 1 x 1 that run on
-    /// the host, through the clamp when `clamped`, else straight from the
-    /// record. Each group marks its own word. `None` without a host GPU.
-    fn groups_that_run(groups: u32, clamped: bool) -> Option<usize> {
+    /// the host. Each group marks its own word. `None` without a host GPU.
+    fn groups_that_run(groups: u32, source: ArgumentSource) -> Option<usize> {
         use super::*;
         use crate::compute::Param;
         const MARK: &str = r#"
@@ -645,29 +888,30 @@ void main(uint3 g : SV_GroupID) {
             let signature = signature.unwrap();
             words.cast::<[u32; 3]>().write_volatile([groups, 1, 1]);
             std::ptr::write_bytes(seen, 0, groups as usize * 4);
-            let arguments = if clamped {
-                bound(&list, record.GetGPUVirtualAddress(), (2, 12, 1), None).unwrap()
-            } else {
-                list.list.ResourceBarrier(&[transition(
-                    &record,
-                    D3D12_RESOURCE_STATE_COMMON,
-                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-                )]);
-                record.clone()
+            let gpu = record.GetGPUVirtualAddress();
+            let (arguments, offset) = match source {
+                ArgumentSource::Batched => {
+                    let mut batch = Batch::open(&list, gpu).expect("compile the batched clamp");
+                    batch.place(gpu, 0, 2).unwrap();
+                    batch.place(gpu, 0, 2).unwrap()
+                }
+                ArgumentSource::Clamped => (bound(&list, gpu, (2, 12, 1), None).unwrap(), 0),
+                ArgumentSource::Original => {
+                    list.list.ResourceBarrier(&[transition(
+                        &record,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    )]);
+                    (record.clone(), 0)
+                }
             };
             let l = &list.list;
             l.SetComputeRootSignature(&root);
             l.SetPipelineState(&pso);
             l.SetComputeRootUnorderedAccessView(0, marks.GetGPUVirtualAddress());
-            l.ExecuteIndirect(&signature, 1, &arguments, 0, None, 0);
-            if clamped {
+            l.ExecuteIndirect(&signature, 1, &arguments, offset, None, 0);
+            if !matches!(source, ArgumentSource::Batched) {
                 done(&list, &arguments);
-            } else {
-                l.ResourceBarrier(&[transition(
-                    &record,
-                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-                    D3D12_RESOURCE_STATE_COMMON,
-                )]);
             }
             list.close();
             host.execute(&[&list]);
@@ -686,21 +930,28 @@ void main(uint3 g : SV_GroupID) {
     /// clamp lets through, so a host that stops running them fails here.
     #[test]
     fn a_wide_tile_pass_runs_every_group_the_host_runs() {
-        let Some(ran) = groups_that_run(67_440, true) else {
+        let Some(ran) = groups_that_run(67_440, ArgumentSource::Clamped) else {
             return; // no host GPU here
         };
         let widest = super::widest();
         assert_eq!(ran, 67_440.min(widest) as usize);
         assert_eq!(
-            groups_that_run(widest, false).unwrap(),
+            groups_that_run(widest, ArgumentSource::Original).unwrap(),
             widest as usize,
             "the host runs the widest dispatch"
         );
         assert_eq!(
-            groups_that_run(widest, true).unwrap(),
+            groups_that_run(widest, ArgumentSource::Clamped).unwrap(),
             widest as usize,
             "the clamp lets it through"
         );
+    }
+
+    #[test]
+    fn batched_clamp_runs_an_indirect_dispatch_at_the_second_slot() {
+        if let Some(ran) = groups_that_run(71, ArgumentSource::Batched) {
+            assert_eq!(ran, 71);
+        }
     }
 
     /// Dispatches wider than [`super::widest`] are cut to 65,535 groups in x

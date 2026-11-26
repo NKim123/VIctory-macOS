@@ -8,7 +8,7 @@ mod inflight;
 mod rec;
 mod submission_profile;
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use inflight::{Boundary, Submission};
@@ -1452,6 +1452,10 @@ pub(crate) struct HostList {
     /// Clamped indirect arguments (`crate::indirect`), reused by each
     /// execution in turn; replaced by a bigger one when too small.
     arguments: Mutex<Option<ID3D12Resource>>,
+    /// Scratch last left ready for indirect execution by a batched clamp.
+    indirect_readable: Mutex<Option<ID3D12Resource>>,
+    /// Title ordering boundaries that may make GPU-written arguments visible.
+    indirect_epoch: AtomicU64,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -1946,6 +1950,8 @@ impl Host {
                 id,
                 budget: OnceLock::new(),
                 arguments: Mutex::new(None),
+                indirect_readable: Mutex::new(None),
+                indirect_epoch: AtomicU64::new(0),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -3482,6 +3488,7 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        self.finish_indirect();
         let textures = std::mem::take(&mut self.deferred().texture_writes);
         let backs = textures.record(self);
         if !backs.is_empty() {
@@ -3509,6 +3516,7 @@ impl HostList {
 
     /// Only after the list's last submission finished.
     pub(crate) fn reset(&self) {
+        self.indirect_boundary();
         if submission_profile::enabled() {
             *self
                 .profile_commands
@@ -4034,6 +4042,7 @@ impl HostList {
     }
 
     fn defer_title_copy(&self, step: Step) {
+        self.indirect_boundary();
         let mut deferred = self.deferred();
         deferred.copies.push(step);
         deferred.title_written();
@@ -4507,6 +4516,46 @@ impl HostList {
             self.keep(&old);
         }
         Some(made)
+    }
+
+    pub(crate) fn indirect_boundary(&self) {
+        if crate::indirect::batching() {
+            self.indirect_epoch.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn indirect_epoch(&self) -> u64 {
+        self.indirect_epoch.load(Ordering::Relaxed)
+    }
+
+    /// Reuse the argument buffer's state across batches. On growth, put
+    /// the old buffer back in COMMON before letting later commands use it.
+    pub(crate) fn indirect_batch_output(&self, out: &ID3D12Resource) -> D3D12_RESOURCE_STATES {
+        let previous = self
+            .indirect_readable
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(out.clone());
+        match previous {
+            Some(old) if old == *out => D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            old => {
+                if let Some(old) = old {
+                    crate::indirect::done(self, &old);
+                }
+                D3D12_RESOURCE_STATE_COMMON
+            }
+        }
+    }
+
+    pub(crate) fn finish_indirect(&self) {
+        if let Some(out) = self
+            .indirect_readable
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            crate::indirect::done(self, &out);
+        }
     }
 
     /// The producer already prepared these exact resources in this list.
@@ -5624,6 +5673,7 @@ impl Meter {
             submission_profile::log(report_frames);
             inflight::log(report_frames);
             rec::report(report_frames);
+            crate::indirect::report_batches(report_frames);
             if pipeline_submissions() {
                 let waits = PIPELINE_WAITS_SAVED.swap(0, Ordering::Relaxed);
                 tracing::info!(

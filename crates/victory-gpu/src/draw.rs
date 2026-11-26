@@ -104,6 +104,18 @@ pub(crate) struct State {
     /// What was set straight onto the host list, for the next segment of
     /// the list ([`State::cut`]).
     fixed: Fixed,
+    /// Jobs already scheduled by the open indirect clamp pass.
+    indirect: Option<IndirectBatch>,
+}
+
+struct IndirectBatch {
+    jobs: crate::indirect::Batch,
+    epoch: u64,
+    compute: bool,
+    // For window mode, the last record and the distance between records.
+    last: u64,
+    step: Option<u64>,
+    signature: (u32, u32),
 }
 
 type TableRecords = (u64, Vec<[u32; 3]>);
@@ -395,6 +407,7 @@ impl State {
         // No title heaps (0) differ from what the host list has, too.
         (self.host_pipeline, self.host_roots, self.host_heaps) = (0, [0; 2], [usize::MAX; 2]);
         self.host_targets = None;
+        self.indirect = None;
     }
 
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
@@ -1234,6 +1247,7 @@ impl State {
         float: bool,
         rects: &[RECT],
     ) {
+        self.indirect = None;
         let Some(view) = crate::descriptor::view(cpu) else {
             once!("an unordered access clear of a slot without a view");
             return;
@@ -1291,6 +1305,13 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        if self
+            .indirect
+            .as_ref()
+            .is_some_and(|b| !b.compute || crate::indirect::batch_mode() != 2)
+        {
+            self.indirect = None;
+        }
         let builder = crate::pipeline::is_builder(self.pipeline as This);
         if builder && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1478,6 +1499,7 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+        self.indirect = None;
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let texture_writes = list.capture_texture_writes();
@@ -1930,6 +1952,7 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        self.indirect = None;
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         // Rectangles: completed by the pipeline's geometry shader, else
@@ -2042,6 +2065,7 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
+        self.indirect = None;
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         let rects = self.topology == RECTANGLES && !self.completes_rectangles();
@@ -2077,6 +2101,47 @@ impl State {
 }
 
 impl State {
+    fn batched_indirect(
+        &mut self,
+        list: &HostList,
+        (kind, stride): (u32, u32),
+        (source, offset): (u64, u64),
+        window: bool,
+    ) -> Option<(ID3D12Resource, u64)> {
+        let epoch = list.indirect_epoch();
+        let compute = kind == 2;
+        if let Some(batch) = &mut self.indirect
+            && batch.epoch == epoch
+            && batch.compute == compute
+        {
+            let step = offset.saturating_sub(batch.last);
+            let fits_window = batch.signature == (kind, stride)
+                && (u64::from(stride)..=256).contains(&step)
+                && batch.step.is_none_or(|previous| step == previous);
+            if (!window || fits_window)
+                && let Some(record) = batch.jobs.place(source, offset, kind)
+            {
+                batch.last = offset;
+                batch.step = Some(step);
+                return Some(record);
+            }
+        }
+        self.indirect = None;
+        let mut jobs = crate::indirect::Batch::open(list, source)?;
+        self.host_pipeline = 0;
+        self.host_roots[1] = 0;
+        let record = jobs.place(source, offset, kind)?;
+        self.indirect = Some(IndirectBatch {
+            jobs,
+            epoch,
+            compute,
+            last: offset,
+            step: None,
+            signature: (kind, stride),
+        });
+        Some(record)
+    }
+
     /// Indirect execution of a one-argument signature of `kind` (PC
     /// numbering: 0 draw, 1 indexed draw, 2 dispatch, 10 mesh dispatch) with
     /// records `stride` bytes apart at title address `arguments`, and the
@@ -2137,12 +2202,12 @@ impl State {
         // the arguments and dispatch a compute shader for records nothing
         // reads. Same order as the `is_skipped` check above, for the same
         // reason.
-        if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             why("no host pipeline");
             return false;
-        }
+        };
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
             why("arguments outside title buffers");
@@ -2172,12 +2237,53 @@ impl State {
         // Bounded first: the clamp binds a compute pipeline of its own. It
         // reads the count, so that it stops where the execution does.
         let counted = counter.as_ref().map(|(s, at)| s.gpu(*at));
-        let Some(clamped) = crate::indirect::bound(list, args.gpu(arguments), (kind, stride, max), counted) else {
-            why("not bounded (no clamp, or arguments not 4-byte aligned)");
-            return false;
+        let mode = crate::indirect::batch_mode();
+        let window = mode == 0 && crate::indirect::windows();
+        let may_write = (mode != 0 || window)
+            && p.stages.iter().any(|stage| {
+                let t = stage.translated();
+                t.host.memory_writes
+                    || t.host.heap_writes
+                    || !t.host.root_uavs.is_empty()
+                    || t.used.iter().any(|u| u.kind == ResourceType::Uav)
+            });
+        let offset = args.offset(arguments);
+        // Aliased arguments must be clamped immediately, after all their
+        // producers (see the reference fork's PORT_CONSTANTS_ORDER fix).
+        let batched = if max == 1
+            && count.is_none()
+            && (mode != 0 || (window && kind != DISPATCH && !may_write))
+            && !args.is_aliased()
+            && !args.is_tiled()
+            && crate::indirect::Batch::accepts(kind, stride, offset)
+        {
+            self.batched_indirect(
+                list,
+                (kind, stride),
+                (args.gpu(arguments) - offset, offset),
+                window,
+            )
+        } else {
+            None
         };
-        self.host_pipeline = 0;
-        self.host_roots[1] = 0;
+        let batch = batched.is_some();
+        let (clamped, at) = if let Some(record) = batched {
+            record
+        } else {
+            self.indirect = None;
+            if mode != 0 || window {
+                list.finish_indirect();
+            }
+            let Some(clamped) =
+                crate::indirect::bound(list, args.gpu(arguments), (kind, stride, max), counted)
+            else {
+                why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                return false;
+            };
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+            (clamped, 0)
+        };
         // The GPU controls the effective count and dimensions. Even a
         // nonzero max cannot prove any shader writes this texture.
         let ran = match kind {
@@ -2188,14 +2294,13 @@ impl State {
                 }) && self.prepare(list, kind == INDEXED, false)
             }
             MESH => self.prepare(list, false, true),
-            DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if p.compute => self.bind(list, p, true),
-                _ => false,
-            },
+            DISPATCH => p.compute && self.bind(list, p, true),
             _ => unreachable!("the signature check above admits only these kinds"),
         };
         if !ran {
-            crate::indirect::done(list, &clamped);
+            if !batch {
+                crate::indirect::done(list, &clamped);
+            }
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => {
@@ -2225,12 +2330,16 @@ impl State {
                 &signature,
                 max,
                 &clamped,
-                0,
+                at,
                 counter.as_ref().map(|(s, _)| &s.buffer),
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
-        self.profile_command(list, kind == DISPATCH);
+        // Tag the aligned COM pointer so an indirect call gets its own
+        // count even when the same pipeline also runs direct commands.
+        list.profile_command(self.host_pipeline | 1, kind == DISPATCH, || {
+            format!("{} (indirect)", p.name)
+        });
         // A listed frame, or any frame for a traced shader: what the records
         // held (after the clamp).
         #[cfg(feature = "diagnostics")]
@@ -2240,10 +2349,22 @@ impl State {
             if always || crate::capture::dump_on() {
                 let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 let name = crate::pipeline::shaders_of(pipeline);
-                crate::capture::read_indirect(list, (&clamped, 0), count, (kind, stride, max), name, always);
+                crate::capture::read_indirect(
+                    list,
+                    (&clamped, at),
+                    count,
+                    (kind, stride, max),
+                    name,
+                    always,
+                );
             }
         }
-        crate::indirect::done(list, &clamped);
+        if !batch {
+            crate::indirect::done(list, &clamped);
+        }
+        if (kind == DISPATCH && mode != 2) || (kind != DISPATCH && may_write) {
+            self.indirect = None;
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {

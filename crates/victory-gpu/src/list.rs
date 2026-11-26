@@ -661,6 +661,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     if let Some(list) = host_list(this)
         && !barriers.is_null()
     {
+        list.indirect_boundary();
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
         #[cfg(feature = "diagnostics")]
@@ -1362,7 +1363,16 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 /// bottom of the pipe `(flags, control, address, size)`. Host lists order
 /// their own work and every submission is waited for, so there is nothing
 /// to do.
-extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
+extern "system" fn sync(this: This, _flags: u32, _control: u32, _address: u64, _size: u64) {
+    #[cfg(windows)]
+    if crate::indirect::batching()
+        && let Some(list) = title_list(this).and_then(current_host)
+    {
+        list.indirect_boundary();
+    }
+    #[cfg(not(windows))]
+    let _ = this;
+}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.
@@ -1894,6 +1904,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     if count > 0
         && let Some(list) = host_list(this)
     {
+        list.indirect_boundary();
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         // Which kinds of barriers (0 global, 1 texture, 2 buffer) and how many.
         #[cfg(feature = "diagnostics")]
