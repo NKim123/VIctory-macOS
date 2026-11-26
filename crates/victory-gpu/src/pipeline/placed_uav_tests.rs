@@ -82,6 +82,7 @@ fn store_shader() -> Arc<Shader> {
         size: container.len(),
         container: std::sync::Mutex::new(container),
         spilled: OnceLock::new(),
+        builder: OnceLock::new(),
         ambient: None,
         translated: OnceLock::from(Some(Translated {
             host,

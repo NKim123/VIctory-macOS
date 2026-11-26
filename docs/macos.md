@@ -311,6 +311,8 @@ A file-backed page can keep a chunk on ordinary shadows before a native binding 
 
 The diagnostics integration test `low_placeholder_is_a_coherent_tiled_buffer` checks CPU writes through root CBV and SRV reads, GPU UAV writes directly into the title page, remaps, NULL reads and queue replacement. Run it serially with the D3DMetal Wine runner and `VICTORY_PHYSICAL_TILES=1`.
 
+Xbox BVH builder dispatches are disabled by default. The pipeline identifies them by the spilled user-data table in their console compute shaders. Its stages read one another's results through title memory, and an incomplete chain can compute store offsets that overwrite adjacent title objects. This matters especially with physical tiles, where writes reach the shared pages immediately. `VICTORY_BVH_BUILDER=1` opts in and requires a host pipeline for every builder stage seen so far. A failed bind pauses the builder through the next frame.
+
 A separate 6.10 GiB heap and reserved buffer worked on the same M1 Max. Readback matched data from four sampled tiles, including the last two in the heap. A GPU write reached the final tile's CPU mapping.
 
 ## Host presentation size

@@ -212,6 +212,12 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     p.made.get()?.as_ref()
 }
 
+/// Completes a builder stage synchronously, sharing the worker's result.
+pub(super) fn now(p: &Pending) -> bool {
+    p.make();
+    p.made.get().is_some_and(Option::is_some)
+}
+
 /// Queues `p` for the workers: once, and once more ahead of the early
 /// starts if a draw waits for it (`now`) while it is still queued.
 fn start(p: &Arc<Pending>, now: bool) {
@@ -546,6 +552,7 @@ mod tests {
             container: std::sync::Mutex::new(Vec::new()),
             translated: OnceLock::new(),
             spilled: OnceLock::new(),
+            builder: OnceLock::new(),
             ambient: None,
         });
         let cold = Arc::new(Pending::new(vec![shader.clone()], None, &hashes));

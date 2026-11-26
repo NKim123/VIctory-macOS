@@ -75,6 +75,8 @@ pub(crate) struct Shader {
     #[cfg(windows)]
     spilled: OnceLock<[u8; 32]>,
     #[cfg(windows)]
+    builder: OnceLock<bool>,
+    #[cfg(windows)]
     pub(crate) ambient: Option<crate::ambient::Role>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
@@ -104,10 +106,15 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
             })
             .clone()
     };
-    // Written outside the lock every pipeline creation takes.
     #[cfg(windows)]
-    if created {
-        spill(&shader, full.as_bytes());
+    {
+        // Classify once using the caller's bytes, outside the shader map lock.
+        if stage == "compute" {
+            shader.builder.get_or_init(|| of_builder(bytes));
+        }
+        if created {
+            spill(&shader, full.as_bytes());
+        }
     }
     #[cfg(not(windows))]
     let _ = created;
@@ -181,6 +188,8 @@ impl Shader {
             container: Mutex::new(bytes.to_vec()),
             #[cfg(windows)]
             spilled: OnceLock::new(),
+            #[cfg(windows)]
+            builder: OnceLock::new(),
             #[cfg(windows)]
             ambient: (stage == "compute")
                 .then(|| crate::ambient::Role::detect(bytes))
@@ -386,6 +395,7 @@ impl Shader {
             size: self.size,
             container: Mutex::new(Vec::new()),
             spilled: OnceLock::new(),
+            builder: self.builder.clone(),
             ambient: self.ambient,
             translated: cell,
         })
@@ -484,6 +494,8 @@ struct Pipeline {
     /// (by a worker: the title may release the pipeline meanwhile).
     #[cfg(windows)]
     host: Arc<make::Pending>,
+    #[cfg(windows)]
+    builder: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -493,6 +505,84 @@ const GRAPHICS_STAGES: [&str; 5] = ["vertex", "pixel", "domain", "hull", "geomet
 fn pipeline<'a>(this: This) -> &'a Pipeline {
     // SAFETY: the title passes one of our pipelines.
     unsafe { &*this.cast::<Pipeline>() }
+}
+
+/// Classify the original container before it can be spilled or discarded.
+#[cfg(windows)]
+fn of_builder(bytes: &[u8]) -> bool {
+    use victory_shader::{Container, FourCC};
+    let Ok(container) = Container::parse(bytes) else {
+        return false;
+    };
+    container
+        .part(FourCC::DXIL)
+        .and_then(|part| victory_shader::native_programs(part.data).ok())
+        .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
+}
+
+/// The builder's stages communicate through unbounded title-memory views.
+/// A missing producer can leave its consumer with arbitrary store offsets.
+#[cfg(windows)]
+struct Builder {
+    pipelines: Vec<Arc<make::Pending>>,
+    whole: bool,
+    failed: bool,
+    rests: u64,
+}
+
+#[cfg(windows)]
+static BUILDER: Mutex<Builder> = Mutex::new(Builder {
+    pipelines: Vec::new(),
+    whole: false,
+    failed: false,
+    rests: 0,
+});
+
+#[cfg(windows)]
+fn builder_allowed() -> bool {
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    *ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
+}
+
+#[cfg(windows)]
+pub(crate) fn is_builder(this: This) -> bool {
+    !this.is_null() && pipeline(this).builder
+}
+
+#[cfg(windows)]
+pub(crate) fn builder_rests(why: &'static str) {
+    let mut builder = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+    builder.rests = crate::frame::current().saturating_add(2);
+    tracing::warn!(why, "BVH builder paused for this frame and the next");
+}
+
+#[cfg(windows)]
+pub(crate) fn builder_runs() -> bool {
+    if !builder_allowed() {
+        return false;
+    }
+    let mut builder = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+    if builder.failed || crate::frame::current() < builder.rests {
+        return false;
+    }
+    if !builder.whole {
+        let missing: Vec<_> = builder
+            .pipelines
+            .iter()
+            .filter(|pending| !make::now(pending))
+            .map(|pending| &pending.key)
+            .collect();
+        if !missing.is_empty() {
+            tracing::warn!(
+                ?missing,
+                "BVH builder disabled because some stages have no host pipeline"
+            );
+            builder.failed = true;
+            return false;
+        }
+        builder.whole = true;
+    }
+    true
 }
 
 /// List method: logs each pipeline's shaders the first time a list binds
@@ -519,7 +609,11 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     if this.is_null() {
         return None;
     }
-    make::ready(&pipeline(this).host)
+    let p = pipeline(this);
+    if p.builder && !builder_allowed() {
+        return None;
+    }
+    make::ready(&p.host)
 }
 
 /// Host pipelines queued and not made yet.
@@ -655,12 +749,24 @@ fn hand_out(
         skip_hashes(),
     ));
     #[cfg(windows)]
-    make::early(&host);
+    let builder = matches!(&shaders[..], [shader] if shader.stage == "compute" && shader.builder.get() == Some(&true))
+        && host.graphics.is_none();
+    #[cfg(windows)]
+    if !builder || builder_allowed() {
+        make::early(&host);
+        if builder {
+            let mut group = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+            group.pipelines.push(host.clone());
+            group.whole = false;
+        }
+    }
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
         packet: [0; 8],
         #[cfg(windows)]
         host,
+        #[cfg(windows)]
+        builder,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });

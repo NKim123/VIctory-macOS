@@ -1285,6 +1285,13 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        let builder = crate::pipeline::is_builder(self.pipeline as This);
+        if builder && !crate::pipeline::builder_runs() {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why("BVH builder disabled".to_owned());
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1307,6 +1314,9 @@ impl State {
         }
         let texture_writes = list.capture_texture_writes();
         if !self.bind(list, p, true) {
+            if builder {
+                crate::pipeline::builder_rests("a direct dispatch could not be bound");
+            }
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "dispatch");
@@ -2068,6 +2078,26 @@ impl State {
     /// from the buffer's host copy, where earlier dispatches may have
     /// written them. False if it cannot run on the host.
     pub(crate) fn execute_indirect(
+        &mut self,
+        list: &HostList,
+        (kind, stride, max): (u32, u32, u32),
+        arguments: u64,
+        count: Option<u64>,
+    ) -> bool {
+        let builder = crate::pipeline::is_builder(self.pipeline as This);
+        if builder && !crate::pipeline::builder_runs() {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why("indirect BVH builder disabled".to_owned());
+            return false;
+        }
+        let ran = self.record_indirect(list, (kind, stride, max), arguments, count);
+        if builder && !ran {
+            crate::pipeline::builder_rests("an indirect dispatch could not be recorded");
+        }
+        ran
+    }
+
+    fn record_indirect(
         &mut self,
         list: &HostList,
         (kind, stride, max): (u32, u32, u32),
