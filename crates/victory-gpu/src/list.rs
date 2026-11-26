@@ -139,6 +139,7 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// is a host GPU.
 #[cfg(windows)]
 pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+    let _timer = crate::queue::CpuTimer::new(crate::queue::CpuPhase::State);
     let Some(list) = host_list(this) else { return };
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
@@ -513,6 +514,8 @@ extern "system" fn list_type(this: This) -> u32 {
 }
 extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
+    let _timer = crate::queue::CpuTimer::new(crate::queue::CpuPhase::ListLifecycle);
+    #[cfg(windows)]
     if let Some(list) = title_list(this)
         && let Some(host) = current_host(list)
     {
@@ -521,6 +524,8 @@ extern "system" fn close(this: This) -> HRESULT {
     S_OK
 }
 extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT {
+    #[cfg(windows)]
+    let _timer = crate::queue::CpuTimer::new(crate::queue::CpuPhase::ListLifecycle);
     if allocator.is_null() {
         return E_INVALIDARG;
     }
@@ -657,6 +662,8 @@ fn read_only_transition(b: &Barrier) -> bool {
 
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
+    #[cfg(windows)]
+    let _timer = crate::queue::CpuTimer::new(crate::queue::CpuPhase::Barriers);
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && !barriers.is_null()
@@ -1900,6 +1907,8 @@ pub(crate) fn take_counts() -> (u64, u64) {
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+    #[cfg(windows)]
+    let _timer = crate::queue::CpuTimer::new(crate::queue::CpuPhase::Barriers);
     #[cfg(windows)]
     if count > 0
         && let Some(list) = host_list(this)

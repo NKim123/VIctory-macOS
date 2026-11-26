@@ -1803,6 +1803,27 @@ impl Deferred {
         self.declared.clear();
         self.filled_scratch.clear();
     }
+
+    fn reset(&mut self) {
+        self.title_written();
+        // Reuse the smaller lookup tables across recordings. Their numeric
+        // keys own no resources. A large list can grow them again if needed.
+        let mut refreshed = std::mem::take(&mut self.refreshed);
+        let mut slots = std::mem::take(&mut self.slots);
+        if refreshed.capacity() > 2 * DEFERRED_CACHE_ENTRIES {
+            refreshed = Default::default();
+        }
+        if slots.capacity() > 2 * DEFERRED_CACHE_ENTRIES {
+            slots = Default::default();
+        }
+        *self = Self {
+            filled_scratch: std::mem::take(&mut self.filled_scratch),
+            declared: std::mem::take(&mut self.declared),
+            refreshed,
+            slots,
+            ..Default::default()
+        };
+    }
 }
 
 /// Keep simultaneous parts off one another's resources. Even read-only
@@ -3742,7 +3763,7 @@ impl HostList {
                 .unwrap_or_else(|e| e.into_inner()) = Default::default();
         }
         self.view_writes.store(false, Ordering::Relaxed);
-        *self.deferred() = Deferred::default();
+        self.deferred().reset();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.widened_writes.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -5930,6 +5951,7 @@ impl Meter {
             });
             submission_profile::log(report_frames);
             inflight::log(report_frames);
+            crate::queue::log_cpu_phases(report_frames);
             rec::report(report_frames);
             crate::indirect::report_batches(report_frames);
             let [boundary_ms, swap_copy_ms, dxgi_ms] = PRESENT_US
