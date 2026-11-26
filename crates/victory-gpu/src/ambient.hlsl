@@ -5,6 +5,7 @@ cbuffer Set : register(b0) {
     float level; float constant_light; float strength; float radius;
     float near_z; float tan_y; uint width; uint height;
     float follow; float most; float air; uint slices;
+    float jump; float fresh; float dt;
 };
 Texture2D<float> depth : register(t0);
 StructuredBuffer<float4> cells : register(t1);
@@ -46,7 +47,12 @@ void main() {
     for (uint i = 0; i < CELLS; i++) sum += cells[i].rgb;
     float4 was = history[0];
     float3 now = sum / CELLS;
-    output.Store4(0, asuint(float4(was.a > 0.0 ? lerp(was.rgb, now, follow) : now, 1.0)));
+    float new_luma = max(dot(now, LUMA), 1e-5);
+    float old_luma = max(dot(was.rgb, LUMA), 1e-5);
+    bool jumped = jump > 0.0 && max(new_luma / old_luma, old_luma / new_luma) > jump;
+    float age = was.a > 0.0 && !jumped ? was.a + dt : 0.001;
+    float3 mean = was.a == 0.0 || jumped ? now : lerp(was.rgb, now, follow);
+    output.Store4(0, asuint(float4(mean, age)));
 }
 #endif
 
@@ -194,7 +200,8 @@ void main(uint3 at : SV_DispatchThreadID) {
     float3 was = unpack(light[p]);
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
-    float top = max(dot(found, LUMA) * most, 1e-6);
+    float bound = fresh > 0.0 ? lerp(1.0, most, saturate(history[0].a / max(fresh, 1e-6))) : most;
+    float top = max(dot(found, LUMA) * bound, 1e-6);
     float has = dot(was, LUMA);
     was *= min(1.0, top / max(has, 1e-6));
     light[p] = pack(max(was, found));

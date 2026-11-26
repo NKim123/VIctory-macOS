@@ -243,7 +243,7 @@ impl Kernel {
     fn new(part: &str, name: windows::core::PCSTR, inputs: &[Param<'_>]) -> Result<Self> {
         let mut params = vec![Param::Constants {
             register: 0,
-            count: 12,
+            count: 15,
         }];
         params.extend_from_slice(inputs);
         let (root, pso) = compute::pipeline(
@@ -260,7 +260,7 @@ impl Kernel {
     fn run(
         &self,
         list: &HostList,
-        words: &[u32; 12],
+        words: &[u32; 15],
         groups: [u32; 3],
         views: &[D3D12_GPU_DESCRIPTOR_HANDLE],
         scratch: (&[&ID3D12Resource], Option<&ID3D12Resource>),
@@ -279,7 +279,7 @@ impl Kernel {
             }
             l.SetComputeRootSignature(&self.root);
             l.SetPipelineState(&self.pso);
-            l.SetComputeRoot32BitConstants(0, 12, words.as_ptr().cast(), 0);
+            l.SetComputeRoot32BitConstants(0, 15, words.as_ptr().cast(), 0);
             let mut slot = 1;
             for &view in views {
                 l.SetComputeRootDescriptorTable(slot, view);
@@ -647,11 +647,54 @@ pub(crate) fn test_constant() {
     });
 }
 
+/// Light history follows elapsed time, with an immediate response to a
+/// sufficiently large change in luminance.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Settle {
+    ms: f32,
+    jump: f32,
+    fresh: f32,
+}
+
+impl Settle {
+    fn parse(spec: &str) -> Option<Self> {
+        let mut parts = spec.split(',').map(|p| {
+            p.trim()
+                .parse::<f32>()
+                .ok()
+                .filter(|v| v.is_finite() && *v >= 0.0)
+        });
+        Some(Self {
+            ms: parts.next().flatten().filter(|&ms| ms > 0.0)?,
+            jump: parts.next().flatten().unwrap_or(3.0),
+            fresh: parts.next().flatten().unwrap_or(0.0),
+        })
+    }
+
+    fn follow(self, dt_ms: f32) -> f32 {
+        -(-dt_ms / self.ms).exp_m1()
+    }
+}
+
+fn settle() -> Option<Settle> {
+    static SETTLE: OnceLock<Option<Settle>> = OnceLock::new();
+    *SETTLE.get_or_init(|| {
+        Settle::parse(&std::env::var("VICTORY_AMBIENT_SETTLE").unwrap_or_else(|_| "250,3".into()))
+    })
+}
+
+fn radiance_ms(last: Option<std::time::Instant>, now: std::time::Instant) -> f32 {
+    last.map(|prev| now.saturating_duration_since(prev).as_secs_f32() * 1000.0)
+        .filter(|&ms| ms <= 1000.0)
+        .map_or(1000.0 / 30.0, |ms| ms.max(1.0))
+}
+
 struct Recorder {
     settings: Settings,
     constant: OnceLock<Option<Kernel>>,
     estimate: OnceLock<Option<Estimate>>,
     air: OnceLock<Option<Kernel>>,
+    last_radiance: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl Recorder {
@@ -661,11 +704,14 @@ impl Recorder {
             constant: OnceLock::new(),
             estimate: OnceLock::new(),
             air: OnceLock::new(),
+            last_radiance: std::sync::Mutex::new(None),
         }
     }
 
     fn after(&self, list: &HostList, role: Role, views: &Views, gate: Option<&Gate>) -> bool {
-        let words = constants(self.settings, views.size);
+        let tuning = settle();
+        let mut words = constants(self.settings, views.size);
+        words[13] = tuning.map_or(0.0, |s| s.fresh).to_bits();
         let [width, height, slices] = views.size;
         let groups = [width.div_ceil(8), height.div_ceil(8), 1];
         match (self.settings.mode, role, views.depth) {
@@ -703,6 +749,15 @@ impl Recorder {
                 };
                 match (role, depth) {
                     (Role::Radiance, _) => {
+                        if let Some(tuning) = tuning {
+                            let mut last =
+                                self.last_radiance.lock().unwrap_or_else(|e| e.into_inner());
+                            let now = std::time::Instant::now();
+                            let dt = radiance_ms(last.replace(now), now);
+                            words[8] = tuning.follow(dt).to_bits();
+                            words[12] = tuning.jump.to_bits();
+                            words[14] = (dt / 1000.0).to_bits();
+                        }
                         uav_barrier(list, &views.resource);
                         pass.keep.run(
                             list,
@@ -800,7 +855,7 @@ fn optional<T>(result: Result<T>) -> Option<T> {
         .ok()
 }
 
-fn constants(settings: Settings, [width, height, slices]: [u32; 3]) -> [u32; 12] {
+fn constants(settings: Settings, [width, height, slices]: [u32; 3]) -> [u32; 15] {
     let (level, constant) = match settings.mode {
         Mode::Estimate(level) => (level, 0.0),
         Mode::Constant(level) => (0.0, level),
@@ -820,6 +875,9 @@ fn constants(settings: Settings, [width, height, slices]: [u32; 3]) -> [u32; 12]
         4.0_f32.to_bits(),
         settings.air.to_bits(),
         slices,
+        0,
+        0,
+        0,
     ]
 }
 

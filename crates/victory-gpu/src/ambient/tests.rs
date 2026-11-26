@@ -385,3 +385,26 @@ fn title_indirect_light_and_air_read_back() {
     assert_eq!(retained_depth.texels(), vec![0.5_f32.to_bits(); len]);
     assert_eq!(fixed.texels(), vec![shared_exp(14, 256, 251, 241); len]);
 }
+
+#[test]
+fn settling_follows_wall_time_at_different_frame_rates() {
+    let settings = Settle::parse("250,3").unwrap();
+    assert_eq!(settings.jump, 3.0);
+    assert_eq!(settings.fresh, 0.0);
+    assert_eq!(Settle::parse("0"), None);
+    assert_eq!(Settle::parse("NaN"), None);
+    assert_eq!(Settle::parse("100,0,2").unwrap().fresh, 2.0);
+    let left_at = |fps: i32| (1.0 - settings.follow(1000.0 / fps as f32)).powi(fps);
+    assert!((left_at(10) - left_at(60)).abs() < 1e-6);
+
+    use std::time::{Duration, Instant};
+    let now = Instant::now();
+    assert_eq!(
+        radiance_ms(Some(now - Duration::from_millis(50)), now),
+        50.0
+    );
+    assert_eq!(
+        radiance_ms(Some(now - Duration::from_secs(5)), now),
+        radiance_ms(None, now)
+    );
+}
