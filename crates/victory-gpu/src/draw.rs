@@ -3625,6 +3625,91 @@ void main() { o.Store(0, asuint(t.Load(int3(0, 0, 0)).x)); o.Store(4, asuint(t.L
 
     #[test]
     #[ignore = "run with VICTORY_SHOW_AFTER=1 on a D3D12 host"]
+    fn shared_texture_slot_replay_follows_replaced_placed_texture() {
+        assert!(crate::descriptor::host::show_after());
+        let host = crate::host::host().expect("D3D12 host");
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 2, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        assert_eq!(
+            crate::descriptor::create_heap(
+                null,
+                heap_desc.as_ptr().cast(),
+                &crate::object::IUNKNOWN,
+                &mut heap
+            ),
+            S_OK
+        );
+        let title = crate::descriptor::heap(heap);
+        let h = title.host().unwrap();
+        let slots = Slots(h.heap.clone(), (h.gpu(1).ptr - h.gpu(0).ptr) as u32);
+        let address = title_memory(1 << 16);
+        // SAFETY: the first byte is the red channel of the first texel.
+        unsafe { (address as *mut u8).write(0x40) };
+        let words = texture_words(64, 64, 28, 1, 0);
+        let View::Placed(_, _, srv) = placed_view(address, words) else {
+            unreachable!();
+        };
+        crate::descriptor::create_placed_srv(null, &words, &srv, title.start);
+        // SAFETY: the title heap stays live and holds this descriptor record.
+        let record = || unsafe { (title.start as *const [u32; 3]).read_unaligned() };
+        let original_record = record();
+
+        let mut state = State::default();
+        state.set_heaps(&[heap]);
+        state.set_table(true, 0, title.start);
+        let read = compile_cs(READ, READS);
+        let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
+        let reading = host.new_list().unwrap();
+        state.table_entry(&reading, &used(ResourceType::Srv), true);
+        run(&reading, &slots, &read, 0, Some(&out), (1, 1));
+        reading.close();
+        host.execute(&[&reading]);
+        host.execute(&[&reading]);
+        // SAFETY: the dispatch wrote this mapped output.
+        let pixel = || unsafe { (data as *const f32).read() };
+        assert_eq!(pixel(), 64.0 / 255.0);
+        let original = crate::resource::texture_at(address, &words).unwrap();
+        let old = crate::resource::made_copy(original).unwrap();
+
+        // An explicit UAV at the same address upgrades the host texture.
+        // The already closed read list still uses the placed SRV slot.
+        let upgraded = texture_at_address(address, &texture_words(64, 64, 28, 1, 4));
+        let uav = [28, 4, 0, 0, 0, 0, 0, 0, 0, 0];
+        let write_handle = title.start + 32;
+        crate::descriptor::create_uav(null, upgraded, null, &uav, write_handle);
+        assert!(!old.current_for_placement());
+        let write = compile_cs(
+            "RWTexture2D<unorm float4> t : register(u0);
+[numthreads(1, 1, 1)]
+void main() { t[uint2(0, 0)] = float4(192.0 / 255.0, 0, 0, 1); }",
+            WRITES,
+        );
+        let writing = host.new_list().unwrap();
+        state.set_table(true, 0, write_handle);
+        state.table_entry(&writing, &used(ResourceType::Uav), true);
+        run(&writing, &slots, &write, 1, None, (1, 1));
+        crate::list::ensure_state(
+            &writing,
+            upgraded,
+            (D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+                | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
+                .0 as u32,
+        );
+        writing.close();
+        host.execute(&[&writing]);
+
+        assert_eq!(record(), original_record);
+        host.execute(&[&reading]);
+        assert_eq!(pixel(), 192.0 / 255.0);
+        assert_eq!(record(), original_record);
+        for object in [heap, upgraded] {
+            assert_eq!(crate::object::release_ref(object), 0);
+        }
+    }
+
+    #[test]
+    #[ignore = "run with VICTORY_SHOW_AFTER=1 on a D3D12 host"]
     fn shared_texture_slot_uploads_bc_edge_and_tail_mips() {
         assert!(crate::descriptor::host::show_after());
         let host = crate::host::host().expect("D3D12 host");

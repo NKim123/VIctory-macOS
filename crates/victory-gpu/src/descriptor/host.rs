@@ -1065,11 +1065,18 @@ impl HostHeap {
                     .0
                     .try_into()
                     .expect("a title descriptor record has three words");
-                let record = words.map(u32::from_le_bytes);
-                if self.ready[index as usize].load(Ordering::Acquire) == record_key(record)
-                    && record[0] == VIEW_TAG
+                let record @ [tag, view, generation] = words.map(u32::from_le_bytes);
+                if tag == VIEW_TAG
+                    && self.ready[index as usize].load(Ordering::Acquire) == record_key(record)
+                    && let Some(pin) = view_at(view, generation)
                 {
-                    continue;
+                    // A placed view can move to a replacement host texture
+                    // while the title's descriptor record stays the same.
+                    let remake = is_placed_texture(&pin) && self.needs_remake(index, &pin, true);
+                    pins.push(pin);
+                    if !remake {
+                        continue;
+                    }
                 }
                 if let Some(pin) = self.mirror(index, handle, true) {
                     pins.push(pin);
