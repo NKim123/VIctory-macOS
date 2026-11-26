@@ -4377,6 +4377,11 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for (i, step) in self.deferred().copies.iter().enumerate() {
+            if let Step::Refresh(shadow, ..) = step
+                && (skip.get(i).copied().unwrap_or(false) || shadow.clean())
+            {
+                continue;
+            }
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(
@@ -4418,14 +4423,7 @@ impl HostList {
                     len
                 }
                 Step::Refresh(shadow, address, len) => {
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        add(C::Refreshes, 1);
-                        add(C::RefreshBytes, *len as u64);
-                    }
-                    if !skip.get(i).copied().unwrap_or(false) {
-                        batch.add(shadow, *address, *len);
-                    }
+                    batch.add(shadow, *address, *len);
                     continue;
                 }
                 Step::Slot(viewed, index) => {
@@ -4570,12 +4568,10 @@ const JOIN: usize = crate::watch::PAGE;
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
-        // Nothing to copy: a world submission asks for every copy its heaps'
-        // views and page tables reach (~9,000), a few of them written.
-        if shadow.clean() {
+        let Some((address, end)) = shadow.refresh_range(address, address + len) else {
             return;
-        }
-        let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
+        };
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
         // Only what is not current: most lists ask for a copy whole, after
         // a title copy took a few bytes of it.
         let empty = crate::ranges::Ranges::default();
@@ -4635,6 +4631,9 @@ impl Batch {
 
     /// Does the refreshes; returns the bytes copied.
     fn flush(&mut self) -> usize {
+        if self.refreshes.is_empty() {
+            return 0;
+        }
         #[cfg(feature = "diagnostics")]
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
         self.pending.clear();
@@ -4671,6 +4670,8 @@ impl Batch {
                 for (from, to, copied, us) in done.into_inner().unwrap_or_else(|e| e.into_inner()) {
                     #[cfg(feature = "diagnostics")]
                     {
+                        crate::copystat::add(crate::copystat::C::Refreshes, 1);
+                        crate::copystat::add(crate::copystat::C::RefreshBytes, (to - from) as u64);
                         counted.range(from, to - from, us, 0);
                         self.summary
                             .record(from as u64, (to - from) as u64, shadow.gpu(from as u64));
@@ -4678,7 +4679,11 @@ impl Batch {
                     PREPARING[0].fetch_add(us, Ordering::Relaxed);
                     PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
                     total += copied;
-                    let (from, to) = taken(from, to, (start as usize, (start + len) as usize));
+                    let (from, to) = if shadow.is_aliased() {
+                        (from, to)
+                    } else {
+                        taken(from, to, (start as usize, (start + len) as usize))
+                    };
                     let (_, have) = match self.current.entry(key) {
                         std::collections::hash_map::Entry::Vacant(vacant) => {
                             self.extents
@@ -4701,6 +4706,8 @@ impl Batch {
                 let us = started.elapsed().as_micros() as u64;
                 #[cfg(feature = "diagnostics")]
                 {
+                    crate::copystat::add(crate::copystat::C::Refreshes, 1);
+                    crate::copystat::add(crate::copystat::C::RefreshBytes, (to - from) as u64);
                     counted.range(from, to - from, us, 0);
                     self.summary
                         .record(from as u64, (to - from) as u64, shadow.gpu(from as u64));
@@ -4708,7 +4715,11 @@ impl Batch {
                 PREPARING[0].fetch_add(us, Ordering::Relaxed);
                 PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
                 total += copied;
-                let (from, to) = taken(from, to, (start as usize, (start + len) as usize));
+                let (from, to) = if shadow.is_aliased() {
+                    (from, to)
+                } else {
+                    taken(from, to, (start as usize, (start + len) as usize))
+                };
                 // The copy's memory joins the index as its first range
                 // joins `current`: a later title copy reaches it by its
                 // bytes.
@@ -6275,6 +6286,42 @@ mod batch {
         assert_eq!(list.fill_scratch(src, 16), Some(first));
         assert_eq!(list.deferred().copies.len(), 1, "a fresh fill after reset");
         list.close();
+    }
+
+    #[test]
+    fn alias_refresh_batch_only_contains_live_widened_views() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let (buffer, data) = host.shared_buffer(PAGE as u64).unwrap();
+        let base = data as usize;
+        // SAFETY: the buffer remains live and mapped through the alias.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let alias = crate::shadow::Shadow::new_aliased(buffer, data, gpu, base as u64, PAGE as u64);
+        let mut batch = Batch::default();
+        batch.add(&alias, base, PAGE);
+        assert!(batch.refreshes.is_empty());
+
+        let at = base + 120;
+        let widened = alias.widened(at as u64, 12, 1).unwrap();
+        batch.add(&alias, base, 100);
+        assert!(batch.refreshes.is_empty());
+        // SAFETY: one aligned element inside the mapped alias.
+        unsafe { (at as *mut [u32; 3]).write([10, 20, 30]) };
+        batch.add(&alias, base, PAGE);
+        assert_eq!(
+            batch.refreshes[0].1.iter().collect::<Vec<_>>(),
+            [(at, at + 12)]
+        );
+        assert_eq!(batch.flush(), 0);
+        assert_eq!(widened.read_host(4), [10, 20, 30, 1]);
+        batch.add(&alias, base, PAGE);
+        assert!(batch.refreshes.is_empty(), "the widened bytes are current");
+
+        batch.title_written();
+        drop(widened);
+        batch.add(&alias, base, PAGE);
+        assert!(batch.refreshes.is_empty(), "the widened view was released");
     }
 
     #[test]

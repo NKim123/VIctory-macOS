@@ -1111,6 +1111,22 @@ impl Tracked {
         pages: &mut [(usize, u16)],
         unmapped: &mut Vec<usize>,
     ) {
+        // Many exact copies share a block. A previous take, or a GPU
+        // notification through a separate mapping, can leave every view
+        // guarded with the dirty parts already resolved.
+        if let [page] = *group
+            && g.protected.contains(&page)
+            && aliases_guarded(g, page)
+            && let Some(dirty) = self.changed.0.get(page)
+            && !dirty.pending
+        {
+            let i = pages
+                .binary_search_by_key(&page, |&(p, _)| p)
+                .expect("requested page");
+            pages[i].1 = dirty.parts;
+            self.changed.clear_page(page);
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         let asked = Timed(std::time::Instant::now(), crate::copystat::C::AliasUs);
         let others = aliases(g, group);
@@ -1924,12 +1940,24 @@ pub(crate) fn notify_written(at: usize, len: usize) {
     }
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let g = guards();
-    if g.holders.range(first..last).next().is_none()
-        && g.alias_of.range(first..last).next().is_none()
+    // The GPU wrote through its own mapping. The title mappings can stay
+    // read-only and still catch the next CPU write.
+    mark_changed(&g, first, last, false);
+    #[cfg(feature = "diagnostics")]
+    let mut held = 0;
+    for &page in g
+        .alias_of
+        .range(first..last)
+        .flat_map(|(_, aliases)| aliases)
     {
-        return;
+        #[cfg(feature = "diagnostics")]
+        {
+            held += u64::from(g.holders.contains_key(&page));
+        }
+        mark_changed(&g, page, page + 1, false);
     }
-    changed(&g, first, last, false);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::AliasMarks, held);
 }
 
 /// What shaders wrote into host copies of `[at, at + len)` is dropped:
@@ -3116,6 +3144,30 @@ pub(crate) mod tests {
         assert!(!aliased(a + PAGE, PAGE) && !aliased(b + PAGE, PAGE));
         assert!(aliased(a, PAGE) && aliased(b + 2 * PAGE, PAGE));
         assert!(aliased(a, usize::MAX), "no overflow");
+    }
+
+    #[test]
+    fn gpu_notifications_mark_both_mappings_without_rearming_them() {
+        if !fault_tracking() {
+            return;
+        }
+        let (a, b) = twin_views(1);
+        let copy = track_copy(a, PAGE, true).unwrap();
+        let texture = track(b, PAGE, true).unwrap();
+        assert_eq!(copy.take(a, a + PAGE), [(a, a + PAGE)]);
+        assert_eq!(texture.take(b, b + PAGE), [(b, b + PAGE)]);
+        let protects = PROTECTS.with(std::cell::Cell::get);
+
+        notify_written(a + 4, 4);
+        assert!(read_only(a) && read_only(b));
+        assert_eq!(copy.take(a, a + PAGE), [(a, a + PAGE)]);
+        assert_eq!(texture.take(b, b + PAGE), [(b, b + PAGE)]);
+        assert_eq!(PROTECTS.with(std::cell::Cell::get), protects);
+
+        // SAFETY: this title store must still fault and dirty the trackers.
+        unsafe { ((b + 8) as *mut u32).write_volatile(3) };
+        assert_eq!(copy.take(a, a + PAGE), [(a, a + PAGE)]);
+        assert_eq!(texture.take(b, b + PAGE), [(b, b + PAGE)]);
     }
 
     /// A tracker of one mapping going away leaves the guard its page shares

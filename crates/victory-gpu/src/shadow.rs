@@ -1179,6 +1179,32 @@ impl Shadow {
             .is_some_and(crate::watch::Tracked::clean)
     }
 
+    /// Aliases already contain the title's bytes. Only format-converted
+    /// views of the alias need refresh, and only where their ranges overlap.
+    pub(crate) fn refresh_range(&self, from: usize, to: usize) -> Option<(usize, usize)> {
+        if from >= to {
+            return None;
+        }
+        if !self.aliased {
+            return (!self.clean()).then_some((from, to));
+        }
+        if !self.has_widened.load(Ordering::Acquire) {
+            return None;
+        }
+        let widened = self.widened.lock().unwrap_or_else(|e| e.into_inner());
+        let (first, last) = widened
+            .iter()
+            .filter_map(|&(start, len, _, ref view)| {
+                let a = from.max(start as usize);
+                let b = to.min((start + len) as usize);
+                (a < b && view.strong_count() != 0).then_some((a, b))
+            })
+            .fold((to, from), |(first, last), (a, b)| {
+                (first.min(a), last.max(b))
+            });
+        (first < last).then_some((first, last))
+    }
+
     /// Bytes of the refreshed buffer, before the GPU can change it.
     pub(crate) fn computed_baseline(&self, offset: usize, bytes: usize) -> Box<[u8]> {
         let _source = self
