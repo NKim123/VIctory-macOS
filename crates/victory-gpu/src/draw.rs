@@ -95,9 +95,8 @@ pub(crate) struct State {
     /// Views made for root SRVs and UAVs in this list ([`State::root_view`]):
     /// (view heap, host copy, unordered access) → dynamic slot.
     root_slots: std::collections::HashMap<(usize, usize, bool), u32>,
-    /// Bounded CBV descriptors start at the root address, so two addresses
-    /// in the same backing buffer need separate slots.
-    root_cbv_slots: std::collections::HashMap<(usize, usize, u64), u32>,
+    /// Bounded CBV views by (heap, backing resource, offset, length).
+    root_cbv_slots: std::collections::HashMap<(usize, usize, u64, u64), u32>,
     /// The run of dynamic slots root views take from (view heap, next
     /// slot, end): taken [`ROOT_VIEW_RUN`] at a time, so that single slots
     /// do not break up the runs fresh tables need.
@@ -1130,9 +1129,12 @@ impl State {
             host.raw_view_at(index, Some(&buffer), offset, bytes, false);
             return Some(index);
         }
-        shadow.refresh(list, address, bytes);
-        let copy = std::sync::Arc::as_ptr(&shadow) as usize;
-        let entry = (key, copy, address);
+        if !shadow.is_aliased() {
+            shadow.refresh(list, address, bytes);
+        }
+        // The slot holds the resource for the list's lifetime, so its
+        // identity is stable even if an aliased shadow is unregistered.
+        let entry = (key, shadow.buffer.as_raw() as usize, offset, bytes);
         if let Some(&index) = self.root_cbv_slots.get(&entry) {
             return Some(index);
         }
@@ -1142,7 +1144,11 @@ impl State {
         Some(index)
     }
 
-    fn root_view_slot(&mut self, key: usize, host: &crate::descriptor::host::HostHeap) -> Option<u32> {
+    fn root_view_slot(
+        &mut self,
+        key: usize,
+        host: &crate::descriptor::host::HostHeap,
+    ) -> Option<u32> {
         let (run_heap, next, end) = self.root_run;
         if run_heap != key || next >= end {
             let Some(first) = host.dynamic(ROOT_VIEW_RUN) else {
@@ -3828,11 +3834,14 @@ void main() { dst.Store4(0, asuint(src[0])); }
         assert_ne!(state.root_cbv_view(&list, true, 1), Some(index));
         // SAFETY: an open list; all descriptors are live through execution.
         unsafe {
-            list.list.SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+            list.list
+                .SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
             list.list.SetComputeRootSignature(&root);
-            list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(index));
+            list.list
+                .SetComputeRootDescriptorTable(0, heap_host.gpu(index));
             list.list.SetComputeRootDescriptorTable(1, heap_host.gpu(1));
-            list.list.SetComputeRoot32BitConstants(2, 2, [0u32; 2].as_ptr().cast(), 0);
+            list.list
+                .SetComputeRoot32BitConstants(2, 2, [0u32; 2].as_ptr().cast(), 0);
             list.list.SetPipelineState(&pso);
             list.list.Dispatch(1, 1, 1);
             (address as *mut u32).write(0xC0B0);

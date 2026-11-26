@@ -24,7 +24,10 @@ fn a_swap_does_not_make_a_lane_varying_destination_wave_uniform() {
         vgprs: 8,
         layout: vec![],
         used: vec![],
-        io: StageIo::Cs(ComputeIo { rsrc2: 0, threads: [64, 1, 1] }),
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 0,
+            threads: [64, 1, 1],
+        }),
         code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
     };
     let p = ir::build(&native.code, true, 8).unwrap();

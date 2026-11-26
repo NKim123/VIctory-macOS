@@ -613,9 +613,10 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
                 }
                 // Accumulators and swaps also read a destination as input.
                 let implicit_alike = !(name == "v_swap_b32" || name.contains("mac_"))
-                    || inst.reads.iter().all(|(reg, v)| {
-                        !matches!(reg, Reg::V(_)) || known(&next, v)
-                    });
+                    || inst
+                        .reads
+                        .iter()
+                        .all(|(reg, v)| !matches!(reg, Reg::V(_)) || known(&next, v));
                 let mask_alike = name != "v_cndmask_b32"
                     || matches!(ops.get(2), Some(Operand::Scalar { code, .. })
                         if inst.read(Reg::S(*code))

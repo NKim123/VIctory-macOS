@@ -2005,7 +2005,11 @@ impl<'a> Lower<'a> {
     /// [`Lower::root_view_offset`]. Host root views have no bounds; a view's
     /// reads past the copy give 0 and its writes there are dropped.
     fn root_view(&mut self, param: usize, uav: bool) -> V {
-        let view = if uav { super::ROOT_UAV_VIEW } else { super::ROOT_SRV_VIEW };
+        let view = if uav {
+            super::ROOT_UAV_VIEW
+        } else {
+            super::ROOT_SRV_VIEW
+        };
         self.root_heap_view(param, view)
     }
 
@@ -2023,7 +2027,11 @@ impl<'a> Lower<'a> {
             root: RootType::Descriptor,
             dword: view,
         });
-        let props = if view == super::ROOT_UAV_VIEW { (11 | 0x1000, 0) } else { (11, 0) };
+        let props = if view == super::ROOT_UAV_VIEW {
+            (11 | 0x1000, 0)
+        } else {
+            (11, 0)
+        };
         let h = self.s.heap_handle(self.s.entry, i, false, false, props);
         self.root_views.insert(index, h);
         h
@@ -2040,11 +2048,21 @@ impl<'a> Lower<'a> {
         };
         let rp = self.x.native.layout.get(address.param)?;
         if rp.root != RootType::Descriptor
-            || self.used_kind(src).is_some_and(|u| u.kind != ResourceType::Cbv)
+            || self
+                .used_kind(src)
+                .is_some_and(|u| u.kind != ResourceType::Cbv)
         {
             return None;
         }
         Some(self.root_heap_view(address.param, super::ROOT_CBV_VIEW))
+    }
+
+    /// The legacy CBV load reads the containing dword. Align the byte
+    /// address before issuing the raw load, which requires dword alignment.
+    fn raw_root_cbv_dword(&mut self, handle: V, byte: V) -> V {
+        let mask = self.s.m.i32(!3);
+        let address = self.s.m.bin(self.cur, Bin::And, byte, mask);
+        self.raw_dword(handle, address)
     }
 
     /// For a root SRV or UAV read through the view of its host copy
@@ -4594,7 +4612,7 @@ impl<'a> Lower<'a> {
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
-                let x = self.raw_dword(h, a);
+                let x = self.raw_root_cbv_dword(h, a);
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
@@ -10319,7 +10337,11 @@ impl<'a> Lower<'a> {
             for k in 0..count {
                 let four = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, byte, four);
-                let x = if raw.is_some() { self.raw_dword(h, a) } else { self.cbuffer_dword(h, a) };
+                let x = if raw.is_some() {
+                    self.raw_root_cbv_dword(h, a)
+                } else {
+                    self.cbuffer_dword(h, a)
+                };
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());

@@ -541,7 +541,6 @@ impl Shadow {
         shadow
     }
 
-    #[cfg(test)]
     pub(crate) fn is_aliased(&self) -> bool {
         self.aliased
     }

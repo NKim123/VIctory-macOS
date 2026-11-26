@@ -559,12 +559,15 @@ fn root_views_read_their_copy_and_zeros_past_it() {
     cbv.used[1].kind = ResourceType::Cbv;
     let mut scalar_cbv = cbv.clone();
     let scalar = [
-        0xF420_0400u32, // s_buffer_load_dword s16, s[0:3], 16
-        0xFA00_0010,
+        0xF420_0400u32, // s_buffer_load_dword s16, s[0:3], 19 (reads dword 4)
+        0xFA00_0013,
         S_WAITCNT_ALL,
         v_mov_b32(2, 16),
     ];
-    scalar_cbv.code.splice(4 * load..4 * load + 8, scalar.into_iter().flat_map(u32::to_le_bytes));
+    scalar_cbv.code.splice(
+        4 * load..4 * load + 8,
+        scalar.into_iter().flat_map(u32::to_le_bytes),
+    );
     let (baseline, raw, scalar_raw) = super::TEST_RAW_ROOT_CBVS.with(|on| {
         on.set(Some(false));
         let baseline = lower_shader(&cbv);
@@ -577,7 +580,12 @@ fn root_views_read_their_copy_and_zeros_past_it() {
     assert_eq!(baseline.root_cbvs, [2]);
     for lowered in [&raw, &scalar_raw] {
         assert!(lowered.root_cbvs.is_empty());
-        assert!(lowered.user_data.iter().any(|u| u.slot == 2 && u.dword == super::ROOT_CBV_VIEW));
+        assert!(
+            lowered
+                .user_data
+                .iter()
+                .any(|u| u.slot == 2 && u.dword == super::ROOT_CBV_VIEW)
+        );
         let hash = |bytes: &[u8]| {
             use crate::dxbc::{Container, FourCC};
             let c = Container::parse(bytes).unwrap();
@@ -597,7 +605,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         .map(|u| (u.index, u.dword))
         .collect();
     assert_eq!(marks, [(6, super::ROOT_SRV_VIEW), (7, super::ROOT_VIEW_OFFSET)]);
-    let shader = HostShader {
+    let as_shader = |l: lower::Lowered| HostShader {
         stage: HwStage::Cs,
         dxil: l.dxil,
         user_data: l.user_data,
@@ -614,6 +622,10 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
     };
+    let shader = as_shader(l);
+    let baseline = as_shader(baseline);
+    let raw = as_shader(raw);
+    let scalar_raw = as_shader(scalar_raw);
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
     }
@@ -652,6 +664,52 @@ fn root_views_read_their_copy_and_zeros_past_it() {
             .unwrap_or_else(|e| panic!("{label}: {e}"));
         let want: Vec<u32> = (0..32).map(|lane| if lane < 16 { 0x1000 + 4 + 16 * lane } else { 0 }).collect();
         assert_eq!(out[0], want, "{label}");
+
+        // Bind the same bytes as an ordinary root CBV and a bounded raw
+        // SRV. Pad the former with zeros through its full 64 KiB range.
+        let data = &copy[4..];
+        let mut padded = data.to_vec();
+        padded.resize(1 << 14, 0);
+        for (shader, raw, expected) in [
+            (&baseline, false, want),
+            (&raw, true, out[0].clone()),
+            (&scalar_raw, true, vec![data[4]; 32]),
+        ] {
+            let (root, pso) = host.compute_pipeline(shader).expect("root CBV pipeline");
+            let mut ud = vec![0; shader.user_data_dwords() as usize];
+            let mut roots = Vec::new();
+            if raw {
+                ud[6] = 1;
+            } else {
+                roots.push((
+                    1,
+                    Root::View {
+                        srv: false,
+                        data: padded.clone(),
+                    },
+                ));
+            }
+            roots.insert(0, (0, Root::Constants(ud)));
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots,
+                        views: &[
+                            View::RawUav(32),
+                            View::Buffer {
+                                data,
+                                stride: super::host::Stride::Raw,
+                            },
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert_eq!(out[0], expected, "{label}, raw root CBV {raw}");
+        }
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
