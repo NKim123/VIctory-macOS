@@ -407,6 +407,9 @@ struct Lower<'a> {
     cur_ir: usize,
     /// Whole-wave sections by block and start index.
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
+    /// Group-wide branch votes and the blocks that read them.
+    group_bits: Map<usize, (V, usize)>,
+    group_bit_uses: Vec<(usize, usize)>,
     /// Values written in a section that code outside it reads.
     section_out: Set<Value>,
     /// The program's constant table (the code from the first byte read
@@ -536,6 +539,8 @@ enum MaskData {
 pub(super) const LDS_ACROSS: Why =
     "LDS one console wave64 shares without barriers, on a host of 32-lane waves";
 pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
+pub(super) const REDUCTION_ACROSS: Why =
+    "a wave reduction over both 32-lane halves (wave64 on a 32-lane host)";
 const LANE_MASK: Why = "a lane mask read as data";
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
@@ -905,7 +910,11 @@ impl<'a> Lower<'a> {
             halves,
             halves_refused,
             relabelled: None,
-            step: if halves { in_step(p, x.st) } else { Vec::new() },
+            step: if halves {
+                in_step(p, x.st, &x.res.waterfall.reads)
+            } else {
+                Vec::new()
+            },
             half_words: None,
             level: 0,
             alike: if halves {
@@ -943,6 +952,8 @@ impl<'a> Lower<'a> {
             descriptor_load_uses: OnceCell::new(),
             cur_ir: 0,
             sections: HashMap::new(),
+            group_bits: Map::default(),
+            group_bit_uses: Vec::new(),
             section_out: Set::default(),
             code_table: None,
             memory_null: None,
@@ -1349,7 +1360,6 @@ impl<'a> Lower<'a> {
     /// expanded gives on that wave.
     fn shape(&mut self, shape: super::wave::Shape) -> Result<V, Why> {
         use super::wave::{Op, Shape};
-        const ACROSS: Why = "a wave reduction over both 32-lane halves (wave64 on a 32-lane host)";
         let (op, src, mask, ident, prefix) = match shape {
             Shape::K(k) => return Ok(self.s.m.i32(k)),
             Shape::Value(v) => return self.i32_of(v),
@@ -1370,7 +1380,7 @@ impl<'a> Lower<'a> {
             Shape::Prefix(op, src, mask, ident, inclusive) => {
                 (op, src, mask, ident, Some(inclusive))
             }
-            Shape::Half(..) if self.halves => return Err(ACROSS),
+            Shape::Half(..) if self.halves => return Err(REDUCTION_ACROSS),
             Shape::Half(_, src, mask, ident, hi) => {
                 // The high half is a console lane's: compute only.
                 if self.mask_data != MaskData::Console {
@@ -1442,7 +1452,7 @@ impl<'a> Lower<'a> {
         // order. Otherwise the halves pass each other their results.
         let across = self.halves && !self.one_host_wave();
         if across && !self.across_here() {
-            return Err(ACROSS);
+            return Err(REDUCTION_ACROSS);
         }
         let c = self.cur;
         let &m = self
@@ -1633,6 +1643,12 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        if !self.s.m.blocks_dominate_uses(&self.group_bit_uses) {
+            return Err(unsupported(
+                0,
+                "a group vote that does not dominate its use",
+            ));
+        }
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -3158,6 +3174,14 @@ impl<'a> Lower<'a> {
 
     fn atom(&mut self, atom: Atom, at: usize) -> Result<V, Why> {
         match atom {
+            Atom::GroupAny(b) => {
+                let &(bit, def) = self
+                    .group_bits
+                    .get(&b)
+                    .ok_or("a group vote written after its use")?;
+                self.group_bit_uses.push((def, at));
+                Ok(bit)
+            }
             Atom::Lane(v) => self.lane_bits.get(&v).copied().ok_or_else(|| {
                 self.lane_fail
                     .get(&v)
@@ -9239,12 +9263,21 @@ impl<'a> Lower<'a> {
     fn uniform_join(&self, b: usize) -> bool {
         let st = self.x.st;
         let preds = &self.x.p.blocks[b].preds;
-        preds.iter().filter(|&&q| self.block[q].is_some()).all(|&q| match st.exits[q] {
-            LaneExit::Branch { when, taken, not_taken } if taken != not_taken => {
-                st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_)))
-            }
-            _ => true,
-        })
+        preds
+            .iter()
+            .filter(|&&q| self.block[q].is_some())
+            .all(|&q| match st.exits[q] {
+                LaneExit::Branch {
+                    when,
+                    taken,
+                    not_taken,
+                } if taken != not_taken => st
+                    .bools
+                    .support(when)
+                    .iter()
+                    .all(|a| matches!(a, Atom::Uniform(_) | Atom::GroupAny(_))),
+                _ => true,
+            })
     }
 
     /// Whether no lane goes from IR block `q` to `b`.
@@ -11324,6 +11357,10 @@ impl<'a> Lower<'a> {
             .insts
             .last()
             .map_or(self.x.p.blocks[b].offset, |i| i.machine.offset);
+        if let Some(&any) = self.x.st.group_branches.get(&b) {
+            let bit = self.group_any(any).map_err(|w| unsupported(offset, w))?;
+            self.group_bits.insert(b, (bit, self.cur));
+        }
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
                 let ok = self.count_iteration(t, pred::IULT);
@@ -11601,6 +11638,7 @@ impl<'a> Lower<'a> {
                 | Atom::Phi(v)
                 | Atom::Quad(v)
                 | Atom::Opaque(v) => Some(v),
+                Atom::GroupAny(_) => return true,
                 Atom::Constant(_) => None,
             };
             if v.is_some_and(|v| tainted.contains(&v)) {

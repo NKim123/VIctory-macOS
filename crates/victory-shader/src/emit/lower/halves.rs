@@ -32,7 +32,10 @@
 //!   ([`Lower::read_lane_across`]);
 //! * whole-wave reductions and prefix sums: each half reduces its own lanes,
 //!   and they pass each other the result; a prefix in the upper half adds
-//!   the lower half's total ([`Lower::reduce_across`]);
+//!   the lower half's total ([`Lower::reduce_across`]). A group of one
+//!   full console wave with no guest LDS can retry a refused reduction by
+//!   restoring the console's wave-wide mask branches. Both halves take
+//!   the same edges and mask their contributions with EXEC;
 //! * `v_readfirstlane_b32` reads the host wave's first lane, which in the
 //!   upper half is console lane 32 or later: kept as it is for a value the
 //!   same in every lane of the console wave ([`lane_uniform`], what the
@@ -187,6 +190,25 @@ impl Lower<'_> {
         self.exchange_halves(own, zero, at)
     }
 
+    /// One console wave per group: take its original scalar branch when
+    /// any lane in either half has its mask bit set.
+    pub(super) fn group_any(&mut self, mask: Bool) -> Result<V, Why> {
+        if !self.across_here() {
+            return Err("a group vote in divergent code");
+        }
+        let c = self.cur;
+        let bit = self.boolean(mask, c)?;
+        let any = self
+            .s
+            .op(c, "waveAnyTrue", Attr::NoUnwind, self.s.t.i1, 113, &[bit]);
+        self.s.flags |= flags::WAVE_OPS;
+        let own = self.s.m.cast(c, Cast::ZExt, any, self.s.t.i32);
+        let zero = self.s.m.i32(0);
+        let (lo, hi) = self.exchange_halves(own, zero, c)?;
+        let either = self.s.m.bin(c, Bin::Or, lo, hi);
+        Ok(self.s.m.cmp(c, pred::NE, either, zero))
+    }
+
     /// What each half of this lane's console wave gave as `own` (a dword
     /// the same in every lane of a host wave): (lower half's, upper half's).
     /// Each host wave stores its own in a group-shared dword of its own, and
@@ -199,7 +221,9 @@ impl Lower<'_> {
         let group: u32 = self.s.threads.map_or(0, |t| t.iter().product());
         // Two dwords per console wave, so the high dword of the last one is
         // inside even where the group has no upper half.
-        let dwords = group.div_ceil(2 * HALF) * 2;
+        let private_slots = !self.x.st.group_branches.is_empty();
+        let stride = if private_slots { HALF } else { 1 };
+        let dwords = group.div_ceil(2 * HALF) * 2 * stride;
         if self.s.lds_dwords + dwords > GROUP_SHARED_DWORDS {
             return Err("no group-shared memory left to pass values between 32-lane halves");
         }
@@ -229,15 +253,32 @@ impl Lower<'_> {
             l.s.op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
         };
         sync(self);
-        let mine = self.s.m.element(at, words, slot);
+        // When replaying the console's branch order, each lane publishes
+        // its half's result to a separate dword so the exchange has no
+        // concurrent writes to the same word. Read the first lane's slot.
+        let mine = self
+            .s
+            .m
+            .element(at, words, if private_slots { f } else { slot });
         self.s.m.store(at, mine, own);
         sync(self);
-        let lo = self.s.m.element(at, words, low);
+        let first_thread = |l: &mut Self, half| l.s.m.bin(at, Bin::Shl, half, five);
+        let lo_index = if private_slots {
+            first_thread(self, low)
+        } else {
+            low
+        };
+        let hi_index = if private_slots {
+            first_thread(self, high)
+        } else {
+            high
+        };
+        let lo = self.s.m.element(at, words, lo_index);
         let lo = self.s.m.load(at, lo);
-        let hi = self.s.m.element(at, words, high);
+        let hi = self.s.m.element(at, words, hi_index);
         let mut hi = self.s.m.load(at, hi);
         if !group.is_multiple_of(2 * HALF) {
-            let first = self.s.m.bin(at, Bin::Shl, high, five);
+            let first = first_thread(self, high);
             let n = self.s.m.i32(group);
             let there = self.s.m.cmp(at, pred::IULT, first, n);
             hi = self.s.m.select(at, there, hi, missing);
@@ -471,7 +512,7 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
     let mut same: HashSet<Value> = HashSet::new();
     loop {
         let alike_atom = |same: &HashSet<Value>, a: &Atom| match *a {
-            Atom::Uniform(_) => true,
+            Atom::Uniform(_) | Atom::GroupAny(_) => true,
             Atom::Lane(v) => same.contains(&v),
             _ => false,
         };

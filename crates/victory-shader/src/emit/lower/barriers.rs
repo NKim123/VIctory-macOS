@@ -56,7 +56,7 @@ pub(crate) fn split_wave_barriers(p: &Program, st: &Structured) -> Option<Set<(u
     };
     let n = p.blocks.len();
     let succ = |b: usize| p.blocks[b].exit.successors();
-    let step = in_step(p, st);
+    let step = in_step(p, st, &[]);
     let divergent_writes = (0..n).any(|b| {
         !step[b]
             && p.blocks[b]
@@ -147,7 +147,7 @@ pub(crate) fn split_wave_barriers(p: &Program, st: &Structured) -> Option<Set<(u
 /// Scalars are assumed alike until shown otherwise (a loop counter needs
 /// itself), and the regions and the scalars are narrowed together to a
 /// fixed point. With an indirect branch, the blocks each lane runs once.
-pub(crate) fn in_step(p: &Program, st: &Structured) -> Vec<bool> {
+pub(crate) fn in_step(p: &Program, st: &Structured, waterfall_reads: &[Value]) -> Vec<bool> {
     let Some(regions) = halves::branch_regions(st) else {
         return once_per_lane(p);
     };
@@ -194,11 +194,9 @@ pub(crate) fn in_step(p: &Program, st: &Structured) -> Vec<bool> {
             let LaneExit::Branch { when, .. } = st.exits[*d] else {
                 continue;
             };
-            let together = st
-                .bools
-                .support(when)
-                .iter()
-                .all(|a| matches!(a, Atom::Uniform(v) if alike.contains(v)));
+            let together = st.bools.support(when).iter().all(|a| {
+                matches!(a, Atom::GroupAny(_)) || matches!(a, Atom::Uniform(v) if alike.contains(v))
+            });
             if !together {
                 for (b, &r) in region.iter().enumerate() {
                     step[b] &= !r;
@@ -224,7 +222,21 @@ pub(crate) fn in_step(p: &Program, st: &Structured) -> Vec<bool> {
                     .reads
                     .iter()
                     .all(|&(r, v)| scalar(r) && !mask(r) && alike.contains(&v));
-                if from && !own(inst) {
+                // The one-console-wave retry broadcasts lane reads across
+                // the group where it is in step. A waterfall's per-lane
+                // replacement or a restored SGPR can still vary by lane.
+                let broadcast = !st.group_branches.is_empty()
+                    && step[b]
+                    && matches!(inst.name(), "v_readfirstlane_b32" | "v_readlane_b32")
+                    && inst.writes.iter().all(|&(_, v)| {
+                        !waterfall_reads.contains(&v)
+                            && st.restored.get(&v).is_none_or(|a| alike.contains(a))
+                    })
+                    && inst
+                        .reads
+                        .iter()
+                        .all(|&(r, v)| !scalar(r) || mask(r) || alike.contains(&v));
+                if (from && !own(inst)) || broadcast {
                     next.extend(inst.writes.iter().filter(|w| scalar(w.0)).map(|w| w.1));
                 }
             }
