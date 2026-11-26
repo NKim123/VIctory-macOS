@@ -73,9 +73,10 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
-    /// Tables made afresh in this list: (table, what it holds) → first
-    /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u64), u32>,
+    /// Tables made afresh in this list, and their first dynamic slots.
+    fresh_tables: std::collections::HashMap<TableRecords, u32>,
+    /// CPU-only templates for buffer views shared by otherwise distinct tables.
+    list_views: Option<Option<crate::descriptor::host::ListViews>>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -97,6 +98,8 @@ pub(crate) struct State {
 }
 
 /// Fixed-function state the title set, as it set it.
+type TableRecords = (u64, Vec<[u32; 3]>);
+
 #[derive(Default)]
 struct Fixed {
     viewports: Option<Vec<D3D12_VIEWPORT>>,
@@ -313,6 +316,7 @@ impl State {
     pub(crate) fn cut(&mut self, list: &HostList) {
         self.host_state_lost();
         self.fresh_tables.clear();
+        self.list_views.take();
         self.root_slots.clear();
         self.memory = None;
         let fixed = std::mem::take(&mut self.fixed);
@@ -1320,21 +1324,15 @@ impl State {
                 .map(|u| u.table_offset_dwords / 8 + 1)
                 .max()
                 .unwrap_or(1);
-            // The table and what its entries hold (record words).
-            let key = {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                for k in 0..n {
-                    let at = table + u64::from(k) * 32;
-                    // SAFETY: a descriptor slot in title memory.
-                    unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
-                }
-                (table, h.finish())
-            };
+            // The exact records identify a table and supply the views below.
+            let records = (0..n)
+                .map(|k| crate::descriptor::record_at(table + u64::from(k) * 32))
+                .collect::<Vec<_>>();
+            let key = (table, records);
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
-                    let handle = table + u64::from(u.table_offset_dwords) * 4;
-                    if let Some(view) = crate::descriptor::view(handle) {
+                    let record = key.1[(u.table_offset_dwords / 8) as usize];
+                    if let Some(view) = crate::descriptor::recorded_view(record) {
                         readable(list, u, &view, true);
                     }
                 }
@@ -1350,20 +1348,30 @@ impl State {
                 self.table_failed = true;
                 continue;
             };
-            self.fresh_tables.insert(key, first);
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
-            for k in 0..n {
+            for (k, &record) in key.1.iter().enumerate() {
+                let k = k as u32;
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                let view = crate::descriptor::view(table + u64::from(k) * 32);
-                match view.as_deref() {
+                match crate::descriptor::recorded_view(record) {
                     Some(view) => {
-                        host.make_at(index, view);
+                        use crate::descriptor::host::ListViews;
+                        let copied = if !heap.samplers() && ListViews::can_cache(&view) {
+                            self.list_views
+                                .get_or_insert_with(ListViews::new)
+                                .as_mut()
+                                .is_some_and(|cache| cache.make(host, index, record, &view))
+                        } else {
+                            false
+                        };
+                        if !copied {
+                            host.make_at(index, &view);
+                        }
                         if let Some(u) = used {
-                            readable(list, u, view, true);
+                            readable(list, u, &view, true);
                         }
                     }
                     None => {
@@ -1374,6 +1382,7 @@ impl State {
                     }
                 }
             }
+            self.fresh_tables.insert(key, first);
             made.push((slot, first * 32));
         }
         made
@@ -2740,6 +2749,100 @@ void main(uint3 id : SV_DispatchThreadID) {{
                 ],
                 "{kind} w"
             );
+        }
+    }
+
+    #[test]
+    fn listed_buffer_views_can_be_copied_to_distinct_tables() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        use crate::descriptor::{
+            self,
+            host::{HostHeap, ListViews},
+        };
+
+        let (src, dst) = (buffer(4096), buffer(4096));
+        let null = std::ptr::null();
+        let (src_bytes, _) = crate::resource::buffer_bytes(src).unwrap();
+        let (dst_bytes, _) = crate::resource::buffer_bytes(dst).unwrap();
+        let mut record = [0u32; 8];
+        let handle = record.as_mut_ptr() as u64;
+        let raw: [u32; 10] = [39, 1, 0x1688, 0, 0, 0, 1024, 0, 1, 0];
+        descriptor::create_srv(null, src, &raw, handle);
+        let record = descriptor::record_at(handle);
+        let view = descriptor::recorded_view(record).unwrap();
+        let heap = HostHeap::new(false, 8).unwrap();
+        let mut templates = ListViews::new().unwrap();
+        let first = heap.dynamic(3).unwrap();
+        assert!(ListViews::can_cache(&view));
+        assert!(templates.make(&heap, first, record, &view));
+        assert!(templates.make(&heap, first + 1, record, &view));
+        let out = [39, 1, 0, 0, 1024, 0, 0, 0, 1, 0];
+        let out_view = View::Unordered(dst as usize, 0, Some(out));
+        heap.make_at(first + 2, &out_view);
+        drop(templates); // destination slots own their backing
+
+        let (root, pso) = compile();
+        let list = host.new_list().unwrap();
+        readable(&list, &used(ResourceType::Srv), &view, true);
+        // SAFETY: the list and its heaps are live; every access is within the
+        // respective title buffer or descriptor table.
+        unsafe {
+            for i in 0..16 {
+                (src_bytes as *mut u32)
+                    .add(i * 16)
+                    .write(0x1234_0000 + i as u32);
+            }
+            list.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list
+                .SetComputeRootDescriptorTable(0, heap.gpu(first + 1));
+            list.list
+                .SetComputeRootDescriptorTable(1, heap.gpu(first + 2));
+            list.list
+                .SetComputeRoot32BitConstants(2, 2, [0u32; 2].as_ptr().cast(), 0);
+            list.list.SetPipelineState(&pso);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+        let out = crate::shadow::find(dst_bytes as u64, 4096).unwrap();
+        assert_eq!(
+            out.read_host(dst_bytes as u64, 16),
+            (0..16).map(|i| 0x1234_0000 + i).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    #[ignore = "synthetic recording benchmark"]
+    fn bench_list_views() {
+        use crate::descriptor::host::{HostHeap, ListViews};
+        let heap = HostHeap::new(false, 8).expect("a host view heap");
+        let first = heap.dynamic(30 * 2500).unwrap();
+        let src = buffer(65536);
+        let raw = |offset| [39, 1, 0x1688, 0, offset, 0, 256, 0, 1, 0];
+        let views: Vec<_> = (0..30)
+            .map(|i| View::Shader(src as usize, Some(raw(i * 256))))
+            .collect();
+        for _ in 0..7 {
+            for cached in [false, true] {
+                let mut cache = ListViews::new().unwrap();
+                let started = std::time::Instant::now();
+                for table in 0..2500 {
+                    for (i, view) in views.iter().enumerate() {
+                        let i = i as u32;
+                        let slot = first + table * 30 + i;
+                        if cached {
+                            assert!(ListViews::can_cache(view));
+                            assert!(cache.make(&heap, slot, [0, i, 0], view));
+                        } else {
+                            heap.make_at(slot, view);
+                        }
+                    }
+                }
+                eprintln!("list cache={cached} elapsed={:?}", started.elapsed());
+            }
         }
     }
 

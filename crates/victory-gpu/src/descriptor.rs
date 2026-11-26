@@ -725,28 +725,55 @@ fn view_at(i: u32, generation: u32) -> Option<ViewPin> {
     all.then_some(pin)
 }
 
-/// For each record (tag, index, generation): whether it names a view that
-/// is current, as [`view_at`] would find it (one lock for them all).
+/// Snapshot records that differ from the host slot, and the key observed
+/// there. An obsolete generation is equivalent to a null descriptor.
 #[cfg(windows)]
-fn views_current(records: impl Iterator<Item = [u32; 3]>) -> Vec<bool> {
+fn changed_records(
+    first: u32,
+    made: &[u64],
+    records: impl Iterator<Item = [u32; 3]>,
+) -> Vec<(u32, [u32; 3], u64)> {
     let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
     records
-        .map(|[tag, i, generation]| {
-            tag == VIEW_TAG && views.list.get(i as usize).is_some_and(|(_, current)| *current == generation)
+        .zip(made)
+        .enumerate()
+        .filter_map(|(index, (record, &old))| {
+            let [tag, i, generation] = record;
+            let current = tag == VIEW_TAG
+                && views
+                    .list
+                    .get(i as usize)
+                    .is_some_and(|(_, current)| *current == generation);
+            let wanted = if current {
+                u64::from(generation) << 32 | u64::from(i)
+            } else {
+                0
+            };
+            (old != wanted).then_some((first + index as u32, record, old))
         })
         .collect()
 }
 
-/// The view recorded at `handle`, if one is (and its resource is alive),
-/// pinned until the returned value is dropped.
+/// The header stored in a descriptor slot the title passes back.
 #[cfg(any(windows, test))]
-pub(crate) fn view(handle: u64) -> Option<ViewPin> {
+pub(crate) fn record_at(handle: u64) -> [u32; 3] {
     if handle == 0 {
-        return None;
+        return [0; 3];
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
-    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    unsafe { (handle as *const [u32; 3]).read_unaligned() }
+}
+
+/// The view named by a descriptor record, pinned while it is used.
+#[cfg(any(windows, test))]
+pub(crate) fn recorded_view([tag, i, generation]: [u32; 3]) -> Option<ViewPin> {
     (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten()
+}
+
+/// The view recorded at `handle`, pinned while it is used.
+#[cfg(any(windows, test))]
+pub(crate) fn view(handle: u64) -> Option<ViewPin> {
+    recorded_view(record_at(handle))
 }
 
 /// A description of `N` words, if the title passes one.

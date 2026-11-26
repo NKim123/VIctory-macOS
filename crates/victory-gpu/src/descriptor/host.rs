@@ -12,7 +12,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::paged::Paged;
-use super::{VIEW_TAG, View, ViewPin, view_at, views_current};
+use super::{VIEW_TAG, View, ViewPin, changed_records, record_at, view_at};
 use crate::host::host;
 
 pub(crate) struct HostHeap {
@@ -75,6 +75,110 @@ pub(crate) struct HostHeap {
     addresses: std::sync::OnceLock<Option<(ID3D12Resource, usize, u64)>>,
     /// What the title slots view that title memory feeds (`crate::bindless`).
     pub(crate) viewed: std::sync::Arc<crate::bindless::Viewed>,
+}
+
+/// Templates for a list's fresh tables. CopyDescriptorsSimple requires a
+/// CPU-only source heap, and each destination still keeps its backing alive.
+pub(crate) struct ListViews {
+    _heap: ID3D12DescriptorHeap,
+    cpu: usize,
+    step: usize,
+    made: std::collections::HashMap<[u32; 3], ListedView>,
+}
+
+struct ListedView {
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    held: Held,
+    stride: u32,
+    mark: Option<(u32, u32)>,
+}
+
+impl ListViews {
+    const CAPACITY: u32 = 512;
+
+    pub(crate) fn new() -> Option<Self> {
+        let host = host()?;
+        // SAFETY: a CPU-only heap of a supported descriptor type.
+        let (heap, cpu, step) = unsafe {
+            let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+            let heap: ID3D12DescriptorHeap = host
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: kind,
+                    NumDescriptors: Self::CAPACITY,
+                    ..Default::default()
+                })
+                .ok()?;
+            let cpu = heap.GetCPUDescriptorHandleForHeapStart().ptr;
+            let step = host.device.GetDescriptorHandleIncrementSize(kind) as usize;
+            (heap, cpu, step)
+        };
+        Some(Self {
+            _heap: heap,
+            cpu,
+            step,
+            made: Default::default(),
+        })
+    }
+
+    /// Only ordinary buffer resources are eligible. An address-only view
+    /// can acquire a different memory backing during a long recording.
+    pub(crate) fn can_cache(view: &View) -> bool {
+        match view {
+            View::Shader(resource, Some(words)) | View::Unordered(resource, _, Some(words)) => {
+                words[1] == 1
+                    && crate::resource::buffer_bytes(*resource as crate::object::This).is_some()
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn make(
+        &mut self,
+        heap: &HostHeap,
+        index: u32,
+        record: [u32; 3],
+        view: &View,
+    ) -> bool {
+        let Some(host) = host() else { return false };
+        let count = self.made.len();
+        let template = match self.made.entry(record) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                if count >= Self::CAPACITY as usize {
+                    return false;
+                }
+                let at = D3D12_CPU_DESCRIPTOR_HANDLE {
+                    ptr: self.cpu + count * self.step,
+                };
+                let (kept, mark) = make_marked(view, at);
+                let Some(held) = kept.flatten() else {
+                    return false;
+                };
+                entry.insert(ListedView {
+                    at,
+                    held,
+                    stride: view_stride(view) | view_kind(view),
+                    mark,
+                })
+            }
+        };
+        // SAFETY: initialized CPU-only source, live destination owned by
+        // this list. The slot and its mark/stride are private to the list.
+        unsafe {
+            host.device.CopyDescriptorsSimple(
+                1,
+                heap.cpu(index),
+                template.at,
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            );
+        }
+        heap.keep(index, Some(template.held.clone()));
+        heap.write_stride(index, template.stride);
+        heap.set_mark(index, template.mark);
+        heap.note_address(index, Some(view));
+        true
+    }
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -737,10 +841,8 @@ impl HostHeap {
     }
 
     /// A heap sync of slots `first..last`, whose records are at `start` +
-    /// index × `step`: [`HostHeap::mirror`] of each slot whose record
-    /// differs from what the slot holds, the rest passed by as `mirror`
-    /// would, with one lock of each kind for them all instead of two per slot
-    /// (a world frame looks at ~700,000 slots, run perf3: ~75 ms).
+    /// index × `step`. Compare the snapshot of their headers to the host
+    /// mirror and apply updates from that same snapshot.
     pub(crate) fn sync_slots(
         &self,
         first: u32,
@@ -756,8 +858,21 @@ impl HostHeap {
         let at = |i: u32| start + u64::from(i) * step;
         // Snapshot the record headers through the kernel. The title can
         // unmap placed heap pages, and a slot can straddle a tracked page.
-        bytes.resize((at(last - 1) - at(first)) as usize + 12, 0);
-        if !crate::host::read_into(at(first) as *const u8, bytes) {
+        let address = at(first);
+        let end = at(last - 1) + 12;
+        bytes.resize((end - address) as usize, 0);
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        if !crate::host::read_into(address as *const u8, bytes) {
+            drop(made);
+            // The write watch's 64 KiB regions can cover multiple Windows
+            // pages. Discard a failed read, then retry its smaller ranges so
+            // an inaccessible page does not hide its readable neighbors.
+            const WINDOWS_PAGE: u64 = 4096;
+            if last - first > 1 && address / WINDOWS_PAGE != (end - 1) / WINDOWS_PAGE {
+                let middle = first + (last - first) / 2;
+                self.sync_slots(first, middle, start, step, bytes);
+                self.sync_slots(middle, last, start, step, bytes);
+            }
             return;
         }
         let records = bytes.chunks(step as usize).map(|record| {
@@ -765,24 +880,10 @@ impl HostHeap {
                 u32::from_le_bytes(record[4 * i..4 * i + 4].try_into().unwrap())
             })
         });
-        let current = views_current(records.clone());
-        let stale: Vec<u32> = {
-            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-            (first..last)
-                .zip(records.zip(current))
-                .filter(|&(i, ([_, view, generation], current))| {
-                    let wanted = if current {
-                        u64::from(generation) << 32 | u64::from(view)
-                    } else {
-                        0
-                    };
-                    made[i as usize] != wanted
-                })
-                .map(|(i, _)| i)
-                .collect()
-        };
-        for i in stale {
-            self.mirror(i, at(i), false);
+        let stale = changed_records(first, &made[first as usize..last as usize], records);
+        drop(made);
+        for (index, record, previous) in stale {
+            let _ = self.mirror_record(index, false, Some(previous), || record);
         }
     }
 
@@ -843,8 +944,7 @@ impl HostHeap {
             }
             return None;
         }
-        // SAFETY: the handle is a descriptor slot in title memory.
-        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let [tag, i, generation] = record_at(handle);
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
         // Made from this record already and readable as it is (what the
@@ -856,10 +956,28 @@ impl HostHeap {
         {
             return Some(view);
         }
+        loop {
+            if let Ok(view) = self.mirror_record(index, for_draw, None, || record_at(handle)) {
+                return view;
+            }
+        }
+    }
+
+    /// Materializes a captured record or the latest record at a live slot.
+    /// A snapshot never reads title memory again, and yields if a recorder
+    /// has already replaced the host slot it observed.
+    fn mirror_record(
+        &self,
+        index: u32,
+        for_draw: bool,
+        previous: Option<u64>,
+        read: impl Fn() -> [u32; 3],
+    ) -> Result<Option<ViewPin>, ()> {
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        // A second recorder may have replaced the slot while this thread waited.
-        // SAFETY: the caller holds the heap alive until the update completes.
-        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        if previous.is_some_and(|key| made[index as usize] != key) {
+            return Ok(None);
+        }
+        let [tag, i, generation] = read();
         let key = u64::from(generation) << 32 | u64::from(i);
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
@@ -871,7 +989,7 @@ impl HostHeap {
                 self.make_null(index);
                 self.note_address(index, None);
             }
-            return None;
+            return Ok(None);
         };
         // A placed texture's view left null below is made when a draw reads
         // the slot through a table; until then the slot is not made again
@@ -879,7 +997,7 @@ impl HostHeap {
         // later unordered or renderable view upgraded the memory's HostTexture.
         let needs_remake = || self.needs_remake(index, &view, for_draw);
         if made[index as usize] == key && !needs_remake() {
-            return Some(view);
+            return Ok(Some(view));
         }
         // Shaders index the heap itself (`crate::bindless`): buffer views
         // are made when written.
@@ -895,16 +1013,18 @@ impl HostHeap {
             drop(made);
             prepare(&view);
             made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-            // The title may have written another record there meanwhile (and
-            // another thread made it): that one is the slot's.
-            // SAFETY: as above.
-            if unsafe { (handle as *const [u32; 3]).read_unaligned() } != [tag, i, generation] {
+            if previous.is_some_and(|key| made[index as usize] != key) {
                 drop(made);
-                drop(view);
-                return self.mirror(index, handle, for_draw);
+                return Ok(None);
+            }
+            // For live writes, retry if the title replaced the record while
+            // the slot lock was released. For snapshots `read` is constant.
+            if read() != [tag, i, generation] {
+                drop(made);
+                return Err(());
             }
             if made[index as usize] == key && !needs_remake() {
-                return Some(view);
+                return Ok(Some(view));
             }
         }
         {
@@ -930,11 +1050,15 @@ impl HostHeap {
             }
             let kept = kept.flatten();
             // A texture's view left null is made again when a draw reads it.
-            let ready = if is_texture(&view) && kept.is_none() { 0 } else { key };
+            let ready = if is_texture(&view) && kept.is_none() {
+                0
+            } else {
+                key
+            };
             self.keep(index, kept);
             self.ready[index as usize].store(ready, Ordering::Release);
         }
-        Some(view)
+        Ok(Some(view))
     }
 
     /// The view host slot `index` was made from, in a few words, with the
@@ -1364,6 +1488,7 @@ type Held = (ID3D12Resource, Option<HeldSource>);
 /// The fields keep the normal and widened copies alive for as long as the
 /// slot shows them.
 #[allow(dead_code)]
+#[derive(Clone)]
 enum HeldSource {
     Shadow(std::sync::Arc<crate::shadow::Shadow>),
     /// A widened three-channel view and the normal shadow it reads.
@@ -2526,6 +2651,123 @@ mod tests {
         assert!(host.made(0) && !host.made(1), "a cleared record leaves its slot");
         host.sync_slots(0, 4, 1, 32, &mut bytes);
         assert!(host.made(0), "an inaccessible scan leaves the slot alone");
+    }
+
+    #[test]
+    fn an_unreadable_neighbor_does_not_hide_readable_slot_headers() {
+        use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, VirtualProtect};
+
+        let Some(heap) = HostHeap::new(true, 4) else {
+            return;
+        };
+        let memory = crate::watch::tests::pool(2);
+        let page = crate::watch::PAGE;
+        let start = (memory + page - 40) as u64;
+        let mut sampler = [0u32; 4];
+        let null = std::ptr::null();
+        let words = [21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+        crate::descriptor::create_sampler(null, &words, sampler.as_mut_ptr() as u64);
+        // The second header begins eight bytes from the end of the page.
+        // SAFETY: both headers lie within the two committed pages.
+        unsafe {
+            (start as *mut [u32; 4]).write_unaligned(sampler);
+            ((start + 32) as *mut [u32; 4]).write_unaligned(sampler);
+        }
+        let mut old = 0;
+        // SAFETY: the second page is ours and covers the end of slot 1.
+        let protected = unsafe { VirtualProtect((memory + page) as *mut _, page, PAGE_NOACCESS, &mut old) };
+        assert_ne!(protected, 0);
+        heap.sync_slots(0, 3, start, 32, &mut Vec::new());
+        assert!(heap.made(0));
+        assert!(!heap.made(1) && !heap.made(2));
+        crate::watch::tests::free(memory);
+    }
+
+    #[test]
+    #[ignore = "synthetic descriptor scan benchmark"]
+    fn bench_sync_heap_snapshots() {
+        use std::time::Instant;
+        let page = crate::watch::PAGE;
+        let pages = 342;
+        let slots = (pages * page / 32) as u32;
+        let memory = crate::watch::tests::pool(pages);
+        let heap = HostHeap::new(false, slots).expect("a host view heap");
+        assert_eq!(heap.count(), slots);
+        let mut record = [0u32; 8];
+        crate::descriptor::create_cbv(
+            std::ptr::null(),
+            &[0, 0, 256, 0],
+            record.as_mut_ptr() as u64,
+        );
+        for i in (0..slots as usize).step_by(8) {
+            // SAFETY: each aligned 32-byte record lies inside our allocation.
+            unsafe { ((memory + i * 32) as *mut [u32; 8]).write(record) };
+        }
+        let mut bytes = Vec::new();
+        for round in 0..12 {
+            for pages_at_once in [1, 4] {
+                let started = Instant::now();
+                let records = (pages_at_once * page / 32) as u32;
+                for first in (0..slots).step_by(records as usize) {
+                    heap.sync_slots(
+                        first,
+                        (first + records).min(slots),
+                        memory as u64,
+                        32,
+                        &mut bytes,
+                    );
+                }
+                eprintln!(
+                    "heap sync round={round} pages/chunk={pages_at_once} elapsed={:?}",
+                    started.elapsed()
+                );
+            }
+        }
+        assert!(heap.made(slots - 8));
+        crate::watch::tests::free(memory);
+    }
+
+    #[test]
+    #[ignore = "synthetic heap read benchmark"]
+    fn bench_read_heap_snapshots() {
+        use std::time::Instant;
+        let page = crate::watch::PAGE;
+        let pages = 342;
+        let start = crate::watch::tests::pool(pages);
+        // SAFETY: these pages are ours. Commit their backing before timing.
+        unsafe { std::ptr::write_bytes(start as *mut u8, 1, pages * page) };
+        fn sweep(start: usize, page: usize, chunk: usize, begin: usize, end: usize) {
+            let mut bytes = vec![0; page * chunk];
+            for i in (begin..end).step_by(chunk) {
+                let len = end.abs_diff(i).min(chunk) * page;
+                assert!(crate::host::read_into(
+                    (start + i * page) as *const u8,
+                    &mut bytes[..len]
+                ));
+                std::hint::black_box(&bytes[..len]);
+            }
+        }
+        for _ in 0..11 {
+            for (chunk, parallel) in [(1, false), (4, false), (1, true), (4, true)] {
+                let now = Instant::now();
+                if parallel {
+                    std::thread::scope(|scope| {
+                        for i in 0..3 {
+                            scope.spawn(move || {
+                                sweep(start, page, chunk, i * pages / 3, (i + 1) * pages / 3)
+                            });
+                        }
+                    });
+                } else {
+                    sweep(start, page, chunk, 0, pages);
+                }
+                eprintln!(
+                    "heap read pages/chunk={chunk} parallel={parallel} elapsed={:?}",
+                    now.elapsed()
+                );
+            }
+        }
+        crate::watch::tests::free(start);
     }
 
     /// The world's 16-byte view of 0 elements removed the device.
