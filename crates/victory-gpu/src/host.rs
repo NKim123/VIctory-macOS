@@ -1,8 +1,8 @@
 //! The host GPU: one D3D12 device and direct queue (decision 0007), and a
 //! window to present on.
 //!
-//! Title-memory submissions wait for the GPU before landing. The optional
-//! ring keeps zero-copy submissions and their resources on the direct queue.
+//! Title-memory writes land after the GPU fence. The optional ring retains
+//! each recording until its GPU work and title-visible completion are done.
 
 mod inflight;
 mod rec;
@@ -11,7 +11,7 @@ mod submission_profile;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use inflight::{BottomWrite, Boundary, Submission};
+use inflight::{BottomWrite, Boundary, OrderedCompletion, Submission};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -1441,6 +1441,7 @@ pub(crate) struct HostList {
     /// The draw or dispatch being recorded runs a program using title
     /// memory ([`HostList::writer_uses_memory`]).
     memory_writer: std::sync::atomic::AtomicBool,
+    view_writes: std::sync::atomic::AtomicBool,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
@@ -1653,7 +1654,10 @@ impl Step {
                 touches(dst, len) || touches(src, len)
             }
             Self::Fill(_, src, len) => touches(src, len),
-            Self::Refresh(_, at, len) | Self::GpuWrite(_, at, len, ..) => touches(at, len),
+            Self::Refresh(ref copy, at, len) => {
+                (!copy.is_aliased() || !copy.clean()) && touches(at, len)
+            }
+            Self::GpuWrite(ref copy, at, len, ..) => !copy.is_aliased() && touches(at, len),
             Self::Slot(..) | Self::Heap(_) | Self::Host(_) | Self::Memory(_) => true,
             #[cfg(test)]
             Self::Run(_) => true,
@@ -1663,10 +1667,8 @@ impl Step {
     }
 
     fn flushes_refreshes(&self) -> bool {
-        matches!(
-            self,
-            Self::Copy(..) | Self::Move(..) | Self::GpuWrite(_, _, _, false, _)
-        )
+        matches!(self, Self::Copy(..) | Self::Move(..))
+            || matches!(self, Self::GpuWrite(copy, _, _, false, _) if !copy.is_aliased())
     }
 
     fn touches_shared_memory(&self) -> bool {
@@ -1679,7 +1681,7 @@ impl Step {
                 alias(dst, len) || alias(src, len)
             }
             Self::Fill(_, src, len) => alias(src, len),
-            Self::Host(_) | Self::Memory(_) => true,
+            Self::Host(_) => true,
             #[cfg(test)]
             Self::Run(_) => true,
             _ => false,
@@ -1688,6 +1690,14 @@ impl Step {
 }
 
 type AfterCallback = Box<dyn Fn(&mut crate::memory::ComputedBaselines, bool) + Send>;
+
+struct CompletionStatus<'a> {
+    landing: Option<u64>,
+    show_after: bool,
+    verified: bool,
+    incomplete: &'a [usize],
+    individual: bool,
+}
 
 enum AfterWork {
     Callback(AfterCallback),
@@ -1742,8 +1752,6 @@ struct Deferred {
     /// Work done once the list has run, before the bottom-of-pipe writes
     /// (title memory shaders wrote at addresses they computed goes back).
     after: Vec<AfterWork>,
-    /// This recording can write through the shared views' write bitmap.
-    view_writes: bool,
     /// Shader-visible heaps and the objects behind their descriptors.
     title_heaps: std::collections::HashMap<usize, Arc<crate::descriptor::host::HostHeap>>,
     /// Commands whose dependencies the submission worker cannot track.
@@ -1991,6 +1999,7 @@ impl Host {
                 widened_states: Mutex::default(),
                 ours: false.into(),
                 memory_writer: false.into(),
+                view_writes: false.into(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 profile_commands: Mutex::default(),
@@ -2470,10 +2479,7 @@ impl Host {
         } else if crate::bindless::remake_pending() {
             Some(Boundary::Descriptors)
         } else {
-            // The global bitmap can require synchronous completion of this
-            // submission. Previous flights cannot need shadow copy-back,
-            // so preparation can overlap until any real memory dependency.
-            runs.iter().find_map(|list| list.inflight_barrier(None))
+            runs.iter().find_map(|list| list.inflight_barrier())
         };
         let mut overlapped = false;
         let owned = if let Some(why) = fallback {
@@ -2491,7 +2497,6 @@ impl Host {
                 .iter()
                 .all(|&list| unique.insert(std::ptr::from_ref(list)))
             {
-                overlapped = self.note_overlap(submission);
                 owned
             } else {
                 self.note_sync(submission, Boundary::ReusedList);
@@ -2499,6 +2504,7 @@ impl Host {
             }
         };
         let started = std::time::Instant::now();
+        let completion_before = submission.completion_us;
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
         #[cfg(feature = "diagnostics")]
@@ -2506,6 +2512,8 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ExecuteLists, runs.len() as u64);
         if !host_only {
+            // Older copied GPU output can land in title memory read below.
+            self.wait_ordered_completion(submission, |work| work.title_memory);
             // Host textures the title has not used for a while (or past the
             // card's budget) are given up first: the last submission has run.
             if !submission.busy() {
@@ -2517,6 +2525,7 @@ impl Host {
                 self.drain_inflight(submission, Boundary::Descriptors);
                 crate::descriptor::remake_unordered();
             }
+            overlapped = owned.is_some() && self.note_overlap(submission);
             // Descriptors the title copied into its heaps itself, before the
             // heaps' views are brought up to date below.
             #[cfg(feature = "diagnostics")]
@@ -2560,6 +2569,7 @@ impl Host {
         // Pending shared SRVs can upload unrelated title memory. The
         // submit-ahead worker only runs lists that have no such dependencies.
         if show_after {
+            self.wait_ordered_completion(submission, |work| work.descriptors);
             let mut demand = crate::descriptor::TableTextureSlots::new();
             for list in runs {
                 for step in &list.deferred().copies {
@@ -2660,6 +2670,24 @@ impl Host {
                     {
                         self.drain_inflight(submission, Boundary::CpuAccess);
                     }
+                    if let Step::Memory(heap) = step
+                        && submission.busy()
+                    {
+                        if landing.is_some() {
+                            self.drain_inflight(submission, Boundary::CpuAccess);
+                            return true;
+                        }
+                        // A stable table and its referenced resources may
+                        // remain bound by older lists. Rewriting the shared
+                        // table or its slot pairs needs the earlier fences.
+                        if crate::memory::prepare(*heap, false, |copy, from, len| {
+                            batch.add(copy, from, len);
+                        }) {
+                            return false;
+                        }
+                        self.drain_inflight(submission, Boundary::CpuAccess);
+                    }
+                    true
                 });
             }
             firsts.push(lists.len());
@@ -2674,6 +2702,10 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         self.order_shared_bottom_writes(submission);
+        // A flight with CPU copy-back or descriptor publication must land
+        // before another native list starts. Overlap the preparation above
+        // where it does not touch the earlier flight's inputs or outputs.
+        self.wait_ordered_completion(submission, |_| true);
         if !batch.refreshes.is_empty() {
             self.drain_inflight(submission, Boundary::CpuAccess);
         }
@@ -2704,17 +2736,15 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         batch.log_refreshes(submission.value + 1, runs.len());
         let prepared = std::time::Instant::now();
+        let prep_us = ((prepared - started).as_micros() as u64)
+            .saturating_sub(submission.completion_us - completion_before);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(
             crate::copystat::C::FaultsPrep,
             crate::copystat::page_faults().saturating_sub(faults),
         );
-        let mut late_fallback = owned.and_then(|_| {
-            runs.iter()
-                .find_map(|list| list.inflight_barrier(Some(&computed)))
-        });
+        let mut late_fallback = None;
         if let Some(owned) = owned
-            && late_fallback.is_none()
             && uploads
                 .as_ref()
                 .is_none_or(crate::bindless::Uploads::is_owned)
@@ -2726,17 +2756,29 @@ impl Host {
             if self.make_flight_room(submission, owned.len(), bytes)
                 && let Some(marks) = self.flight_marks(submission, native_boundaries.len() + 1)
             {
-                let needs_feedback = runs.iter().any(|list| list.deferred().view_writes);
+                let mut ordered = OrderedCompletion {
+                    landing,
+                    show_after,
+                    ..Default::default()
+                };
+                for list in runs {
+                    list.note_ordered_completion(&computed, &mut ordered);
+                }
+                let ordered = ordered.reason().map(|_| ordered);
+                let needs_feedback = ordered.is_none()
+                    && runs
+                        .iter()
+                        .any(|list| list.view_writes.load(Ordering::Relaxed));
                 let feedback = needs_feedback
                     .then(|| self.flight_feedback(submission))
                     .flatten();
                 if !needs_feedback || feedback.is_some() {
-                    let computed = runs
-                        .iter()
-                        .any(|list| list.deferred().has_computed_feedback())
-                        .then_some(computed);
-                    SUBMISSION_US[0]
-                        .fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
+                    let computed = (ordered.is_some()
+                        || runs
+                            .iter()
+                            .any(|list| list.deferred().has_computed_feedback()))
+                    .then_some(computed);
+                    SUBMISSION_US[0].fetch_add(prep_us, Ordering::Relaxed);
                     self.enqueue_flight(
                         submission,
                         marks,
@@ -2749,6 +2791,7 @@ impl Host {
                         bytes,
                         feedback,
                         computed,
+                        ordered,
                         overlapped,
                     );
                     return None;
@@ -2972,7 +3015,7 @@ impl Host {
         }
         let _ = &firsts;
         let gpu = prepared.elapsed();
-        SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
+        SUBMISSION_US[0].fetch_add(prep_us, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
         // The host resets a device whose submission runs for about 2 s.
         if gpu > std::time::Duration::from_millis(250) {
@@ -3009,9 +3052,67 @@ impl Host {
             self.log_messages();
             return None;
         }
-        let ran = |list: usize| {
-            verified && !incomplete.contains(&if groups.len() == 1 { 0 } else { list })
-        };
+        self.finish_title_submission(
+            runs,
+            computed,
+            CompletionStatus {
+                landing,
+                show_after,
+                verified,
+                incomplete: &incomplete,
+                individual: groups.len() > 1,
+            },
+            pending_pins,
+        );
+        for list in runs {
+            for write in &list.deferred().writes {
+                write.publish();
+            }
+        }
+        // The submission has run and the next waits for our lock. Host
+        // copies the title gave up meanwhile may have their last holder here.
+        release_retired();
+        release_later(Box::new((batch, heaps)));
+        self.log_messages();
+        // A listed frame: what this submission's lists drew, as it is now
+        // (the dumps submit lists of their own).
+        #[cfg(feature = "diagnostics")]
+        if traced {
+            let sub = submission.value;
+            let mut targets: Vec<(usize, String)> = Vec::new();
+            for r in runs {
+                for t in r.targets.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+                    if !targets.iter().any(|x| x.0 == t.0) {
+                        targets.push(t.clone());
+                    }
+                }
+            }
+            return Some((sub, targets));
+        }
+        if let Some(upload) = uploads.and_then(crate::bindless::Uploads::into_owned) {
+            submission.recycle_upload(upload.list);
+        }
+        None
+    }
+
+    /// Completes title-visible writes once the relevant native work is done.
+    /// The submission lock excludes younger GPU work that shares this storage.
+    fn finish_title_submission(
+        &self,
+        runs: &[&HostList],
+        mut computed: crate::memory::ComputedBaselines,
+        status: CompletionStatus<'_>,
+        pending_pins: &mut Vec<crate::descriptor::ViewPin>,
+    ) -> u64 {
+        let CompletionStatus {
+            landing,
+            show_after,
+            verified,
+            incomplete,
+            individual,
+        } = status;
+        let ran =
+            |list: usize| verified && !incomplete.contains(&if individual { list } else { 0 });
         // Shadow contents and write bitmaps are shared by every group of
         // this part. A group that stopped before its mark may have written
         // part of a buffer that another group also touched.
@@ -3021,7 +3122,7 @@ impl Host {
         // confirmed occurrence cannot vouch for bytes overwritten by an
         // unconfirmed occurrence in another timing group.
         let mut unconfirmed_lists = std::collections::HashSet::new();
-        if groups.len() > 1 {
+        if individual {
             unconfirmed_lists.extend(incomplete.iter().map(|&i| std::ptr::from_ref(runs[i])));
         }
         // What shaders wrote goes back before the bottom-of-pipe writes,
@@ -3220,38 +3321,14 @@ impl Host {
             }
             crate::descriptor::service_pending(&Default::default(), &[], pending_pins, None);
         }
-        COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let elapsed = copying.elapsed().as_micros() as u64;
+        COPY_BACK[0].fetch_add(elapsed, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsBack, crate::copystat::page_faults().saturating_sub(faults));
-        for list in runs {
-            for write in &list.deferred().writes {
-                write.publish();
-            }
+        if !back.is_empty() || !withheld.is_empty() {
+            release_later(Box::new((back, withheld)));
         }
-        // The submission has run and the next waits for our lock. Host
-        // copies the title gave up meanwhile may have their last holder here.
-        release_retired();
-        release_later(Box::new((batch, back, withheld, heaps)));
-        self.log_messages();
-        // A listed frame: what this submission's lists drew, as it is now
-        // (the dumps submit lists of their own).
-        #[cfg(feature = "diagnostics")]
-        if traced {
-            let sub = submission.value;
-            let mut targets: Vec<(usize, String)> = Vec::new();
-            for r in runs {
-                for t in r.targets.lock().unwrap_or_else(|e| e.into_inner()).iter() {
-                    if !targets.iter().any(|x| x.0 == t.0) {
-                        targets.push(t.clone());
-                    }
-                }
-            }
-            return Some((sub, targets));
-        }
-        if let Some(upload) = uploads.and_then(crate::bindless::Uploads::into_owned) {
-            submission.recycle_upload(upload.list);
-        }
-        None
+        elapsed
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
@@ -3664,6 +3741,7 @@ impl HostList {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = Default::default();
         }
+        self.view_writes.store(false, Ordering::Relaxed);
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -4371,10 +4449,7 @@ impl HostList {
         self.deferred().synchronous = true;
     }
 
-    fn inflight_barrier(
-        &self,
-        computed: Option<&crate::memory::ComputedBaselines>,
-    ) -> Option<Boundary> {
+    fn inflight_barrier(&self) -> Option<Boundary> {
         let d = self.deferred();
         #[cfg(test)]
         if !d.missed.is_empty() {
@@ -4382,27 +4457,51 @@ impl HostList {
         }
         if d.synchronous {
             Some(Boundary::Synchronous)
-        } else if !d.texture_fills.is_empty() {
-            Some(Boundary::Descriptors)
         } else if !d.texture_backs.is_empty() {
             Some(Boundary::TextureBack)
-        } else if d.after.iter().any(|work| match work {
-            AfterWork::Callback(_) => true,
-            AfterWork::Computed(feedback) => {
-                computed.is_some_and(|b| !feedback.only_plain_tiles(b))
-            }
-        }) {
+        } else if d
+            .after
+            .iter()
+            .any(|work| matches!(work, AfterWork::Callback(_)))
+        {
             Some(Boundary::ComputedBack)
-        } else if d.copies.iter().any(|step| {
-            matches!(step, Step::GpuWrite(copy, address, len, ..)
-                if !copy.is_aliased()
-                    || copy.refresh_range(*address, address.saturating_add(*len)).is_some())
-        }) {
-            Some(Boundary::ShadowBack)
-        } else if computed.is_some() && d.view_writes && crate::shadow::has_copy_back_marks() {
-            Some(Boundary::MarkedBack)
         } else {
             None
+        }
+    }
+
+    fn note_ordered_completion(
+        &self,
+        computed: &crate::memory::ComputedBaselines,
+        ordered: &mut OrderedCompletion,
+    ) {
+        let d = self.deferred();
+        ordered.descriptors |= !d.texture_fills.is_empty();
+        for work in &d.after {
+            if let AfterWork::Computed(feedback) = work
+                && !feedback.only_plain_tiles(computed)
+            {
+                ordered.computed = true;
+                ordered.title_memory |= feedback.has_copies(computed);
+            }
+        }
+        for step in &d.copies {
+            if let Step::GpuWrite(copy, address, len, ..) = step {
+                if !copy.is_aliased() {
+                    ordered.shadow = true;
+                    ordered.title_memory = true;
+                } else if copy
+                    .refresh_range(*address, address.saturating_add(*len))
+                    .is_some()
+                {
+                    ordered.shadow = true;
+                }
+            }
+        }
+        if self.view_writes.load(Ordering::Relaxed) {
+            let (copies, widened) = crate::shadow::mark_landing_owners();
+            ordered.marked |= copies != 0 || widened != 0;
+            ordered.title_memory |= copies != 0;
         }
     }
 
@@ -4438,7 +4537,7 @@ impl HostList {
 
     pub(crate) fn note_view_writes(&self) {
         if inflight_enabled() {
-            self.deferred().view_writes = true;
+            self.view_writes.store(true, Ordering::Relaxed);
         }
     }
 
@@ -4822,19 +4921,21 @@ impl HostList {
     /// lists of a submission, through many ranges).
     #[cfg(test)]
     fn run_deferred(&self, batch: &mut Batch) {
-        self.run_deferred_planned(batch, &[], |_, _| {});
+        self.run_deferred_planned(batch, &[], |_, _| true);
     }
 
     fn run_deferred_planned(
         &self,
         batch: &mut Batch,
         skip: &[bool],
-        mut before: impl FnMut(&Batch, &Step),
+        mut before: impl FnMut(&mut Batch, &Step) -> bool,
     ) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for (i, step) in self.deferred().copies.iter().enumerate() {
-            before(batch, step);
+            if !before(batch, step) {
+                continue;
+            }
             if let Step::Refresh(shadow, ..) = step
                 && (skip.get(i).copied().unwrap_or(false) || shadow.clean())
             {
@@ -4906,7 +5007,7 @@ impl HostList {
                 Step::GpuWrite(shadow, address, len, marked, _) => {
                     // The shaders start from the title's data, which a
                     // snapshot must hold (marked ranges keep none).
-                    if !marked {
+                    if step.flushes_refreshes() {
                         batch.flush();
                     }
                     shadow.writing(*address, *len, *marked);
@@ -4919,7 +5020,7 @@ impl HostList {
                     continue;
                 }
                 &Step::Memory(heap) => {
-                    crate::memory::prepare(heap, |s, a, l| batch.add(s, a, l));
+                    crate::memory::prepare(heap, true, |s, a, l| batch.add(s, a, l));
                     continue;
                 }
             };
@@ -6851,8 +6952,8 @@ mod batch {
         assert!(plan[0].skip.iter().all(|&skip| skip));
         assert!(plan[1].skip.is_empty());
         let mut batch = Batch::default();
-        before.run_deferred_planned(&mut batch, &plan[0].skip, |_, _| {});
-        writes.run_deferred_planned(&mut batch, &plan[1].skip, |_, _| {});
+        before.run_deferred_planned(&mut batch, &plan[0].skip, |_, _| true);
+        writes.run_deferred_planned(&mut batch, &plan[1].skip, |_, _| true);
         after.run_deferred(&mut batch);
         assert!(batch.flush() > 0);
         assert_eq!(copy.read_host(base as u64, 1), [12]);

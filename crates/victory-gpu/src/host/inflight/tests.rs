@@ -246,11 +246,20 @@ fn shared_uav_page_marks_retire_before_a_younger_flight() {
     assert!(OVERLAPPED.load(Ordering::Relaxed) >= overlaps + 2);
     let widened = alias.widened(title as u64, 12, 1).unwrap();
     assert!(!alias.clean());
-    assert!(!host.execute_title(&[record(false, 44, true)]));
+    let ordered = ORDERED[Boundary::MarkedBack as usize].load(Ordering::Relaxed);
+    let mut gate = Gate::new(host);
+    assert!(host.execute_title(&[record(false, 44, true)]));
+    assert_eq!(widened.read_host(4)[0], 33);
+    gate.open();
+    host.present_boundary();
     assert_eq!(widened.read_host(4)[0], 44);
     assert_eq!(
+        ORDERED[Boundary::MarkedBack as usize].load(Ordering::Relaxed),
+        ordered + 1
+    );
+    assert_eq!(
         FALLBACKS[Boundary::MarkedBack as usize].load(Ordering::Relaxed),
-        before + 1
+        before
     );
     drop(widened);
     assert!(alias.clean(), "only live widened views require retirement");
@@ -258,6 +267,101 @@ fn shared_uav_page_marks_retire_before_a_younger_flight() {
     host.present_boundary();
     drop((tracker, alias));
     crate::watch::tests::free(title);
+}
+
+#[test]
+fn copied_shadow_lands_before_the_bottom_label() {
+    let Some(host) = host_for_ring() else { return };
+    use crate::watch::PAGE;
+    let title = crate::watch::tests::pool(1);
+    let label = AtomicU32::new(0);
+    crate::shadow::register(title, title as u64, PAGE as u64);
+    let copy = crate::shadow::find(title as u64, PAGE as u64).unwrap();
+    assert!(!copy.is_aliased());
+    let list = host.new_list().unwrap();
+    copy.refresh(&list, title as u64, 4);
+    copy.gpu_writes(&list, title as u64, 4, false);
+    let (upload, at, data) = list.upload(4).unwrap();
+    // SAFETY: the upload range and the host shadow hold at least four bytes.
+    unsafe {
+        data.cast::<u32>().write(91);
+        list.list
+            .CopyBufferRegion(&copy.buffer, copy.offset(title as u64), &upload, at, 4);
+    }
+    list.defer_write(label.as_ptr().cast(), crate::queue::Written::Value(1), 4);
+    list.close();
+
+    let mut gate = Gate::new(host);
+    let before = ORDERED[Boundary::ShadowBack as usize].load(Ordering::Relaxed);
+    assert!(host.execute_title(&[Arc::new(list)]));
+    assert_eq!(label.load(Ordering::Acquire), 0);
+    gate.open();
+    host.present_boundary();
+    assert_eq!(label.load(Ordering::Acquire), 1);
+    // SAFETY: the registered pool is live and the copy-back has finished.
+    assert_eq!(unsafe { (title as *const u32).read() }, 91);
+    assert_eq!(
+        ORDERED[Boundary::ShadowBack as usize].load(Ordering::Relaxed),
+        before + 1
+    );
+    drop(copy);
+    crate::shadow::unregister(title, title as u64);
+    crate::watch::tests::free(title);
+}
+
+#[test]
+fn texture_fill_is_published_only_after_its_fence() {
+    let Some(host) = host_for_ring() else { return };
+    if !crate::descriptor::host::show_after() {
+        return;
+    }
+    let mut texture = None;
+    // SAFETY: the description is a valid tiny color texture and output is ours.
+    unsafe {
+        host.device.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            },
+            D3D12_HEAP_FLAG_NONE,
+            &D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 4,
+                Height: 4,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                ..Default::default()
+            },
+            D3D12_RESOURCE_STATE_COMMON,
+            None,
+            &mut texture,
+        )
+    }
+    .unwrap();
+    let copy = Arc::new(crate::resource::HostTexture::new(
+        texture.unwrap(),
+        0,
+        Vec::new(),
+    ));
+    let list = host.new_list().unwrap();
+    list.defer_texture_fill(crate::texture::Fill::Upload(copy.clone()));
+    list.close();
+    let before = ORDERED[Boundary::Descriptors as usize].load(Ordering::Relaxed);
+    let mut gate = Gate::new(host);
+    assert!(host.execute_title(&[Arc::new(list)]));
+    assert!(!copy.initialized.load(Ordering::Acquire));
+    gate.open();
+    host.present_boundary();
+    assert!(copy.initialized.load(Ordering::Acquire));
+    assert_eq!(
+        ORDERED[Boundary::Descriptors as usize].load(Ordering::Relaxed),
+        before + 1
+    );
 }
 
 #[test]
@@ -298,6 +402,15 @@ fn additive_mapping_can_proceed_while_a_destructive_edit_waits() {
 
 #[test]
 fn computed_writes_to_tiles_retire_with_their_captured_layout() {
+    computed_writes_to_tiles(false);
+}
+
+#[test]
+fn computed_writes_to_tiles_retire_with_a_mixed_layout() {
+    computed_writes_to_tiles(true);
+}
+
+fn computed_writes_to_tiles(mixed: bool) {
     let Some(host) = host_for_ring() else { return };
     if !crate::switch::on("VICTORY_PHYSICAL_TILES") {
         return;
@@ -309,6 +422,13 @@ fn computed_writes_to_tiles_retire_with_their_captured_layout() {
     use crate::compute::Param;
     use crate::watch::PAGE;
     host.present_boundary();
+    let ordinary = mixed.then(|| {
+        let title = crate::watch::tests::pool(1);
+        crate::shadow::register(title, title as u64, PAGE as u64);
+        let copy = crate::shadow::find(title as u64, PAGE as u64).unwrap();
+        assert!(!copy.is_aliased());
+        (title, copy)
+    });
     let title = crate::watch::tests::pool(1);
     let heap = Arc::new(crate::alias::physical_heap(PAGE).expect("CPU-visible physical tiles"));
     let tiled = crate::tiled::TiledAlias::new(title, PAGE).expect("a tiled title reservation");
@@ -357,12 +477,17 @@ fn computed_writes_to_tiles_retire_with_their_captured_layout() {
     }
     list.close();
     let before = QUEUED_COMPUTED.load(Ordering::Relaxed);
+    let ordered = ORDERED[Boundary::ComputedBack as usize].load(Ordering::Relaxed);
     let mut gate = Gate::new(host);
     assert!(host.execute_title(&[Arc::new(list)]));
     assert!(tracker.clean());
     gate.open();
     host.present_boundary();
     assert_eq!(QUEUED_COMPUTED.load(Ordering::Relaxed), before + 1);
+    assert_eq!(
+        ORDERED[Boundary::ComputedBack as usize].load(Ordering::Relaxed),
+        ordered + u64::from(mixed)
+    );
     assert!(
         !tracker.clean(),
         "computed tile marks notified the title tracker"
@@ -372,6 +497,11 @@ fn computed_writes_to_tiles_retire_with_their_captured_layout() {
     assert_eq!(physical_value, 0x55667788);
     drop((tiled, copy, tracker));
     crate::watch::tests::free(title);
+    if let Some((address, copy)) = ordinary {
+        drop(copy);
+        crate::shadow::unregister(address, address as u64);
+        crate::watch::tests::free(address);
+    }
 }
 
 #[test]
@@ -636,7 +766,7 @@ fn a_native_copy_sees_an_earlier_label_through_a_zero_copy_buffer() {
     let first = record_copy(host, &out, 4, 1);
     first.defer_gpu_write(&shadow, src as usize, 4, false);
     first.defer_write(src, crate::queue::Written::Value(91), 4);
-    assert_eq!(first.inflight_barrier(Some(&Default::default())), None);
+    assert_eq!(first.inflight_barrier(), None);
     assert!(host.execute_title(&[first]));
     let next = host.new_list().unwrap();
     // SAFETY: both buffers are retained through the submission's fence.
