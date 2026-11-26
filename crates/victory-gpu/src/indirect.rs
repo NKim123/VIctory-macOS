@@ -58,7 +58,7 @@ const JOBS: u32 = 64;
 const JOB_BYTES: u64 = 16;
 const SLOT_BYTES: u64 = 32;
 
-static BATCH_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static BATCH_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// A clamp shared by executions reading one host backing buffer. Its
 /// mapped job table is finalized by recording, before the list can run.
@@ -113,7 +113,7 @@ impl Batch {
         let budget = list.budget()?;
         let (table, jobs) = list.scratch((u64::from(JOBS) + 1) * JOB_BYTES)?;
         let output = list.arguments(u64::from(JOBS) * SLOT_BYTES)?;
-        let before = list.indirect_batch_output(&output);
+        let before = list.indirect_output_state(&output);
         let l = &list.list;
         // SAFETY: the list owns the table, budget and output. The caller
         // keeps the source alive. The table's count starts at zero.
@@ -188,13 +188,18 @@ impl Batch {
     }
 }
 
+pub(crate) fn note_aliased_record() {
+    BATCH_STATS[2].fetch_add(1, Ordering::Relaxed);
+}
+
 pub(crate) fn report_batches(frames: f64) {
-    let [passes, records] = BATCH_STATS.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
-    if passes > 0 {
+    let [passes, records, aliased] = BATCH_STATS.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
+    if passes > 0 || aliased > 0 {
         tracing::info!(
-            "indirect batch per frame: {:.0} records in {:.0} passes",
+            "indirect batch per frame: {:.0} records in {:.0} passes, {:.0} aliased single records clamped immediately",
             records as f64 / frames,
-            passes as f64 / frames
+            passes as f64 / frames,
+            aliased as f64 / frames
         );
     }
 }
@@ -426,7 +431,8 @@ fn from_bytes(bytes: &[u8]) -> windows::core::Result<Clamp> {
 /// input assembler, these reads), with unordered-access barriers for order.
 /// Only the list's argument buffer moves, common, unordered access,
 /// indirect argument, common: its states are known whatever order lists
-/// run in.
+/// run in. With `keep_readable`, the next clamp starts from indirect
+/// argument and the list returns the buffer to common when it closes.
 // shortcut: a buffer a shader writes through an unordered view and the
 // input assembler then reads in one submission is, by the letter of D3D12,
 // promoted to a write state the input assembler may not use (the debug
@@ -437,8 +443,16 @@ pub(crate) fn bound(
     gpu: u64,
     (kind, stride, records): (u32, u32, u32),
     count: Option<u64>,
+    keep_readable: bool,
 ) -> Option<ID3D12Resource> {
-    bound_with(clamp()?, list, gpu, (kind, stride, records), count)
+    bound_with(
+        clamp()?,
+        list,
+        gpu,
+        (kind, stride, records),
+        count,
+        keep_readable,
+    )
 }
 
 /// [`bound`] with a given clamp.
@@ -448,6 +462,7 @@ fn bound_with(
     gpu: u64,
     (kind, stride, records): (u32, u32, u32),
     count: Option<u64>,
+    keep_readable: bool,
 ) -> Option<ID3D12Resource> {
     let budget = list.budget()?;
     if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
@@ -459,6 +474,11 @@ fn bound_with(
         RECORDS[1].fetch_add(u64::from(records), Ordering::Relaxed);
     }
     let out = list.arguments(u64::from(stride) * u64::from(records.max(1)))?;
+    let before = if keep_readable {
+        list.indirect_output_state(&out)
+    } else {
+        D3D12_RESOURCE_STATE_COMMON
+    };
     let l = &list.list;
     let constants = [kind, stride, records, u32::from(count.is_some()), widest()];
     // SAFETY: an open list; our root signature, pipeline and buffers, and
@@ -467,7 +487,7 @@ fn bound_with(
         // Earlier shader writes (the title's argument passes) first.
         l.ResourceBarrier(&[
             uav_barrier(),
-            transition(&out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            transition(&out, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
         ]);
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
@@ -616,7 +636,8 @@ mod tests {
                 data.add(at).write_volatile(word);
             }
             let spec = (kind, per as u32 * 4, records);
-            let out = super::bound_with(c, &list, buffer.GetGPUVirtualAddress(), spec, None).unwrap();
+            let out = super::bound_with(c, &list, buffer.GetGPUVirtualAddress(), spec, None, false)
+                .unwrap();
             super::done(&list, &out);
             list.close();
             host.execute(&[&list]);
@@ -689,8 +710,7 @@ mod tests {
             let counted = count.map(|_| counter.GetGPUVirtualAddress());
             let mut out = None;
             for _ in 0..calls {
-                let clamped = super::bound(&list, gpu, spec, counted).unwrap();
-                super::done(&list, &clamped);
+                let clamped = super::bound(&list, gpu, spec, counted, true).unwrap();
                 out = Some(clamped);
             }
             list.close();
@@ -771,7 +791,7 @@ mod tests {
             let recorded: Vec<_> = lists
                 .iter()
                 .map(|l| {
-                    let out = super::bound(l, gpu, (2, 12, 1), None).unwrap();
+                    let out = super::bound(l, gpu, (2, 12, 1), None, false).unwrap();
                     super::done(l, &out);
                     l.close();
                     (out, issued())
@@ -865,7 +885,7 @@ void main(uint3 g : SV_GroupID) {
         let host = host()?;
         let (root, pso) =
             crate::compute::pipeline(MARK, s!("marks"), 0, &[Param::Uav { register: 0 }]).unwrap();
-        let (record, words) = host.shared_buffer(12).unwrap();
+        let (record, words) = host.shared_buffer(24).unwrap();
         let (marks, seen) = host.shared_buffer(u64::from(groups) * 4).unwrap();
         let argument = D3D12_INDIRECT_ARGUMENT_DESC {
             Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
@@ -886,16 +906,18 @@ void main(uint3 g : SV_GroupID) {
                 .CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut signature)
                 .unwrap();
             let signature = signature.unwrap();
-            words.cast::<[u32; 3]>().write_volatile([groups, 1, 1]);
+            words
+                .cast::<[u32; 6]>()
+                .write_volatile([groups, 1, 1, 1, 1, 1]);
             std::ptr::write_bytes(seen, 0, groups as usize * 4);
             let gpu = record.GetGPUVirtualAddress();
             let (arguments, offset) = match source {
                 ArgumentSource::Batched => {
                     let mut batch = Batch::open(&list, gpu).expect("compile the batched clamp");
-                    batch.place(gpu, 0, 2).unwrap();
+                    batch.place(gpu, 12, 2).unwrap();
                     batch.place(gpu, 0, 2).unwrap()
                 }
-                ArgumentSource::Clamped => (bound(&list, gpu, (2, 12, 1), None).unwrap(), 0),
+                ArgumentSource::Clamped => (bound(&list, gpu, (2, 12, 1), None, false).unwrap(), 0),
                 ArgumentSource::Original => {
                     list.list.ResourceBarrier(&[transition(
                         &record,

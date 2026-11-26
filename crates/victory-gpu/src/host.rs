@@ -1452,7 +1452,7 @@ pub(crate) struct HostList {
     /// Clamped indirect arguments (`crate::indirect`), reused by each
     /// execution in turn; replaced by a bigger one when too small.
     arguments: Mutex<Option<ID3D12Resource>>,
-    /// Scratch last left ready for indirect execution by a batched clamp.
+    /// Scratch last left ready for indirect execution by a clamp.
     indirect_readable: Mutex<Option<ID3D12Resource>>,
     /// Title ordering boundaries that may make GPU-written arguments visible.
     indirect_epoch: AtomicU64,
@@ -4530,7 +4530,7 @@ impl HostList {
 
     /// Reuse the argument buffer's state across batches. On growth, put
     /// the old buffer back in COMMON before letting later commands use it.
-    pub(crate) fn indirect_batch_output(&self, out: &ID3D12Resource) -> D3D12_RESOURCE_STATES {
+    pub(crate) fn indirect_output_state(&self, out: &ID3D12Resource) -> D3D12_RESOURCE_STATES {
         let previous = self
             .indirect_readable
             .lock()
@@ -4547,7 +4547,7 @@ impl HostList {
         }
     }
 
-    pub(crate) fn finish_indirect(&self) {
+    fn finish_indirect(&self) {
         if let Some(out) = self
             .indirect_readable
             .lock()

@@ -2239,7 +2239,9 @@ impl State {
         let counted = counter.as_ref().map(|(s, at)| s.gpu(*at));
         let mode = crate::indirect::batch_mode();
         let window = mode == 0 && crate::indirect::windows();
-        let may_write = (mode != 0 || window)
+        let keep_readable = mode != 0 || window;
+        let may_write = keep_readable
+            && kind != DISPATCH
             && p.stages.iter().any(|stage| {
                 let t = stage.translated();
                 t.host.memory_writes
@@ -2250,13 +2252,15 @@ impl State {
         let offset = args.offset(arguments);
         // Aliased arguments must be clamped immediately, after all their
         // producers (see the reference fork's PORT_CONSTANTS_ORDER fix).
-        let batched = if max == 1
+        let eligible = max == 1
             && count.is_none()
             && (mode != 0 || (window && kind != DISPATCH && !may_write))
-            && !args.is_aliased()
-            && !args.is_tiled()
-            && crate::indirect::Batch::accepts(kind, stride, offset)
-        {
+            && crate::indirect::Batch::accepts(kind, stride, offset);
+        let aliased = eligible && args.is_aliased();
+        if aliased {
+            crate::indirect::note_aliased_record();
+        }
+        let batched = if eligible && !aliased {
             self.batched_indirect(
                 list,
                 (kind, stride),
@@ -2266,17 +2270,17 @@ impl State {
         } else {
             None
         };
-        let batch = batched.is_some();
         let (clamped, at) = if let Some(record) = batched {
             record
         } else {
             self.indirect = None;
-            if mode != 0 || window {
-                list.finish_indirect();
-            }
-            let Some(clamped) =
-                crate::indirect::bound(list, args.gpu(arguments), (kind, stride, max), counted)
-            else {
+            let Some(clamped) = crate::indirect::bound(
+                list,
+                args.gpu(arguments),
+                (kind, stride, max),
+                counted,
+                keep_readable,
+            ) else {
                 why("not bounded (no clamp, or arguments not 4-byte aligned)");
                 return false;
             };
@@ -2298,7 +2302,7 @@ impl State {
             _ => unreachable!("the signature check above admits only these kinds"),
         };
         if !ran {
-            if !batch {
+            if !keep_readable {
                 crate::indirect::done(list, &clamped);
             }
             #[cfg(feature = "diagnostics")]
@@ -2359,7 +2363,7 @@ impl State {
                 );
             }
         }
-        if !batch {
+        if !keep_readable {
             crate::indirect::done(list, &clamped);
         }
         if (kind == DISPATCH && mode != 2) || (kind != DISPATCH && may_write) {
