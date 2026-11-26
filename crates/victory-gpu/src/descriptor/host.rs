@@ -1045,7 +1045,7 @@ impl HostHeap {
         step: u64,
         demand: &std::collections::HashSet<(usize, u32)>,
         pins: &mut Vec<ViewPin>,
-        mut upload: Option<&mut dyn FnMut(crate::texture::UploadSource)>,
+        mut upload: Option<&mut dyn FnMut(super::PendingUpload)>,
     ) {
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let Mirrored { keys, pending } = &mut *made;
@@ -1060,7 +1060,7 @@ impl HostHeap {
             let handle = start + u64::from(index) * step;
             let ready = copy.initialized.load(Ordering::Acquire);
             let demanded = texture.demanded || demand.contains(&(viewed, index));
-            if !ready && (!demanded || upload.is_none()) {
+            if !ready && (!demanded || upload.is_none()) && !copy.evicted.load(Ordering::Acquire) {
                 return true;
             }
             let Some(pin) = view_at(texture.record[1], texture.record[2]) else {
@@ -1079,31 +1079,21 @@ impl HostHeap {
                 assert!(crate::object::release_ref(texture.resource as crate::object::This) > 0);
             }
             let current = texture.current(&copy);
-            let mut published = false;
+            let bytes = copy.gated_upload_bytes();
             let same_record = super::with_current_record(handle, texture.record, || {
                 if !current {
                     return;
                 }
                 if !ready {
-                    let Some(upload) = upload.as_mut() else {
-                        return;
-                    };
-                    let staging =
-                        crate::texture::staging_for(texture.memory, &texture.layout, &copy);
-                    if let Some(staging) = staging {
-                        if crate::texture::staging_bytes(&staging) <= super::PENDING_STAGING_BYTES {
-                            upload((staging, copy.clone()));
-                        } else if texture.demanded {
-                            // Tables already request this through their upload step.
-                            // Heap reads request it through the ordinary bindless
-                            // upload path when this heap is next submitted.
-                            self.viewed.set(
-                                index,
-                                Some(&View::Shader(texture.resource, None)),
-                                true,
-                            );
-                            copy.stamp();
-                        }
+                    if texture.demanded
+                        && bytes.is_some_and(|bytes| bytes > super::PENDING_STAGING_BYTES)
+                    {
+                        // Tables request large textures through their upload step.
+                        // For heap reads, register ordinary upload demand without
+                        // publishing the descriptor.
+                        self.viewed
+                            .set(index, Some(&View::Shader(texture.resource, None)), true);
+                        copy.stamp();
                     }
                     return;
                 }
@@ -1112,7 +1102,6 @@ impl HostHeap {
                 self.viewed
                     .set(index, Some(&View::Shader(texture.resource, None)), true);
                 self.ready[index as usize].store(record_key(texture.record), Ordering::Release);
-                published = true;
             });
             if !same_record {
                 keys[index as usize] = 0;
@@ -1123,14 +1112,23 @@ impl HostHeap {
             if !current {
                 // Keep the title record so a subsequent shader read can
                 // make its placed view again. The host slot is already null.
-                if texture.placed {
-                    self.viewed
-                        .set(index, pins.last().map(|view| &**view), false);
-                }
+                self.viewed
+                    .set(index, pins.last().map(|view| &**view), false);
                 crate::shadow::forget_read(index);
                 return false;
             }
-            !published
+            if !ready
+                && let Some(upload) = upload.as_mut()
+                && let Some(bytes) = bytes.filter(|&bytes| bytes <= super::PENDING_STAGING_BYTES)
+            {
+                upload(super::PendingUpload {
+                    copy,
+                    memory: texture.memory,
+                    layout: texture.layout,
+                    bytes,
+                });
+            }
+            !ready
         });
     }
 
@@ -1920,22 +1918,26 @@ fn null_texture_srv(
     desc: Option<&D3D12_SHADER_RESOURCE_VIEW_DESC>,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) {
-    let (dimension, format) = desc.map_or_else(
+    if let Some(desc) = desc.filter(|desc| desc.Format != DXGI_FORMAT_UNKNOWN) {
+        null_texture(desc.ViewDimension.0 as u32, desc.Format, at);
+        return;
+    }
+    // A null SRV has no resource from which to infer DXGI_FORMAT_UNKNOWN.
+    // SAFETY: the host texture is live.
+    let texture = unsafe { copy.texture.GetDesc() };
+    let dimension = desc.map_or_else(
         || {
-            // SAFETY: a live host texture.
-            let desc = unsafe { copy.texture.GetDesc() };
-            let array = desc.DepthOrArraySize > 1;
-            let dimension = match desc.Dimension {
+            let array = texture.DepthOrArraySize > 1;
+            match texture.Dimension {
                 D3D12_RESOURCE_DIMENSION_TEXTURE1D => 2 + u32::from(array),
                 D3D12_RESOURCE_DIMENSION_TEXTURE3D => 8,
-                _ if desc.SampleDesc.Count > 1 => 6 + u32::from(array),
+                _ if texture.SampleDesc.Count > 1 => 6 + u32::from(array),
                 _ => 4 + u32::from(array),
-            };
-            (dimension, desc.Format)
+            }
         },
-        |desc| (desc.ViewDimension.0 as u32, desc.Format),
+        |desc| desc.ViewDimension.0 as u32,
     );
-    null_texture(dimension, format, at);
+    null_texture(dimension, texture.Format, at);
 }
 
 /// Whether the host stores to typed unordered views of `format`.

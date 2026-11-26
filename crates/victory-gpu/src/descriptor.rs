@@ -291,13 +291,21 @@ thread_local! {
         const { std::cell::Cell::new(PENDING_STAGING_BYTES) };
 }
 
+#[cfg(windows)]
+struct PendingUpload {
+    copy: std::sync::Arc<crate::resource::HostTexture>,
+    memory: usize,
+    layout: crate::resource::ResourceDesc,
+    bytes: u64,
+}
+
 /// Collects uploads for pending SRVs, or publishes those whose copy has
 /// finished. Only Host::execute calls this, with submissions held off.
 #[cfg(windows)]
 pub(crate) fn service_pending(
     demand: &std::collections::HashSet<(usize, u32)>,
     pins: &mut Vec<ViewPin>,
-    mut uploads: Option<&mut Vec<crate::texture::UploadSource>>,
+    uploads: Option<&mut Vec<crate::texture::UploadSource>>,
 ) {
     #[cfg(not(test))]
     let mut budget = PENDING_STAGING_BYTES;
@@ -305,22 +313,15 @@ pub(crate) fn service_pending(
     let mut budget = TEST_PENDING_STAGING_BYTES.with(std::cell::Cell::get);
     let mut seen = std::collections::HashSet::new();
     if let Some(uploads) = &uploads {
-        seen.extend(
-            uploads
-                .iter()
-                .map(|(staging, _)| std::sync::Arc::as_ptr(staging)),
-        );
+        seen.extend(uploads.iter().map(|(_, copy)| std::sync::Arc::as_ptr(copy)));
     }
     let collecting = uploads.is_some();
-    let mut upload = |source: crate::texture::UploadSource| {
-        let key = std::sync::Arc::as_ptr(&source.0);
-        let bytes = crate::texture::staging_bytes(&source.0);
-        if bytes <= budget
-            && seen.insert(key)
-            && let Some(uploads) = &mut uploads
-        {
-            budget -= bytes;
-            uploads.push(source);
+    let mut planned = Vec::new();
+    let mut upload = |source: PendingUpload| {
+        let key = std::sync::Arc::as_ptr(&source.copy);
+        if source.bytes <= budget && seen.insert(key) {
+            budget -= source.bytes;
+            planned.push(source);
         }
     };
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
@@ -337,6 +338,25 @@ pub(crate) fn service_pending(
                 pins,
                 collecting.then_some(&mut upload as &mut dyn FnMut(_)),
             );
+        }
+    }
+    drop(heaps);
+
+    // The records were validated while their owners were pinned. Footprint
+    // allocation and write tracking can take Wine's memory lock, so prepare
+    // only admitted sources and do it after leaving all descriptor locks.
+    if let Some(uploads) = uploads {
+        for source in planned {
+            if !source
+                .copy
+                .evicted
+                .load(std::sync::atomic::Ordering::Acquire)
+                && let Some(staging) =
+                    crate::texture::staging_for(source.memory, &source.layout, &source.copy)
+                && crate::texture::staging_bytes(&staging) <= source.bytes
+            {
+                uploads.push((staging, source.copy));
+            }
         }
     }
 }

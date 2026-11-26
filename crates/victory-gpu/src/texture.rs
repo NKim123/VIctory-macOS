@@ -745,7 +745,7 @@ pub(crate) fn refresh_all(work: &[UploadSource]) -> Vec<Option<Upload>> {
         .enumerate()
         .filter_map(|(i, (staging, copy))| {
             let initial = gate
-                && copy.gated.get() == Some(&true)
+                && copy.gated_upload_bytes().is_some()
                 && !copy.initialized.load(std::sync::atomic::Ordering::Acquire);
             (initial || staging.maybe_changed()).then_some((i, initial))
         })
@@ -1126,48 +1126,49 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
 /// Decide at registration which title-fed textures the experiment covers.
 /// The query does not allocate staging, read title bytes or start tracking.
 pub(crate) fn eligible_for_gating(resource: This, copy: &HostTexture) -> bool {
-    *copy.gated.get_or_init(|| {
-        if !title_written(&copy.texture) {
-            return false;
-        }
-        let Some((memory, desc)) = crate::resource::texture_memory(resource) else {
-            return false;
-        };
-        let Some(layout) = crate::resource::texture_layout(&desc) else {
-            return false;
-        };
-        let [plane] = &layout.planes[..] else {
-            return false;
-        };
-        if !plane.layout.addressable()
-            || (memory as usize)
-                .checked_add(layout.size as usize)
-                .is_none()
-        {
-            return false;
-        }
-        let Some(host) = host() else { return false };
-        // SAFETY: a live texture and one output for the total.
-        let d = unsafe { copy.texture.GetDesc() };
-        if d.SampleDesc.Count != 1 {
-            return false;
-        }
-        let mut total = 0;
-        // SAFETY: sizes only; the optional arrays are not requested.
-        unsafe {
-            host.device.GetCopyableFootprints(
-                &d,
-                0,
-                subresource_count(&d),
-                0,
-                None,
-                None,
-                None,
-                Some(&mut total),
-            );
-        }
-        total != 0 && total != u64::MAX
-    })
+    copy.gated_bytes
+        .get_or_init(|| {
+            if !title_written(&copy.texture) {
+                return None;
+            }
+            let (memory, desc) = crate::resource::texture_memory(resource)?;
+            let layout = crate::resource::texture_layout(&desc)?;
+            let [plane] = &layout.planes[..] else {
+                return None;
+            };
+            if !plane.layout.addressable()
+                || (memory as usize)
+                    .checked_add(layout.size as usize)
+                    .is_none()
+            {
+                return None;
+            }
+            let host = host()?;
+            // SAFETY: a live texture and one output for the total.
+            let d = unsafe { copy.texture.GetDesc() };
+            if d.SampleDesc.Count != 1 {
+                return None;
+            }
+            let mut total = 0;
+            // SAFETY: sizes only; the optional arrays are not requested.
+            unsafe {
+                host.device.GetCopyableFootprints(
+                    &d,
+                    0,
+                    subresource_count(&d),
+                    0,
+                    None,
+                    None,
+                    None,
+                    Some(&mut total),
+                );
+            }
+            if total == 0 {
+                return None;
+            }
+            total.max(layout.size).checked_next_multiple_of(512)
+        })
+        .is_some()
 }
 
 fn subresource_count(d: &D3D12_RESOURCE_DESC) -> u32 {

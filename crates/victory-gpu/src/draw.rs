@@ -3135,7 +3135,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         // SAFETY: the allocated title bytes, with 256-byte rows.
         unsafe { std::ptr::write_bytes(address as *mut u8, 0x80, 64 * 64 * 4) };
         let object = texture_at_address(address, &words);
-        let view = [28, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0];
+        // Inherit the format of a typed texture, even while its view is null.
+        let view = [0, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0];
         // A dropped host copy cannot suppress the title-memory upload.
         // Submit it before creating the pending slot, so its group is the
         // first one even when diagnostics time lists individually.
@@ -3263,6 +3264,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         host.execute(&[&list]);
         assert!(h.kept(4));
         assert!(!h.kept(5));
+        let later_copy = crate::resource::made_copy(later).unwrap();
+        assert!(later_copy.staging.lock().unwrap().is_none());
         host.execute(&[&list]);
         assert!(h.kept(5));
         crate::descriptor::TEST_PENDING_STAGING_BYTES.set(limit);

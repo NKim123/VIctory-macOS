@@ -832,7 +832,8 @@ pub(crate) struct HostTexture {
     heap_writable: std::sync::atomic::AtomicBool,
     /// Its first upload or host copy has passed the submission fence.
     pub(crate) initialized: std::sync::atomic::AtomicBool,
-    pub(crate) gated: std::sync::OnceLock<bool>,
+    /// Cached staging charge for the opt-in SRV gate, if supported.
+    pub(crate) gated_bytes: std::sync::OnceLock<Option<u64>>,
     /// Verified host writes awaiting the first complete title-memory seed.
     pub(crate) partial_writes: std::sync::Mutex<Vec<crate::texture::CopyCoverage>>,
     /// Eviction has started. Pending SRVs must give this copy up.
@@ -880,7 +881,7 @@ impl HostTexture {
             gpu_written: false.into(),
             heap_writable: false.into(),
             initialized: false.into(),
-            gated: std::sync::OnceLock::new(),
+            gated_bytes: std::sync::OnceLock::new(),
             partial_writes: std::sync::Mutex::default(),
             evicted: false.into(),
             staging: std::sync::Mutex::new(None),
@@ -892,6 +893,10 @@ impl HostTexture {
             placement: None,
             last: [crate::queue::presented().into(), now_ms().into()],
         }
+    }
+
+    pub(crate) fn gated_upload_bytes(&self) -> Option<u64> {
+        self.gated_bytes.get().copied().flatten()
     }
 
     /// Whether a placed view can still publish this copy for its memory.
@@ -1681,7 +1686,7 @@ fn evictable(t: &HostTexture) -> bool {
         && !t.host_written.load(Relaxed)
         && !t.gpu_written.load(Relaxed)
         && !(t.heap_writable.load(Relaxed) && crate::bindless::heap_written())
-        && (t.gated.get() != Some(&true)
+        && (t.gated_upload_bytes().is_none()
             || t.partial_writes
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())

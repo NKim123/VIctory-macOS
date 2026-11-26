@@ -249,7 +249,9 @@ pub(crate) fn uploads(
                 continue;
             }
             // Not made (given up, or never read): nothing to bring up.
-            let Some(texture) = crate::resource::made_copy(r as This) else {
+            let Some(texture) = crate::resource::made_copy(r as This)
+                .filter(|copy| !copy.evicted.load(std::sync::atomic::Ordering::Acquire))
+            else {
                 continue;
             };
             // Only what shaders read lately (the eviction pass's stamps):
@@ -267,18 +269,21 @@ pub(crate) fn uploads(
             if texture.host_written.load(Relaxed) {
                 continue;
             }
+            let large = !texture.initialized.load(Relaxed)
+                && texture
+                    .gated_upload_bytes()
+                    .is_some_and(|bytes| bytes > crate::descriptor::PENDING_STAGING_BYTES);
+            // At most one new large heap-backed texture per submission.
+            // An explicit transfer may already have selected this texture.
+            if large
+                && (large_first_fill || work.iter().any(|(_, copy)| Arc::ptr_eq(copy, &texture)))
+            {
+                continue;
+            }
             if let Some(staging) = crate::texture::staging(r as This, &texture)
                 && staged.insert(Arc::as_ptr(&staging))
             {
-                let large = texture.gated.get() == Some(&true)
-                    && !texture.initialized.load(Relaxed)
-                    && crate::texture::staging_bytes(&staging)
-                        > crate::descriptor::PENDING_STAGING_BYTES;
-                // At most one new large heap-backed texture per submission.
-                // Existing explicit transfers already selected their uploads.
-                if large && std::mem::replace(&mut large_first_fill, true) {
-                    continue;
-                }
+                large_first_fill |= large;
                 work.push((staging, texture));
             }
         }
