@@ -10,7 +10,7 @@ const ADD_LINE: [u8; 4] = [0x48, 0x83, 0xc0, 0x40];
 const MAX_SITES: usize = 256;
 const ZERO_STORES_START: usize = 6;
 const ZERO_STORES_END: usize = ZERO_STORES_START + 8 * 8;
-#[cfg(windows)]
+#[cfg(all(windows, target_arch = "x86_64"))]
 const PAGE: usize = 4096;
 const EXECUTE: u32 = 0x2000_0000;
 const WRITE: u32 = 0x8000_0000;
@@ -26,7 +26,14 @@ fn sites(value: &str, hash: blake3::Hash) -> Option<Vec<usize>> {
     let mut sites: Vec<_> = list
         .split(',')
         .take(MAX_SITES + 1)
-        .map(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).map(|rva| rva as usize))
+        .map(|item| {
+            let item = item.trim();
+            let digits = item
+                .strip_prefix("0x")
+                .or_else(|| item.strip_prefix("0X"))
+                .unwrap_or(item);
+            u32::from_str_radix(digits, 16).map(|rva| rva as usize)
+        })
         .collect::<Result<_, _>>()
         .ok()?;
     if sites.len() > MAX_SITES {
@@ -209,9 +216,9 @@ fn zero_stub(site: u64, stub: u64, next: [u8; 4], len: usize) -> Option<Vec<u8>>
     Some(code)
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, target_arch = "x86_64"))]
 mod windows;
-#[cfg(windows)]
+#[cfg(all(windows, target_arch = "x86_64"))]
 pub use windows::Patches;
 
 #[cfg(test)]
@@ -234,7 +241,7 @@ mod tests {
             assert_eq!(sites(value, hash), None);
         }
         assert_eq!(
-            sites(&format!("{hash}:ff,0x10,ff"), hash),
+            sites(&format!("{hash}:ff, 0x10, 0XFF"), hash),
             Some(vec![0x10, 0xff])
         );
         assert_eq!(sites(&format!("{hash}:ff,zz"), hash), None);

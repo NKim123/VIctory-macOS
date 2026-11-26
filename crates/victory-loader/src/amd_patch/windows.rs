@@ -3,6 +3,7 @@ use std::sync::OnceLock;
 use anyhow::{Result, bail};
 use windows_sys::Win32::System::Diagnostics::Debug::{
     AddVectoredExceptionHandler, EXCEPTION_POINTERS, FlushInstructionCache,
+    RemoveVectoredExceptionHandler,
 };
 use windows_sys::Win32::System::Memory::{
     MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ,
@@ -212,10 +213,13 @@ unsafe fn install(base: usize, sites: &[Site]) -> Result<(usize, usize)> {
             .and_then(|_| flush(pool.address, used))
             .and_then(|_| {
                 // SAFETY: the handler uses only immutable metadata after startup.
-                if unsafe { AddVectoredExceptionHandler(0, Some(remap_zero_fault)) }.is_null() {
+                let handler = unsafe { AddVectoredExceptionHandler(0, Some(remap_zero_fault)) };
+                if handler.is_null() {
                     bail!("registering CLZERO stub fault translation");
                 }
                 if FAULT_SITES.set(faults).is_err() {
+                    // SAFETY: the registration succeeded and no patch can enter this pool.
+                    unsafe { RemoveVectoredExceptionHandler(handler) };
                     bail!("CLZERO stub fault translation already registered");
                 }
                 Ok(())
@@ -249,24 +253,35 @@ unsafe fn install(base: usize, sites: &[Site]) -> Result<(usize, usize)> {
 }
 
 unsafe fn unchanged(base: usize, site: &Site) -> bool {
-    let at = base + site.guard_rva;
-    let end = at + site.expected.len();
-    // Keep this check and each page protection within a single Windows page.
-    if at / PAGE != (end - 1) / PAGE {
-        return false;
-    }
-    let Some(region) = query(at) else {
-        return false;
+    let patch = base + site.rva;
+    let size = match site.change {
+        Change::Wait(bytes) => bytes.len(),
+        Change::Zero { len, .. } => len,
     };
-    if region.State != MEM_COMMIT
-        || region.Protect != PAGE_EXECUTE_READ
-        || region.AllocationBase as usize != base
-        || end > (region.BaseAddress as usize).saturating_add(region.RegionSize)
-    {
+    // A write may only change protection on one page. The extra bytes we
+    // check on either side can occupy an adjacent executable page.
+    if patch / PAGE != (patch + size - 1) / PAGE {
         return false;
     }
-    // SAFETY: the checked range is readable in the idle mapping.
-    unsafe { std::slice::from_raw_parts(at as *const u8, site.expected.len()) == site.expected }
+    let start = base + site.guard_rva;
+    let end = start + site.expected.len();
+    let mut at = start;
+    while at < end {
+        let Some(region) = query(at) else {
+            return false;
+        };
+        let region_end = (region.BaseAddress as usize).saturating_add(region.RegionSize);
+        if region.State != MEM_COMMIT
+            || region.Protect != PAGE_EXECUTE_READ
+            || region.AllocationBase as usize != base
+            || region_end <= at
+        {
+            return false;
+        }
+        at = region_end;
+    }
+    // SAFETY: every region in the checked range is readable and owned by the idle image.
+    unsafe { std::slice::from_raw_parts(start as *const u8, site.expected.len()) == site.expected }
 }
 
 fn query(at: usize) -> Option<MEMORY_BASIC_INFORMATION> {
@@ -286,9 +301,8 @@ mod execution_tests {
         EXCEPTION_ACCESS_VIOLATION, EXCEPTION_ILLEGAL_INSTRUCTION, STATUS_GUARD_PAGE_VIOLATION,
     };
     use windows_sys::Win32::System::Diagnostics::Debug::{
-        IMAGE_RUNTIME_FUNCTION_ENTRY, IMAGE_RUNTIME_FUNCTION_ENTRY_0,
-        RemoveVectoredExceptionHandler, RtlAddFunctionTable, RtlDeleteFunctionTable,
-        RtlLookupFunctionEntry, RtlVirtualUnwind, UNW_FLAG_NHANDLER,
+        IMAGE_RUNTIME_FUNCTION_ENTRY, IMAGE_RUNTIME_FUNCTION_ENTRY_0, RtlAddFunctionTable,
+        RtlDeleteFunctionTable, RtlLookupFunctionEntry, RtlVirtualUnwind, UNW_FLAG_NHANDLER,
     };
     use windows_sys::Win32::System::Memory::{PAGE_GUARD, PAGE_READONLY};
     use windows_sys::Win32::System::Threading::GetCurrentThreadId;
@@ -393,20 +407,54 @@ mod execution_tests {
         }
     }
 
-    fn allocate() -> Pool {
+    fn allocate(size: usize) -> Pool {
         // SAFETY: asks Windows for a private writable page.
         let address = unsafe {
             VirtualAlloc(
                 std::ptr::null(),
-                PAGE,
+                size,
                 MEM_COMMIT | MEM_RESERVE,
                 PAGE_READWRITE,
             )
         } as usize;
         assert_ne!(address, 0);
-        Pool {
-            address,
-            size: PAGE,
+        Pool { address, size }
+    }
+
+    #[test]
+    fn patch_fits_one_page_with_verified_context_across_the_boundary() {
+        let code = allocate(2 * PAGE);
+        let rva = PAGE - 4;
+        let guard_rva = rva - 14;
+        let mut expected = vec![0xcc; 31];
+        expected[14..17].copy_from_slice(&[0x0f, 0x01, 0xfa]);
+        // SAFETY: the two-page allocation is privately owned and writable.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                expected.as_ptr(),
+                (code.address + guard_rva) as *mut u8,
+                expected.len(),
+            )
+        };
+        let site = Site {
+            rva,
+            span: rva..rva + 3,
+            guard_rva,
+            expected,
+            change: Change::Wait([0x0f, 0x1f, 0]),
+        };
+
+        protect(code.address, PAGE, PAGE_EXECUTE_READ).unwrap();
+        // SAFETY: all these checks run against the idle test allocation.
+        unsafe {
+            assert!(!unchanged(code.address, &site));
+            protect(code.address + PAGE, PAGE, PAGE_EXECUTE_READ).unwrap();
+            assert!(unchanged(code.address, &site));
+            let straddling_patch = Site {
+                rva: PAGE - 1,
+                ..site
+            };
+            assert!(!unchanged(code.address, &straddling_patch));
         }
     }
 
@@ -419,7 +467,7 @@ mod execution_tests {
             AddVectoredExceptionHandler(1, Some(observe))
         };
         assert!(!observer.is_null());
-        let code = allocate();
+        let code = allocate(PAGE);
         let mut bytes = [0xcc; PAGE];
         let (forward, backward, waits, modified) = (64, 144, 229, 320);
         // The forward loop runs in a synthetic non-leaf stack frame.
@@ -487,7 +535,7 @@ mod execution_tests {
                 std::mem::transmute::<usize, Wait>(code.address + waits),
             )
         };
-        let data = allocate();
+        let data = allocate(PAGE);
         let forward_pc = code.address + forward_zero;
         let run = |zero: Zero,
                    misalignment: usize,
