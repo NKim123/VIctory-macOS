@@ -322,10 +322,18 @@ static SPARE: std::sync::Mutex<Vec<crate::host::HostList>> = std::sync::Mutex::n
 /// and kept for [`restart`].
 #[cfg(windows)]
 pub(crate) fn recycle(list: std::sync::Arc<crate::host::HostList>) {
+    recycle_into(list, &SPARE);
+}
+
+#[cfg(windows)]
+pub(crate) fn recycle_into(
+    list: std::sync::Arc<crate::host::HostList>,
+    spare: &std::sync::Mutex<Vec<crate::host::HostList>>,
+) {
     const KEPT: usize = 64;
     if let Ok(list) = std::sync::Arc::try_unwrap(list) {
         list.reset();
-        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spare = spare.lock().unwrap_or_else(|e| e.into_inner());
         if spare.len() < KEPT {
             spare.push(list);
         }

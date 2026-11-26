@@ -74,12 +74,11 @@ impl ColorClear {
                 )]);
             }
         }
+        // A whole-view clear uses zero rectangles and a null rectangle pointer.
+        let rects = (!rects.is_empty()).then_some(rects);
         host.with_clear_rtv(&texture.texture, self.desc.as_ref(), |view| {
             // SAFETY: the list is open and this call holds the live RTV slot.
-            unsafe {
-                list.list
-                    .ClearRenderTargetView(view, &self.color, Some(rects))
-            };
+            unsafe { list.list.ClearRenderTargetView(view, &self.color, rects) };
         });
     }
 }

@@ -230,7 +230,9 @@ those running on macOS under Wine.
   or resource-specific aliasing and UAV barriers stay synchronous.
   Guest heap sync, texture eviction, copy-back, and retirement also stay
   on the synchronous path. Queue signals, waits, mapping changes, and
-  presents drain the worker in order.
+  presents drain the worker in order. Completed lists that the title reset
+  early can return their allocators to the existing spare pool after dropping
+  their texture references.
 - `VICTORY_JOIN_PARTS=2` through `4` enables the submission worker and
   runs adjacent eligible submissions on the same queue under one hold
   of the host submission lock. Each keeps its own host submission and

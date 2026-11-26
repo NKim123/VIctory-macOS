@@ -53,19 +53,24 @@ impl Lane {
                     account.pieces += parts.len() as u32;
                     account.segments += parts.iter().map(|part| part.len() as u32).sum::<u32>();
                 },
+                crate::list::recycle,
                 join,
             )
         })
         .as_ref()
     }
 
-    fn start(execute: impl Fn(&[&[&HostList]]) + Send + 'static, join: usize) -> Option<Self> {
+    fn start(
+        execute: impl Fn(&[&[&HostList]]) + Send + 'static,
+        recycle: impl Fn(Arc<HostList>) + Send + 'static,
+        join: usize,
+    ) -> Option<Self> {
         let (sender, receiver) = mpsc::sync_channel(LIST_LIMIT);
         let outstanding = Arc::new(Outstanding::default());
         let worker_outstanding = outstanding.clone();
         match std::thread::Builder::new()
             .name("victory-submit".into())
-            .spawn(move || run(execute, receiver, &worker_outstanding, join))
+            .spawn(move || run(execute, recycle, receiver, &worker_outstanding, join))
         {
             Ok(_) => Some(Self {
                 admission: Mutex::new(()),
@@ -162,6 +167,7 @@ fn byte_limit() -> u64 {
 
 fn run(
     execute: impl Fn(&[&[&HostList]]),
+    recycle: impl Fn(Arc<HostList>),
     receiver: Receiver<Message>,
     outstanding: &Outstanding,
     join: usize,
@@ -195,9 +201,10 @@ fn run(
         execute(&runs);
         for part in parts {
             let count = part.lists.len() as u64;
-            // The async path does not leave idle allocators or staging in
-            // the host list pool beyond those the title still holds.
-            drop(part.lists);
+            // Reclaim uniquely held lists after the fence. Recycling clears
+            // their texture references before returning the allocators to
+            // the existing bounded spare pool.
+            part.lists.into_iter().for_each(&recycle);
             outstanding.bytes.fetch_sub(part.bytes, Ordering::Release);
             outstanding.lists.fetch_sub(count, Ordering::Release);
         }
@@ -207,6 +214,78 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn submission_worker_recycles_an_early_reset_list() {
+        use crate::object::{HRESULT, S_OK, This, slot};
+        use crate::resource::PAGEABLE_IIDS;
+
+        let host = crate::host::host().expect("test needs a host GPU");
+        let (started, running) = mpsc::channel();
+        let (resume, blocked) = mpsc::channel();
+        let gate = std::cell::Cell::new(Some(blocked));
+        let spare = Arc::new(Mutex::new(Vec::new()));
+        let worker_spare = spare.clone();
+        let lane = Lane::start(
+            move |parts| {
+                if let Some(blocked) = gate.take() {
+                    started.send(()).unwrap();
+                    blocked.recv().unwrap();
+                }
+                host.execute_host_parts(parts);
+            },
+            move |list| crate::list::recycle_into(list, &worker_spare),
+            1,
+        )
+        .unwrap();
+
+        let null: This = std::ptr::null();
+        let mut allocator = null;
+        let mut list = null;
+        let iid = &PAGEABLE_IIDS[1];
+        assert_eq!(
+            crate::list::create_allocator(null, 0, iid, &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, allocator, null, iid, &mut list),
+            S_OK
+        );
+        let close = slot::<extern "system" fn(This) -> HRESULT>(list, 0x48);
+        let reset = slot::<extern "system" fn(This, This, This) -> HRESULT>(list, 0x50);
+        assert_eq!(close(list), S_OK);
+
+        let _ordered = lane.order();
+        let original = crate::list::segments(list);
+        let handle = original[0].list.clone();
+        assert!(lane.submit(1, original).is_ok());
+        running.recv().unwrap();
+
+        assert_eq!(reset(list, allocator, null), S_OK);
+        assert!(crate::list::host_list(list).unwrap().list != handle);
+        resume.send(()).unwrap();
+        lane.drain();
+
+        let recycled = Arc::new(
+            spare
+                .lock()
+                .unwrap()
+                .pop()
+                .expect("early-reset host list in the spare pool"),
+        );
+        assert!(recycled.list == handle);
+        recycled.close();
+        assert_eq!(recycled.submit_ahead_bytes(), Some(0));
+        assert!(lane.submit(1, vec![recycled.clone()]).is_ok());
+        lane.drain();
+
+        for object in [list, allocator] {
+            assert_eq!(
+                slot::<extern "system" fn(This) -> u32>(object, 0x10)(object),
+                0
+            );
+        }
+    }
 
     #[test]
     fn submission_worker_bounds_work_and_joins_only_adjacent_same_queue_parts() {
@@ -222,6 +301,7 @@ mod tests {
                 }
                 host.execute_host_parts(parts);
             },
+            crate::list::recycle,
             LIST_LIMIT,
         )
         .unwrap();

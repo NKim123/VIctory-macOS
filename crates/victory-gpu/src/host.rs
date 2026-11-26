@@ -862,6 +862,11 @@ pub(crate) mod tests {
         list.close();
         host.execute(&[&list]);
         list.reset();
+        assert_eq!(
+            list.submit_ahead_bytes(),
+            None,
+            "reset retains the scratch chunks"
+        );
         assert_eq!(list.scratch(96 << 10).unwrap(), large);
         assert_eq!(list.scratch.lock().unwrap().chunks.len(), 2);
         list.close();
