@@ -553,6 +553,40 @@ fn root_views_read_their_copy_and_zeros_past_it() {
     fixed.code[4 * load..4 * load + 4].copy_from_slice(&((word & !(1 << 12)) | 48).to_le_bytes());
     fixed.code[4 * load + 4..4 * load + 8].copy_from_slice(&registers.to_le_bytes());
     assert_eq!(lower_shader(&fixed).root_srv_bytes, [(2, 52)]);
+    // The same native root descriptor also models a root CBV. Exercise
+    // both the dynamic vector load and the scalar load with a fixed offset.
+    let mut cbv = native.clone();
+    cbv.used[1].kind = ResourceType::Cbv;
+    let mut scalar_cbv = cbv.clone();
+    let scalar = [
+        0xF420_0400u32, // s_buffer_load_dword s16, s[0:3], 16
+        0xFA00_0010,
+        S_WAITCNT_ALL,
+        v_mov_b32(2, 16),
+    ];
+    scalar_cbv.code.splice(4 * load..4 * load + 8, scalar.into_iter().flat_map(u32::to_le_bytes));
+    let (baseline, raw, scalar_raw) = super::TEST_RAW_ROOT_CBVS.with(|on| {
+        on.set(Some(false));
+        let baseline = lower_shader(&cbv);
+        on.set(Some(true));
+        let raw = lower_shader(&cbv);
+        let scalar_raw = lower_shader(&scalar_cbv);
+        on.set(None);
+        (baseline, raw, scalar_raw)
+    });
+    assert_eq!(baseline.root_cbvs, [2]);
+    for lowered in [&raw, &scalar_raw] {
+        assert!(lowered.root_cbvs.is_empty());
+        assert!(lowered.user_data.iter().any(|u| u.slot == 2 && u.dword == super::ROOT_CBV_VIEW));
+        let hash = |bytes: &[u8]| {
+            use crate::dxbc::{Container, FourCC};
+            let c = Container::parse(bytes).unwrap();
+            c.part(FourCC(*b"HASH")).unwrap().data.to_vec()
+        };
+        let raw_hash = hash(&lowered.dxil);
+        assert_ne!(raw_hash, hash(&baseline.dxil));
+        assert!(raw_hash[4..].iter().any(|&byte| byte != 0));
+    }
     let l = lower_shader(&native);
     assert!(l.root_srv_bytes.is_empty(), "a shader with a dynamic load has no bound");
     assert!(l.root_srvs.is_empty() && !l.memory, "no root descriptor, no title memory");

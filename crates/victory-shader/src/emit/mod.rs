@@ -406,6 +406,23 @@ pub const ROOT_UAV_VIEW: u32 = 3;
 /// address's byte offset in the view [`ROOT_SRV_VIEW`] or [`ROOT_UAV_VIEW`]
 /// names.
 pub const ROOT_VIEW_OFFSET: u32 = 4;
+/// Heap index of the bounded raw view at a root constant buffer's address.
+pub const ROOT_CBV_VIEW: u32 = 5;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_RAW_ROOT_CBVS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether to lower eligible root constant buffers to bounded raw views.
+pub fn raw_root_cbvs() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_RAW_ROOT_CBVS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PORT_CBV").as_deref() == Ok("1"))
+}
 
 /// One dword of user data and the root parameter that fills it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -418,7 +435,7 @@ pub struct UserData {
     /// value).
     pub root: RootType,
     /// Dword within the parameter; for a root descriptor
-    /// [`ROOT_SRV_VIEW`], [`ROOT_UAV_VIEW`] or [`ROOT_VIEW_OFFSET`] name
+    /// [`ROOT_SRV_VIEW`], [`ROOT_UAV_VIEW`], [`ROOT_CBV_VIEW`] or [`ROOT_VIEW_OFFSET`] name
     /// its view's heap index or its offset in that view instead.
     pub dword: u32,
 }
