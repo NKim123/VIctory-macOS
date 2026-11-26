@@ -700,6 +700,94 @@ fn bottom_of_pipe_labels_and_title_signals_retire_without_another_submit() {
 }
 
 #[test]
+fn fifo_queue_waits_use_the_latest_label_before_the_cpu_can_read_it() {
+    let Some(host) = host_for_ring() else { return };
+    host.present_boundary();
+    let (out, data) = host.mapped_buffer(16, true).unwrap();
+    // SAFETY: a new readback allocation, with no GPU work using it.
+    unsafe { data.write_bytes(0, 16) };
+    let label = AtomicU32::new(4);
+    let mut gate = Gate::new(host);
+    for value in [0x104, 0x105] {
+        let producer = record_copy(host, &out, 4, 1);
+        producer.defer_write(
+            label.as_ptr().cast(),
+            crate::queue::Written::Value(value),
+            4,
+        );
+        crate::queue::submit_test_segments(0, [producer]);
+    }
+    let waiter = |offset, reference| {
+        let list = record_copy(host, &out, offset, 73);
+        list.defer_wait(crate::hold::ValueWait {
+            address: label.as_ptr() as u64,
+            bytes: 4,
+            comparison: 3,
+            reference,
+            mask: 0xff,
+        });
+        list
+    };
+    // Queue 2 must wait, even though the current CPU value and the older
+    // submitted write both satisfy it. Queue 3 can run after the newer write.
+    crate::queue::submit_test_segments(2, [waiter(8, 4)]);
+    crate::queue::submit_test_segments(3, [waiter(12, 5)]);
+    assert_eq!(label.load(Ordering::Acquire), 4);
+    assert_eq!(host.submitted.lock().unwrap().flights.len(), 3);
+    gate.open();
+    host.present_boundary();
+    assert_eq!(label.load(Ordering::Acquire), 0x105);
+    // SAFETY: all submitted GPU work has finished.
+    assert_eq!(unsafe { data.cast::<[u32; 4]>().read() }, [73, 1, 0, 73]);
+    label.store(4, Ordering::Release);
+    crate::queue::pump_held(crate::queue::Why::Fence);
+    host.present_boundary();
+    // SAFETY: the CPU write released the wait and the GPU work has finished.
+    assert_eq!(unsafe { data.cast::<u32>().add(2).read() }, 73);
+}
+
+#[test]
+fn fifo_queue_waits_see_earlier_segments_in_the_same_piece() {
+    let Some(host) = host_for_ring() else { return };
+    host.present_boundary();
+    let (out, data) = host.mapped_buffer(12, true).unwrap();
+    // SAFETY: a new readback allocation, with no GPU work using it.
+    unsafe { data.write_bytes(0, 12) };
+    let label = AtomicU64::new(0);
+    let mut gate = Gate::new(host);
+    let producer = |value| {
+        let list = record_copy(host, &out, 4, 1);
+        list.defer_write(
+            label.as_ptr().cast(),
+            crate::queue::Written::Value(value),
+            8,
+        );
+        list
+    };
+    crate::queue::submit_test_segments(0, [producer(7)]);
+    let waiter = record_copy(host, &out, 8, 73);
+    waiter.defer_wait(crate::hold::ValueWait {
+        address: label.as_ptr() as u64,
+        bytes: 8,
+        comparison: 3,
+        reference: 7,
+        mask: u64::MAX,
+    });
+    crate::queue::submit_test_segments(2, [producer(8), waiter]);
+    assert_eq!(host.submitted.lock().unwrap().flights.len(), 2);
+    gate.open();
+    host.present_boundary();
+    assert_eq!(label.load(Ordering::Acquire), 8);
+    // SAFETY: the wait is still held and the other GPU work has finished.
+    assert_eq!(unsafe { data.cast::<u32>().add(2).read() }, 0);
+    label.store(7, Ordering::Release);
+    crate::queue::pump_held(crate::queue::Why::Fence);
+    host.present_boundary();
+    // SAFETY: the CPU write released the wait and the GPU work has finished.
+    assert_eq!(unsafe { data.cast::<u32>().add(2).read() }, 73);
+}
+
+#[test]
 fn a_deferred_upload_reads_the_earlier_label() {
     let Some(host) = host_for_ring() else { return };
     host.present_boundary();

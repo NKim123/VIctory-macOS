@@ -161,10 +161,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
             lane.drain();
         }
         let mut held = held();
-        let mut push = |segment: std::sync::Arc<crate::host::HostList>| {
-            let waits = segment.waits();
-            held.push(key, Item::Segment(segment, waits));
-        };
+        let mut push = |segment| push_segment(&mut held, key, segment);
         match fast {
             Some(segments) => segments.into_iter().for_each(push),
             None => lists
@@ -210,6 +207,32 @@ fn held() -> std::sync::MutexGuard<'static, Holding> {
     HELD.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+// A null fence cannot be signalled through the title API. Use it as a
+// flush marker so a wait cannot skip writes in an unsubmitted piece.
+#[cfg(windows)]
+const PIECE_BOUNDARY: usize = 0;
+
+#[cfg(windows)]
+fn push_segment(held: &mut Holding, queue: usize, segment: std::sync::Arc<crate::host::HostList>) {
+    let waits = segment.waits();
+    if !waits.is_empty() && crate::host::inflight_enabled() && held.holds_work(queue) {
+        held.push(queue, Item::Signal(PIECE_BOUNDARY, 0));
+    }
+    held.push(queue, Item::Segment(segment, waits));
+}
+
+#[cfg(all(windows, test))]
+pub(crate) fn submit_test_segments(
+    queue: usize,
+    segments: impl IntoIterator<Item = std::sync::Arc<crate::host::HostList>>,
+) {
+    let mut held = held();
+    for segment in segments {
+        push_segment(&mut held, queue, segment);
+    }
+    pump(&mut held, Why::Submission);
+}
+
 /// Runs held work that may run now (`why` for the frame line).
 pub(crate) fn pump_held(why: Why) {
     #[cfg(windows)]
@@ -243,8 +266,8 @@ fn pump(held: &mut Holding, why: Why) {
     }
     let Some(host) = crate::host::host() else { return };
     let read = |address, bytes| {
-        host.order_bottom_read(address as usize, usize::from(bytes));
-        read_value(address, bytes)
+        host.queued_wait_value(address as usize, usize::from(bytes))
+            .or_else(|| read_value(address, bytes))
     };
     for (queue, waits) in held.force_older_than(VALVE) {
         account().forced += 1;
@@ -262,8 +285,10 @@ fn pump(held: &mut Holding, why: Why) {
         segments.into_iter().for_each(crate::list::recycle);
     };
     let mut signal = |f: usize, value: u64| {
-        signal_host(f as This, value);
-        crate::fence::let_go(f as This);
+        if f != PIECE_BOUNDARY {
+            signal_host(f as This, value);
+            crate::fence::let_go(f as This);
+        }
     };
     let pumped = held.pump(&mut crate::hold::World {
         read: &read,

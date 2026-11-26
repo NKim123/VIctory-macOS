@@ -187,6 +187,20 @@ impl BottomWrite {
             self.address.saturating_add(self.bytes) as u64,
         )
     }
+
+    fn value_for_wait(&self, address: usize, bytes: usize) -> Option<u64> {
+        if self.address == address
+            && self.bytes == bytes
+            && let crate::queue::Written::Value(value) = self.value
+        {
+            return match bytes {
+                4 => Some(u64::from(value as u32)),
+                8 => Some(value),
+                _ => None,
+            };
+        }
+        None
+    }
 }
 
 struct TitleSignal {
@@ -227,6 +241,7 @@ static QUEUED: AtomicU64 = AtomicU64::new(0);
 static QUEUED_COMPUTED: AtomicU64 = AtomicU64::new(0);
 static OVERLAPPED: AtomicU64 = AtomicU64::new(0);
 static QUEUED_OVERLAPPED: AtomicU64 = AtomicU64::new(0);
+static BOTTOM_FIFO_READS: AtomicU64 = AtomicU64::new(0);
 static FALLBACKS: [AtomicU64; Boundary::Fence as usize + 1] =
     [const { AtomicU64::new(0) }; Boundary::Fence as usize + 1];
 static ORDERED: [AtomicU64; Boundary::Fence as usize + 1] =
@@ -282,6 +297,7 @@ pub(super) fn log(frames: f64) {
         bottom_cpu,
         bottom_native,
         bottom_read,
+        bottom_fifo_reads = BOTTOM_FIFO_READS.swap(0, Ordering::Relaxed),
         diagnostics = count(Boundary::Diagnostics),
         cpu_access = count(Boundary::CpuAccess),
         descriptors = count(Boundary::Descriptors),
@@ -385,17 +401,42 @@ impl Host {
         }
     }
 
-    /// An emulated queue wait must not compare a stale label that still
-    /// satisfies its predicate before the previous flight overwrites it.
-    pub(crate) fn order_bottom_read(&self, address: usize, bytes: usize) {
+    /// Evaluate a held GPU queue's wait against a label already ordered
+    /// before it on our single native queue. The held scheduler will still
+    /// apply the mask and comparison, and CPU publication stays fenced.
+    pub(crate) fn queued_wait_value(&self, address: usize, bytes: usize) -> Option<u64> {
         if limit() == 0 || HOLDS_SUBMISSIONS.with(std::cell::Cell::get) {
-            return;
+            return None;
         }
         let mut s = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let _holding = Holding::enter();
-        self.wait_bottom_writes(&mut s, Boundary::BottomOfPipeRead, |write, may_alias| {
-            may_alias || write.overlaps(address, bytes)
-        });
+        let mut younger_title_writes = false;
+        for flight in s.flights.iter().rev() {
+            if let Some((write, _)) = flight
+                .writes
+                .iter()
+                .rev()
+                .find(|(write, may_alias)| *may_alias || write.overlaps(address, bytes))
+            {
+                if !flight.shared_writes
+                    && !younger_title_writes
+                    && let Some(value) = write.value_for_wait(address, bytes)
+                {
+                    BOTTOM_FIFO_READS.fetch_add(1, Ordering::Relaxed);
+                    return Some(value);
+                }
+                // Timestamps, partial overlaps and possible physical
+                // aliases still require reading the published bytes.
+                let value = flight.value;
+                self.wait_inflight(&mut s, value, Boundary::BottomOfPipeRead);
+                break;
+            }
+            younger_title_writes |= flight
+                .ordered
+                .as_ref()
+                .is_some_and(|work| work.title_memory);
+        }
+        None
     }
 
     fn wait_inflight(&self, s: &mut Submission, value: u64, why: Boundary) {
