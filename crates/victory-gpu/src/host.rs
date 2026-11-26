@@ -2191,16 +2191,26 @@ impl Host {
     }
 
     pub(crate) fn quiet_mapping(&self) -> Option<Quiet<'_>> {
-        self.quiet_for(Boundary::Mapping)
+        self.quiet_mapping_if(|| true)
+    }
+
+    pub(crate) fn quiet_mapping_if(&self, destructive: impl FnOnce() -> bool) -> Option<Quiet<'_>> {
+        self.quiet_for_if(Boundary::Mapping, destructive)
     }
 
     fn quiet_for(&self, why: Boundary) -> Option<Quiet<'_>> {
+        self.quiet_for_if(why, || true)
+    }
+
+    fn quiet_for_if(&self, why: Boundary, wait: impl FnOnce() -> bool) -> Option<Quiet<'_>> {
         if HOLDS_SUBMISSIONS.with(std::cell::Cell::get) {
             return None;
         }
         let mut held = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let holding = Holding::enter();
-        self.drain_inflight(&mut held, why);
+        if held.busy() && (held.has_bottom_writes() || wait()) {
+            self.drain_inflight(&mut held, why);
+        }
         Some(Quiet {
             _holding: holding,
             _held: held,

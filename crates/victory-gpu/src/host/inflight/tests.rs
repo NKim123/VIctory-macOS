@@ -146,6 +146,42 @@ fn capacity_waits_for_the_oldest_fence_only() {
 }
 
 #[test]
+fn additive_mapping_can_proceed_while_a_destructive_edit_waits() {
+    let Some(host) = host_for_ring() else { return };
+    host.present_boundary();
+    let (out, data) = host.mapped_buffer(8, true).unwrap();
+    let before = DRAINS[Boundary::Mapping as usize].load(Ordering::Relaxed);
+    let mut gate = Gate::new(host);
+    assert!(host.execute_title(&[record_copy(host, &out, 4, 0x1234)]));
+    crate::tiled::with_physical_mapping(
+        || false,
+        || {
+            assert_eq!(
+                DRAINS[Boundary::Mapping as usize].load(Ordering::Relaxed),
+                before
+            );
+        },
+    );
+    assert!(host.submitted.lock().unwrap().busy());
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(20));
+        gate.open();
+    });
+    crate::tiled::with_physical_mapping(
+        || true,
+        || {
+            // SAFETY: the destructive boundary has fenced the GPU write.
+            assert_eq!(unsafe { data.cast::<u32>().add(1).read() }, 0x1234);
+        },
+    );
+    release.join().unwrap();
+    assert_eq!(
+        DRAINS[Boundary::Mapping as usize].load(Ordering::Relaxed),
+        before + 1
+    );
+}
+
+#[test]
 fn reset_uses_another_allocator_while_the_title_recording_is_in_flight() {
     use crate::object::guid;
     let Some(host) = host_for_ring() else { return };
