@@ -18,7 +18,7 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::System::Diagnostics::Debug::{
     AddVectoredExceptionHandler, CONTEXT, EXCEPTION_POINTERS, FlushInstructionCache,
-    ReadProcessMemory,
+    ReadProcessMemory, RemoveVectoredExceptionHandler,
 };
 use windows_sys::Win32::System::Memory::{
     MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE, VirtualAlloc,
@@ -147,11 +147,13 @@ impl<'a> FlagOr<'a> {
 
 type Sites = std::collections::BTreeMap<u32, blake3::Hash>;
 
-fn read_profile(path: &Path, image: blake3::Hash) -> anyhow::Result<Sites> {
+fn read_profile(path: &Path, image: blake3::Hash, allow_missing: bool) -> anyhow::Result<Sites> {
     use std::io::{ErrorKind, Read};
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Sites::new()),
+        Err(error) if allow_missing && error.kind() == ErrorKind::NotFound => {
+            return Ok(Sites::new());
+        }
         Err(error) => return Err(error.into()),
     };
     let mut text = String::new();
@@ -387,6 +389,24 @@ fn record(
     Ok(Session(Some((stop, worker))))
 }
 
+fn code_section(
+    s: &victory_pe::SectionInfo,
+    image_size: u32,
+) -> Option<(std::ops::Range<u32>, u32)> {
+    const SECTION_CODE: u32 = 0x6000_0000; // readable and executable
+    const SECTION_WRITE: u32 = 0x8000_0000;
+    if s.characteristics & (SECTION_CODE | SECTION_WRITE) != SECTION_CODE {
+        return None;
+    }
+    let size = match s.virtual_size {
+        0 => s.file_size,
+        size => size.min(s.file_size),
+    };
+    let end = s.rva.checked_add(size)?;
+    (size != 0 && end <= image_size && s.file_offset.checked_add(size).is_some())
+        .then_some((s.rva..end, s.file_offset))
+}
+
 /// Record candidates, or apply a runtime profile explicitly selected for use.
 /// The caller registers [`observe`] when this returns a session.
 ///
@@ -400,9 +420,12 @@ pub unsafe fn start(
     page_shift: u8,
 ) -> anyhow::Result<Option<Session>> {
     let apply_to_title = std::env::var_os("VICTORY_WRITE_SITES");
+    let record_to = std::env::var_os("VICTORY_WRITE_SITES_RECORD");
+    if apply_to_title.is_some() && record_to.is_some() {
+        tracing::warn!("VICTORY_WRITE_SITES takes precedence over VICTORY_WRITE_SITES_RECORD");
+    }
     let recording = apply_to_title.is_none();
-    let Some(path) = apply_to_title.or_else(|| std::env::var_os("VICTORY_WRITE_SITES_RECORD"))
-    else {
+    let Some(path) = apply_to_title.or(record_to) else {
         return Ok(None);
     };
     let path = PathBuf::from(path);
@@ -411,7 +434,7 @@ pub unsafe fn start(
         victory_core::ensure_outside_repo(&path)?;
         // Read the starting snapshot only after declaring this writer.
         let writer = recording.then(|| lock_recording(&path)).transpose()?;
-        Ok((read_profile(&path, image_hash)?, writer))
+        Ok((read_profile(&path, image_hash, recording)?, writer))
     })();
     let (sites, writer) = match loaded {
         Ok(loaded) => loaded,
@@ -424,16 +447,7 @@ pub unsafe fn start(
         .info()
         .sections
         .iter()
-        .filter_map(|s| {
-            const SECTION_CODE: u32 = 0x6000_0000; // readable and executable
-            const SECTION_WRITE: u32 = 0x8000_0000;
-            if s.characteristics & (SECTION_CODE | SECTION_WRITE) != SECTION_CODE {
-                return None;
-            }
-            let end = s.rva.checked_add(s.virtual_size.min(s.file_size))?;
-            (end <= image.info().size_of_image && s.file_offset.checked_add(end - s.rva).is_some())
-                .then_some((s.rva..end, s.file_offset))
-        })
+        .filter_map(|s| code_section(s, image.info().size_of_image))
         .collect();
     let recorder = Recorder {
         base: image.base(),
@@ -590,8 +604,14 @@ unsafe fn apply(
     // SAFETY: the handler consults only immutable metadata after startup.
     let handler = unsafe { AddVectoredExceptionHandler(0, Some(remap_write_fault)) };
     if handler.is_null() || FAULT_SITES.set(faults).is_err() {
-        // SAFETY: no branch points to the private pool.
-        unsafe { VirtualFree(pool, 0, MEM_RELEASE) };
+        // SAFETY: the handler, if registered, belongs to this attempt.
+        // No branch points to the private pool.
+        unsafe {
+            if !handler.is_null() {
+                RemoveVectoredExceptionHandler(handler);
+            }
+            VirtualFree(pool, 0, MEM_RELEASE);
+        }
         tracing::warn!("write-site stub fault translation unavailable");
         return Ok(0);
     }
@@ -615,14 +635,51 @@ mod tests {
     };
     use windows_sys::Win32::System::Diagnostics::Debug::{
         EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH, IMAGE_RUNTIME_FUNCTION_ENTRY,
-        IMAGE_RUNTIME_FUNCTION_ENTRY_0, RemoveVectoredExceptionHandler, RtlAddFunctionTable,
-        RtlDeleteFunctionTable, RtlLookupFunctionEntry, RtlVirtualUnwind, UNW_FLAG_NHANDLER,
+        IMAGE_RUNTIME_FUNCTION_ENTRY_0, RtlAddFunctionTable, RtlDeleteFunctionTable,
+        RtlLookupFunctionEntry, RtlVirtualUnwind, UNW_FLAG_NHANDLER,
     };
     use windows_sys::Win32::System::Memory::{PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY};
     use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 
     // or byte [r9-1], 80h; used only as part of our synthetic function.
     const OR: [u8; 5] = [0x41, 0x80, 0x49, 0xff, 0x80];
+
+    #[test]
+    fn only_record_mode_accepts_a_missing_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.txt");
+        let hash = blake3::hash(b"synthetic profile image");
+        assert!(read_profile(&path, hash, true).unwrap().is_empty());
+        let error = read_profile(&path, hash, false).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn executable_sections_with_no_virtual_size_use_file_size() {
+        let mut section = victory_pe::SectionInfo {
+            name: ".text".into(),
+            rva: 0x1000,
+            virtual_size: 0,
+            file_offset: 0x200,
+            file_size: 0x400,
+            characteristics: 0x6000_0000,
+        };
+        assert_eq!(
+            code_section(&section, 0x2000),
+            Some((0x1000..0x1400, 0x200))
+        );
+        assert_eq!(code_section(&section, 0x1200), None);
+        section.virtual_size = 0x100;
+        assert_eq!(
+            code_section(&section, 0x2000),
+            Some((0x1000..0x1100, 0x200))
+        );
+        section.characteristics |= 0x8000_0000;
+        assert_eq!(code_section(&section, 0x2000), None);
+    }
 
     #[test]
     fn only_single_bit_flags_with_simple_addresses_are_eligible() {
@@ -675,8 +732,8 @@ mod tests {
         let file = dir.path().join("sites.txt");
         let image = blake3::hash(b"synthetic image");
         write_profile(&file, image, &sites).unwrap();
-        assert_eq!(read_profile(&file, image).unwrap(), sites);
-        assert!(read_profile(&file, blake3::hash(b"other image")).is_err());
+        assert_eq!(read_profile(&file, image, false).unwrap(), sites);
+        assert!(read_profile(&file, blake3::hash(b"other image"), false).is_err());
         let text = std::fs::read_to_string(file).unwrap();
         assert_eq!(text.lines().count(), 2);
     }
@@ -718,7 +775,7 @@ mod tests {
         // Publication still works while the stable sidecar is held.
         let hash = blake3::hash(b"synthetic profile image");
         write_profile(&profile, hash, &Sites::new()).unwrap();
-        assert!(read_profile(&profile, hash).unwrap().is_empty());
+        assert!(read_profile(&profile, hash, false).unwrap().is_empty());
         drop(writer);
         run_child(false);
     }
