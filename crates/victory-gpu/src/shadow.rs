@@ -1299,7 +1299,19 @@ impl Shadow {
         };
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        let owner = {
+            use crate::copystat::{C, add};
+            if self.slice.is_some() {
+                add(C::ExactTakes, 1);
+                crate::watch::ProtectOwner::set(C::ExactProtects)
+            } else {
+                crate::watch::ProtectOwner::set(C::BufferProtects)
+            }
+        };
         let (runs, unmapped) = t.take_split(from, to);
+        #[cfg(feature = "diagnostics")]
+        drop(owner);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(
             crate::copystat::C::WatchUs,

@@ -27,6 +27,22 @@ fn record_key([_, view, generation]: [u32; 3]) -> u64 {
     u64::from(generation) << 32 | u64::from(view)
 }
 
+fn header_matches(address: u64, record: [u32; 3]) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if super::scan::on() {
+        return super::scan::matches(address as *const u8, record);
+    }
+    let mut bytes = [0u8; 12];
+    crate::host::read_into(address as *const u8, &mut bytes)
+        && bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .copied()
+            .map(u32::from_le_bytes)
+            .eq(record)
+}
+
 #[cfg(test)]
 thread_local! {
     pub(crate) static RELEASE_BEFORE_PENDING_PUBLICATION: std::cell::Cell<Option<usize>> =
@@ -1165,58 +1181,71 @@ impl HostHeap {
         (word >> (index % 64)) & 1 != 0
     }
 
-    /// A heap sync of slots `first..last`, whose records are at `start` +
-    /// index × `step`. Compare the snapshot of their headers to the host
-    /// mirror and apply updates from that same snapshot.
-    pub(crate) fn sync_slots(
-        &self,
-        first: u32,
-        last: u32,
-        start: u64,
-        step: u64,
-        bytes: &mut Vec<u8>,
-    ) {
-        let last = last.min(self.count);
-        if first >= last {
+    /// Capture disjoint dirty spans in bounded jobs, then publish in slot
+    /// order on the submission thread. Workers only read title memory and
+    /// the host's atomic keys; D3DMetal view creation stays serial.
+    pub(super) fn sync_ranges(&self, ranges: &[(u32, u32)], start: u64, step: u64) {
+        const SLOTS_PER_SPAN: u32 = 2048;
+        let spans: Vec<_> = ranges
+            .iter()
+            .flat_map(|&(first, last)| {
+                let mut at = first;
+                std::iter::from_fn(move || {
+                    if at == last {
+                        return None;
+                    }
+                    let lo = at;
+                    at = ((at / SLOTS_PER_SPAN + 1) * SLOTS_PER_SPAN).min(last);
+                    Some((lo, at))
+                })
+            })
+            .collect();
+        let slots: u64 = spans.iter().map(|&(lo, hi)| u64::from(hi - lo)).sum();
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::SyncSlots, slots);
+        static PARALLEL: OnceLock<bool> = OnceLock::new();
+        let mut bytes = Vec::new();
+        if spans.len() <= 1
+            || slots < 4096
+            || !*PARALLEL
+                .get_or_init(|| std::env::var_os("VICTORY_SYNC_FINE").is_none_or(|v| v != "0"))
+        {
+            for (lo, hi) in spans {
+                self.sync_slots_serial(lo, hi, start, step, &mut bytes);
+            }
             return;
         }
-        static FINE: OnceLock<bool> = OnceLock::new();
-        if last - first > SYNC_BLOCK_SLOTS
-            && *FINE.get_or_init(|| std::env::var_os("VICTORY_SYNC_FINE").is_some_and(|v| v == "1"))
-        {
-            self.sync_slots_fine(first, last, start, step, bytes);
-        } else {
-            self.sync_slots_serial(first, last, start, step, bytes);
+
+        let spans_per_job = spans.len().div_ceil(8);
+        let scans: Vec<OnceLock<Vec<Option<SlotScan>>>> = spans
+            .chunks(spans_per_job)
+            .map(|_| OnceLock::new())
+            .collect();
+        crate::texture::in_parallel(scans.len(), |i| {
+            let first = i * spans_per_job;
+            let job = &spans[first..(first + spans_per_job).min(spans.len())];
+            let mut bytes = Vec::new();
+            let captured = job
+                .iter()
+                .map(|&(lo, hi)| self.capture_slots(lo, hi, start, step, &mut bytes))
+                .collect();
+            let _ = scans[i].set(captured);
+        });
+        let scans = scans.into_iter().flat_map(|job| job.into_inner().unwrap());
+        for ((lo, hi), scan) in spans.into_iter().zip(scans) {
+            if let Some(scan) = scan {
+                self.publish_slots(lo, hi, start, step, scan);
+            } else {
+                self.sync_slots_serial(lo, hi, start, step, &mut bytes);
+            }
         }
     }
 
-    fn sync_slots_fine(&self, first: u32, last: u32, start: u64, step: u64, bytes: &mut Vec<u8>) {
-        const SLOTS_PER_JOB: u32 = SYNC_BLOCK_SLOTS;
-        // Only capture headers on the workers; publication and host view
-        // creation stay on the submitting thread under the same locks.
-        let results: Vec<OnceLock<Option<SlotScan>>> = (first / SLOTS_PER_JOB
-            ..last.div_ceil(SLOTS_PER_JOB))
-            .map(|_| OnceLock::new())
-            .collect();
-        let range = |i| {
-            let block = first / SLOTS_PER_JOB + i as u32;
-            (
-                (block * SLOTS_PER_JOB).max(first),
-                ((block + 1) * SLOTS_PER_JOB).min(last),
-            )
-        };
-        crate::texture::in_parallel(results.len(), |i| {
-            let (lo, hi) = range(i);
-            let scan = self.capture_slots(lo, hi, start, step, &mut Vec::new());
-            let _ = results[i].set(scan);
-        });
-        for (i, result) in results.into_iter().enumerate() {
-            let (lo, hi) = range(i);
-            if let Some(scan) = result.into_inner().flatten() {
-                self.publish_slots(lo, hi, start, step, scan);
-            } else {
-                self.sync_slots_serial(lo, hi, start, step, bytes);
-            }
+    #[cfg(test)]
+    fn sync_slots(&self, first: u32, last: u32, start: u64, step: u64, bytes: &mut Vec<u8>) {
+        let last = last.min(self.count);
+        if first < last {
+            self.sync_slots_serial(first, last, start, step, bytes);
         }
     }
 
@@ -1245,6 +1274,9 @@ impl HostHeap {
         step: u64,
         bytes: &mut Vec<u8>,
     ) -> Option<SlotScan> {
+        #[cfg(feature = "diagnostics")]
+        let _timed =
+            crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncCaptureUs);
         let at = |i: u32| start + u64::from(i) * step;
         let forgot = views_forgot();
         let blocks_verified = (first / SYNC_BLOCK_SLOTS..=(last - 1) / SYNC_BLOCK_SLOTS)
@@ -1293,6 +1325,9 @@ impl HostHeap {
     }
 
     fn publish_slots(&self, first: u32, last: u32, start: u64, step: u64, scan: SlotScan) {
+        #[cfg(feature = "diagnostics")]
+        let _timed =
+            crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncPublishUs);
         let SlotScan { candidates, forgot } = scan;
         if !candidates.is_empty() {
             let stale = {
@@ -1302,6 +1337,8 @@ impl HostHeap {
                     candidates.into_iter().map(|c| (c.index, c.record)),
                 )
             };
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::SyncChanged, stale.len() as u64);
             for (index, record, previous) in stale {
                 let address = start + u64::from(index) * step;
                 let _ = self.mirror_record(index, false, Some((previous, address)), || record);
@@ -1408,8 +1445,8 @@ impl HostHeap {
 
     /// Materializes a captured record or the latest record at a live slot.
     /// Snapshot publication closes the live-write fast path and validates
-    /// the capture under the slot lock. The title may have unmapped the
-    /// slot since capture, so validation reads through the kernel.
+    /// the capture under the slot lock, including if the title has unmapped
+    /// the slot since capture.
     fn mirror_record(
         &self,
         index: u32,
@@ -1430,15 +1467,7 @@ impl HostHeap {
                 }
                 let ready = &self.ready[index as usize];
                 let saved = ready.swap(0, Ordering::AcqRel);
-                let mut bytes = [0u8; 12];
-                let changed = !crate::host::read_into(address as *const u8, &mut bytes)
-                    || bytes
-                        .as_chunks::<4>()
-                        .0
-                        .iter()
-                        .copied()
-                        .map(u32::from_le_bytes)
-                        .ne(record);
+                let changed = !header_matches(address, record);
                 if changed {
                     ready.store(saved, Ordering::Release);
                 }
@@ -1480,12 +1509,12 @@ impl HostHeap {
         // staging copy) for each of the ~20,000 the title has views of
         // ran the host out of memory (run b2).
         let later = !for_draw && is_placed_texture(&view);
-        if !later {
+        let backing = if !later {
             // What the view needs (the texture it views, the copy of the
             // memory) is made without the slot lock, which title threads
             // binding and writing views wait on (run evict5).
             drop(made);
-            prepare(&view);
+            let backing = prepare(&view);
             made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             // For live writes, retry if the title replaced the record while
             // the slot lock was released. For snapshots `read` is constant.
@@ -1496,7 +1525,10 @@ impl HostHeap {
             if made.keys[index as usize] == key && !needs_remake(&made) {
                 return Ok(Some(view));
             }
-        }
+            backing
+        } else {
+            None
+        };
         if snapshot_changed(made.keys[index as usize]) {
             drop(made);
             return Ok(None);
@@ -1522,14 +1554,19 @@ impl HostHeap {
             let (kept, mark) = if later {
                 (None, None)
             } else {
-                make_marked(&view, self.cpu(index))
+                make_marked_with_backing(
+                    &view,
+                    self.cpu(index),
+                    backing.as_ref().map(|(shadow, _, _)| shadow),
+                )
             };
             self.set_mark(index, mark);
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
             if !self.sampler {
-                self.viewed.set(index, Some(&view), kept.is_some());
+                self.viewed
+                    .set_with_backing(index, Some(&view), kept.is_some(), backing);
             }
             let kept = kept.flatten();
             // A texture's view left null is made again when a draw reads it.
@@ -2647,13 +2684,7 @@ thread_local! {
     static MARK: std::cell::Cell<Option<(u32, u32)>> = const { std::cell::Cell::new(None) };
 }
 
-/// [`make`], and the view-mark entry of the view if it is an unordered
-/// buffer view whose writes shaders mark (`victory_shader::emit`, "Write
-/// marks").
-fn make_marked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> (Option<Kept>, Option<(u32, u32)>) {
-    make_marked_with_backing(view, at, None)
-}
-
+/// [`make`] with the view-mark entry for writes through a buffer UAV.
 fn make_marked_with_backing(
     view: &View,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
@@ -3026,9 +3057,9 @@ fn make(
             let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
             let words: &[u32; 10] = desc[..10].try_into().unwrap_or(&[0; 10]);
             if *unordered {
-                buffer_uav(address, len, uav_desc(words), at, None)
+                buffer_uav(address, len, uav_desc(words), at, backing)
             } else {
-                buffer_srv(address, len, srv_desc(words), at, None)
+                buffer_srv(address, len, srv_desc(words), at, backing)
             }
         }
     }
@@ -3047,21 +3078,21 @@ fn is_placed_texture(view: &View) -> bool {
 /// Makes what a host view of `view` needs, if it is not made yet: the
 /// texture it views (made on first use) or the host copy of the buffer
 /// memory it views. The slot's view is then quick to make.
-fn prepare(view: &View) {
+fn prepare(view: &View) -> Option<BufferView> {
     #[cfg(test)]
     tests::while_preparing();
     match view {
         View::Placed(..) if is_placed_texture(view) => {
             let _ = placed_texture(view);
+            None
         }
         View::Shader(r, _) | View::Unordered(r, _, _)
             if crate::resource::texture_memory(*r as crate::object::This).is_some() =>
         {
             let _ = crate::resource::host_resource(*r as crate::object::This);
+            None
         }
-        _ => {
-            let _ = view_copy(view);
-        }
+        _ => view_copy(view),
     }
 }
 

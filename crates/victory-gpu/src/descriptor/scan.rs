@@ -57,6 +57,17 @@ std::arch::global_asm!(
     "victory_scan_failed:",
     "mov rax, -1",
     "ret",
+    ".globl victory_match_header, victory_match_tag, victory_match_key, victory_match_failed",
+    "victory_match_header:",
+    "xor eax, eax",
+    "victory_match_tag:",
+    "cmp edx, dword ptr [rcx]",
+    "jne victory_match_failed",
+    "victory_match_key:",
+    "cmp r8, qword ptr [rcx + 4]",
+    "sete al",
+    "victory_match_failed:",
+    "ret",
     tag = const VIEW_TAG,
 );
 
@@ -72,6 +83,10 @@ unsafe extern "system" {
     fn victory_scan_tag();
     fn victory_scan_key();
     fn victory_scan_failed();
+    fn victory_match_header(source: *const u8, tag: u32, key: u64) -> u32;
+    fn victory_match_tag();
+    fn victory_match_key();
+    fn victory_match_failed();
 }
 
 unsafe extern "system" fn fault(info: *mut EXCEPTION_POINTERS) -> i32 {
@@ -82,14 +97,23 @@ unsafe extern "system" fn fault(info: *mut EXCEPTION_POINTERS) -> i32 {
         EXCEPTION_ACCESS_VIOLATION | STATUS_GUARD_PAGE_VIOLATION | STATUS_IN_PAGE_ERROR
     ) && record.NumberParameters >= 2
         && record.ExceptionInformation[0] == 0
-        && [victory_scan_tag as *const (), victory_scan_key as *const ()]
-            .contains(&(context.Rip as *const ()))
     {
-        context.Rip = victory_scan_failed as *const () as u64;
-        EXCEPTION_CONTINUE_EXECUTION
-    } else {
-        EXCEPTION_CONTINUE_SEARCH
+        let at = context.Rip as *const ();
+        if [victory_scan_tag as *const (), victory_scan_key as *const ()].contains(&at) {
+            context.Rip = victory_scan_failed as *const () as u64;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        if [
+            victory_match_tag as *const (),
+            victory_match_key as *const (),
+        ]
+        .contains(&at)
+        {
+            context.Rip = victory_match_failed as *const () as u64;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
     }
+    EXCEPTION_CONTINUE_SEARCH
 }
 
 pub(super) fn on() -> bool {
@@ -101,8 +125,18 @@ pub(super) fn on() -> bool {
 
 fn install() -> bool {
     static INSTALLED: OnceLock<bool> = OnceLock::new();
-    // SAFETY: the handler only intercepts the two guarded title reads.
+    // SAFETY: the handler only intercepts the guarded title reads above.
     *INSTALLED.get_or_init(|| !unsafe { AddVectoredExceptionHandler(1, Some(fault)) }.is_null())
+}
+
+/// Revalidate a captured header with a fault-contained read while its host
+/// slot is locked. An unreadable mapping counts as a changed header.
+pub(super) fn matches(source: *const u8, [tag, index, generation]: [u32; 3]) -> bool {
+    debug_assert!(on());
+    let key = u64::from(generation) << 32 | u64::from(index);
+    // SAFETY: the installed handler covers both reads before the function
+    // changes any stack or nonvolatile registers. A fault returns zero.
+    unsafe { victory_match_header(source, tag, key) != 0 }
 }
 
 pub(super) fn changed(
@@ -165,5 +199,33 @@ mod tests {
             ],
         );
         assert!(changed(std::ptr::null(), &ready, &occupied, 0, 5).is_none());
+    }
+
+    #[test]
+    fn captured_header_validation_rejects_rewrites_and_unmapped_memory() {
+        if !on() {
+            return;
+        }
+        let record = [VIEW_TAG, 17, 3];
+        let at = record.as_ptr().cast();
+        assert!(matches(at, record));
+        assert!(!matches(at, [0, 17, 3]));
+        assert!(!matches(at, [VIEW_TAG, 17, 4]));
+        assert!(!matches(std::ptr::null(), record));
+        // The tag is readable, but the adjacent key crosses out of the pool.
+        use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, VirtualFree};
+        let base = crate::watch::tests::pool(2);
+        let end = (base + crate::watch::PAGE - 4) as *mut u32;
+        // SAFETY: the reserved pool has two blocks; leave the second
+        // inaccessible, with the record's tag in the first.
+        unsafe {
+            assert_ne!(
+                VirtualFree(end.add(1).cast(), crate::watch::PAGE, MEM_DECOMMIT),
+                0
+            );
+            end.write(VIEW_TAG);
+        };
+        assert!(!matches(end.cast(), record));
+        crate::watch::tests::free(base);
     }
 }

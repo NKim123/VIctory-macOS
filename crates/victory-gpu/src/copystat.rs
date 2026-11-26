@@ -8,6 +8,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// Counters since the last line.
+#[derive(Clone, Copy)]
 pub(crate) enum C {
     Submissions,
     Copies,
@@ -102,6 +103,19 @@ pub(crate) enum C {
     SyncHeapsUs,
     /// Of those: heap slots looked at (every slot of each page written).
     SyncSlots,
+    SyncTakeUs,
+    SyncCaptureUs,
+    SyncPublishUs,
+    SyncChanged,
+    SyncMarkedSlots,
+    SyncAuditSlots,
+    TextureTakes,
+    DescriptorTakes,
+    ExactTakes,
+    BufferProtects,
+    ExactProtects,
+    TextureProtects,
+    DescriptorProtects,
     /// Time in copies redone piece by piece after meeting an unmapped page.
     FallbackUs,
     /// Title threads writing a view into a shader-visible heap: time
@@ -404,6 +418,27 @@ pub(crate) fn log(frames: f64) {
             let hard = hard_faults();
             (hard - HARD.swap(hard, Relaxed).min(hard)) as f64 / frames
         },
+    );
+    let per_frame = |counter: C| c[counter as usize];
+    tracing::info!(
+        "heap sync per frame: take {:.1} ms, capture {:.1} worker-ms, publish {:.1} ms; {:.0} changed, {:.0} marked, {:.0} audit slots",
+        ms(per_frame(C::SyncTakeUs)),
+        ms(per_frame(C::SyncCaptureUs)),
+        ms(per_frame(C::SyncPublishUs)),
+        per_frame(C::SyncChanged),
+        per_frame(C::SyncMarkedSlots),
+        per_frame(C::SyncAuditSlots),
+    );
+    tracing::info!(
+        "watch takes/protects per frame: buffer {:.0}/{:.0}, exact view {:.0}/{:.0}, texture {:.0}/{:.0}, descriptor {:.0}/{:.0}",
+        per_frame(C::Watches) - per_frame(C::ExactTakes),
+        per_frame(C::BufferProtects),
+        per_frame(C::ExactTakes),
+        per_frame(C::ExactProtects),
+        per_frame(C::TextureTakes),
+        per_frame(C::TextureProtects),
+        per_frame(C::DescriptorTakes),
+        per_frame(C::DescriptorProtects),
     );
     let held: Vec<String> = crate::watch::held_times()
         .iter()

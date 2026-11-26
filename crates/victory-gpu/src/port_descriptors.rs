@@ -115,6 +115,7 @@ pub(crate) fn adopt(id: usize, start: u64, count: u32) {
     // The first eligible heap alone is adopted. Fixed storage and base
     // make an in-flight writer safe even if the heap is retired.
     if SLOTS.get().is_some() {
+        tracing::info!(start, count, "placed view heap uses descriptor watch");
         return;
     }
     let slots = SLOTS.get_or_init(|| Slots::new(count));
@@ -125,6 +126,7 @@ pub(crate) fn adopt(id: usize, start: u64, count: u32) {
         .chunks
         .store(slots.chunks.as_ptr().cast_mut(), Relaxed);
     MARKS.len.store((count * STRIDE) as u64, Release);
+    tracing::info!(start, count, "placed view heap uses descriptor marks");
 }
 
 pub(crate) fn retire(id: usize) {

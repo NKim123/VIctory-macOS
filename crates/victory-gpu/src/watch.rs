@@ -485,6 +485,28 @@ impl Changed {
 /// Byte runs `[start, end)` in order.
 pub(crate) type Runs = Vec<(usize, usize)>;
 
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    static PROTECT_OWNER: std::cell::Cell<Option<crate::copystat::C>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) struct ProtectOwner(Option<crate::copystat::C>);
+
+#[cfg(feature = "diagnostics")]
+impl ProtectOwner {
+    pub(crate) fn set(owner: crate::copystat::C) -> Self {
+        Self(PROTECT_OWNER.with(|cell| cell.replace(Some(owner))))
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+impl Drop for ProtectOwner {
+    fn drop(&mut self) {
+        PROTECT_OWNER.with(|cell| cell.set(self.0.take()));
+    }
+}
+
 /// Title memory a host copy or texture staging takes: bytes `[start, end)`.
 pub(crate) struct Tracked {
     start: usize,
@@ -1285,6 +1307,11 @@ fn protect_noting(g: &Guards, pages: &[usize], unmapped_pages: &mut Vec<usize>) 
     let counted = |calls: u64, pages: u64| {
         crate::copystat::add(crate::copystat::C::ProtectCalls, calls);
         crate::copystat::add(crate::copystat::C::ProtectPages, pages);
+        PROTECT_OWNER.with(|cell| {
+            if let Some(owner) = cell.get() {
+                crate::copystat::add(owner, calls);
+            }
+        });
     };
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualProtect, VirtualQuery,

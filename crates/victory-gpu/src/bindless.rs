@@ -154,9 +154,20 @@ impl Viewed {
     /// Title slot `index` now holds `view` (none: no view), made on the
     /// host (`made`) or left without a host view.
     pub(crate) fn set(&self, index: u32, view: Option<&View>, made: bool) {
+        self.set_with_backing(index, view, made, None);
+    }
+
+    /// Record the same exact backing used to make the descriptor, if known.
+    pub(crate) fn set_with_backing(
+        &self,
+        index: u32,
+        view: Option<&View>,
+        made: bool,
+        backing: Option<(Arc<Shadow>, u64, u64)>,
+    ) {
         let seen = view.and_then(|v| {
             if made {
-                seen(v)
+                seen(v, backing)
             } else {
                 Some(Seen::Left(left_kind(v)))
             }
@@ -223,7 +234,7 @@ impl Viewed {
 }
 
 /// What a made view reads that title memory feeds.
-fn seen(view: &View) -> Option<Seen> {
+fn seen(view: &View, backing: Option<(Arc<Shadow>, u64, u64)>) -> Option<Seen> {
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
     if let View::Shader(resource, _) = view
@@ -243,7 +254,7 @@ fn seen(view: &View) -> Option<Seen> {
                 len,
             )
         }
-        _ => crate::descriptor::host::view_copy(view)?,
+        _ => backing.or_else(|| crate::descriptor::host::view_copy(view))?,
     };
     let uav = matches!(view, View::Unordered(..) | View::Placed(true, ..));
     if len == 0 {

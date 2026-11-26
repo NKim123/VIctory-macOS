@@ -909,7 +909,15 @@ impl Staging {
             if !initial && t.clean() {
                 return (0, None);
             }
-            let ranges = t.take(start, start + size);
+            let ranges = {
+                #[cfg(feature = "diagnostics")]
+                let _owner = {
+                    use crate::copystat::{C, add};
+                    add(C::TextureTakes, 1);
+                    crate::watch::ProtectOwner::set(C::TextureProtects)
+                };
+                t.take(start, start + size)
+            };
             if !initial && ranges.is_empty() {
                 return (0, None);
             }

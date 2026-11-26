@@ -251,6 +251,17 @@ struct HeapRequests {
 #[cfg(windows)]
 static HEAP_REQUESTS: std::sync::OnceLock<Option<HeapRequests>> = std::sync::OnceLock::new();
 
+#[cfg(windows)]
+fn watch_heap(written: &crate::watch::Tracked, from: usize, to: usize) -> crate::watch::Runs {
+    #[cfg(feature = "diagnostics")]
+    let _owner = {
+        use crate::copystat::{C, add};
+        add(C::DescriptorTakes, 1);
+        crate::watch::ProtectOwner::set(C::DescriptorProtects)
+    };
+    written.take(from, to)
+}
+
 /// Discover dirty descriptor ranges from title memory while submissions
 /// wait for the host. Only the normal submission path publishes slots.
 #[cfg(windows)]
@@ -284,6 +295,8 @@ pub(crate) fn request_heap_records() {
 
 #[cfg(windows)]
 fn take_heap_writes(mut budget: usize) -> Vec<HeapWrites> {
+    #[cfg(feature = "diagnostics")]
+    let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncTakeUs);
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     let mut work = Vec::new();
     for &(start, _, at) in heaps.iter() {
@@ -311,10 +324,26 @@ fn take_heap_writes(mut budget: usize) -> Vec<HeapWrites> {
             if audit {
                 ranges = heap.written.as_ref().map_or_else(
                     || vec![(start_address, limit)],
-                    |written| written.take(start_address, limit),
+                    |written| watch_heap(written, start_address, limit),
+                );
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(
+                    crate::copystat::C::SyncAuditSlots,
+                    ranges
+                        .iter()
+                        .map(|&(a, b)| (b - a).div_ceil(step as usize) as u64)
+                        .sum(),
                 );
             }
             let count = host.count() as usize;
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(
+                crate::copystat::C::SyncMarkedSlots,
+                marks
+                    .iter()
+                    .map(|&(a, b)| (b.min(count).saturating_sub(a)) as u64)
+                    .sum(),
+            );
             ranges.extend(marks.into_iter().filter(|&(first, _)| first < count).map(
                 |(first, last)| {
                     let addr = |index| start_address + index * step as usize;
@@ -342,7 +371,7 @@ fn take_heap_writes(mut budget: usize) -> Vec<HeapWrites> {
         if written.clean() {
             continue;
         }
-        let ranges = written.take(start_address, limit);
+        let ranges = watch_heap(written, start_address, limit);
         if !ranges.is_empty() {
             work.push(HeapWrites {
                 start,
@@ -381,56 +410,52 @@ pub(crate) fn sync_heaps() {
 
 #[cfg(windows)]
 fn publish_heap_writes(work: Vec<HeapWrites>) {
-    // Then page by page, the lock held for one page at a time: title
-    // threads writing views (`mirror`) wait on it, and held across every
-    // page of every heap they waited ~100 ms a frame in the world (some
-    // 650,000 slots checked a frame, 29 submissions). A heap is not dropped
-    // while its page is made: `Heap::drop` takes the write lock to leave the
-    // list, so a heap still listed under the lock is alive.
-    let page_size = crate::watch::PAGE;
-    let mut page_bytes = Vec::new();
-    for HeapWrites {
-        start,
-        at,
-        sync_id,
-        ranges,
-    } in work
-    {
-        for (from, to) in ranges {
-            for page in (from & !(page_size - 1)..to).step_by(page_size) {
-                let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-                if !heaps.iter().any(|&(s, _, h)| (s, h) == (start, at)) {
-                    break;
-                }
-                // SAFETY: listed under the lock we hold, so not yet dropped.
-                let heap = unsafe { &*(at as *const Heap) };
-                if heap.sync_id != sync_id {
-                    break;
-                }
-                let (Some(Some(host)), Some(step)) = (heap.host.get(), increment(heap.desc.kind))
-                else {
-                    break;
-                };
-                let step = u64::from(step);
-                let (page, end) = (page.max(from), (page + page_size).min(to));
-                let (first, last) = (
-                    (page as u64 - start) / step,
-                    (end as u64 - start).div_ceil(step),
-                );
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(
-                    crate::copystat::C::SyncSlots,
-                    last.min(u64::from(heap.desc.count)).saturating_sub(first),
-                );
-                host.sync_slots(
-                    first as u32,
-                    last.min(u64::from(heap.desc.count)) as u32,
-                    start,
-                    step,
-                    &mut page_bytes,
-                );
+    let mut work = work;
+    work.sort_unstable_by_key(|w| (w.at, w.sync_id));
+    for items in work.chunk_by(|a, b| (a.at, a.sync_id) == (b.at, b.sync_id)) {
+        let HeapWrites {
+            start, at, sync_id, ..
+        } = items[0];
+        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+        if !heaps.iter().any(|&(s, _, h)| (s, h) == (start, at)) {
+            continue;
+        }
+        // SAFETY: retirement takes the registry's write lock.
+        let heap = unsafe { &*(at as *const Heap) };
+        if heap.sync_id != sync_id {
+            continue;
+        }
+        let (Some(Some(host)), Some(step)) = (heap.host.get(), increment(heap.desc.kind)) else {
+            continue;
+        };
+        let step = u64::from(step);
+        let mut ranges = items
+            .iter()
+            .flat_map(|w| &w.ranges)
+            .map(|&(from, to)| {
+                let first = (from as u64 - start) / step;
+                let last = (to as u64 - start)
+                    .div_ceil(step)
+                    .min(u64::from(host.count()));
+                (first as u32, last as u32)
+            })
+            .filter(|(first, last)| first < last)
+            .collect::<Vec<_>>();
+        ranges.sort_unstable();
+        // Marks and the audit can cover the same slots, as can the early
+        // and submit-time rounds. Read each slot once after both rounds.
+        let mut end = 0;
+        for i in 0..ranges.len() {
+            let (first, last) = ranges[i];
+            if end > 0 && first <= ranges[end - 1].1 {
+                ranges[end - 1].1 = ranges[end - 1].1.max(last);
+            } else {
+                ranges[end] = (first, last);
+                end += 1;
             }
         }
+        ranges.truncate(end);
+        host.sync_ranges(&ranges, start, step);
     }
 }
 

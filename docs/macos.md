@@ -516,7 +516,7 @@ These switches port work from avatarmanz/VIctory-7900XTX (GPL-3.0).
 | --- | --- |
 | `VICTORY_PORT_DESCRIPTORS=1` | On the known Series 1.0.2.1 image, six byte-checked table stores and the host CRT copy imports mark written slots in the first eligible placed view heap. All six store hooks must install before marks replace per-submission page scans. The first sync and every eighth frame also scan the watched changes, or the eligible heap range when fault tracking is off. Writes through uninstrumented paths can first appear at that audit. Off by default. |
 | `VICTORY_SYNC_IN_PLACE=0` | Use kernel snapshots for each descriptor sweep. By default on x86-64, verified 32-byte slots are compared to the host mirror as their headers are read. A failed read retries through the existing kernel path. |
-| `VICTORY_SYNC_FINE=1` | Capture large descriptor scan ranges in 128-slot jobs through the existing bounded texture worker pool. The submitting thread still creates and publishes the host views. Off by default. |
+| `VICTORY_SYNC_FINE=0` | Capture dirty descriptor ranges on the submitting thread. By default, scans of at least 4,096 slots use the bounded texture worker pool when they can be split. The submitting thread creates and publishes the host views in both modes. |
 | `VICTORY_SPANS_QUICK=0` | Take the bindless view lock on every slot update. By default, an occupancy bit lets updates that would neither add nor remove a tracked view leave that lock alone. |
 | `VICTORY_UNDER_FUSED=1` | During a refresh that overlaps a pending GPU write baseline, compare and apply title bytes to the mapped shadow from at most 64 KiB of scratch per worker. Update the baseline from the same read even when shadow bytes already match. Off by default. |
 
