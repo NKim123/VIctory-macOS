@@ -1253,14 +1253,16 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        let live_upload = u.kind == ResourceType::Srv
-            && !heap.samplers()
-            && crate::descriptor::host::show_after();
-        if let Some(view) = host.mirror(index, handle, true) {
-            prepare_readable(list, u, &view, true, live_upload);
-        }
-        if live_upload {
+        if u.kind == ResourceType::Srv && !heap.samplers() && crate::descriptor::host::show_after() {
+            if let Some(view) = host.mirror(index, handle, true) {
+                prepare_readable(list, u, &view, true, true);
+            }
             list.defer_texture_slot(&host.viewed, index);
+            list.defer_slot(&host.viewed, index);
+            return;
+        }
+        if let Some(view) = host.mirror(index, handle, true) {
+            readable(list, u, &view, true);
         }
         if !heap.samplers() {
             list.defer_slot(&host.viewed, index);
