@@ -1450,6 +1450,47 @@ mod tests {
         region
     }
 
+    fn release_placeholders(base: *mut c_void, pages: usize) {
+        let mut at = base;
+        let end = base.wrapping_byte_add(pages * PAGE);
+        while at < end {
+            let bytes = query(at).host.RegionSize;
+            assert!((1..=end as usize - at as usize).contains(&bytes));
+            // SAFETY: the test owns every placeholder in the range.
+            assert_ne!(unsafe { VirtualFree(at, 0, MEM_RELEASE) }, 0);
+            at = at.wrapping_byte_add(bytes);
+        }
+    }
+
+    #[test]
+    fn alias_subrange_of_a_direct_view_keeps_both_neighbors() {
+        const N: usize = 4;
+        let pages = allocate(N);
+        let (source, target) = (reserve_pages(N), reserve_pages(N));
+        for base in [source, target] {
+            assert_eq!(XMemMapPhysicalPages(base, N, pages.as_ptr()), base);
+        }
+        let at = |base: *mut c_void, k| base.wrapping_byte_add(k * PAGE);
+        let keys = |base: *mut c_void| {
+            let map = physical();
+            std::array::from_fn::<_, N, _>(|k| slice_at(&map, at(base, k) as usize).unwrap().key(0))
+        };
+        let [first, second, _, last] = keys(source);
+        let middle = at(target, 1);
+        assert!(has_multi_page_view(&physical(), middle as usize, 2 * PAGE));
+        assert!(map_alias(middle as u64, source as u64, (2 * PAGE) as u64));
+        assert_eq!(keys(target), [first, first, second, last]);
+
+        // The established overlapping-copy path reads successive source pages in order.
+        assert!(map_alias(middle as u64, target as u64, (2 * PAGE) as u64));
+        assert_eq!(keys(target), [first, first, first, last]);
+        for base in [source, target] {
+            assert!(map_alias(base as u64, 0, (N * PAGE) as u64));
+            release_placeholders(base, N);
+        }
+        assert_eq!(XMemFreePhysicalPages(N, pages.as_ptr()), 1);
+    }
+
     #[test]
     fn alias_batch_remaps_only_changed_pages() {
         const N: usize = 8;
@@ -1505,16 +1546,7 @@ mod tests {
         assert_eq!(query(at(target, N - 1)).host.State, MEM_RESERVE);
         for base in [source, target] {
             assert!(copy(base, std::ptr::null_mut(), N));
-            // Each formerly mapped view is now a separate placeholder.
-            let mut at = base;
-            let end = base.wrapping_byte_add(N * PAGE);
-            while at < end {
-                let bytes = query(at).host.RegionSize;
-                assert!((1..=end as usize - at as usize).contains(&bytes));
-                // SAFETY: this test owns the entire placeholder at this address.
-                assert_ne!(unsafe { VirtualFree(at, 0, MEM_RELEASE) }, 0);
-                at = at.wrapping_byte_add(bytes);
-            }
+            release_placeholders(base, N);
         }
         assert_eq!(XMemFreePhysicalPages(N, pages.as_ptr()), 1);
     }
