@@ -1342,6 +1342,14 @@ fn wave64(words: &[u32]) -> ir::Program {
     ir::build(&code, true, 256).unwrap()
 }
 
+/// [`super::split_wave_barriers`] of a program.
+fn barriers_at(p: &ir::Program) -> Option<Vec<(usize, usize)>> {
+    let st = structure::structure(p).unwrap();
+    let mut at: Vec<_> = super::split_wave_barriers(p, &st)?.into_iter().collect();
+    at.sort_unstable();
+    Some(at)
+}
+
 /// Lowers a wave64 compute program of `lanes` threads with 512 bytes of
 /// LDS: the barriers it got for narrow host waves.
 fn split_barriers(words: &[u32], lanes: u32, narrow_waves: bool) -> usize {
@@ -1394,8 +1402,7 @@ fn a_read_after_another_lanes_write_syncs_in_a_split_wave() {
     w.extend(DS_WRITE_V1_V0);
     w.extend(DS_READ_V2_V1_4);
     w.push(S_ENDPGM);
-    let at = super::split_wave_barriers(&wave64(&w)).unwrap();
-    assert_eq!(at.into_iter().collect::<Vec<_>>(), [(0, 2)]);
+    assert_eq!(barriers_at(&wave64(&w)).unwrap(), [(0, 2)]);
     assert_eq!(split_barriers(&w, 64, true), 1);
     // Option off, or a group one host wave holds: as before.
     assert_eq!(split_barriers(&w, 64, false), 0);
@@ -1416,7 +1423,7 @@ fn a_divergent_write_syncs_at_the_join_before_the_read() {
     w.extend(DS_READ_V2_V1_4);
     w.push(S_ENDPGM);
     let p = wave64(&w);
-    let at: Vec<_> = super::split_wave_barriers(&p).unwrap().into_iter().collect();
+    let at = barriers_at(&p).unwrap();
     assert_eq!(at.len(), 1);
     let (b, i) = at[0];
     assert!(p.blocks[b].insts[i].name().starts_with("ds_read"));
@@ -1433,7 +1440,7 @@ fn a_write_before_divergent_reads_syncs_where_all_lanes_run() {
     w.push(RESTORE_EXEC);
     w.push(S_ENDPGM);
     let p = wave64(&w);
-    let at: Vec<_> = super::split_wave_barriers(&p).unwrap().into_iter().collect();
+    let at = barriers_at(&p).unwrap();
     assert_eq!(at, [(0, p.blocks[0].insts.len())], "the end of the entry");
     assert_eq!(split_barriers(&w, 64, true), 1);
 }
@@ -1446,8 +1453,133 @@ fn no_barrier_in_divergent_code() {
     w.extend(DS_READ_V2_V1_4);
     w.push(RESTORE_EXEC);
     w.push(S_ENDPGM);
-    assert!(super::split_wave_barriers(&wave64(&w)).is_none());
+    assert!(barriers_at(&wave64(&w)).is_none());
     assert_eq!(split_barriers(&w, 64, true), 0);
+}
+
+const S_MOV_S20_0: u32 = 0xBE94_0380; // s_mov_b32 s20, 0
+const S_ADD_S20_1: u32 = 0x8014_8114; // s_add_u32 s20, s20, 1
+const S_CMP_LT_S20_4: u32 = 0xBF0A_8414; // s_cmp_lt_u32 s20, 4
+const S_CMP_LT_S20_S21: u32 = 0xBF0A_1514; // s_cmp_lt_u32 s20, s21
+const READFIRSTLANE_S21_V0: u32 = 0x7E2A_0500; // v_readfirstlane_b32 s21, v0
+
+/// `body` in a loop on s20, ending at the compare `cmp` (`s_cbranch_scc1`
+/// back to the body's start).
+fn looped(before: &[u32], body: &[u32], cmp: u32) -> Vec<u32> {
+    let mut w = before.to_vec();
+    w.push(S_MOV_S20_0);
+    w.extend(body);
+    let back = -(body.len() as i32 + 3);
+    w.extend([S_ADD_S20_1, cmp, 0xBF85_0000 | (back as u32 & 0xFFFF)]);
+    w.push(S_ENDPGM);
+    w
+}
+
+#[test]
+fn the_loop_programs_are_what_their_comments_say() {
+    let w = looped(
+        &[V_LSHLREV_V1_2_V0, READFIRSTLANE_S21_V0],
+        &[DS_WRITE_V1_V0, DS_READ_V2_V1_4].concat(),
+        S_CMP_LT_S20_S21,
+    );
+    let code: Vec<u8> = w.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let all = crate::gfx10::decode(&code)
+        .unwrap()
+        .iter()
+        .map(|i| i.text(true))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for want in [
+        "v_readfirstlane_b32 s21, v0",
+        "s_mov_b32 s20, 0",
+        "ds_write_b32 v1, v0",
+        "ds_read_b32 v2, v1 offset:4",
+        "s_add_u32 s20, s20, 1",
+        "s_cmp_lt_u32 s20, s21",
+        "s_cbranch_scc1",
+    ] {
+        assert!(all.contains(want), "{want:?} not in:\n{all}");
+    }
+    let w = looped(&[], &[], S_CMP_LT_S20_4);
+    let code: Vec<u8> = w.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let all = crate::gfx10::decode(&code)
+        .unwrap()
+        .iter()
+        .map(|i| i.text(true))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(all.contains("s_cmp_lt_u32 s20, 4"), "{all}");
+}
+
+#[test]
+fn lds_in_a_loop_on_a_scalar_count_syncs_inside_the_loop() {
+    // Each pass writes, then reads what another lane wrote: a barrier
+    // before the read, and one before the write, which the last pass's read
+    // of another lane must not miss.
+    let w = looped(
+        &[V_LSHLREV_V1_2_V0],
+        &[DS_WRITE_V1_V0, DS_READ_V2_V1_4].concat(),
+        S_CMP_LT_S20_4,
+    );
+    let p = wave64(&w);
+    assert!(p.blocks[1].insts[0].name().starts_with("ds_write"));
+    assert_eq!(barriers_at(&p).unwrap(), [(1, 0), (1, 1)]);
+    assert_eq!(split_barriers(&w, 64, true), 2);
+    assert_eq!(lowered(&w, 64, true).wave_size, None);
+}
+
+#[test]
+fn lds_in_a_loop_on_a_lane_value_gets_no_barrier() {
+    // The count comes from a lane (`v_readfirstlane`): the host waves need
+    // not agree on it, so no barrier can go in the loop.
+    let w = looped(
+        &[V_LSHLREV_V1_2_V0, READFIRSTLANE_S21_V0],
+        &[DS_WRITE_V1_V0, DS_READ_V2_V1_4].concat(),
+        S_CMP_LT_S20_S21,
+    );
+    assert!(barriers_at(&wave64(&w)).is_none());
+    assert_eq!(split_barriers(&w, 64, true), 0);
+    // A loop on a lane's own condition (`s_cbranch_vccnz`) neither.
+    let mut w = vec![V_LSHLREV_V1_2_V0];
+    w.extend(DS_WRITE_V1_V0);
+    w.extend(DS_READ_V2_V1_4);
+    w.extend([
+        0x7D88_0480, // v_cmp_gt_u32 vcc, 0, v2
+        0xBF87_FFFA, // s_cbranch_vccnz (back to the write)
+        S_ENDPGM,
+    ]);
+    assert!(barriers_at(&wave64(&w)).is_none());
+}
+
+#[test]
+fn a_write_after_another_lanes_read_syncs_before_it() {
+    let mut w = vec![V_LSHLREV_V1_2_V0];
+    w.extend(DS_WRITE_V1_V0);
+    w.extend(DS_READ_V2_V1_4);
+    w.extend(DS_WRITE_V1_V0);
+    w.extend(DS_READ_V2_V1_4);
+    w.push(S_ENDPGM);
+    assert_eq!(barriers_at(&wave64(&w)).unwrap(), [(0, 2), (0, 3), (0, 4)]);
+}
+
+#[test]
+fn a_read_before_divergent_writes_syncs_where_all_lanes_run() {
+    let mut w = vec![V_LSHLREV_V1_2_V0];
+    w.extend(DS_READ_V2_V1_4);
+    w.extend([SAVE_EXEC, CMPX_V0_EQ_0, skip(2)]);
+    w.extend(DS_WRITE_V1_V0);
+    w.push(RESTORE_EXEC);
+    w.push(S_ENDPGM);
+    let p = wave64(&w);
+    assert_eq!(barriers_at(&p).unwrap(), [(0, p.blocks[0].insts.len())]);
+    // A write after a read, both under the branch: no barrier can go
+    // there, and the program runs as before.
+    let mut w = vec![V_LSHLREV_V1_2_V0, SAVE_EXEC, CMPX_V0_EQ_0, skip(4)];
+    w.extend(DS_READ_V2_V1_4);
+    w.extend(DS_WRITE_V1_V0);
+    w.push(RESTORE_EXEC);
+    w.push(S_ENDPGM);
+    assert_eq!(barriers_at(&wave64(&w)).unwrap(), []);
 }
 
 #[test]
@@ -1676,4 +1808,106 @@ fn pixel_shader_skips_early_depth_stencil_with_discard_depth_or_uav() {
         true,
     );
     assert!(!uav.early_depth_stencil);
+}
+
+/// GLOBAL `op` with address `s[saddr:saddr+1] + vaddr + offset`.
+const fn global(op: u32, vdst: u8, vaddr: u8, saddr: u8, offset: u32) -> [u32; 2] {
+    [
+        0x37 << 26 | op << 18 | 2 << 14 | (offset & 0xFFF),
+        vaddr as u32 | (saddr as u32) << 16 | (vdst as u32) << 24,
+    ]
+}
+
+/// Lowers a one-thread compute program with a pointer to title memory in
+/// root constants s[0:1] (and s2, s3), the raw UAV of table entry 0 (s4) in
+/// s[8:11], around `body`.
+fn lower_memory(body: &[u32]) -> Lowered {
+    let mut words = vec![
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+        0xFA00_0000,
+    ];
+    words.extend_from_slice(body);
+    words.push(S_ENDPGM);
+    let constants = RootParam {
+        sgprs: 4,
+        ..root(RootType::Constants, 0, 0)
+    };
+    let buffer = UsedResource {
+        kind: ResourceType::Uav,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 4,
+        user_data: 4,
+        slot: 1,
+    };
+    let l = lower_with(
+        &words,
+        vec![constants, root(RootType::Table, 4, 1)],
+        vec![buffer],
+    )
+    .expect("lower");
+    assert!(l.memory);
+    l
+}
+
+/// Each title-memory access reads the page table twice, its level-1 entry
+/// and then the page's entry (view and start in one load), and the null
+/// pair's view, the same for all, is read once in the entry block: here
+/// two loads behind a branch from it.
+#[test]
+fn the_null_pair_is_read_once_in_the_entry_block() {
+    let mut w = vec![
+        0xBF06_8002, // s_cmp_eq_u32 s2, 0
+        0xBF85_000A, // s_cbranch_scc1 -> s_endpgm
+        0x7E02_0280, // v_mov_b32 v1, 0
+    ];
+    w.extend(global(0x0C, 2, 1, 0, 0)); // global_load_dword v2, v1, s[0:1]
+    w.extend(global(0x0C, 3, 1, 0, 0x100));
+    w.push(0xBF8C_0000); // s_waitcnt
+    w.extend([0xE070_0000, 0x8002_0200]); // buffer_store_dword v2, off, s[8:11], 0
+    w.extend([0xE070_0004, 0x8002_0300]); // v3 at 4
+    let l = lower_memory(&w);
+    let [loads, table] = &l.raw_loads;
+    assert_eq!(table.len(), 1 + 2 * 2, "{table:?}");
+    assert_eq!(loads.len(), 1 + 2 * 3, "{loads:?}");
+    assert_eq!(table.iter().filter(|&&b| b == 0).count(), 1, "{table:?}");
+    assert_eq!(loads.iter().filter(|&&b| b == 0).count(), 1, "{loads:?}");
+}
+
+/// A box32 node's last 48 bytes are read through its first 64 bytes'
+/// page-table lookup, and looked up again only in lanes whose node starts
+/// in the last 64 bytes of a page (`raw_load_past`): the head's lookup and
+/// the null pair's view in the entry block, then the head's 16 dwords and
+/// the tail's 12 through that lookup, and the second lookup in a block of
+/// its own.
+#[test]
+fn a_box32_nodes_tail_reuses_its_heads_lookup() {
+    // The descriptor in s[12:15], based at the pointer.
+    let mut w = vec![
+        0x908C_8800, // s_lshr_b64 s[12:13], s[0:1], 8
+        0x880D_FF0D, // s_or_b32 s13, s13, 0x80000000
+        0x8000_0000,
+        0xBE8E_03C1, // s_mov_b32 s14, -1
+        0xBE8F_03FF, // s_mov_b32 s15: type 8, barycentrics, no bound
+        8 << 28 | 1 << 24 | 1 << 27 | 0x3FF,
+    ];
+    // v2..v12: the node pointer and the ray, from s2 and s3.
+    w.extend((0..11u32).map(|k| 0x7E00_0200 | (2 + k) << 17 | (2 + k % 2)));
+    // image_bvh_intersect_ray v[20:23], v[2:12], s[12:15]
+    w.extend([0xF198_9F01, 20 << 8 | (12 >> 2) << 16 | 2]);
+    // buffer_store_dwordx4 v[20:23], off, s[8:11], 0
+    w.extend([0xE078_0000, 0x8002_1400]);
+    let l = lower_memory(&w);
+    let [loads, table] = &l.raw_loads;
+    let at = |b: usize| loads.iter().filter(|&&x| x == b).count();
+    assert_eq!(table.len(), 1 + 2 + 2, "{table:?}");
+    assert_eq!(loads.len(), 1 + (2 + 4) + 3 + (2 + 3), "{loads:?}");
+    assert_eq!(table[..3], [0; 3], "{table:?}");
+    let again = table[3];
+    assert!(table[4] == again && at(again) == 2, "{loads:?} {table:?}");
+    let through_head = loads.iter().filter(|&&b| b != 0 && b < again);
+    assert_eq!(through_head.count(), 4 + 3, "{loads:?} {table:?}");
 }

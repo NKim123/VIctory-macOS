@@ -15,14 +15,17 @@ use super::shader::{Shader, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_ST
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Attribute, Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
-use crate::ir::{Block, EXEC, Exit, Inst, Phi, Program, Reg, Value};
+use crate::ir::{Block, EXEC, Exit, Inst, Phi, Program, Reg, VCC, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER_DATA};
 use crate::structure::{Atom, Bool, LaneExit, Map, Set, Structured};
 
+mod barriers;
+mod atomics;
 mod bvh;
 mod halves;
 mod mesh;
+use barriers::{in_step, split_wave_barriers};
 pub(crate) use mesh::KeptOutputs;
 use mesh::prune_signature;
 
@@ -97,6 +100,10 @@ pub(crate) struct Lowered {
     /// Whether the module sets DXIL `ForceEarlyDepthStencil`.
     #[cfg(test)]
     pub early_depth_stencil: bool,
+    /// Blocks of the written raw buffer loads, and of those that read the
+    /// title-memory page table, one entry per load.
+    #[cfg(test)]
+    pub raw_loads: [Vec<usize>; 2],
 }
 
 pub(crate) struct Parts<'a> {
@@ -316,9 +323,9 @@ struct Lower<'a> {
     halves_refused: Option<Why>,
     /// [`Lower::relabelled_flat`], once made.
     relabelled: Option<V>,
-    /// In halves: per IR block, whether each lane runs it once
-    /// ([`once_per_lane`]), where lane masks can pass between the halves.
-    once: Vec<bool>,
+    /// In halves: per IR block, whether every lane of the group runs it
+    /// together ([`in_step`]), where values can pass between the halves.
+    step: Vec<bool>,
     /// In halves: the group-shared dwords values pass between the halves
     /// through, once made ([`Lower::exchange_halves`]).
     half_words: Option<V>,
@@ -367,6 +374,8 @@ struct Lower<'a> {
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
+    /// The null pair's view in the page table ([`Lower::memory_null`]).
+    memory_null: Option<V>,
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
@@ -728,7 +737,7 @@ impl<'a> Lower<'a> {
                 // shortcut: a read in divergent code of what divergent code
                 // wrote gets no barrier (none could be placed there); the
                 // program then runs as before.
-                if let Some(b) = split_wave_barriers(p) {
+                if let Some(b) = split_wave_barriers(p, x.st) {
                     split_barriers = b;
                     synced = true;
                 }
@@ -855,7 +864,7 @@ impl<'a> Lower<'a> {
             halves,
             halves_refused,
             relabelled: None,
-            once: if halves { once_per_lane(p) } else { Vec::new() },
+            step: if halves { in_step(p, x.st) } else { Vec::new() },
             half_words: None,
             level: 0,
             alike: if halves {
@@ -894,6 +903,7 @@ impl<'a> Lower<'a> {
             sections: HashMap::new(),
             section_out: Set::default(),
             code_table: None,
+            memory_null: None,
             counters: HashMap::new(),
             abort: None,
             round16: round16(p),
@@ -1611,6 +1621,15 @@ impl<'a> Lower<'a> {
         {
             self.s.flags |= flags::EARLY_DEPTH_STENCIL;
         }
+        #[cfg(test)]
+        let raw_loads = {
+            let (m, name) = (&self.s.m, "dx.op.rawBufferLoad.f32");
+            let table = match self.s.memory {
+                Some(h) => m.written_call_blocks_on(name, h),
+                None => Vec::new(),
+            };
+            [m.written_call_blocks(name), table]
+        };
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
@@ -1652,6 +1671,8 @@ impl<'a> Lower<'a> {
             has_half_wave_mask: self.s.m.has_i32_const(!31),
             #[cfg(test)]
             early_depth_stencil: self.s.flags & flags::EARLY_DEPTH_STENCIL != 0,
+            #[cfg(test)]
+            raw_loads,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -4868,280 +4889,6 @@ impl<'a> Lower<'a> {
         (sum, hi)
     }
 
-    /// A 64-bit image atomic `op` of `value` (cmpswap: replacing
-    /// `compare`) on the texel at `cs` of the globally coherent R32G32_UINT
-    /// view `h`, under a lock word (`emit`, "Atomic locks"). The wave's
-    /// lanes take turns in a loop over lane indices that every lane runs
-    /// alike: in its turn a lane takes its texel's lock, reads, writes and
-    /// frees it. Lanes of one wave never wait for each other's locks (that
-    /// never finishes on Apple GPUs), and the loop needs no wave operation
-    /// in divergent code (D3DMetal's return other lanes' values there).
-    /// With [`Parts::atomic_lock_rounds`] the lanes first try their locks
-    /// in rounds, all at once, and only the lanes still not done take
-    /// turns. `not_rep` marks the lanes a reduction before this made
-    /// members of a representative's group, done from the start.
-    /// Returns the old value's low and high dwords.
-    #[allow(clippy::too_many_arguments)]
-    fn locked_atomic64(
-        &mut self,
-        h: V,
-        cs: &[V],
-        coords: usize,
-        op: &str,
-        value: V,
-        compare: Option<V>,
-        not_rep: V,
-    ) -> (V, V) {
-        let i32t = self.s.t.i32;
-        let i64t = self.s.m.int(64);
-        let void = self.s.t.void;
-        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
-        self.s.flags |= flags::WAVE_OPS | flags::TYPED_UAV_LOADS | flags::INT64;
-        let c = self.cur;
-        // The lock: a hash of the coordinates.
-        let mut hash = k(self, 0);
-        for (&x, m) in cs
-            .iter()
-            .take(coords)
-            .zip([0x9E37_79B1u32, 0x85EB_CA77, 0xC2B2_AE3D])
-        {
-            let m = k(self, m);
-            let x = self.s.m.bin(c, Bin::Mul, x, m);
-            hash = self.s.m.bin(c, Bin::Xor, hash, x);
-            let k15 = k(self, 15);
-            let r = self.s.m.bin(c, Bin::LShr, hash, k15);
-            hash = self.s.m.bin(c, Bin::Xor, hash, r);
-        }
-        let mask = k(self, super::ATOMIC_LOCKS - 1);
-        let slot = self.s.m.bin(c, Bin::And, hash, mask);
-        let k2 = k(self, 2);
-        let slot = self.s.m.bin(c, Bin::Shl, slot, k2);
-        let base = k(self, super::ATOMIC_LOCKS_AT);
-        let lock = self.s.m.bin(c, Bin::Add, slot, base);
-        let locks = self.s.view_writes_handle();
-        let me = self
-            .s
-            .op(c, "waveGetLaneIndex", Attr::ReadNone, i32t, 111, &[]);
-        let lanes = self
-            .s
-            .op(c, "waveGetLaneCount", Attr::ReadNone, i32t, 112, &[]);
-        let iu = self.s.m.undef(i32t);
-        let (zero, one) = (k(self, 0), k(self, 1));
-        // The global unordered-access fence, with the group's where the
-        // stage has groups: DXIL validation refuses mode 10 in a pixel
-        // shader (found by evan-kolberg, #240).
-        let fence_mode = if matches!(self.x.native.stage, HwStage::Cs | HwStage::Ms) {
-            2 | 8
-        } else {
-            2
-        };
-        let fence = k(self, fence_mode);
-        // Under the lock, in block `b`: fence, read, write, fence, free (only
-        // if `won`: past the bounded spin a lane goes on without it). The
-        // old value's low and high dwords.
-        let step = |l: &mut Self, b: usize, won: V| -> (V, V) {
-            l.s.op(b, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
-            let mut args = vec![h, iu];
-            args.extend(cs);
-            args.extend([iu, iu, iu]);
-            let r = l.s.op(
-                b,
-                "textureLoad.i32",
-                Attr::ReadOnly,
-                l.s.t.res_ret_i32,
-                66,
-                &args,
-            );
-            let lo = l.s.m.extract(b, r, 0);
-            let hi = l.s.m.extract(b, r, 1);
-            let l64 = l.s.m.cast(b, Cast::ZExt, lo, i64t);
-            let h64 = l.s.m.cast(b, Cast::ZExt, hi, i64t);
-            let k32 = l.s.m.int_const(i64t, 32);
-            let h64 = l.s.m.bin(b, Bin::Shl, h64, k32);
-            let old = l.s.m.bin(b, Bin::Or, l64, h64);
-            let m = &mut l.s.m;
-            let pick = |m: &mut Module, p: u8| {
-                let keep = m.cmp(b, p, old, value);
-                m.select(b, keep, old, value)
-            };
-            let new = match op {
-                "add" | "sub" => m.bin(b, Bin::Add, old, value),
-                "and" => m.bin(b, Bin::And, old, value),
-                "or" => m.bin(b, Bin::Or, old, value),
-                "xor" => m.bin(b, Bin::Xor, old, value),
-                "smin" => pick(m, pred::SLT),
-                "smax" => pick(m, pred::SGT),
-                "umin" => pick(m, pred::IULT),
-                "umax" => pick(m, pred::IUGT),
-                "swap" => value,
-                _ => {
-                    let same = m.cmp(b, pred::EQ, old, compare.expect("a compare value"));
-                    m.select(b, same, value, old)
-                }
-            };
-            let nlo = l.s.m.cast(b, Cast::Trunc, new, i32t);
-            let nhi = l.s.m.bin(b, Bin::LShr, new, k32);
-            let nhi = l.s.m.cast(b, Cast::Trunc, nhi, i32t);
-            let mut args = vec![h];
-            args.extend(cs);
-            // DXIL stores all four channels; an R32G32 view keeps two.
-            args.extend([nlo, nhi, nlo, nhi, l.s.m.i8(0xF)]);
-            l.s.op(b, "textureStore.i32", Attr::NoUnwind, void, 67, &args);
-            l.s.op(b, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
-            // One add either way: a lane that took the lock frees it (it
-            // holds 1, so all ones brings it to 0), and a lane that gave up
-            // counts itself at `ATOMIC_LOCKS_GAVE_UP_AT` instead.
-            let add = l.s.m.i32(0);
-            let count = l.s.m.i32(super::ATOMIC_LOCKS_GAVE_UP_AT);
-            let at = l.s.m.select(b, won, lock, count);
-            let all = l.s.m.i32(u32::MAX);
-            let by = l.s.m.select(b, won, all, one);
-            l.atomic_bin_op(b, &[locks, add, at, iu, iu, by]);
-            (lo, hi)
-        };
-
-        // Rounds ([`Parts::atomic_lock_rounds`]), before the turns: in each
-        // of a few rounds that every lane runs alike, every lane not yet done
-        // tries its lock once, and the lanes that take it read, write and
-        // free it in that round. No lane waits on a lock in a round, so lanes
-        // of one wave cannot wait for each other's, and their locks are all
-        // free again before the turns. Lanes whose locks differ finish in the
-        // first round together, where the turns run them one after another.
-        // Only lanes still not done take turns (a lane that met another of
-        // its wave on its lock, or one held from another wave in every
-        // round). In a pixel program helper lanes are done from the start:
-        // their writes and atomics are discarded, so a helper could never
-        // take a lock, and in its turn it would spin to the bound.
-        let (c, finished, olo0, ohi0) = if self.x.atomic_lock_rounds {
-            let i1 = self.s.t.i1;
-            // Done from the start: a helper lane, and a lane the umax
-            // reduction reduced to a representative's member.
-            let start = if self.s.pixel {
-                let helper = self.s.op(c, "isHelperLane.i1", Attr::ReadOnly, i1, 221, &[]);
-                self.s.m.bin(c, Bin::Or, helper, not_rep)
-            } else {
-                not_rep
-            };
-            let yes = self.s.m.bool(true);
-            let mut blocks = [0; 5];
-            for b in &mut blocks {
-                *b = self.s.m.new_block();
-            }
-            let [head, attempt, held, latch, done] = blocks;
-            self.s.m.terminate(c, Term::Br(head));
-            let round = self.s.m.phi(head, i32t);
-            let was = self.s.m.phi(head, i1);
-            let plo = self.s.m.phi(head, i32t);
-            let phi_ = self.s.m.phi(head, i32t);
-            let open = self.s.m.bin(head, Bin::Xor, was, yes);
-            self.s.m.terminate(head, Term::CondBr(open, attempt, latch));
-            let got = self.s.op(
-                attempt,
-                "atomicCompareExchange.i32",
-                Attr::NoUnwind,
-                i32t,
-                79,
-                &[locks, lock, iu, iu, zero, one],
-            );
-            let won = self.s.m.cmp(attempt, pred::EQ, got, zero);
-            self.s.m.terminate(attempt, Term::CondBr(won, held, latch));
-            let (lo, hi) = step(self, held, won);
-            self.s.m.terminate(held, Term::Br(latch));
-            let is = self.s.m.phi(latch, i1);
-            self.s
-                .m
-                .set_phi(is, vec![(yes, held), (was, head), (was, attempt)]);
-            let olo = self.s.m.phi(latch, i32t);
-            self.s
-                .m
-                .set_phi(olo, vec![(lo, held), (plo, head), (plo, attempt)]);
-            let ohi = self.s.m.phi(latch, i32t);
-            self.s
-                .m
-                .set_phi(ohi, vec![(hi, held), (phi_, head), (phi_, attempt)]);
-            let next = self.s.m.bin(latch, Bin::Add, round, one);
-            let rounds = k(self, super::ATOMIC_LOCK_ROUNDS);
-            let more = self.s.m.cmp(latch, pred::IULT, next, rounds);
-            self.s.m.set_phi(round, vec![(zero, c), (next, latch)]);
-            self.s.m.set_phi(was, vec![(start, c), (is, latch)]);
-            self.s.m.set_phi(plo, vec![(iu, c), (olo, latch)]);
-            self.s.m.set_phi(phi_, vec![(iu, c), (ohi, latch)]);
-            self.s.m.terminate(latch, Term::CondBr(more, head, done));
-            (done, Some((is, yes)), olo, ohi)
-        } else {
-            (c, None, iu, iu)
-        };
-
-        let mut blocks = [0; 5];
-        for b in &mut blocks {
-            *b = self.s.m.new_block();
-        }
-        let [head, spin, held, latch, done] = blocks;
-        // After the rounds only the lanes still not done take turns, in a
-        // branch the others skip: a wave whose lanes all finished in the
-        // rounds runs no turn at all (on D3DMetal the turns cost a wave
-        // about as much again as the rounds even when every turn is empty).
-        match finished {
-            Some((is, yes)) => {
-                let open = self.s.m.bin(c, Bin::Xor, is, yes);
-                self.s.m.terminate(c, Term::CondBr(open, head, done));
-            }
-            None => self.s.m.terminate(c, Term::Br(head)),
-        }
-
-        // Head: lane `i`'s turn.
-        let i = self.s.m.phi(head, i32t);
-        let plo = self.s.m.phi(head, i32t);
-        let phi_ = self.s.m.phi(head, i32t);
-        let turn = self.s.m.cmp(head, pred::EQ, me, i);
-        self.s.m.terminate(head, Term::CondBr(turn, spin, latch));
-
-        // Spin, bounded by the stage (`atomic_lock_spins`): past the bound a
-        // lane goes on without the lock, and its step counts it.
-        let got = self.s.op(
-            spin,
-            "atomicCompareExchange.i32",
-            Attr::NoUnwind,
-            i32t,
-            79,
-            &[locks, lock, iu, iu, zero, one],
-        );
-        let won = self.s.m.cmp(spin, pred::EQ, got, zero);
-        let tries = self.s.m.phi(spin, i32t);
-        let more = self.s.m.bin(spin, Bin::Add, tries, one);
-        self.s.m.set_phi(tries, vec![(zero, head), (more, spin)]);
-        let limit = k(self, super::shader::atomic_lock_spins(self.x.native.stage));
-        let out = self.s.m.cmp(spin, pred::IUGE, more, limit);
-        let leave = self.s.m.bin(spin, Bin::Or, won, out);
-        self.s.m.terminate(spin, Term::CondBr(leave, held, spin));
-
-        // Held: fence, read, write, fence, free.
-        let (lo, hi) = step(self, held, won);
-        self.s.m.terminate(held, Term::Br(latch));
-
-        // Latch: the next lane.
-        let olo = self.s.m.phi(latch, i32t);
-        self.s.m.set_phi(olo, vec![(lo, held), (plo, head)]);
-        let ohi = self.s.m.phi(latch, i32t);
-        self.s.m.set_phi(ohi, vec![(hi, held), (phi_, head)]);
-        let next = self.s.m.bin(latch, Bin::Add, i, one);
-        let more = self.s.m.cmp(latch, pred::IULT, next, lanes);
-        self.s.m.set_phi(i, vec![(zero, c), (next, latch)]);
-        self.s.m.set_phi(plo, vec![(olo0, c), (olo, latch)]);
-        self.s.m.set_phi(phi_, vec![(ohi0, c), (ohi, latch)]);
-        self.s.m.terminate(latch, Term::CondBr(more, head, done));
-        self.cur = done;
-        if finished.is_none() {
-            return (olo, ohi);
-        }
-        // From the turns, or from the rounds for lanes that skipped them.
-        let rlo = self.s.m.phi(done, i32t);
-        self.s.m.set_phi(rlo, vec![(olo, latch), (olo0, c)]);
-        let rhi = self.s.m.phi(done, i32t);
-        self.s.m.set_phi(rhi, vec![(ohi, latch), (ohi0, c)]);
-        (rlo, rhi)
-    }
-
     /// The umax reduction ([`Parts::atomic_umax`]): each texel's lanes of
     /// the wave collapse to one representative carrying their maximum
     /// key, in registers, before any of them locks. One pass a group: the
@@ -5543,14 +5290,17 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let map = self.s.memory_handle();
         let k = |l: &mut Self, x: u32| l.s.m.i32(x);
-        let (k3, first, four) = (k(self, 3), k(self, 4096 * 4), k(self, 4));
+        let (k3, first) = (k(self, 3), k(self, 4096 * 4));
         let at = self.s.m.bin(c, Bin::Shl, entry, k3);
         let at = self.s.m.bin(c, Bin::Add, at, first);
-        let view = self.raw_dword(map, at);
-        let at = self.s.m.bin(c, Bin::Add, at, four);
-        let start = self.raw_dword(map, at);
-        // Block 0's first entry names the null pair: no copy holds the page.
-        let null = self.raw_dword(map, first);
+        // The entry's two dwords in one load: view, then start.
+        let (u, mask, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i8(3), k(self, 4));
+        let r = self.raw_buffer_load(c, &[map, at, u, mask, al]);
+        let [view, start] = [0, 1].map(|j| {
+            let x = self.s.m.extract(c, r, j);
+            self.as_int(x)
+        });
+        let null = self.memory_null();
         let miss = self.s.m.cmp(c, pred::EQ, view, null);
         // Views come in pairs: the raw SRV, then the raw UAV of one copy.
         let (view, props) = if write {
@@ -5570,6 +5320,24 @@ impl<'a> Lower<'a> {
             l1,
             miss,
         }
+    }
+
+    /// Block 0's first entry in the page table, the null pair's view: no
+    /// copy holds a page whose entry names it. The same for every access,
+    /// so read once, in the entry block.
+    fn memory_null(&mut self) -> V {
+        if let Some(null) = self.memory_null {
+            return null;
+        }
+        let map = self.s.memory_handle();
+        let b = self.s.entry;
+        let u = self.s.m.undef(self.s.t.i32);
+        let (mask, al, first) = (self.s.m.i8(1), self.s.m.i32(4), self.s.m.i32(4096 * 4));
+        let r = self.raw_buffer_load(b, &[map, first, u, mask, al]);
+        let x = self.s.m.extract(b, r, 0);
+        let null = self.s.m.cast(b, Cast::Bitcast, x, self.s.t.i32);
+        self.memory_null = Some(null);
+        null
     }
 
     /// A descriptor load from a table or heap whose dwords the program only
@@ -12018,92 +11786,6 @@ impl<'a> Lower<'a> {
         }
         Ok(())
     }
-}
-
-/// Where a compute group that is one console wave needs group barriers
-/// when the host splits it into narrower waves: (block, instruction) to
-/// sync before, instruction index = the block's length for its end.
-///
-/// The console runs such a group in lockstep, so its compiler leaves out
-/// the barrier between one lane's LDS write and another's read. Here a
-/// read (or atomic) of LDS that a write may have changed since the last
-/// barrier gets one before it. Barriers need every lane of the group, so
-/// they go only in blocks each lane runs exactly once (no cycle through
-/// them, on every path from the entry to an end); such a block still dirty
-/// at its end syncs there when a successor is not one, so divergent code
-/// after it reads clean LDS. `None`: a read in divergent code may see a
-/// write made in divergent code since the last such block.
-pub(crate) fn split_wave_barriers(p: &Program) -> Option<Set<(usize, usize)>> {
-    let n = p.blocks.len();
-    let succ = |b: usize| p.blocks[b].exit.successors();
-    let uniform = once_per_lane(p);
-    let order = crate::ir::reverse_postorder(&p.blocks);
-    let mut dirty_out = vec![false; n];
-    loop {
-        let mut at = Set::default();
-        let mut changed = false;
-        for &b in &order {
-            let mut dirty = p.blocks[b].preds.iter().any(|&q| dirty_out[q]);
-            for (i, inst) in p.blocks[b].insts.iter().enumerate() {
-                let name = inst.name();
-                if name == "s_barrier" {
-                    dirty = false;
-                }
-                if !matches!(inst.fields, Fields::Ds { .. })
-                    || name.starts_with("ds_swizzle")
-                    || name.contains("permute")
-                {
-                    continue;
-                }
-                if dirty && !name.starts_with("ds_write") {
-                    if !uniform[b] {
-                        return None;
-                    }
-                    at.insert((b, i));
-                }
-                dirty = !name.starts_with("ds_read");
-            }
-            if dirty && uniform[b] && succ(b).iter().any(|&s| !uniform[s]) {
-                at.insert((b, p.blocks[b].insts.len()));
-                dirty = false;
-            }
-            changed |= std::mem::replace(&mut dirty_out[b], dirty) != dirty;
-        }
-        if !changed {
-            return Some(at);
-        }
-    }
-}
-
-/// Per block, whether each lane of the group runs it exactly once: no cycle
-/// passes through it, and every path from the entry to an end does. A group
-/// barrier needs every lane of the group, so it can go only in these.
-pub(crate) fn once_per_lane(p: &Program) -> Vec<bool> {
-    let n = p.blocks.len();
-    let succ = |b: usize| p.blocks[b].exit.successors();
-    // Blocks reachable from `from`'s successors (or from `from` itself when
-    // `start`), never entering `avoid`.
-    let reach = |from: usize, start: bool, avoid: Option<usize>| {
-        let mut seen = vec![false; n];
-        let mut stack = if start { vec![from] } else { succ(from) };
-        while let Some(b) = stack.pop() {
-            if Some(b) == avoid || std::mem::replace(&mut seen[b], true) {
-                continue;
-            }
-            stack.extend(succ(b));
-        }
-        seen
-    };
-    (0..n)
-        .map(|b| {
-            let ends_around = b != 0
-                && reach(0, true, Some(b))
-                    .iter()
-                    .enumerate()
-                    .any(|(q, &r)| r && succ(q).is_empty());
-            !reach(b, false, None)[b] && !ends_around
-        })
-        .collect()
 }
 
 #[cfg(test)]
