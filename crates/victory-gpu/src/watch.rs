@@ -235,10 +235,17 @@ mod write_sites {
 #[cfg(target_arch = "x86_64")]
 pub use write_sites::{observe_write_sites, write_site_guards};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TrackerUse {
+    Regular,
+    Copy,
+    Texture,
+}
+
 /// The pages a tracker has not taken since they changed, what it saves of
 /// pages it armed, its bit in [`DIRTY`] (none: always taken as dirty), and
 /// whether it is a host buffer copy's (the only trackers [`retake`] marks).
-struct Changed(DirtyJournal, Mutex<Saved>, Option<u32>, bool);
+struct Changed(DirtyJournal, Mutex<Saved>, Option<u32>, TrackerUse);
 
 /// A bit per tracker, set while it holds changed pages: set and cleared
 /// under the tracker's lock, read without one ([`Tracked::clean`]). Dense,
@@ -517,11 +524,16 @@ pub(crate) struct Tracked {
     untracked: Vec<(usize, usize)>,
 }
 
-/// The blocks we made read-only. The value records whether the block uses
-/// kernel write watch. Only the publishing thread holds this lock, and
-/// only for a lookup or update, never across a memory system call.
+/// The blocks we made read-only. Each remembers the end of the successful
+/// protection run it belonged to. The lock never spans a memory system call.
 #[derive(Default)]
-struct Protected(RwLock<BTreeMap<usize, bool>>);
+struct Protected(RwLock<BTreeMap<usize, Protection>>);
+
+#[derive(Clone, Copy)]
+struct Protection {
+    watched: bool,
+    end: usize,
+}
 
 impl Protected {
     fn contains(&self, page: &usize) -> bool {
@@ -532,7 +544,11 @@ impl Protected {
     }
 
     fn watched(&self, page: usize) -> bool {
-        self.0.read().unwrap_or_else(|e| e.into_inner()).get(&page) == Some(&true)
+        self.0
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&page)
+            .is_some_and(|protection| protection.watched)
     }
 
     fn remove(&self, page: usize) -> bool {
@@ -563,11 +579,15 @@ impl Protected {
 
     fn insert(&self, pages: &[usize], ends: &[usize]) {
         let mut protected = self.0.write().unwrap_or_else(|e| e.into_inner());
+        let end = pages.last().unwrap() + 1;
         protected.extend(
             pages
                 .iter()
                 .copied()
-                .zip(ends.iter().map(|&end| page_parts() && end == usize::MAX)),
+                .zip(ends.iter().map(|&region_end| Protection {
+                    watched: page_parts() && region_end == usize::MAX,
+                    end,
+                })),
         );
     }
 }
@@ -769,28 +789,52 @@ pub(crate) fn held_times() -> Vec<(u64, f64, f64)> {
     out
 }
 
-/// (page, other page) for the pages (page numbers) showing the same memory
-/// as `pages` elsewhere.
-fn aliases(g: &Guards, pages: &[usize]) -> Vec<(usize, usize)> {
-    pages
-        .iter()
-        .flat_map(|&p| g.alias_of.get(&p).into_iter().flatten().map(move |&a| (p, a)))
-        .collect()
-}
-
-/// Guards the other mappings of taken pages, returning those that still
-/// have an unguarded mapping (cannot be taken yet).
-fn guard_aliases(g: &Guards, pairs: &[(usize, usize)]) -> BTreeSet<usize> {
-    if pairs.is_empty() {
-        return BTreeSet::new();
+/// Rearm dirty pages and their open aliases together. In particular, a
+/// contiguous run of pool pages may be paired with separate views, whose
+/// addresses arrive in physical-page order rather than address order.
+fn protect_with_aliases(g: &Guards, pages: &[usize], unmapped: &mut Vec<usize>) -> Vec<usize> {
+    if pages.is_empty() {
+        return Vec::new();
     }
-    let others: Vec<usize> = pairs.iter().map(|&(_, a)| a).collect();
-    let guarded: BTreeSet<usize> = protect(g, &others).into_iter().collect();
-    pairs
-        .iter()
-        .filter(|(_, a)| !guarded.contains(a))
-        .map(|&(p, _)| p)
-        .collect()
+    #[cfg(feature = "diagnostics")]
+    let asked = Timed(std::time::Instant::now(), crate::copystat::C::AliasUs);
+    let mut pairs = Vec::new();
+    if g.alias_of
+        .range(pages[0]..=pages[pages.len() - 1])
+        .next()
+        .is_some()
+    {
+        let protected = g.protected.0.read().unwrap_or_else(|e| e.into_inner());
+        for &page in pages {
+            if let Some(aliases) = g.alias_of.get(&page) {
+                pairs.extend(aliases.iter().filter_map(|&alias| {
+                    (!protected.contains_key(&alias)
+                        || g.busy.iter().any(|&(a, b)| (a..b).contains(&alias)))
+                    .then_some((page, alias))
+                }));
+            }
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    drop(asked);
+    if pairs.is_empty() {
+        return protect_noting(g, pages, unmapped);
+    }
+    let mut both = Vec::with_capacity(pages.len() + pairs.len());
+    both.extend_from_slice(pages);
+    both.extend(pairs.iter().map(|&(_, alias)| alias));
+    both.sort_unstable();
+    both.dedup();
+    let mut holes = Vec::new();
+    let taken = protect_noting(g, &both, &mut holes);
+    let blocked: BTreeSet<_> = pairs
+        .into_iter()
+        .filter(|&(_, alias)| taken.binary_search(&alias).is_err())
+        .map(|(page, _)| page)
+        .collect();
+    let eligible = |page: &usize| pages.binary_search(page).is_ok() && !blocked.contains(page);
+    unmapped.extend(holes.into_iter().filter(eligible));
+    taken.into_iter().filter(eligible).collect()
 }
 
 /// Tracks `[start, start + len)` if it is the runtime's GPU memory (every
@@ -803,16 +847,20 @@ fn guard_aliases(g: &Guards, pairs: &[(usize, usize)]) -> BTreeSet<usize> {
 /// Only the pages of the range that are such memory are tracked; the rest is
 /// never guarded and is copied whole at each use, as memory with no tracker.
 pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
-    track_as(start, len, views, false)
+    track_as(start, len, views, TrackerUse::Regular)
 }
 
 /// [`track`] for a host buffer copy: what shaders write lands in it, so a
 /// [`retake`] of its memory marks it.
 pub(crate) fn track_copy(start: usize, len: usize, views: bool) -> Option<Tracked> {
-    track_as(start, len, views, true)
+    track_as(start, len, views, TrackerUse::Copy)
 }
 
-fn track_as(start: usize, len: usize, views: bool, copy: bool) -> Option<Tracked> {
+pub(crate) fn track_texture(start: usize, len: usize) -> Option<Tracked> {
+    track_as(start, len, true, TrackerUse::Texture)
+}
+
+fn track_as(start: usize, len: usize, views: bool, usage: TrackerUse) -> Option<Tracked> {
     if len == 0 || !fault_tracking() {
         return None;
     }
@@ -844,7 +892,7 @@ fn track_as(start: usize, len: usize, views: bool, copy: bool) -> Option<Tracked
     // A tracker with untracked parts is never clean: no bit.
     let bit = if untracked.is_empty() { dirty_bit() } else { None };
     let dirty = DirtyJournal::new(&pages, bit, port_journal());
-    let changed = Arc::new(Changed(dirty, Mutex::default(), bit, copy));
+    let changed = Arc::new(Changed(dirty, Mutex::default(), bit, usage));
     let mut g = guards();
     for &page in &pages {
         g.holders.entry(page).or_default().push(changed.clone());
@@ -1028,6 +1076,9 @@ impl Tracked {
     /// `[from, to)` stays changed.
     pub(crate) fn take(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
         let (copy, zero) = self.take_split(from, to);
+        if zero.is_empty() {
+            return copy;
+        }
         let mut runs: Vec<(usize, usize)> = copy.into_iter().chain(zero).collect();
         runs.sort_unstable();
         let mut merged: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
@@ -1127,18 +1178,7 @@ impl Tracked {
             self.changed.clear_page(page);
             return;
         }
-        #[cfg(feature = "diagnostics")]
-        let asked = Timed(std::time::Instant::now(), crate::copystat::C::AliasUs);
-        let others = aliases(g, group);
-        let unguarded = guard_aliases(g, &others);
-        #[cfg(feature = "diagnostics")]
-        drop(asked);
-        let whole: Vec<_> = group
-            .iter()
-            .copied()
-            .filter(|p| !unguarded.contains(p))
-            .collect();
-        let taken = protect_noting(g, &whole, unmapped);
+        let taken = protect_with_aliases(g, group, unmapped);
         for &page in &taken {
             let pending = self.changed.0.get(page).is_some_and(|dirty| dirty.pending);
             if !pending {
@@ -1190,14 +1230,10 @@ impl Tracked {
     }
 
     fn taken_claimed(&self, g: &Guards, pages: &[usize]) {
-        let others = aliases(g, pages);
-        let unguarded = guard_aliases(g, &others);
-        let pages: Vec<usize> = pages
-            .iter()
-            .copied()
-            .filter(|p| !unguarded.contains(p))
-            .collect();
-        for page in protect(g, &pages) {
+        let mut pages = pages.to_vec();
+        pages.sort_unstable();
+        pages.dedup();
+        for page in protect_with_aliases(g, &pages, &mut Vec::new()) {
             self.changed.clear_page(page);
         }
     }
@@ -1982,7 +2018,7 @@ pub(crate) fn retake(at: usize, len: usize) {
 /// tracker holding them.
 fn mark_copies(g: &Guards, first: usize, last: usize) {
     for (&page, holders) in g.holders.range(first..last) {
-        for c in holders.iter().filter(|c| c.3) {
+        for c in holders.iter().filter(|c| c.3 == TrackerUse::Copy) {
             c.0.update(page, c.2, |map| map.insert(page, DirtyPage::WHOLE));
         }
     }
@@ -2022,6 +2058,35 @@ pub(crate) fn aliased(at: usize, len: usize) -> bool {
     guards().alias_of.range(first..last).next().is_some()
 }
 
+/// Open ahead only within an already guarded pool run, and only for
+/// texture staging. Every opened block is marked before it becomes writable.
+const TEXTURE_FAULT_BLOCKS: usize = 4;
+
+fn texture_fault_end(g: &Guards, page: usize, limit: usize) -> usize {
+    let texture_only = |page| {
+        !g.alias_of.contains_key(&page)
+            && g.holders.get(&page).is_some_and(|holders| {
+                !holders.is_empty() && holders.iter().all(|holder| holder.3 == TrackerUse::Texture)
+            })
+    };
+    if !texture_only(page) {
+        return page + 1;
+    }
+    let protected = g.protected.0.read().unwrap_or_else(|e| e.into_inner());
+    let Some(guard) = protected.get(&page).filter(|guard| guard.watched) else {
+        return page + 1;
+    };
+    let end = guard
+        .end
+        .min((page / TEXTURE_FAULT_BLOCKS + 1) * TEXTURE_FAULT_BLOCKS)
+        .min(limit);
+    (page + 1..end)
+        .find(|next| {
+            !texture_only(*next) || !protected.get(next).is_some_and(|guard| guard.watched)
+        })
+        .unwrap_or(end)
+}
+
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
 fn install() {
@@ -2056,13 +2121,27 @@ fn install() {
         let page = at / PAGE;
         let opened = if port_guard() {
             let g = guards_shared();
-            let _claims = claim_blocks(&g, &[page]);
-            // SAFETY: the system is dispatching this exception.
-            unsafe { open_faulted(&g, info, at) }
+            let end = texture_fault_end(&g, page, usize::MAX);
+            if end == page + 1 && !g.alias_of.contains_key(&page) {
+                let _claim = CLAIMS[page % CLAIM_COUNT]
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                // SAFETY: the system is dispatching this exception.
+                unsafe { open_faulted(&g, info, at, end) }
+            } else {
+                let mut pages = [0; TEXTURE_FAULT_BLOCKS];
+                for (slot, block) in pages.iter_mut().zip(page..end) {
+                    *slot = block;
+                }
+                let _claims = claim_blocks(&g, &pages[..end - page]);
+                let end = texture_fault_end(&g, page, end);
+                // SAFETY: the system is dispatching this exception.
+                unsafe { open_faulted(&g, info, at, end) }
+            }
         } else {
             let g = guards();
             // SAFETY: the system is dispatching this exception.
-            unsafe { open_faulted(&g, info, at) }
+            unsafe { open_faulted(&g, info, at, texture_fault_end(&g, page, usize::MAX)) }
         };
         if opened {
             EXCEPTION_CONTINUE_EXECUTION
@@ -2071,7 +2150,12 @@ fn install() {
         }
     }
 
-    unsafe fn open_faulted(g: &Guards, info: *mut EXCEPTION_POINTERS, at: usize) -> bool {
+    unsafe fn open_faulted(
+        g: &Guards,
+        info: *mut EXCEPTION_POINTERS,
+        at: usize,
+        end: usize,
+    ) -> bool {
         #[cfg(target_arch = "x86_64")]
         // SAFETY: the system is dispatching this exception. The page's
         // protection cannot change under the exclusive lock or claim.
@@ -2086,7 +2170,7 @@ fn install() {
         } else {
             DirtyPage::WHOLE
         };
-        if changed_with(g, page, page + 1, true, dirty) {
+        if changed_with(g, page, end, true, dirty) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             return true;
@@ -2472,6 +2556,38 @@ pub(crate) mod tests {
         drop(t);
         // SAFETY: our reservation.
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn texture_fault_opens_only_texture_blocks_in_the_guarded_run() {
+        if !fault_tracking() || !page_parts() {
+            return;
+        }
+        let pool = pool(8);
+        let start = pool.next_multiple_of(TEXTURE_FAULT_BLOCKS * PAGE);
+        let end = start + TEXTURE_FAULT_BLOCKS * PAGE;
+        let texture = track_texture(start, end - start).expect("texture memory is tracked");
+        let other = track(start + 2 * PAGE, PAGE, true).expect("pool memory is tracked");
+        assert_eq!(texture.take(start, end), [(start, end)]);
+        assert_eq!(
+            other.take(start, end),
+            [(start + 2 * PAGE, start + 3 * PAGE)]
+        );
+
+        // SAFETY: the live pool's first guard fault opens the next texture block.
+        unsafe { ((start + 8) as *mut u8).write_volatile(1) };
+        assert!(writable(start + PAGE));
+        assert!(read_only(start + 2 * PAGE));
+        assert!(!other.changed(start / PAGE + 2));
+        // SAFETY: the adjacent block is in the live pool.
+        unsafe { ((start + PAGE + 12) as *mut u8).write_volatile(2) };
+        let ranges = texture.take(start, end);
+        for changed in [start + 8, start + PAGE + 12] {
+            assert!(ranges.iter().any(|&(a, b)| (a..b).contains(&changed)));
+        }
+        assert!(read_only(start + PAGE));
+        drop((other, texture));
+        free(pool);
     }
 
     #[test]

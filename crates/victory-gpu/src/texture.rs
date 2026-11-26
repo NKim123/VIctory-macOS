@@ -956,15 +956,21 @@ impl Staging {
             // are written, and only they are hashed and detiled.
             let mut scratch = Scratch::take(size);
             let read = &mut scratch.0[..size];
+            let mut spans: Vec<_> = touched.iter().map(|&i| span(i)).collect();
+            spans.sort_unstable();
             let mut bytes = 0;
-            let mut done: Vec<(usize, usize)> = Vec::new();
-            for &i in &touched {
-                let (a, b) = span(i);
-                if !done.contains(&(a, b)) {
-                    // SAFETY: inside the buffer of the texture's size.
-                    crate::host::copy_mapped(unsafe { read.as_mut_ptr().add(a) }, self.memory.wrapping_add(a), b - a, false);
-                    (bytes, _) = (bytes + b - a, done.push((a, b)));
+            let mut spans = spans.into_iter().peekable();
+            while let Some((a, mut b)) = spans.next() {
+                while let Some((_, end)) = spans.next_if(|&(next, _)| next <= b) {
+                    b = b.max(end);
                 }
+                crate::host::copy_mapped(
+                    read[a..b].as_mut_ptr(),
+                    self.memory.wrapping_add(a),
+                    b - a,
+                    false,
+                );
+                bytes += b - a;
             }
             // A changed page that holds only the subresource's bytes says it
             // changed. Pages it shares with other data the title writes
@@ -1515,7 +1521,7 @@ pub(crate) fn staging_for(
         layout,
         mips: u32::from(d.MipLevels),
         memory: memory as *const u8,
-        tracked: crate::watch::track(memory, layout_size, true),
+        tracked: crate::watch::track_texture(memory, layout_size),
         uploaded_once: std::sync::atomic::AtomicBool::new(false),
         retry: std::sync::atomic::AtomicBool::new(false),
         checked_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
