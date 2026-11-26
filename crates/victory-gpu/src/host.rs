@@ -5,6 +5,7 @@
 //! ring keeps zero-copy submissions and their resources on the direct queue.
 
 mod inflight;
+mod rec;
 mod submission_profile;
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -1395,7 +1396,7 @@ enum WidenedEvent {
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
-    pub(crate) list: ID3D12GraphicsCommandList,
+    pub(crate) list: rec::Rec,
     pub(crate) depth_bounds: Option<ID3D12GraphicsCommandList1>,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
@@ -1925,7 +1926,7 @@ impl Host {
             Ok(HostList {
                 allocator,
                 depth_bounds: self.depth_bounds_supported.then(|| list.cast()).transpose()?,
-                list,
+                list: rec::Rec::new(list),
                 deferred: Mutex::default(),
                 ambient_upload: OnceLock::new(),
                 scratch: Mutex::default(),
@@ -3475,7 +3476,7 @@ impl HostList {
                 }),
             )
         };
-        let (pointers, name) = (identities(&self.list), list_name(self.id));
+        let (pointers, name) = (identities(&*self.list), list_name(self.id));
         node_is_list(pointer, wide.as_deref(), &pointers, &name)
             || node_is_list(None, ansi.as_deref(), &pointers, &name)
     }
@@ -5622,6 +5623,7 @@ impl Meter {
             });
             submission_profile::log(report_frames);
             inflight::log(report_frames);
+            rec::report(report_frames);
             if pipeline_submissions() {
                 let waits = PIPELINE_WAITS_SAVED.swap(0, Ordering::Relaxed);
                 tracing::info!(

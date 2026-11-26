@@ -614,9 +614,10 @@ impl State {
     }
 
     fn apply_depth_bounds(&self, list: &HostList) {
-        if let (Some(list), Some((min, max))) = (&list.depth_bounds, self.depth_bounds) {
+        if let (Some(bounds), Some((min, max))) = (&list.depth_bounds, self.depth_bounds) {
+            list.list.flush();
             // SAFETY: the host supports depth bounds and the list is open.
-            unsafe { list.OMSetDepthBounds(min, max) };
+            unsafe { bounds.OMSetDepthBounds(min, max) };
         }
     }
 
