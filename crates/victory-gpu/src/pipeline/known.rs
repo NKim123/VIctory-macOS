@@ -38,6 +38,10 @@ pub(super) fn enable(dir: PathBuf) {
     let _ = BOOK.set((dir, Mutex::new(Recorded::default())));
 }
 
+pub(super) fn enabled() -> bool {
+    BOOK.get().is_some()
+}
+
 pub(super) fn valid_key(key: &str) -> bool {
     key.len() == 32
         && key
@@ -68,7 +72,7 @@ pub(super) fn record(key: &str, shaders: &[Arc<Shader>], graphics: Option<&Graph
             key,
             shaders,
             graphics,
-            SPILL_DIR.get().map(PathBuf::as_path),
+            SPILL_DIR.get().is_some(),
         ) {
             Ok(()) => {
                 recorded.pipelines.insert(key.to_owned());
@@ -96,7 +100,7 @@ fn write_record(
     key: &str,
     shaders: &[Arc<Shader>],
     graphics: Option<&GraphicsState>,
-    spill_dir: Option<&Path>,
+    use_spill: bool,
 ) -> io::Result<()> {
     let mut record = vec![
         shaders
@@ -113,25 +117,20 @@ fn write_record(
         let hash = blake3::Hash::from(shader.full_hash);
         record.extend(hash.as_bytes());
         if !known.contains(&hash) {
-            let path = shader_path(dir, hash);
-            // Hash the existing file once per session without allocating a second container.
-            let valid = match std::fs::File::open(&path) {
-                Ok(file) => blake3::Hasher::new().update_reader(file)?.finalize() == hash,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => false,
-                Err(e) => return Err(e),
-            };
-            if !valid {
-                let bytes = shader.container.lock().unwrap_or_else(|e| e.into_inner());
-                if bytes.is_empty() {
-                    let dir = spill_dir
-                        .ok_or_else(|| invalid("shader container is no longer available"))?;
-                    // A spilled file is published before the in-memory bytes are cleared.
-                    let spilled = crate::read_file(&spill_path(dir, &shader.full_hash))?;
-                    if blake3::hash(&spilled) != hash {
-                        return Err(invalid("spilled shader checksum mismatch"));
+            let bytes = shader.container.lock().unwrap_or_else(|e| e.into_inner());
+            // The spill file already has the bytes. Legacy records that
+            // have a private copy still load from the same record format.
+            if !use_spill || shader.spilled.get().is_none() {
+                let path = shader_path(dir, hash);
+                let valid = match std::fs::File::open(&path) {
+                    Ok(file) => blake3::Hasher::new().update_reader(file)?.finalize() == hash,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+                    Err(e) => return Err(e),
+                };
+                if !valid {
+                    if bytes.is_empty() {
+                        return Err(invalid("shader container is no longer available"));
                     }
-                    super::library::write_atomically(&path, &[&spilled])?;
-                } else {
                     super::library::write_atomically(&path, &[&bytes])?;
                 }
             }
@@ -158,12 +157,24 @@ pub(super) fn load(dir: &Path, key: &str) -> io::Result<Prebuild> {
     if blake3::hash(content).as_bytes() != checksum {
         return Err(invalid("pipeline record checksum mismatch"));
     }
+    let spill = dir.join("../../shader-containers");
     let result = parse(content, |hash| {
-        let bytes = crate::read_file(&shader_path(dir, hash))?;
-        if blake3::hash(&bytes) != hash {
-            return Err(invalid("recorded shader checksum mismatch"));
-        }
-        Ok(bytes)
+        let checked = |path: PathBuf| {
+            let bytes = crate::read_file(&path)?;
+            if blake3::hash(&bytes) != hash {
+                return Err(invalid("recorded shader checksum mismatch"));
+            }
+            Ok(bytes)
+        };
+        checked(shader_path(dir, hash)).or_else(|error| {
+            checked(spill_path(&spill, hash.as_bytes())).map_err(|fallback| {
+                if fallback.kind() == io::ErrorKind::NotFound {
+                    error
+                } else {
+                    fallback
+                }
+            })
+        })
     })?;
     if result.key() != key {
         return Err(invalid("recorded pipeline key mismatch"));
@@ -407,7 +418,7 @@ mod tests {
         let p = Prebuild::compute(b"synthetic shader");
         let key = p.key();
         let mut shaders = HashSet::new();
-        write_record(dir.path(), &mut shaders, &key, &p.shaders, None, None).unwrap();
+        write_record(dir.path(), &mut shaders, &key, &p.shaders, None, false).unwrap();
         assert_eq!(load(dir.path(), &key).unwrap().key(), key);
         assert_eq!(shaders.len(), 1);
         assert!(load(dir.path(), "../invalid").is_err());
@@ -415,7 +426,7 @@ mod tests {
         let path = record_path(dir.path(), &key);
         std::fs::write(&path, [1, 5]).unwrap();
         assert!(load(dir.path(), &key).is_err());
-        write_record(dir.path(), &mut shaders, &key, &p.shaders, None, None).unwrap();
+        write_record(dir.path(), &mut shaders, &key, &p.shaders, None, false).unwrap();
         let hash = blake3::Hash::from(p.shaders[0].full_hash);
         std::fs::write(shader_path(dir.path(), hash), b"corrupt").unwrap();
         assert!(load(dir.path(), &key).is_err());
@@ -431,39 +442,34 @@ mod tests {
         std::fs::write(&path, b"synthetic").unwrap();
 
         let mut known = HashSet::new();
-        write_record(dir.path(), &mut known, &key, &p.shaders, None, None).unwrap();
+        write_record(dir.path(), &mut known, &key, &p.shaders, None, false).unwrap();
         assert_eq!(load(dir.path(), &key).unwrap().key(), key);
 
         std::fs::write(&path, b"synthetic").unwrap();
-        write_record(dir.path(), &mut known, &key, &p.shaders, None, None).unwrap();
+        write_record(dir.path(), &mut known, &key, &p.shaders, None, false).unwrap();
         assert!(
             load(dir.path(), &key).is_err(),
             "already checked in this session"
         );
 
         known.clear();
-        write_record(dir.path(), &mut known, &key, &p.shaders, None, None).unwrap();
+        write_record(dir.path(), &mut known, &key, &p.shaders, None, false).unwrap();
         assert_eq!(load(dir.path(), &key).unwrap().key(), key);
     }
 
     #[test]
     fn a_spilled_shader_can_still_be_recorded() {
-        let spill = tempfile::tempdir().unwrap();
-        let records = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let spill = cache.path().join("shader-containers");
+        let records = cache.path().join("pipelines/known-v1");
+        std::fs::create_dir_all(&records).unwrap();
         let p = Prebuild::compute(b"synthetic spilled shader");
         let shader = &p.shaders[0];
-        super::super::spill_to(spill.path(), shader, &shader.full_hash);
+        super::super::spill_to(&spill, shader, &shader.full_hash);
         assert!(shader.container.lock().unwrap().is_empty());
         let key = p.key();
-        write_record(
-            records.path(),
-            &mut HashSet::new(),
-            &key,
-            &p.shaders,
-            None,
-            Some(spill.path()),
-        )
-        .unwrap();
-        assert_eq!(load(records.path(), &key).unwrap().key(), key);
+        write_record(&records, &mut HashSet::new(), &key, &p.shaders, None, true).unwrap();
+        assert!(!shader_path(&records, blake3::Hash::from(shader.full_hash)).exists());
+        assert_eq!(load(&records, &key).unwrap().key(), key);
     }
 }

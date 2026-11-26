@@ -120,7 +120,11 @@ enum Command {
     },
     #[cfg(windows)]
     #[command(hide = true)]
-    WarmBatch { keys: Vec<String> },
+    WarmBatch {
+        #[arg(long)]
+        list_cached: bool,
+        keys: Vec<String>,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -238,7 +242,7 @@ fn main() -> Result<()> {
             }
         }
         #[cfg(windows)]
-        Command::WarmBatch { keys } => warm::batch(keys),
+        Command::WarmBatch { list_cached, keys } => warm::batch(keys, list_cached),
         Command::Run {
             exe,
             unimplemented,

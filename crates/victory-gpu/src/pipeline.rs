@@ -139,10 +139,15 @@ fn spill(shader: &Shader, full: &[u8; 32]) {
 #[cfg(windows)]
 fn spill_to(dir: &std::path::Path, shader: &Shader, full: &[u8; 32]) {
     let path = spill_path(dir, full);
-    let there = std::fs::File::open(&path).is_ok();
+    let there = std::fs::File::open(&path).is_ok_and(|file| {
+        !known::enabled()
+            || blake3::Hasher::new()
+                .update_reader(file)
+                .is_ok_and(|h| h.finalize().as_bytes() == full)
+    });
+    let mut container = shader.container.lock().unwrap_or_else(|e| e.into_inner());
     if !there {
         let Some(shard) = path.parent() else { return };
-        let mut container = shader.container.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
         let ok = crate::make_dir(shard).is_ok()
             && std::fs::write(&tmp, &*container).is_ok()
@@ -151,11 +156,10 @@ fn spill_to(dir: &std::path::Path, shader: &Shader, full: &[u8; 32]) {
             let _ = std::fs::remove_file(&tmp);
             return;
         }
-        *container = Vec::new();
-    } else {
-        *shader.container.lock().unwrap_or_else(|e| e.into_inner()) = Vec::new();
     }
+    // A recorder holding the container lock can rely on this publication.
     let _ = shader.spilled.set(*full);
+    *container = Vec::new();
 }
 
 impl Shader {
@@ -868,6 +872,12 @@ pub fn require_pipeline_cache() -> std::io::Result<()> {
     library::require_library()
 }
 
+/// Title pipeline keys from the prebuilt list validated against the host library.
+#[cfg(windows)]
+pub fn prebuilt_keys() -> Vec<String> {
+    library::prebuilt_keys()
+}
+
 /// Saves a batch and reports any publication error to offline callers.
 #[cfg(windows)]
 pub fn flush_pipeline_cache() -> std::io::Result<()> {
@@ -958,11 +968,9 @@ impl Prebuild {
         // Without the run's log lines per shader and pipeline: tens of
         // thousands of them would bury the pre-build's own report.
         let quiet = tracing::Dispatch::none();
-        let started = std::time::Instant::now();
         let made = tracing::dispatcher::with_default(&quiet, || {
             host::HostPipeline::new(&self.shaders, self.graphics.as_deref())
         });
-        library::note_time(&key, started.elapsed());
         #[cfg(feature = "diagnostics")]
         make::log_built(&key);
         if made

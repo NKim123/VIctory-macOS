@@ -63,6 +63,8 @@ struct Library {
     /// key, and whether that list changed since the last save.
     prebuilt: HashSet<String>,
     prebuilt_changed: bool,
+    /// Tag of the blob currently on disk, which may differ from the input blob.
+    saved_tag: Option<String>,
 }
 
 // SAFETY: D3D12 objects are free-threaded (a pipeline library with the
@@ -140,13 +142,14 @@ fn library() -> Option<&'static Shared> {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let read = |file| DIR.get().and_then(|d| crate::read_file(&d.join(file)).ok());
             let blob = read(LIBRARY_FILE).and_then(unseal).unwrap_or_default();
-            let tag = tag(&blob);
             let mut library = open(&device, blob);
             // The pre-build's list, if it was saved with these bytes.
             if let (Some(l), Some(list)) = (library.as_mut(), read(PREBUILT_FILE))
                 && !l._blob.is_empty()
             {
+                let tag = tag(&l._blob);
                 l.prebuilt = listed(&list, &tag);
+                l.saved_tag = Some(tag);
             }
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
@@ -235,6 +238,7 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
                     added: 0,
                     prebuilt: HashSet::new(),
                     prebuilt_changed: false,
+                    saved_tag: None,
                 });
             }
             Err(e) => {
@@ -251,6 +255,7 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
         added: 0,
         prebuilt: HashSet::new(),
         prebuilt_changed: false,
+        saved_tag: None,
     })
 }
 
@@ -286,7 +291,7 @@ fn listed(list: &[u8], tag: &str) -> HashSet<String> {
     let list = String::from_utf8_lossy(list);
     let mut lines = list.lines();
     match lines.next() == Some(tag) {
-        true => lines.map(str::to_owned).collect(),
+        true => lines.filter(|key| super::known::valid_key(key)).map(str::to_owned).collect(),
         false => HashSet::new(),
     }
 }
@@ -294,6 +299,19 @@ fn listed(list: &[u8], tag: &str) -> HashSet<String> {
 /// Whether the pre-build has the title pipeline `key` in the library.
 pub(crate) fn prebuilt(key: &str) -> bool {
     library().is_some_and(|l| l.state.lock().unwrap_or_else(|e| e.into_inner()).prebuilt.contains(key))
+}
+
+/// Snapshot of the validated prebuilt keys for the offline parent.
+pub(super) fn prebuilt_keys() -> Vec<String> {
+    library().map_or_else(Vec::new, |l| {
+        l.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .prebuilt
+            .iter()
+            .cloned()
+            .collect()
+    })
 }
 
 /// The pre-build has the title pipeline `key` in the library now.
@@ -412,22 +430,12 @@ pub(super) fn save_result(now: bool) -> std::io::Result<()> {
         return Ok(());
     }
     *last = Some(std::time::Instant::now());
-    let (blob, prebuilt, added, prebuilt_changed, used_changed) = {
+    let (blob, prebuilt, saved_tag, added, prebuilt_changed, used_changed) = {
         let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
-        if l.added == 0 && !l.prebuilt_changed {
-            // Nothing new is in the library, so its file stays as it is, and
-            // with it the pre-build's list that holds for its bytes. A load
-            // reads the early list on its own, not from the library, so a
-            // change of it is written alone: serialising the library holds
-            // this lock against every worker's stores, for a list
-            // of 270 KB at most.
-            let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
-            if !used_changed {
-                return Ok(());
-            }
-            (None, None, 0, false, used_changed)
+        let blob = if l.added == 0 {
+            None
         } else {
-            // SAFETY: a plain size query on a live library.
+            // SAFETY: the store lock keeps the size stable until serialisation.
             let size = unsafe { l.library.GetSerializedSize() };
             let Some(mut bytes) = zeroed(size) else {
                 return Err(std::io::Error::new(
@@ -437,22 +445,44 @@ pub(super) fn save_result(now: bool) -> std::io::Result<()> {
             };
             // SAFETY: a buffer of the size the library asks for.
             unsafe { l.library.Serialize(&mut bytes) }.map_err(std::io::Error::other)?;
-            let added = std::mem::take(&mut l.added);
-            let prebuilt_changed = std::mem::take(&mut l.prebuilt_changed);
-            let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
-            let prebuilt = (!l.prebuilt.is_empty()).then(|| list(&tag(&bytes), &l.prebuilt));
-            (Some(bytes), prebuilt, added, prebuilt_changed, used_changed)
+            Some(bytes)
+        };
+        let saved_tag = if let Some(bytes) = &blob {
+            Some(tag(bytes))
+        } else if l.prebuilt_changed && l.saved_tag.is_none() {
+            Some(tag(&l._blob))
+        } else {
+            None
+        };
+        let prebuilt = if blob.is_some() || l.prebuilt_changed {
+            saved_tag
+                .as_deref()
+                .or(l.saved_tag.as_deref())
+                .filter(|_| !l.prebuilt.is_empty())
+                .map(|tag| list(tag, &l.prebuilt))
+        } else {
+            None
+        };
+        let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
+        if blob.is_none() && prebuilt.is_none() && !used_changed {
+            return Ok(());
         }
+        let added = std::mem::take(&mut l.added);
+        let prebuilt_changed = std::mem::take(&mut l.prebuilt_changed);
+        (blob, prebuilt, saved_tag, added, prebuilt_changed, used_changed)
     };
-    let used = used().as_ref().map(Used::list).unwrap_or_default();
+    let used = used_changed.then(|| used().as_ref().map(Used::list).unwrap_or_default());
     let written = crate::make_dir(dir)
         .and_then(|()| match &blob {
             Some(blob) => write_atomically(&dir.join(LIBRARY_FILE), &[&mark(blob), blob]),
             None => Ok(()),
         })
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), &[used.join("\n").as_bytes()]))
         .and_then(|()| match &prebuilt {
             Some(list) => write_atomically(&dir.join(PREBUILT_FILE), &[list.as_bytes()]),
+            None => Ok(()),
+        })
+        .and_then(|()| match &used {
+            Some(used) => write_atomically(&dir.join(EARLY_FILE), &[used.join("\n").as_bytes()]),
             None => Ok(()),
         });
     let (created, distinct) = created();
@@ -466,10 +496,13 @@ pub(super) fn save_result(now: bool) -> std::io::Result<()> {
         }
         return Err(e);
     }
+    if let Some(tag) = saved_tag {
+        library.state.lock().unwrap_or_else(|e| e.into_inner()).saved_tag = Some(tag);
+    }
     tracing::info!(
-        // Zero if only the early list was written.
+        // Zero if only cache metadata was written.
         bytes = blob.as_ref().map_or(0, Vec::len),
-        early = used.len(),
+        early = used.as_ref().map(Vec::len),
         made = MADE.load(Ordering::Relaxed),
         loaded = LOADED.load(Ordering::Relaxed),
         started_early = EARLY.load(Ordering::Relaxed),

@@ -91,7 +91,12 @@ impl Pending {
             #[cfg(feature = "diagnostics")]
             log_built(&self.key);
             let elapsed = started.elapsed();
-            super::library::note_time(&self.key, elapsed);
+            if made
+                .as_ref()
+                .is_some_and(|p| p.cache_status != super::library::CacheStatus::Loaded)
+            {
+                super::library::note_time(&self.key, elapsed);
+            }
             let (user, kernel) = super::thread_cpu_since(cpu);
             tracing::debug!(
                 shaders = ?self.shaders,
@@ -295,7 +300,7 @@ impl Queue {
         fn claim(lane: &mut VecDeque<Arc<Pending>>) -> Option<Arc<Pending>> {
             std::iter::from_fn(|| lane.pop_front()).find(|p| !p.taken.swap(true, Ordering::Relaxed))
         }
-        if let Some(p) = claim(&mut self.requested) {
+        if let Some(p) = claim(&mut self.requested).or_else(|| claim(&mut self.early)) {
             return Some((p, false));
         }
         if self.slow_active < slow_limit
@@ -304,7 +309,7 @@ impl Queue {
             self.slow_active += 1;
             return Some((p, true));
         }
-        claim(&mut self.early).map(|p| (p, false))
+        None
     }
 }
 
@@ -493,7 +498,7 @@ mod tests {
     }
 
     #[test]
-    fn slow_slots_are_used_even_with_quick_work_queued() {
+    fn quick_early_starts_precede_slow_work() {
         let mut queue = Queue::new();
         let limit = slow_limit(8);
         for _ in 0..8 {
@@ -501,8 +506,9 @@ mod tests {
             queue.push(empty_pending(), false, false);
         }
         // Saturate the pool without completing any work.
-        let slow = (0..8).filter(|_| queue.pop(limit).unwrap().1).count();
-        assert_eq!(slow, 2);
+        assert!((0..8).all(|_| !queue.pop(limit).unwrap().1));
+        assert!((0..limit).all(|_| queue.pop(limit).unwrap().1));
+        assert!(queue.pop(limit).is_none());
         assert_eq!(queue.slow_active, 2);
         queue.slow_active -= 1;
         assert!(queue.pop(limit).unwrap().1);
