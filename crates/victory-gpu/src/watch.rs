@@ -131,6 +131,13 @@ pub(crate) fn port_guard_plan() -> bool {
     port_guard() && *ON
 }
 
+/// Enable sharded dirty journals and early descriptor-heap refresh asks.
+pub(crate) fn port_journal() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("VICTORY_PORT_JOURNAL").is_some_and(|v| v == "1"));
+    *ON
+}
+
 /// Known dirty 4 KiB parts and whether the open guard has let through writes
 /// still to be collected from the write watch. Unknown writes set every bit.
 #[derive(Clone, Copy)]
@@ -231,12 +238,7 @@ pub use write_sites::{observe_write_sites, write_site_guards};
 /// The pages a tracker has not taken since they changed, what it saves of
 /// pages it armed, its bit in [`DIRTY`] (none: always taken as dirty), and
 /// whether it is a host buffer copy's (the only trackers [`retake`] marks).
-struct Changed(
-    Mutex<BTreeMap<usize, DirtyPage>>,
-    Mutex<Saved>,
-    Option<u32>,
-    bool,
-);
+struct Changed(DirtyJournal, Mutex<Saved>, Option<u32>, bool);
 
 /// A bit per tracker, set while it holds changed pages: set and cleared
 /// under the tracker's lock, read without one ([`Tracked::clean`]). Dense,
@@ -244,6 +246,110 @@ struct Changed(
 /// reads a few KB instead of a cache line per copy.
 static DIRTY: [AtomicU64; DIRTY_WORDS] = [const { AtomicU64::new(0) }; DIRTY_WORDS];
 const DIRTY_WORDS: usize = 1 << 14;
+
+// Each bit names a journal shard that still holds dirty pages. Updating it
+// under that shard's lock makes concurrent publishes and clears independent.
+static DIRTY_SHARDS: [AtomicU64; DIRTY_WORDS * 64] =
+    [const { AtomicU64::new(0) }; DIRTY_WORDS * 64];
+
+const JOURNAL_SHARDS: usize = 64;
+const SHARD_PAGES: usize = 16;
+type DirtyMap = BTreeMap<usize, DirtyPage>;
+
+enum DirtyJournal {
+    Single(Mutex<DirtyMap>),
+    Sharded(Box<[Mutex<DirtyMap>; JOURNAL_SHARDS]>),
+}
+
+impl DirtyJournal {
+    fn new(pages: &[usize], bit: Option<u32>, sharded: bool) -> Self {
+        // Keep the inline map for small copies. A 64-lock directory there
+        // would cost more memory than their dirty entries.
+        let distributed = sharded && pages.len() >= JOURNAL_SHARDS;
+        let journal = if distributed {
+            Self::Sharded(Box::new(std::array::from_fn(|_| Mutex::default())))
+        } else {
+            Self::Single(Mutex::default())
+        };
+        for &page in pages {
+            journal.update(page, bit, |map| map.insert(page, DirtyPage::WHOLE));
+        }
+        journal
+    }
+
+    fn shard_of(page: usize) -> usize {
+        page / SHARD_PAGES % JOURNAL_SHARDS
+    }
+
+    fn shard(&self, page: usize) -> (usize, &Mutex<DirtyMap>) {
+        match self {
+            Self::Single(map) => (0, map),
+            Self::Sharded(shards) => {
+                let i = Self::shard_of(page);
+                (i, &shards[i])
+            }
+        }
+    }
+
+    fn get(&self, page: usize) -> Option<DirtyPage> {
+        self.shard(page)
+            .1
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&page)
+            .copied()
+    }
+
+    fn update<T>(
+        &self,
+        page: usize,
+        bit: Option<u32>,
+        update: impl FnOnce(&mut DirtyMap) -> T,
+    ) -> T {
+        let (index, map) = self.shard(page);
+        let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
+        let was_empty = map.is_empty();
+        let result = update(&mut map);
+        if let Some(bit) = bit
+            && was_empty != map.is_empty()
+        {
+            if port_journal() {
+                let entry = &DIRTY_SHARDS[bit as usize];
+                if map.is_empty() {
+                    entry.fetch_and(!(1 << index), Ordering::Release);
+                } else {
+                    entry.fetch_or(1 << index, Ordering::Release);
+                }
+            } else {
+                set_dirty(Some(bit), !map.is_empty());
+            }
+        }
+        result
+    }
+
+    fn range(&self, first: usize, last: usize) -> Vec<(usize, u16)> {
+        let mut out = Vec::new();
+        if first >= last {
+            return out;
+        }
+        let mut collect = |map: &Mutex<DirtyMap>| {
+            let map = map.lock().unwrap_or_else(|e| e.into_inner());
+            out.extend(map.range(first..last).map(|(&page, _)| (page, WHOLE)));
+        };
+        match self {
+            Self::Single(map) => collect(map),
+            Self::Sharded(shards) => {
+                let count = (last.div_ceil(SHARD_PAGES) - first / SHARD_PAGES).min(JOURNAL_SHARDS);
+                let start = Self::shard_of(first);
+                for i in 0..count {
+                    collect(&shards[(start + i) % JOURNAL_SHARDS]);
+                }
+                out.sort_unstable_by_key(|&(page, _)| page);
+            }
+        }
+        out
+    }
+}
 
 /// Bits of [`DIRTY`] given back, and the first never handed out.
 static FREE_BITS: Mutex<(Vec<u32>, u32)> = Mutex::new((Vec::new(), 0));
@@ -274,13 +380,23 @@ fn set_dirty(bit: Option<u32>, dirty: bool) {
 /// Whether the tracker with bit `bit` holds no changed page (see
 /// [`Tracked::clean`]).
 pub(crate) fn clean_bit(bit: Option<u32>) -> bool {
-    bit.is_some_and(|bit| DIRTY[bit as usize / 64].load(Ordering::Acquire) & 1 << (bit % 64) == 0)
+    bit.is_some_and(|bit| {
+        if port_journal() {
+            DIRTY_SHARDS[bit as usize].load(Ordering::Acquire) == 0
+        } else {
+            DIRTY[bit as usize / 64].load(Ordering::Acquire) & 1 << (bit % 64) == 0
+        }
+    })
 }
 
 impl Drop for Changed {
     fn drop(&mut self) {
         if let Some(bit) = self.2 {
-            set_dirty(Some(bit), false);
+            if port_journal() {
+                DIRTY_SHARDS[bit as usize].store(0, Ordering::Release);
+            } else {
+                set_dirty(Some(bit), false);
+            }
             FREE_BITS.lock().unwrap_or_else(|e| e.into_inner()).0.push(bit);
         }
     }
@@ -340,6 +456,11 @@ impl Saved {
 }
 
 impl Changed {
+    fn clear_page(&self, page: usize) {
+        self.0.update(page, self.2, |map| map.remove(&page));
+        self.taken(page);
+    }
+
     /// Page `page` was taken: what it saved of it is stale.
     fn taken(&self, page: usize) {
         self.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.remove(&page);
@@ -700,9 +821,8 @@ fn track_as(start: usize, len: usize, views: bool, copy: bool) -> Option<Tracked
     }
     // A tracker with untracked parts is never clean: no bit.
     let bit = if untracked.is_empty() { dirty_bit() } else { None };
-    set_dirty(bit, true);
-    let dirty = pages.iter().map(|&page| (page, DirtyPage::WHOLE)).collect();
-    let changed = Arc::new(Changed(Mutex::new(dirty), Mutex::default(), bit, copy));
+    let dirty = DirtyJournal::new(&pages, bit, port_journal());
+    let changed = Arc::new(Changed(dirty, Mutex::default(), bit, copy));
     let mut g = guards();
     for &page in &pages {
         g.holders.entry(page).or_default().push(changed.clone());
@@ -909,13 +1029,10 @@ impl Tracked {
         let mut pages: Vec<(usize, u16)> = {
             #[cfg(feature = "diagnostics")]
             let waited = Timed(std::time::Instant::now(), crate::copystat::C::GuardWaitUs);
-            let changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
+            let pages = self.changed.0.range(from / PAGE, to.div_ceil(PAGE));
             #[cfg(feature = "diagnostics")]
             drop(waited);
-            changed
-                .range(from / PAGE..to.div_ceil(PAGE))
-                .map(|(&page, _)| (page, WHOLE))
-                .collect()
+            pages
         };
         if pages.is_empty() {
             return (Vec::new(), Vec::new());
@@ -946,13 +1063,11 @@ impl Tracked {
         }
         // Partial pages were copied but not taken. Read their remaining
         // dirty masks after the tracked pages in this range are rearmed.
-        let changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
         for (page, mask) in &mut pages {
             if whole.binary_search(page).is_err() {
-                *mask = changed.get(page).map_or(WHOLE, |dirty| dirty.mask());
+                *mask = self.changed.0.get(*page).map_or(WHOLE, DirtyPage::mask);
             }
         }
-        drop(changed);
         let (mut copy, mut zero): (Runs, Runs) = (Vec::new(), Vec::new());
         let mut unmapped = unmapped.into_iter().peekable();
         for (page, mask) in pages {
@@ -987,13 +1102,7 @@ impl Tracked {
             .collect();
         let taken = protect_noting(g, &whole, unmapped);
         for &page in &taken {
-            let pending = self
-                .changed
-                .0
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&page)
-                .is_some_and(|dirty| dirty.pending);
+            let pending = self.changed.0.get(page).is_some_and(|dirty| dirty.pending);
             if !pending {
                 continue;
             }
@@ -1004,37 +1113,27 @@ impl Tracked {
             };
             // A reset consumes a shared answer. Every holder must see it.
             for holder in &g.holders[&page] {
-                if let Some(dirty) = holder
-                    .0
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .get_mut(&page)
-                {
-                    dirty.resolve(parts);
-                }
+                holder.0.update(page, holder.2, |map| {
+                    if let Some(dirty) = map.get_mut(&page) {
+                        dirty.resolve(parts);
+                    }
+                });
             }
         }
-        let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
         for &page in group {
             let i = pages
                 .binary_search_by_key(&page, |&(p, _)| p)
                 .expect("requested page");
-            pages[i].1 = changed.get(&page).map_or(WHOLE, |dirty| dirty.mask());
+            pages[i].1 = self.changed.0.get(page).map_or(WHOLE, DirtyPage::mask);
         }
         for page in taken {
-            changed.remove(&page);
-            self.changed.taken(page);
+            self.changed.clear_page(page);
         }
-        set_dirty(self.changed.2, !changed.is_empty());
     }
 
     /// Whether page `page` (a page number) changed since it was taken.
     pub(crate) fn changed(&self, page: usize) -> bool {
-        self.changed
-            .0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(&page)
+        self.changed.0.get(page).is_some()
     }
 
     /// The caller made pages (page numbers) of its copy equal to title
@@ -1060,13 +1159,9 @@ impl Tracked {
             .copied()
             .filter(|p| !unguarded.contains(p))
             .collect();
-        let taken = protect(g, &pages);
-        let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
-        for page in taken {
-            changed.remove(&page);
-            self.changed.taken(page);
+        for page in protect(g, &pages) {
+            self.changed.clear_page(page);
         }
-        set_dirty(self.changed.2, !changed.is_empty());
     }
 
     /// Whether no page changed since it was taken: then [`Tracked::take`]
@@ -1389,20 +1484,16 @@ fn mark_changed(g: &Guards, first: usize, last: usize, save: bool) {
 fn mark_changed_with(g: &Guards, first: usize, last: usize, save: bool, dirty: DirtyPage) {
     for (&page, holders) in g.holders.range(first..last) {
         for c in holders {
-            let first_write = {
-                let mut set = c.0.lock().unwrap_or_else(|e| e.into_inner());
-                set_dirty(c.2, true);
-                match set.entry(page) {
-                    std::collections::btree_map::Entry::Occupied(mut entry) => {
-                        entry.get_mut().merge(dirty);
-                        false
-                    }
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert(dirty);
-                        true
-                    }
+            let first_write = c.0.update(page, c.2, |map| match map.entry(page) {
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    entry.get_mut().merge(dirty);
+                    false
                 }
-            };
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(dirty);
+                    true
+                }
+            });
             if first_write && save {
                 c.save(page);
             }
@@ -1557,10 +1648,7 @@ pub(crate) fn land(
         {
             // The writing copy now has every byte it holds of this page.
             // Clear only its tracker, with the guards still held.
-            let mut dirty = t.changed.0.lock().unwrap_or_else(|e| e.into_inner());
-            dirty.remove(&page);
-            t.changed.taken(page);
-            set_dirty(t.changed.2, !dirty.is_empty());
+            t.changed.clear_page(page);
         }
         landed = Some(if writes { host.len() } else { 0 });
     });
@@ -1724,9 +1812,7 @@ pub(crate) fn retake(at: usize, len: usize) {
 fn mark_copies(g: &Guards, first: usize, last: usize) {
     for (&page, holders) in g.holders.range(first..last) {
         for c in holders.iter().filter(|c| c.3) {
-            let mut set = c.0.lock().unwrap_or_else(|e| e.into_inner());
-            set_dirty(c.2, true);
-            set.insert(page, DirtyPage::WHOLE);
+            c.0.update(page, c.2, |map| map.insert(page, DirtyPage::WHOLE));
         }
     }
 }
@@ -2184,6 +2270,38 @@ pub(crate) mod tests {
         assert!(slow.clean());
         drop((a, b, slow));
         free(p);
+    }
+
+    #[test]
+    fn disjoint_faults_and_takes_keep_a_shared_trackers_dirty_pages() {
+        if !fault_tracking() {
+            return;
+        }
+        let base = pool(4 * SHARD_PAGES);
+        let end = base + 4 * SHARD_PAGES * PAGE;
+        let tracker = track(base, end - base, true).unwrap();
+        assert_eq!(tracker.take(base, end), [(base, end)]);
+        let start = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for (i, page) in (base..end).step_by(SHARD_PAGES * PAGE).enumerate() {
+                let tracker = &tracker;
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    for byte in 1..=32u8 {
+                        // SAFETY: each worker writes only its own page.
+                        unsafe { ((page + i) as *mut u8).write_volatile(byte) };
+                        assert!(tracker.changed(page / PAGE));
+                        let runs = tracker.take(page, page + PAGE);
+                        assert!(runs.iter().any(|&(a, b)| (a..b).contains(&(page + i))));
+                        assert!(!tracker.changed(page / PAGE));
+                    }
+                });
+            }
+        });
+        assert!(tracker.clean());
+        drop(tracker);
+        free(base);
     }
 
     #[test]

@@ -66,7 +66,12 @@ pub(crate) struct Heap {
     /// copies descriptors into it itself, as bytes (`sync_heaps`).
     #[cfg(windows)]
     written: Option<crate::watch::Tracked>,
+    #[cfg(windows)]
+    sync_id: u64,
 }
+
+#[cfg(windows)]
+static HEAP_SYNC_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(windows)]
 pub(crate) use host::fallback_samplers;
@@ -223,6 +228,97 @@ fn mirror(handle: u64) {
     }
 }
 
+#[cfg(windows)]
+struct HeapWrites {
+    start: u64,
+    at: usize,
+    sync_id: u64,
+    ranges: crate::watch::Runs,
+}
+
+#[cfg(windows)]
+struct HeapRequests {
+    ask: std::sync::mpsc::SyncSender<()>,
+    ready: std::sync::Arc<std::sync::Mutex<Vec<HeapWrites>>>,
+}
+
+#[cfg(windows)]
+static HEAP_REQUESTS: std::sync::OnceLock<Option<HeapRequests>> = std::sync::OnceLock::new();
+
+/// Discover dirty descriptor ranges from title memory while submissions
+/// wait for the host. Only the normal submission path publishes slots.
+#[cfg(windows)]
+pub(crate) fn request_heap_records() {
+    if !crate::watch::port_journal() {
+        return;
+    }
+    let requests = HEAP_REQUESTS.get_or_init(|| {
+        let ready = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let result = ready.clone();
+        let (ask, requests) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("victory-heap-asks".into())
+            .spawn(move || {
+                while requests.recv().is_ok() {
+                    let mut result = result.lock().unwrap_or_else(|e| e.into_inner());
+                    if result.is_empty() {
+                        // One outstanding result and a bounded number of 4
+                        // KiB dirty spans, even for a very large title heap.
+                        *result = take_heap_writes(64 << 20);
+                    }
+                }
+            })
+            .ok()?;
+        Some(HeapRequests { ask, ready })
+    });
+    if let Some(requests) = requests {
+        let _ = requests.ask.try_send(());
+    }
+}
+
+#[cfg(windows)]
+fn take_heap_writes(mut budget: usize) -> Vec<HeapWrites> {
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let mut work = Vec::new();
+    for &(start, _, at) in heaps.iter() {
+        if budget == 0 {
+            break;
+        }
+        // SAFETY: registered heaps are live under the read lock.
+        let heap = unsafe { &*(at as *const Heap) };
+        let (Some(Some(host)), Some(written), Some(step)) =
+            (heap.host.get(), &heap.written, increment(heap.desc.kind))
+        else {
+            continue;
+        };
+        if written.clean() {
+            continue;
+        }
+        // The remaining title slots have no direct host index. Use complete
+        // pages when the early round stops partway through a large heap.
+        let start_address = start as usize;
+        let end = start_address + host.count() as usize * step as usize;
+        let budget_end =
+            (start_address / crate::watch::PAGE * crate::watch::PAGE).saturating_add(budget);
+        let limit = end.min(budget_end);
+        if limit <= start_address {
+            continue;
+        }
+        let ranges = written.take(start_address, limit);
+        if !ranges.is_empty() {
+            work.push(HeapWrites {
+                start,
+                at,
+                sync_id: heap.sync_id,
+                ranges,
+            });
+        }
+        let pages = limit.div_ceil(crate::watch::PAGE) - start_address / crate::watch::PAGE;
+        budget = budget.saturating_sub(pages * crate::watch::PAGE);
+    }
+    work
+}
+
 /// Mirrors what the title wrote into its shader-visible heaps without a
 /// call: Grand Theft Auto VI copies descriptors (our records) into its heap
 /// as bytes, so only a change of its memory shows them. Each slot of a page
@@ -232,30 +328,21 @@ fn mirror(handle: u64) {
 /// heap at indices in their data, where a slot never mirrored reads nothing.
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
-    /// A heap's start, its address, and the ranges written since the last sync.
-    type Written = (u64, usize, Vec<(usize, usize)>);
-    // The written ranges of every heap, taken in one short hold of the lock.
-    let work: Vec<Written> = {
-        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-        heaps
-            .iter()
-            .filter_map(|&(start, _, at)| {
-                // SAFETY: registered heaps are live (removed when dropped).
-                let heap = unsafe { &*(at as *const Heap) };
-                // As before: ranges are taken only once the heap has its
-                // host heap, so writes before that are not lost.
-                let (Some(Some(host)), Some(written), Some(step)) =
-                    (heap.host.get(), &heap.written, increment(heap.desc.kind))
-                else {
-                    return None;
-                };
-                // The remaining title slots have no direct host index.
-                // Draw recording supplies those entries in dynamic tables.
-                let end = start + u64::from(host.count()) * u64::from(step);
-                Some((start, at, written.take(start as usize, end as usize)))
-            })
-            .collect()
+    let work = if let Some(Some(requests)) = HEAP_REQUESTS.get() {
+        let mut ready = requests.ready.lock().unwrap_or_else(|e| e.into_inner());
+        let mut work = std::mem::take(&mut *ready);
+        // Recheck live writes here. A queue wait can release after the
+        // early round, and the title can rewrite a record while held.
+        work.extend(take_heap_writes(usize::MAX));
+        work
+    } else {
+        take_heap_writes(usize::MAX)
     };
+    publish_heap_writes(work);
+}
+
+#[cfg(windows)]
+fn publish_heap_writes(work: Vec<HeapWrites>) {
     // Then page by page, the lock held for one page at a time: title
     // threads writing views (`mirror`) wait on it, and held across every
     // page of every heap they waited ~100 ms a frame in the world (some
@@ -264,7 +351,13 @@ pub(crate) fn sync_heaps() {
     // list, so a heap still listed under the lock is alive.
     let page_size = crate::watch::PAGE;
     let mut page_bytes = Vec::new();
-    for (start, at, ranges) in work {
+    for HeapWrites {
+        start,
+        at,
+        sync_id,
+        ranges,
+    } in work
+    {
         for (from, to) in ranges {
             for page in (from & !(page_size - 1)..to).step_by(page_size) {
                 let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
@@ -273,6 +366,9 @@ pub(crate) fn sync_heaps() {
                 }
                 // SAFETY: listed under the lock we hold, so not yet dropped.
                 let heap = unsafe { &*(at as *const Heap) };
+                if heap.sync_id != sync_id {
+                    break;
+                }
                 let (Some(Some(host)), Some(step)) = (heap.host.get(), increment(heap.desc.kind))
                 else {
                     break;
@@ -1185,6 +1281,8 @@ pub(crate) extern "system" fn create_heap(
         written: (placed && visible)
             .then(|| crate::watch::track(start as usize, size as usize, true))
             .flatten(),
+        #[cfg(windows)]
+        sync_id: HEAP_SYNC_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     });
     #[cfg(windows)]
     let at = std::ptr::from_ref::<Heap>(&heap) as usize;
@@ -1525,6 +1623,81 @@ pub(crate) mod tests {
         }
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         crate::watch::tests::free(memory);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn early_heap_asks_keep_later_writes_visible_at_publication() {
+        if !crate::watch::fault_tracking() {
+            return;
+        }
+        let base = crate::watch::tests::pool(1);
+        let size = 64 * 16;
+        let desc = HeapDesc {
+            kind: SAMPLERS,
+            count: 64,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let mut h = std::ptr::null();
+        assert_eq!(
+            create(
+                desc,
+                Placement {
+                    address: base as u64,
+                    size: size as u64
+                },
+                &mut h
+            ),
+            S_OK
+        );
+        let host = heap(h).host().expect("sampler heap");
+        let address = h as usize;
+        // Other tests can submit on the same host. Keep this heap private
+        // until its ranges have been collected.
+        unregister_heap(&mut SHADER_HEAPS.write().unwrap(), address);
+        let mut record = [0u64; 2];
+        let from = record.as_mut_ptr() as u64;
+        create_sampler(
+            std::ptr::null(),
+            &[21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0],
+            from,
+        );
+        let write = |index: usize| {
+            // SAFETY: both records are live and disjoint for this test.
+            unsafe {
+                std::ptr::copy_nonoverlapping(from as *const u8, (base + 16 * index) as *mut u8, 16)
+            };
+        };
+        write(5);
+        // Collect just this heap in the test, using the same page-taking
+        // logic as the worker without consuming other tests' work.
+        let written = heap(h).written.as_ref().unwrap();
+        let end = base + 16 * host.count() as usize;
+        let early = written.take(base, end);
+        assert!(!early.is_empty() && !host.made(5));
+        write(6);
+        let mut work = vec![HeapWrites {
+            start: base as u64,
+            at: h as usize,
+            sync_id: heap(h).sync_id,
+            ranges: early,
+        }];
+        let late = written.take(base, end);
+        assert!(late.iter().any(|&(a, b)| (a..b).contains(&(base + 16 * 6))));
+        work.push(HeapWrites {
+            ranges: late,
+            ..work[0]
+        });
+        register_heap(
+            &mut SHADER_HEAPS.write().unwrap(),
+            (base as u64, end as u64),
+            address,
+        );
+        publish_heap_writes(work);
+        assert!(host.made(5) && host.made(6));
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        crate::watch::tests::free(base);
     }
 
     /// A placed heap reused at the same address replaces the stale range;
