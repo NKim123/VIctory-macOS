@@ -843,7 +843,7 @@ pub(crate) fn in_parallel(n: usize, f: impl Fn(usize) + Sync) {
 /// [`Staging::refresh`] of each of `work`, those whose memory may have
 /// changed on several threads at once (reading title memory and detiling
 /// cost ~6 ms of frame a MB on one thread in a new shot, run evict5).
-pub(crate) fn refresh_all(work: &[UploadSource], local: Option<&HostList>) -> Vec<Option<Upload>> {
+pub(crate) fn refresh_all(work: &[UploadSource], local: Option<&HostList>) -> Vec<(usize, Upload)> {
     // Most find nothing changed (their trackers' clean bits say so): those
     // are not handed to threads.
     let gate = crate::descriptor::host::show_after();
@@ -857,16 +857,19 @@ pub(crate) fn refresh_all(work: &[UploadSource], local: Option<&HostList>) -> Ve
             (initial || staging.maybe_changed()).then_some((i, initial))
         })
         .collect();
-    let results: Vec<Mutex<Option<Upload>>> = changed.iter().map(|_| Mutex::new(None)).collect();
+    let results: Vec<OnceLock<Option<Upload>>> = changed.iter().map(|_| OnceLock::new()).collect();
     in_parallel(changed.len(), |k| {
         let (i, initial) = changed[k];
-        *results[k].lock().unwrap_or_else(|e| e.into_inner()) = work[i].0.refresh(initial, local);
+        let _ = results[k].set(work[i].0.refresh(initial, local));
     });
-    let mut out: Vec<Option<Upload>> = vec![None; work.len()];
-    for ((i, _), r) in changed.into_iter().zip(results) {
-        out[i] = r.into_inner().unwrap_or_else(|e| e.into_inner());
-    }
-    out
+    changed
+        .into_iter()
+        .zip(results)
+        .filter_map(|((i, _), result)| {
+            let upload = result.into_inner().expect("completed refresh job")?;
+            Some((i, upload))
+        })
+        .collect()
 }
 
 impl Staging {

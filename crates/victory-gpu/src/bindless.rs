@@ -448,7 +448,6 @@ pub(crate) fn uploads_for(
         }
         UploadList::Shared(guard)
     };
-    let list = storage.list();
     // What to bring up: the textures lists read through tables, and those
     // the heaps view that shaders read lately. Collected under the heaps'
     // locks and brought up without them, several at a time: reading title
@@ -533,22 +532,26 @@ pub(crate) fn uploads_for(
             }
         }
     }
-    let mut recorded = false;
-    let mut staged_uploads = Vec::new();
-    // The textures copied into stay alive in `work` until recorded.
-    let mut readable = Vec::new();
     before_refresh(&work);
-    let local = matches!(storage, UploadList::Owned(_)).then_some(list);
-    for ((staging, copy), upload) in work.iter().zip(crate::texture::refresh_all(&work, local)) {
-        if let Some(upload) = upload {
-            readable.extend(crate::texture::record_upload(list, copy, staging, &upload));
-            recorded = true;
-            if local.is_some() {
-                staged_uploads.push(staging.clone());
-            }
-            #[cfg(feature = "diagnostics")]
-            UPLOADED.fetch_add(1, Relaxed);
+    let local = match &storage {
+        UploadList::Owned(list) => Some(&**list),
+        UploadList::Shared(_) => None,
+    };
+    let refreshed = crate::texture::refresh_all(&work, local);
+    let private = local.is_some();
+    let list = storage.list();
+    let recorded = !refreshed.is_empty();
+    let mut staged_uploads = Vec::new();
+    let mut readable = Vec::new();
+    // The textures copied into stay alive in `work` until recorded.
+    for (index, upload) in refreshed {
+        let (staging, copy) = &work[index];
+        readable.extend(crate::texture::record_upload(list, copy, staging, &upload));
+        if private {
+            staged_uploads.push(staging.clone());
         }
+        #[cfg(feature = "diagnostics")]
+        UPLOADED.fetch_add(1, Relaxed);
     }
     if !readable.is_empty() {
         // SAFETY: an open list; the barriers name live textures.

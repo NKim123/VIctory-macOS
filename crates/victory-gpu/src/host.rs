@@ -2561,50 +2561,33 @@ impl Host {
         }
         // Textures heap-indexing shaders may read, uploaded first by a list
         // of ours where their title memory changed.
-        let heaps: Vec<std::sync::Arc<crate::bindless::Viewed>> = runs
-            .iter()
-            .filter(|_| !host_only)
-            .flat_map(|l| {
-                l.deferred()
-                    .copies
-                    .iter()
-                    .filter_map(|s| match s {
-                        Step::Heap(v) => Some(v.clone()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
         // And textures read through tables, uploaded by the same list.
-        let mut textures: Vec<_> = runs
-            .iter()
-            .filter(|_| !host_only)
-            .flat_map(|l| {
-                l.deferred()
-                    .copies
-                    .iter()
-                    .filter_map(|s| match s {
-                        Step::Texture(staging, copy) => Some((staging.clone(), copy.clone())),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+        let mut heaps = Vec::new();
+        let mut textures = Vec::new();
+        let mut demand = crate::descriptor::TableTextureSlots::new();
+        for list in runs.iter().filter(|_| !host_only) {
+            for step in &list.deferred().copies {
+                match step {
+                    Step::Heap(viewed) => {
+                        if !heaps.iter().any(|heap| Arc::ptr_eq(heap, viewed)) {
+                            heaps.push(viewed.clone());
+                        }
+                    }
+                    Step::Texture(staging, copy) => textures.push((staging.clone(), copy.clone())),
+                    Step::TextureSlot(viewed, index) if show_after => {
+                        demand
+                            .entry(Arc::as_ptr(viewed) as usize)
+                            .or_default()
+                            .insert(*index);
+                    }
+                    _ => {}
+                }
+            }
+        }
         // Pending shared SRVs can upload unrelated title memory. The
         // submit-ahead worker only runs lists that have no such dependencies.
         if show_after {
             self.wait_ordered_completion(submission, |work| work.descriptors);
-            let mut demand = crate::descriptor::TableTextureSlots::new();
-            for list in runs {
-                for step in &list.deferred().copies {
-                    if let Step::TextureSlot(viewed, index) = step {
-                        demand
-                            .entry(std::sync::Arc::as_ptr(viewed) as usize)
-                            .or_default()
-                            .insert(*index);
-                    }
-                }
-            }
             crate::descriptor::service_pending(&demand, &heaps, pending_pins, Some(&mut textures));
             #[cfg(test)]
             if let Some(resource) =
@@ -4973,6 +4956,11 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for (i, step) in self.deferred().copies.iter().enumerate() {
+            // Upload work ran before entering the deferred loop and does
+            // not touch this loop's refresh batch or pending CPU writes.
+            if matches!(step, Step::Texture(..) | Step::TextureSlot(..)) {
+                continue;
+            }
             if !before(batch, step) {
                 continue;
             }
@@ -4981,10 +4969,12 @@ impl HostList {
             {
                 continue;
             }
-            let started = std::time::Instant::now();
+            let started = (cfg!(feature = "diagnostics")
+                || matches!(step, Step::Copy(..) | Step::Move(..) | Step::Fill(..)))
+            .then(Instant::now);
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(
-                started,
+                started.unwrap(),
                 match step {
                     Step::Refresh(..) | Step::Slot(..) => C::StepRefreshUs,
                     Step::Copy(..) | Step::Move(..) | Step::Fill(..) => C::StepCopyUs,
@@ -5040,7 +5030,7 @@ impl HostList {
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Runs, 1);
-                        add(C::RunUs, started.elapsed().as_micros() as u64);
+                        add(C::RunUs, started.unwrap().elapsed().as_micros() as u64);
                     }
                     continue;
                 }
@@ -5064,7 +5054,10 @@ impl HostList {
                     continue;
                 }
             };
-            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            PREPARING[0].fetch_add(
+                started.unwrap().elapsed().as_micros() as u64,
+                Ordering::Relaxed,
+            );
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
     }
