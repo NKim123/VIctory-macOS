@@ -1282,7 +1282,7 @@ mod tests {
             };
             tag_with_settings(b"library", translation_build(options), link)
         };
-        let keys = HashSet::from(["pipeline".to_owned()]);
+        let keys = HashSet::from(["a".repeat(32)]);
         let original = current(false, false, false, false);
         let saved = list(&original, &keys);
         assert_eq!(listed(saved.as_bytes(), &original), keys);
