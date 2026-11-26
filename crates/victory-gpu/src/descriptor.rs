@@ -61,7 +61,7 @@ pub(crate) struct Heap {
     /// descriptor order when a draw first uses them (decision 0007, step
     /// 3); slots written before wait in `pending`.
     #[cfg(windows)]
-    host: std::sync::OnceLock<Option<host::HostHeap>>,
+    host: std::sync::OnceLock<Option<std::sync::Arc<host::HostHeap>>>,
     #[cfg(windows)]
     pending: std::sync::Mutex<Vec<u32>>,
     /// A shader-visible heap in the title's memory, tracked: the title also
@@ -103,7 +103,7 @@ impl Heap {
     #[cfg(windows)]
     pub(crate) fn host(&self) -> Option<&host::HostHeap> {
         if let Some(h) = self.host.get() {
-            return h.as_ref();
+            return h.as_deref();
         }
         if self.desc.flags & SHADER_VISIBLE == 0 || !matches!(self.desc.kind, VIEWS_KIND | SAMPLERS)
         {
@@ -128,9 +128,9 @@ impl Heap {
                 for i in pending.drain(..) {
                     h.mirror(i, self.start + u64::from(i) * step, false);
                 }
-                Some(h)
+                Some(std::sync::Arc::new(h))
             })
-            .as_ref()
+            .as_deref()
     }
 
     /// Exercises the remapped-table path on a host that can fit the title heap.
@@ -139,7 +139,7 @@ impl Heap {
         assert!(count < self.desc.count);
         assert!(
             self.host
-                .set(Some(host::HostHeap::new(false, count).unwrap()))
+                .set(Some(host::HostHeap::new(false, count).unwrap().into()))
                 .is_ok()
         );
     }
@@ -151,6 +151,10 @@ impl Heap {
         let at = handle.checked_sub(self.start)?;
         let index = at / step;
         (index < u64::from(self.desc.count)).then_some(index as u32)
+    }
+    #[cfg(windows)]
+    pub(crate) fn host_owner(&self) -> Option<&std::sync::Arc<host::HostHeap>> {
+        self.host.get()?.as_ref()
     }
 }
 

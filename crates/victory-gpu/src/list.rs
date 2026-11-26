@@ -332,6 +332,10 @@ pub(crate) fn recycle_into(
 ) {
     const KEPT: usize = 64;
     if let Ok(list) = std::sync::Arc::try_unwrap(list) {
+        // Bound the extra idle upload storage kept for early title resets.
+        if crate::host::inflight_enabled() && list.inflight_bytes() > 2 << 20 {
+            return;
+        }
         list.reset();
         let mut spare = spare.lock().unwrap_or_else(|e| e.into_inner());
         if spare.len() < KEPT {

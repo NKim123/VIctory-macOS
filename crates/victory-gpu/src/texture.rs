@@ -60,6 +60,8 @@ pub(crate) struct Staging {
     tracked: Option<crate::watch::Tracked>,
     /// True once real readable title memory has been uploaded at least once.
     uploaded_once: std::sync::atomic::AtomicBool,
+    /// A queued upload may have been dropped before writing its texture.
+    retry: std::sync::atomic::AtomicBool,
     /// Last `crate::queue::presented()` frame on which an untracked check ran.
     checked_frame: std::sync::atomic::AtomicU64,
     /// Per subresource, the bytes of the texture's memory it lies in (from
@@ -469,7 +471,10 @@ pub(crate) fn host_writes(
         }
         list.defer_texture_fill(Fill::HostCopy(copy, coverage));
     } else {
-        list.defer_host(move || copy.host_written.store(true, std::sync::atomic::Ordering::Relaxed));
+        list.defer_private(move || {
+            copy.host_written
+                .store(true, std::sync::atomic::Ordering::Relaxed)
+        });
     }
 }
 
@@ -838,7 +843,7 @@ pub(crate) fn in_parallel(n: usize, f: impl Fn(usize) + Sync) {
 /// [`Staging::refresh`] of each of `work`, those whose memory may have
 /// changed on several threads at once (reading title memory and detiling
 /// cost ~6 ms of frame a MB on one thread in a new shot, run evict5).
-pub(crate) fn refresh_all(work: &[UploadSource]) -> Vec<Option<Upload>> {
+pub(crate) fn refresh_all(work: &[UploadSource], local: Option<&HostList>) -> Vec<Option<Upload>> {
     // Most find nothing changed (their trackers' clean bits say so): those
     // are not handed to threads.
     let gate = crate::descriptor::host::show_after();
@@ -846,16 +851,16 @@ pub(crate) fn refresh_all(work: &[UploadSource]) -> Vec<Option<Upload>> {
         .iter()
         .enumerate()
         .filter_map(|(i, (staging, copy))| {
-            let initial = gate
-                && copy.gated_upload_bytes().is_some()
-                && !copy.initialized.load(std::sync::atomic::Ordering::Acquire);
+            use std::sync::atomic::Ordering::Acquire;
+            let initial = staging.retry.load(Acquire)
+                || gate && copy.gated_upload_bytes().is_some() && !copy.initialized.load(Acquire);
             (initial || staging.maybe_changed()).then_some((i, initial))
         })
         .collect();
     let results: Vec<Mutex<Option<Upload>>> = changed.iter().map(|_| Mutex::new(None)).collect();
     in_parallel(changed.len(), |k| {
         let (i, initial) = changed[k];
-        *results[k].lock().unwrap_or_else(|e| e.into_inner()) = work[i].0.refresh(initial);
+        *results[k].lock().unwrap_or_else(|e| e.into_inner()) = work[i].0.refresh(initial, local);
     });
     let mut out: Vec<Option<Upload>> = vec![None; work.len()];
     for ((i, _), r) in changed.into_iter().zip(results) {
@@ -865,6 +870,16 @@ pub(crate) fn refresh_all(work: &[UploadSource]) -> Vec<Option<Upload>> {
 }
 
 impl Staging {
+    pub(crate) fn retry_upload(&self) {
+        self.retry.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn may_read_alias(&self) -> bool {
+        let start = self.memory as u64;
+        crate::shadow::has_aliased_overlap(start, start.saturating_add(self.layout.size))
+            || crate::watch::aliased(start as usize, self.layout.size as usize)
+    }
+
     /// Whether its memory may have changed since it was last detiled (an
     /// untracked texture always may).
     pub(crate) fn maybe_changed(&self) -> bool {
@@ -874,10 +889,13 @@ impl Staging {
     /// A staging buffer with the texture memory detiled into it if it
     /// changed since the last time (and is mapped at all), and the
     /// subresources that changed (only those are detiled and to be copied).
-    fn refresh(&self, initial: bool) -> Option<Upload> {
+    fn refresh(&self, initial: bool, local: Option<&HostList>) -> Option<Upload> {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
-        let (read, buffer) = self.refresh_now(initial);
+        let (read, buffer) = self.refresh_now(initial, local);
+        if buffer.is_some() {
+            self.retry.store(false, Relaxed);
+        }
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
@@ -886,7 +904,7 @@ impl Staging {
 
     /// Returns the bytes of title memory read, and the buffer it detiled
     /// into with the subresources detiled.
-    fn refresh_now(&self, initial: bool) -> (usize, Option<Upload>) {
+    fn refresh_now(&self, initial: bool, local: Option<&HostList>) -> (usize, Option<Upload>) {
         if !initial
             && self.tracked.is_none()
             && once_per_frame()
@@ -972,7 +990,7 @@ impl Staging {
             if fresh.is_empty() {
                 return (bytes, None);
             }
-            let buffer = self.detile(read, &fresh);
+            let buffer = self.detile(read, &fresh, local);
             if buffer.is_none() {
                 for &i in &fresh {
                     last.hashes[i as usize] = None;
@@ -1032,7 +1050,7 @@ impl Staging {
             }
             let zeros = vec![0u8; size];
             let every = all();
-            let buffer = self.detile(&zeros, &every);
+            let buffer = self.detile(&zeros, &every, local);
             last.uploaded = buffer.is_some();
             return (0, buffer.map(|(b, at)| (b, at, every)));
         };
@@ -1054,7 +1072,11 @@ impl Staging {
             })
             .map(|i| i as u32)
             .collect();
-        let buffer = if fresh.is_empty() { None } else { self.detile(&last.read, &fresh) };
+        let buffer = if fresh.is_empty() {
+            None
+        } else {
+            self.detile(&last.read, &fresh, local)
+        };
         if buffer.is_some() {
             self.uploaded_once
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1072,7 +1094,12 @@ impl Staging {
     /// Detiles `subresources` of `tiled` (the texture's memory) into a
     /// staging buffer (`None` if none could be had or a subresource could
     /// not be read).
-    fn detile(&self, tiled: &[u8], subresources: &[u32]) -> Option<(ID3D12Resource, u64)> {
+    fn detile(
+        &self,
+        tiled: &[u8],
+        subresources: &[u32],
+        local: Option<&HostList>,
+    ) -> Option<(ID3D12Resource, u64)> {
         #[cfg(test)]
         if self
             .fail_detile
@@ -1080,7 +1107,8 @@ impl Staging {
         {
             return None;
         }
-        let (buffer, at, data) = staging_space(self.size)?;
+        let (buffer, at, data) =
+            local.map_or_else(|| staging_space(self.size), |list| list.upload(self.size))?;
         #[cfg(feature = "diagnostics")]
         // Scanned only when its message is wanted: a pass over every
         // texture read, in timing runs too.
@@ -1489,6 +1517,7 @@ pub(crate) fn staging_for(
         memory: memory as *const u8,
         tracked: crate::watch::track(memory, layout_size, true),
         uploaded_once: std::sync::atomic::AtomicBool::new(false),
+        retry: std::sync::atomic::AtomicBool::new(false),
         checked_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
         spans,
         last: Mutex::default(),

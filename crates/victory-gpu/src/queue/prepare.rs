@@ -35,6 +35,9 @@ struct Submission {
 
 impl Lane {
     pub(super) fn get() -> Option<&'static Self> {
+        if crate::host::inflight_enabled() {
+            return None;
+        }
         static LANE: OnceLock<Option<Lane>> = OnceLock::new();
         LANE.get_or_init(|| {
             let join = std::env::var("VICTORY_JOIN_PARTS")

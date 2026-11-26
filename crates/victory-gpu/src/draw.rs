@@ -752,6 +752,7 @@ impl State {
         // The bound view heap's mark table and the bitmap shaders mark
         // their writes through views in (`crate::shadow::copy_back_marks`).
         let marks = if let Some((table_param, bitmap_param)) = p.marks {
+            list.note_view_writes();
             let heap = match self.heaps[0] {
                 0 => crate::memory::heap(),
                 h => crate::descriptor::heap(h as This).host(),
@@ -1191,8 +1192,12 @@ impl State {
                 .heaps
                 .iter()
                 .filter(|&&h| h != 0 && h != SAMPLERS_OURS)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
+                .filter_map(|&h| {
+                    let title = crate::descriptor::heap(h as This);
+                    let host = title.host()?;
+                    list.keep_title_heap(title);
+                    Some(Some(host.heap.clone()))
+                })
                 .collect();
             if memory_heap && let Some(h) = crate::memory::heap() {
                 heaps.insert(0, Some(h.heap.clone()));

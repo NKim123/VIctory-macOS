@@ -3,7 +3,7 @@
 //! cache, scene depth and a slow mean to estimate light outside the view.
 //! See VIctory-7900XTX 82ca134 and 7da523a, based on beloooo's resolve hook.
 
-use std::sync::{Arc, OnceLock, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -428,15 +428,34 @@ fn buffer(size: u64, writable: bool) -> Result<ID3D12Resource> {
 /// A version of one host descriptor slot. Rewrites wait for an executing
 /// pair, and invalidate the version before writing a new descriptor.
 #[derive(Clone)]
-pub(crate) struct Watch(Arc<RwLock<bool>>);
+pub(crate) struct Watch(Arc<Mutex<Version>>);
+
+pub(crate) struct Version {
+    valid: bool,
+    frozen: Weak<Frozen>,
+}
+
+/// The native fence that protects a recorded descriptor version. A
+/// descriptor writer can wait for it even while holding its slot lock.
+pub(crate) struct Frozen {
+    fence: ID3D12Fence,
+    value: u64,
+}
 
 impl Watch {
     pub(crate) fn new() -> Self {
-        Self(Arc::new(RwLock::new(true)))
+        Self(Arc::new(Mutex::new(Version {
+            valid: true,
+            frozen: Weak::new(),
+        })))
     }
 
     pub(crate) fn invalidate(&self) {
-        *self.0.write().unwrap_or_else(|e| e.into_inner()) = false;
+        let mut version = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(frozen) = version.frozen.upgrade() {
+            crate::host::poll_fence(&frozen.fence, frozen.value);
+        }
+        version.valid = false;
     }
 
     fn key(&self) -> usize {
@@ -485,24 +504,46 @@ impl Candidate {
 
 /// Under the submission lock, after all heap sync and deferred CPU copies.
 /// Hold each version at most once, even if many passes share the same slot.
-pub(crate) fn arm(candidates: &[Candidate]) -> Vec<RwLockReadGuard<'_, bool>> {
+pub(crate) fn arm(candidates: &[Candidate]) -> Vec<MutexGuard<'_, Version>> {
     let mut watches: Vec<_> = candidates.iter().flat_map(Candidate::watches).collect();
     watches.sort_unstable_by_key(|w| w.key());
     watches.dedup_by_key(|w| w.key());
     let locks: Vec<_> = watches
         .iter()
-        .map(|w| w.0.read().unwrap_or_else(|e| e.into_inner()))
+        .map(|w| w.0.lock().unwrap_or_else(|e| e.into_inner()))
         .collect();
     for pass in candidates {
         let ready = pass.watches().all(|w| {
             let index = watches.binary_search_by_key(&w.key(), |w| w.key()).unwrap();
-            *locks[index]
+            locks[index].valid
         });
         // SAFETY: a mapped word owned by the closed list, with no other
         // instance executing (submissions hold the host lock).
         unsafe { (pass.count as *mut u32).write_volatile(u32::from(ready)) };
     }
     locks
+}
+
+/// Arm the gate words while these exact descriptor versions are locked,
+/// then hand the hold to the native submission fence.
+pub(crate) fn freeze(
+    candidates: &[Candidate],
+    fence: &ID3D12Fence,
+    value: u64,
+) -> Option<Arc<Frozen>> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let frozen = Arc::new(Frozen {
+        fence: fence.clone(),
+        value,
+    });
+    for mut version in arm(candidates) {
+        if version.valid {
+            version.frozen = Arc::downgrade(&frozen);
+        }
+    }
+    Some(frozen)
 }
 
 pub(crate) struct Gate {
