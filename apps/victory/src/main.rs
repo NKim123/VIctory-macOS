@@ -9,7 +9,6 @@ mod inspect;
 mod prebuild;
 mod run;
 mod shader;
-#[cfg(windows)]
 mod translate;
 #[cfg(windows)]
 mod warm;
@@ -109,6 +108,10 @@ enum Command {
         /// (with `--pipelines`, then the shader pack's pipelines).
         #[arg(long, conflicts_with_all = ["validate", "list"])]
         cache: bool,
+        /// Target 32-lane D3DMetal with Wine defaults and the same
+        /// VICTORY_* overrides as the game. No GPU is needed.
+        #[arg(long, requires = "cache", conflicts_with = "pipelines")]
+        wine_defaults: bool,
     },
     /// Build recorded title pipelines offline, or prebuild from shader pack paths.
     Warm {
@@ -199,18 +202,9 @@ fn main() -> Result<()> {
             jobs,
             pipelines,
             cache: true,
+            wine_defaults,
             ..
-        } => {
-            #[cfg(windows)]
-            {
-                translate::warm(paths, jobs.map(NonZeroUsize::get), pipelines)
-            }
-            #[cfg(not(windows))]
-            {
-                let _ = (paths, jobs, pipelines);
-                anyhow::bail!("translate needs a Windows host for now")
-            }
-        }
+        } => translate::warm(paths, jobs.map(NonZeroUsize::get), pipelines, wine_defaults),
         Command::Translate {
             paths,
             validate,
@@ -219,19 +213,15 @@ fn main() -> Result<()> {
             jobs,
             cache: false,
             wave32,
-        } => {
-            #[cfg(windows)]
-            {
-                translate::run(paths, validate, pipelines, list, jobs.map(NonZeroUsize::get), wave32)
-            }
-            // Translation checks shaders with the Windows DXC host, which
-            // other hosts do not have yet.
-            #[cfg(not(windows))]
-            {
-                let _ = (paths, validate, pipelines, list, jobs, wave32);
-                anyhow::bail!("translate needs a Windows host for now")
-            }
-        }
+            ..
+        } => translate::run(
+            paths,
+            validate,
+            pipelines,
+            list,
+            jobs.map(NonZeroUsize::get),
+            wave32,
+        ),
         Command::Warm { paths, jobs } => {
             #[cfg(windows)]
             {

@@ -20,7 +20,7 @@ const TIMEOUT: Duration = Duration::from_secs(180);
 pub fn run(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
     if !paths.is_empty() {
         // Use the existing shader pack path and its cache.
-        return crate::translate::warm(paths, Some(jobs.unwrap_or(2)), true);
+        return crate::translate::warm(paths, Some(jobs.unwrap_or(2)), true, false);
     }
     ensure!(jobs.is_none(), "--jobs requires shader pack paths");
     let dir = victory_core::Config::load()?.cache_subdir(RECORDS)?;

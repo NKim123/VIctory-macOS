@@ -15,33 +15,72 @@
 //! The entry is our own encoding of [`HostShader`]; this file's text is part
 //! of the key, so changing the encoding invalidates every entry.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::emit::{HostShader, Options, StaticSampler, UserData};
 use victory_shader::{HwStage, RootType};
 
-static CACHE: OnceLock<Cache> = OnceLock::new();
+static CACHE: OnceLock<ShaderCache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 
-/// Keeps translated shaders in a folder of `dir` from now on: the folder
-/// of this translator, `None` if it cannot be opened.
+/// An offline or runtime cache using the same translation and fingerprint.
+pub struct ShaderCache {
+    dir: PathBuf,
+    cache: Cache,
+    options: Options,
+    build: [u8; 32],
+}
+
+impl ShaderCache {
+    /// Uses the current host, or targets D3DMetal's 32-lane GPU for
+    /// offline translation. Both use the same environment overrides.
+    pub fn open(dir: &Path, wine_defaults: bool) -> anyhow::Result<Self> {
+        let options = if wine_defaults {
+            options_for(true, true)
+        } else {
+            runtime_options()
+        };
+        let base = build(options.host_wave32);
+        let dir = dir.join(&blake3::Hash::from(*base).to_hex()[..16]);
+        let cache = Cache::open(&dir)?;
+        tracing::info!(dir = %dir.display(), "shader cache");
+        Ok(Self {
+            dir,
+            cache,
+            options,
+            build: *translation_build(options),
+        })
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn host_shader(&self, container: &[u8]) -> (Result<HostShader, String>, bool) {
+        cached(&self.cache, &self.build, container, |c| {
+            translate(c, self.options)
+        })
+    }
+}
+
+/// Keeps translated shaders in a folder of `dir` for this process.
 pub fn use_shader_cache(dir: PathBuf) -> Option<PathBuf> {
-    let dir = dir.join(&blake3::Hash::from(*build()).to_hex()[..16]);
-    match Cache::open(&dir) {
-        Ok(cache) => {
-            tracing::info!(dir = %dir.display(), "shader cache");
-            let _ = CACHE.set(cache);
-            Some(dir)
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "no shader cache");
-            None
+    if CACHE.get().is_none() {
+        match ShaderCache::open(&dir, false) {
+            Ok(cache) => {
+                let _ = CACHE.set(cache);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "no shader cache");
+                return None;
+            }
         }
     }
+    CACHE.get().map(|cache| cache.dir.clone())
 }
 
 /// Shaders found in the cache and translated since the start.
@@ -55,9 +94,9 @@ pub fn counts() -> (u64, u64) {
 /// translation settings (the loop limit, which a diagnostics build can
 /// change at run time, and whether the host's waves are 32 lanes at most,
 /// [`host_wave32`]).
-fn build() -> &'static [u8; 32] {
-    static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
-    BUILD.get_or_init(|| {
+fn build(wave32: bool) -> &'static [u8; 32] {
+    static BUILD: [OnceLock<[u8; 32]>; 2] = [const { OnceLock::new() }; 2];
+    BUILD[usize::from(wave32)].get_or_init(|| {
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
@@ -69,7 +108,7 @@ fn build() -> &'static [u8; 32] {
             victory_shader::SOURCE_HASH,
             ENCODING,
             limit,
-            host_wave32(),
+            wave32,
             victory_shader::emit::raw_root_cbvs(),
         )
     })
@@ -78,8 +117,14 @@ fn build() -> &'static [u8; 32] {
 /// Whether translations are for a host of 32-lane waves: the host GPU's
 /// (made here if it is not yet: the cache belongs to the GPU it was filled
 /// on, as the pipeline library does); none without one.
+#[cfg(windows)]
 fn host_wave32() -> bool {
     crate::host::host().is_some_and(crate::host::Host::wave32)
+}
+
+#[cfg(not(windows))]
+fn host_wave32() -> bool {
+    false
 }
 
 /// This file, whose `encode` and `decode` define the entries.
@@ -100,71 +145,29 @@ fn key(
     *h.finalize().as_bytes()
 }
 
-/// Whether translations put 64-bit image atomics under locks: under Wine,
-/// whose D3DMetal claims the atomics and leaves the texels untouched.
-/// `VICTORY_ATOMIC_LOCKS=0` or `1` overrides.
-fn atomic_locks() -> bool {
-    static LOCKS: OnceLock<bool> = OnceLock::new();
-    *LOCKS.get_or_init(|| match std::env::var("VICTORY_ATOMIC_LOCKS").as_deref() {
+/// Respect the same emission overrides for native warm-up and Wine.
+fn options_for(wine: bool, wave32: bool) -> Options {
+    let flag = |name, default| match std::env::var(name).as_deref() {
         Ok("0") => false,
         Ok("1") => true,
-        _ => under_wine(),
-    })
+        _ => default,
+    };
+    let atomic_locks = flag("VICTORY_ATOMIC_LOCKS", wine);
+    let rounds = std::env::var("VICTORY_ATOMIC_LOCK_ROUNDS").ok();
+    let atomic_lock_rounds = rounds_on(atomic_locks, rounds.as_deref());
+    Options {
+        view_marks: true,
+        atomic_locks,
+        atomic_lock_rounds,
+        atomic_umax: atomic_lock_rounds && flag("VICTORY_ATOMIC_UMAX", false),
+        bias_as_gradients: flag("VICTORY_BIAS_AS_GRADIENTS", wine),
+        host_wave32: wave32,
+        narrow_waves: flag("VICTORY_NARROW_WAVES", wine),
+    }
 }
 
-/// Whether the lanes of a wave first try their 64-bit atomics' locks in
-/// rounds before the lanes still not done take turns (`emit`, "Atomic
-/// locks"; #240): wherever [`atomic_locks`] are on. In the game the rounds
-/// took a world frame from 7.9 to 2.5 s on an M2 Max, from 5.29 to 0.71 s
-/// on an M4 Pro and from 2.9 to 0.88 s on an M4, and left no GPU resets.
-/// `VICTORY_ATOMIC_LOCK_ROUNDS=0` goes back to the turns alone.
-fn atomic_lock_rounds() -> bool {
-    static ROUNDS: OnceLock<bool> = OnceLock::new();
-    *ROUNDS.get_or_init(|| {
-        let var = std::env::var("VICTORY_ATOMIC_LOCK_ROUNDS").ok();
-        rounds_on(atomic_locks(), var.as_deref())
-    })
-}
-
-/// Whether a glc-clear 64-bit `umax` first reduces each texel's lanes of
-/// a wave to their maximum key, one representative locking (`emit`,
-/// "Atomic locks"; #240): opt-in while it is measured,
-/// `VICTORY_ATOMIC_UMAX=1`. Only with [`atomic_lock_rounds`].
-fn atomic_umax() -> bool {
-    static UMAX: OnceLock<bool> = OnceLock::new();
-    *UMAX.get_or_init(|| {
-        atomic_lock_rounds() && std::env::var("VICTORY_ATOMIC_UMAX").as_deref() == Ok("1")
-    })
-}
-
-/// The rounds, given whether the locks are on and
-/// `VICTORY_ATOMIC_LOCK_ROUNDS`: on with the locks unless it is `0`.
 fn rounds_on(locks: bool, var: Option<&str>) -> bool {
     locks && var != Some("0")
-}
-
-/// Whether compute shaders' biased samples run as scaled gradient samples:
-/// under Wine, whose D3DMetal ignores the bias there (#30).
-/// `VICTORY_BIAS_AS_GRADIENTS=0` or `1` overrides.
-fn bias_as_gradients() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("VICTORY_BIAS_AS_GRADIENTS").as_deref() {
-        Ok("0") => false,
-        Ok("1") => true,
-        _ => under_wine(),
-    })
-}
-
-/// Whether translations take wave64 programs to run in 32-lane host waves:
-/// under Wine, whose D3DMetal reports 32 lanes and ignores `WaveSize(64)`.
-/// `VICTORY_NARROW_WAVES=0` or `1` overrides.
-fn narrow_waves() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("VICTORY_NARROW_WAVES").as_deref() {
-        Ok("0") => false,
-        Ok("1") => true,
-        _ => under_wine(),
-    })
 }
 
 /// Whether this runs under Wine (on a Mac: D3DMetal's D3D12).
@@ -189,24 +192,25 @@ pub(crate) fn under_wine() -> bool {
 /// [`build`] for translations with host workarounds (atomic locks, their
 /// rounds and umax reduction, bias as gradients, narrow waves): their own
 /// cache entries, one per combination.
-pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'static [u8; 32] {
+pub(crate) fn translation_build(options: Options) -> &'static [u8; 32] {
     let locks = options.atomic_locks;
     let bias = options.bias_as_gradients;
     let narrow = options.narrow_waves;
     let rounds = locks && options.atomic_lock_rounds;
     let umax = rounds && options.atomic_umax;
     if !locks && !bias && !narrow {
-        return build();
+        return build(options.host_wave32);
     }
-    static BUILDS: [OnceLock<[u8; 32]>; 32] = [const { OnceLock::new() }; 32];
+    static BUILDS: [OnceLock<[u8; 32]>; 64] = [const { OnceLock::new() }; 64];
     let n = usize::from(locks)
         | usize::from(bias) << 1
         | usize::from(narrow) << 2
         | usize::from(rounds) << 3
-        | usize::from(umax) << 4;
+        | usize::from(umax) << 4
+        | usize::from(options.host_wave32) << 5;
     BUILDS[n].get_or_init(|| {
         let mut h = blake3::Hasher::new();
-        h.update(build());
+        h.update(build(options.host_wave32));
         if locks {
             h.update(b"atomic locks");
         }
@@ -226,33 +230,20 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
     })
 }
 
-pub(crate) fn runtime_options() -> victory_shader::emit::Options {
-    // Writes through views mark their pages: copy-backs compare only those
-    // (`crate::shadow::copy_back_marks`).
-    // Under Wine (D3DMetal), 64-bit image atomics run under locks: its own
-    // leave the texels untouched (`emit`, "Atomic locks"). On a host of
-    // 32-lane waves, wave64 programs run in halves (`build` keys on it).
-    victory_shader::emit::Options {
-        view_marks: true,
-        atomic_locks: atomic_locks(),
-        atomic_lock_rounds: atomic_lock_rounds(),
-        atomic_umax: atomic_umax(),
-        bias_as_gradients: bias_as_gradients(),
-        host_wave32: host_wave32(),
-        narrow_waves: narrow_waves(),
-    }
+pub(crate) fn runtime_options() -> Options {
+    static OPTIONS: OnceLock<Options> = OnceLock::new();
+    *OPTIONS.get_or_init(|| options_for(under_wine(), host_wave32()))
 }
 
-/// The translation of a console shader container, from the cache when
-/// there is one, and whether it came from there.
+fn translate(container: &[u8], options: Options) -> Result<HostShader, String> {
+    victory_shader::emit::translate_with(container, options).map_err(|e| e.to_string())
+}
+
+/// The translation of a console shader container, and whether it was cached.
 pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
-    let options = runtime_options();
-    let translate =
-        |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
-    let build = translation_build(options);
     match CACHE.get() {
-        Some(cache) => cached(cache, build, container, translate),
-        None => (translate(container), false),
+        Some(cache) => cache.host_shader(container),
+        None => (translate(container, runtime_options()), false),
     }
 }
 
@@ -694,7 +685,7 @@ mod tests {
             key("0123456789abcdef", b"encoding", 1 << 20, false, true)
         );
         assert_eq!(
-            *build(),
+            *build(host_wave32()),
             key(
                 victory_shader::SOURCE_HASH,
                 ENCODING,
