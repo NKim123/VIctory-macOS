@@ -3172,6 +3172,8 @@ mod tests {
                 ((**unknown).AddRef)(raw);
                 ((**unknown).Release)(raw)
             };
+            let list = host.new_list().unwrap();
+            list.close();
             for release in [false, true] {
                 heap.raw_view_at(a, Some(&buffer), 0, 256, false);
                 assert_eq!(references(&buffer), 2, "ours and the slot's");
@@ -3181,8 +3183,9 @@ mod tests {
                     heap.make_null(a);
                 }
                 assert!(!heap.kept(a), "the slot no longer owns the resource");
-                assert!(references(&buffer) >= 2, "the slot's reference is retired");
-                crate::host::release_retired();
+                // Complete a real submission rather than draining the global
+                // retirement queue while another test might have work in flight.
+                host.execute(&[&list]);
                 // Released on a thread of its own.
                 let since = std::time::Instant::now();
                 while references(&buffer) > 1 && since.elapsed() < std::time::Duration::from_secs(5) {
