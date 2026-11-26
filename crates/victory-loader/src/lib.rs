@@ -26,7 +26,6 @@ pub mod amd_patch;
 #[cfg(windows)]
 mod crash;
 pub mod masked;
-pub mod wide;
 #[cfg(windows)]
 mod patch;
 pub mod prepare;
@@ -43,6 +42,7 @@ mod threads;
 mod thunks;
 #[cfg(windows)]
 mod tls;
+pub mod wide;
 #[cfg(windows)]
 mod windows;
 #[cfg(all(windows, target_arch = "x86_64"))]

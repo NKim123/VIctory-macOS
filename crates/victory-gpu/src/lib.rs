@@ -22,10 +22,10 @@ mod alias;
 mod ambient;
 #[cfg(windows)]
 mod bindless;
-#[cfg(all(windows, feature = "diagnostics"))]
-mod capture;
 #[cfg(any(windows, test))]
 mod caption;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod capture;
 #[cfg(windows)]
 mod composite;
 #[cfg(windows)]
@@ -95,11 +95,11 @@ mod widened;
 mod inplace_probe;
 
 #[cfg(all(windows, feature = "diagnostics"))]
-pub use copystat::CountingAlloc;
+pub use alias::{PhysicalHeap, physical_heap};
 #[cfg(windows)]
 pub use alias::{alias_region, enabled as alias_buffers, unalias_region};
 #[cfg(all(windows, feature = "diagnostics"))]
-pub use alias::{PhysicalHeap, physical_heap};
+pub use copystat::CountingAlloc;
 #[cfg(windows)]
 pub use host::{MeshSupport, host_mesh_support, on_failure};
 #[cfg(windows)]
