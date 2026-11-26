@@ -31,6 +31,19 @@ enum Seen {
     Left(#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))] (usize, u64, u64)),
 }
 
+impl Seen {
+    fn same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Buffer(a, start, len, uav), Self::Buffer(b, x, n, write)) => {
+                Arc::ptr_eq(a, b) && (start, len, uav) == (x, n, write)
+            }
+            (Self::Texture(a), Self::Texture(b)) => a == b,
+            (Self::Left(a), Self::Left(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
 /// Kinds of views left without a host view, for the census.
 #[cfg(feature = "diagnostics")]
 const KINDS: [&str; 4] = ["buffer", "unordered buffer", "placed texture", "other"];
@@ -43,6 +56,12 @@ pub(crate) struct Viewed {
     occupied: Box<[AtomicU64]>,
 }
 
+/// A short run of slot updates covered by the host heap's mirror lock.
+pub(crate) struct Updates<'a> {
+    viewed: &'a Viewed,
+    inner: Option<std::sync::MutexGuard<'a, Inner>>,
+}
+
 type Range = (usize, u64, u64, bool);
 
 /// A merged range: copy, start, bytes, unordered access, the copy's bit in
@@ -52,7 +71,7 @@ type Hull = (Arc<Shadow>, u64, u64, bool, Option<u32>);
 #[derive(Default)]
 struct Inner {
     slots: HashMap<u32, Seen>,
-    ranges: BTreeMap<Range, (u32, Arc<Shadow>)>,
+    ranges: HashMap<Range, (u32, Arc<Shadow>)>,
     textures: BTreeMap<usize, u32>,
     /// `ranges` merged per copy and kind ([`Viewed::ranges`]), kept current
     /// as ranges come and go (each list running heap shaders asks for all
@@ -172,28 +191,13 @@ impl Viewed {
                 Some(Seen::Left(left_kind(v)))
             }
         });
-        let word = self.occupied.get(index as usize / 64);
-        let bit = 1 << (index % 64);
-        // HostHeap serializes changes to a title slot with its made lock.
-        // Outside the bitmap, always use the map.
-        if seen.is_none()
-            && spans_quick()
-            && word.is_some_and(|word| word.load(std::sync::atomic::Ordering::Acquire) & bit == 0)
-        {
-            return;
-        }
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(old) = inner.slots.remove(&index) {
-            inner.count(&old, false);
-        }
-        if let Some(seen) = seen {
-            inner.count(&seen, true);
-            inner.slots.insert(index, seen);
-            if let Some(word) = word {
-                word.fetch_or(bit, std::sync::atomic::Ordering::Release);
-            }
-        } else if let Some(word) = word {
-            word.fetch_and(!bit, std::sync::atomic::Ordering::Release);
+        self.updates().set(index, seen);
+    }
+
+    pub(crate) fn updates(&self) -> Updates<'_> {
+        Updates {
+            viewed: self,
+            inner: None,
         }
     }
 
@@ -233,8 +237,70 @@ impl Viewed {
     }
 }
 
+impl Updates<'_> {
+    pub(crate) fn clear(&mut self, index: u32) {
+        self.set(index, None);
+    }
+
+    /// Install the range already resolved when a buffer descriptor was made.
+    pub(crate) fn buffer(&mut self, index: u32, backing: BufferView, uav: bool) {
+        self.set(index, seen_buffer(backing, uav));
+    }
+
+    fn set(&mut self, index: u32, seen: Option<Seen>) {
+        let word = self.viewed.occupied.get(index as usize / 64);
+        let bit = 1 << (index % 64);
+        // HostHeap serializes changes to a title slot with its made lock.
+        // Outside the bitmap, always use the map.
+        if seen.is_none()
+            && spans_quick()
+            && word.is_some_and(|word| word.load(std::sync::atomic::Ordering::Acquire) & bit == 0)
+        {
+            return;
+        }
+        let inner = self
+            .inner
+            .get_or_insert_with(|| self.viewed.inner.lock().unwrap_or_else(|e| e.into_inner()));
+        if let Some(seen) = seen {
+            use std::collections::hash_map::Entry;
+            let old = match inner.slots.entry(index) {
+                Entry::Occupied(mut slot) => {
+                    if slot.get().same(&seen) {
+                        return;
+                    }
+                    Some(slot.insert(seen.clone()))
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert(seen.clone());
+                    None
+                }
+            };
+            if let Some(old) = old {
+                inner.count(&old, false);
+            }
+            inner.count(&seen, true);
+            if let Some(word) = word {
+                word.fetch_or(bit, std::sync::atomic::Ordering::Release);
+            }
+        } else {
+            if let Some(old) = inner.slots.remove(&index) {
+                inner.count(&old, false);
+            }
+            if let Some(word) = word {
+                word.fetch_and(!bit, std::sync::atomic::Ordering::Release);
+            }
+        }
+    }
+}
+
+type BufferView = (Arc<Shadow>, u64, u64);
+
 /// What a made view reads that title memory feeds.
-fn seen(view: &View, backing: Option<(Arc<Shadow>, u64, u64)>) -> Option<Seen> {
+fn seen(view: &View, backing: Option<BufferView>) -> Option<Seen> {
+    let unordered = |v: &View| matches!(v, View::Unordered(..) | View::Placed(true, ..));
+    if let Some(backing) = backing {
+        return seen_buffer(backing, unordered(view));
+    }
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
     if let View::Shader(resource, _) = view
@@ -243,7 +309,7 @@ fn seen(view: &View, backing: Option<(Arc<Shadow>, u64, u64)>) -> Option<Seen> {
         return texture.title_written().then_some(Seen::Texture(*resource));
     }
     // The copy the host view reads.
-    let (shadow, address, len) = match *view {
+    let backing = match *view {
         View::Constant(address, size) => {
             let len = u64::from(size);
             (
@@ -254,9 +320,12 @@ fn seen(view: &View, backing: Option<(Arc<Shadow>, u64, u64)>) -> Option<Seen> {
                 len,
             )
         }
-        _ => backing.or_else(|| crate::descriptor::host::view_copy(view))?,
+        _ => crate::descriptor::host::view_copy(view)?,
     };
-    let uav = matches!(view, View::Unordered(..) | View::Placed(true, ..));
+    seen_buffer(backing, unordered(view))
+}
+
+fn seen_buffer((shadow, address, len): BufferView, uav: bool) -> Option<Seen> {
     if len == 0 {
         return None;
     }

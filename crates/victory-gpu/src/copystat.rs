@@ -107,6 +107,7 @@ pub(crate) enum C {
     SyncCaptureUs,
     SyncPublishUs,
     SyncChanged,
+    SyncTemplateHits,
     SyncMarkedSlots,
     SyncAuditSlots,
     SyncAuditUs,
@@ -422,13 +423,14 @@ pub(crate) fn log(frames: f64) {
     );
     let per_frame = |counter: C| c[counter as usize];
     tracing::info!(
-        "heap sync per frame: take {:.1} ms, capture {:.1} worker-ms, publish {:.1} ms; {:.0} changed, {:.0} marked, {:.0} audit slots; audit scheduling {:.3} ms",
+        "heap sync per frame: take {:.1} ms, capture {:.1} worker-ms, publish {:.1} ms; {:.0} changed, {:.0} marked, {:.0} audit slots, {:.0} template hits; audit scheduling {:.3} ms",
         ms(per_frame(C::SyncTakeUs)),
         ms(per_frame(C::SyncCaptureUs)),
         ms(per_frame(C::SyncPublishUs)),
         per_frame(C::SyncChanged),
         per_frame(C::SyncMarkedSlots),
         per_frame(C::SyncAuditSlots),
+        per_frame(C::SyncTemplateHits),
         ms(per_frame(C::SyncAuditUs)),
     );
     tracing::info!(

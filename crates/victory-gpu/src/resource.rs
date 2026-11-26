@@ -2149,8 +2149,8 @@ impl Drop for Resource {
             use windows::core::Interface;
             life::note(h.texture.as_raw() as usize, life::RELEASED, 0, life::holders(&h.texture));
         }
-        crate::bindless::forget(std::ptr::from_ref::<Resource>(self) as usize);
         if self.desc.dimension != BUFFER {
+            crate::bindless::forget(std::ptr::from_ref::<Resource>(self) as usize);
             crate::texback::released(std::ptr::from_ref::<Resource>(self) as usize);
             let mut map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
             let at = self.data() as u64;

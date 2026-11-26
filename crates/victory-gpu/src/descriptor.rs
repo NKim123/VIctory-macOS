@@ -210,29 +210,42 @@ fn heap_at(heaps: &[Registration], handle: u64) -> Option<usize> {
 /// so `Heap::drop` cannot free the heap concurrently.
 #[cfg(windows)]
 fn mirror(handle: u64) {
+    mirror_all(std::iter::once(handle));
+}
+
+#[cfg(windows)]
+fn mirror_all(handles: impl Iterator<Item = u64>) {
     #[cfg(feature = "diagnostics")]
     let waited = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MirrorWaitUs);
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     #[cfg(feature = "diagnostics")]
     drop(waited);
-    let Some(at) = heap_at(&heaps, handle) else {
-        return;
-    };
-    // SAFETY: registered heaps stay alive until `Heap::drop`, which takes
-    // the `SHADER_HEAPS` lock we hold here.
-    let heap = unsafe { &*(at as *const Heap) };
-    let Some(index) = heap.index(handle) else {
-        return;
-    };
-    #[cfg(target_arch = "x86_64")]
-    crate::port_descriptors::mark(handle);
-    let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
-    match heap.host.get() {
-        None => pending.push(index),
-        Some(host) => {
-            drop(pending);
+    for handle in handles {
+        let Some(at) = heap_at(&heaps, handle) else {
+            continue;
+        };
+        // SAFETY: registered heaps stay alive until `Heap::drop`, which
+        // takes the `SHADER_HEAPS` lock we hold here.
+        let heap = unsafe { &*(at as *const Heap) };
+        let Some(index) = heap.index(handle) else {
+            continue;
+        };
+        #[cfg(target_arch = "x86_64")]
+        crate::port_descriptors::mark(handle);
+        if let Some(host) = heap.host.get() {
             if let Some(host) = host {
                 host.mirror(index, handle, false);
+            }
+        } else {
+            let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
+            match heap.host.get() {
+                None => pending.push(index),
+                Some(host) => {
+                    drop(pending);
+                    if let Some(host) = host {
+                        host.mirror(index, handle, false);
+                    }
+                }
             }
         }
     }
@@ -1243,9 +1256,7 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
         // An equal record may still have arrived as bytes and be new to the
         // host heap, or be from a resource since released.
         #[cfg(windows)]
-        for i in 0..u64::from(count) {
-            mirror(dst + i * step);
-        }
+        mirror_all((0..u64::from(count)).map(|i| dst + i * step));
     }
 }
 
