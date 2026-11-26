@@ -109,6 +109,7 @@ pub(crate) enum C {
     SyncChanged,
     SyncMarkedSlots,
     SyncAuditSlots,
+    SyncAuditUs,
     TextureTakes,
     DescriptorTakes,
     ExactTakes,
@@ -421,13 +422,14 @@ pub(crate) fn log(frames: f64) {
     );
     let per_frame = |counter: C| c[counter as usize];
     tracing::info!(
-        "heap sync per frame: take {:.1} ms, capture {:.1} worker-ms, publish {:.1} ms; {:.0} changed, {:.0} marked, {:.0} audit slots",
+        "heap sync per frame: take {:.1} ms, capture {:.1} worker-ms, publish {:.1} ms; {:.0} changed, {:.0} marked, {:.0} audit slots; audit scheduling {:.3} ms",
         ms(per_frame(C::SyncTakeUs)),
         ms(per_frame(C::SyncCaptureUs)),
         ms(per_frame(C::SyncPublishUs)),
         per_frame(C::SyncChanged),
         per_frame(C::SyncMarkedSlots),
         per_frame(C::SyncAuditSlots),
+        ms(per_frame(C::SyncAuditUs)),
     );
     tracing::info!(
         "watch takes/protects per frame: buffer {:.0}/{:.0}, exact view {:.0}/{:.0}, texture {:.0}/{:.0}, descriptor {:.0}/{:.0}",

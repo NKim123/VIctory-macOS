@@ -1,8 +1,9 @@
 //! Records title descriptor writes from the byte-verified table stores and
 //! imported copies. Based on VIctory-7900XTX's renderer port 2 (GPL-3.0).
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, Ordering};
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 
 use Ordering::{AcqRel, Acquire, Relaxed, Release};
 
@@ -100,7 +101,6 @@ impl Slots {
 
 static SLOTS: OnceLock<Slots> = OnceLock::new();
 static HEAP: RwLock<Option<usize>> = RwLock::new(None);
-static LAST_SCAN: AtomicU64 = AtomicU64::new(u64::MAX);
 
 pub(crate) fn adopt(id: usize, start: u64, count: u32) {
     let count = count as usize;
@@ -141,17 +141,111 @@ pub(crate) fn retire(id: usize) {
 }
 
 /// Taken with the descriptor registry held, which serializes retirement.
-pub(crate) fn take(id: usize) -> Option<(Vec<(usize, usize)>, bool)> {
+pub(crate) fn take(id: usize) -> Option<Vec<(usize, usize)>> {
     if MARKS.len.load(Acquire) == 0 || *HEAP.read().unwrap_or_else(|e| e.into_inner()) != Some(id) {
         return None;
     }
-    let frame = crate::frame::current();
-    let scanned = LAST_SCAN.load(Relaxed);
-    let audit = scanned == u64::MAX || frame.saturating_sub(scanned) >= 8;
-    if audit {
-        LAST_SCAN.store(frame, Relaxed);
+    Some(SLOTS.get().unwrap().take())
+}
+
+// Use the dirty parts returned by the watch. One console page can contain
+// sixteen of these, and a single store need not make all sixteen due.
+const AUDIT_PAGE: usize = 4096;
+
+#[derive(Default)]
+struct Audit {
+    dirty: BTreeSet<usize>,
+    asked: Option<u64>,
+    checked: Option<u64>,
+    next: usize,
+    untracked: bool,
+}
+
+impl Audit {
+    fn take(
+        &mut self,
+        frame: u64,
+        bounds: std::ops::Range<usize>,
+        pages: usize,
+        interval: u64,
+        watch: impl FnOnce() -> Option<crate::watch::Runs>,
+    ) -> crate::watch::Runs {
+        if self.checked == Some(frame) || bounds.is_empty() {
+            return Vec::new();
+        }
+        self.checked = Some(frame);
+        let first = self.asked.is_none();
+        let due = first || frame.saturating_sub(self.asked.unwrap_or(frame)) >= interval;
+        if due {
+            self.asked = Some(frame);
+            let watched = watch();
+            self.untracked = watched.is_none();
+            if first || pages == 0 {
+                return watched.unwrap_or_else(|| vec![(bounds.start, bounds.end)]);
+            }
+            for (from, to) in watched.unwrap_or_default() {
+                self.dirty
+                    .extend(from / AUDIT_PAGE..to.div_ceil(AUDIT_PAGE));
+            }
+        }
+        if self.untracked && pages != 0 {
+            let from = (self.next * AUDIT_PAGE).max(bounds.start);
+            let to = (from / AUDIT_PAGE)
+                .saturating_add(pages)
+                .saturating_mul(AUDIT_PAGE)
+                .min(bounds.end);
+            self.next = if to == bounds.end { 0 } else { to / AUDIT_PAGE };
+            return vec![(from, to)];
+        }
+        let mut out = Vec::new();
+        for _ in 0..pages {
+            let Some(&page) = self
+                .dirty
+                .range(self.next..)
+                .next()
+                .or_else(|| self.dirty.first())
+            else {
+                break;
+            };
+            self.dirty.remove(&page);
+            self.next = page + 1;
+            let from = (page * AUDIT_PAGE).max(bounds.start);
+            let to = ((page + 1) * AUDIT_PAGE).min(bounds.end);
+            if from < to {
+                out.push((from, to));
+            }
+        }
+        out
     }
-    Some((SLOTS.get().unwrap().take(), audit))
+}
+
+/// Fallback for the one adopted heap. Like the 7900XTX audit, rearm the
+/// watch periodically and visit queued dirty pages in address order with
+/// wraparound, so later writes cannot starve an older dirty page.
+pub(crate) fn audit(
+    start: usize,
+    end: usize,
+    watch: impl FnOnce() -> Option<crate::watch::Runs>,
+) -> crate::watch::Runs {
+    static AUDIT: OnceLock<Mutex<Audit>> = OnceLock::new();
+    static CONFIG: OnceLock<(usize, u64)> = OnceLock::new();
+    let &(pages, interval) = CONFIG.get_or_init(|| {
+        let pages = std::env::var("VICTORY_DESCRIPTOR_AUDIT_PAGES")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(16);
+        let frames = std::env::var("VICTORY_DESCRIPTOR_AUDIT_FRAMES")
+            .ok()
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(8)
+            .max(1);
+        (pages, frames)
+    });
+    AUDIT
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take(crate::frame::current(), start..end, pages, interval, watch)
 }
 
 fn overlap(to: usize, len: usize, start: usize, bytes: usize) -> std::ops::Range<usize> {
@@ -262,6 +356,58 @@ unsafe fn copy_guarded(dst: *mut u8, src: *const u8, len: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_wraps_past_pages_that_keep_getting_dirtied() {
+        let p = AUDIT_PAGE;
+        let mut audit = Audit::default();
+        let bounds = 4 * p + 32..9 * p - 32;
+        let writes = || {
+            Some(vec![
+                (4 * p + 64, 5 * p),
+                (6 * p, 7 * p),
+                (8 * p, 8 * p + 32),
+            ])
+        };
+        assert_eq!(
+            audit.take(0, bounds.clone(), 1, 1, writes),
+            writes().unwrap()
+        );
+        assert_eq!(
+            audit.take(1, bounds.clone(), 1, 1, writes),
+            [(bounds.start, 5 * p)]
+        );
+        assert!(
+            audit
+                .take(1, bounds.clone(), 1, 1, || unreachable!())
+                .is_empty()
+        );
+        assert_eq!(
+            audit.take(2, bounds.clone(), 1, 1, writes),
+            [(6 * p, 7 * p)]
+        );
+        assert_eq!(
+            audit.take(3, bounds.clone(), 1, 1, writes),
+            [(8 * p, bounds.end)]
+        );
+        assert_eq!(
+            audit.take(4, bounds.clone(), 1, 1, writes),
+            [(bounds.start, 5 * p)]
+        );
+    }
+
+    #[test]
+    fn audit_without_a_watch_sweeps_every_page() {
+        let p = AUDIT_PAGE;
+        let lo = 4 * p + 32;
+        let hi = 7 * p - 32;
+        let mut audit = Audit::default();
+        assert_eq!(audit.take(0, lo..hi, 1, 8, || None), [(lo, hi)]);
+        assert_eq!(audit.take(1, lo..hi, 1, 8, || unreachable!()), [(lo, 5 * p)]);
+        assert_eq!(audit.take(2, lo..hi, 1, 8, || unreachable!()), [(5 * p, 6 * p)]);
+        assert_eq!(audit.take(3, lo..hi, 1, 8, || unreachable!()), [(6 * p, hi)]);
+        assert_eq!(audit.take(4, lo..hi, 1, 8, || unreachable!()), [(lo, 5 * p)]);
+    }
 
     #[test]
     fn copy_marks_partial_slots_and_coalesces_across_chunks() {

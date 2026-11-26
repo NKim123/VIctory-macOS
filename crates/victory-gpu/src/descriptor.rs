@@ -285,7 +285,7 @@ pub(crate) fn request_heap_records() {
                     if result.is_empty() {
                         // One outstanding result and a bounded number of 4
                         // KiB dirty spans, even for a very large title heap.
-                        *result = take_heap_writes(64 << 20);
+                        *result = take_heap_writes(64 << 20, false);
                     }
                 }
             })
@@ -298,7 +298,7 @@ pub(crate) fn request_heap_records() {
 }
 
 #[cfg(windows)]
-fn take_heap_writes(mut budget: usize) -> Vec<HeapWrites> {
+fn take_heap_writes(mut budget: usize, _audit: bool) -> Vec<HeapWrites> {
     #[cfg(feature = "diagnostics")]
     let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncTakeUs);
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
@@ -323,22 +323,27 @@ fn take_heap_writes(mut budget: usize) -> Vec<HeapWrites> {
             continue;
         }
         #[cfg(target_arch = "x86_64")]
-        if let Some((marks, audit)) = crate::port_descriptors::take(at) {
-            let mut ranges = Vec::new();
-            if audit {
-                ranges = heap.written.as_ref().map_or_else(
-                    || vec![(start_address, limit)],
-                    |written| watch_heap(written, start_address, limit),
-                );
+        if let Some(marks) = crate::port_descriptors::take(at) {
+            let mut ranges = if _audit {
                 #[cfg(feature = "diagnostics")]
-                crate::copystat::add(
-                    crate::copystat::C::SyncAuditSlots,
-                    ranges
-                        .iter()
-                        .map(|&(a, b)| (b - a).div_ceil(step as usize) as u64)
-                        .sum(),
-                );
-            }
+                let _timed =
+                    crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncAuditUs);
+                crate::port_descriptors::audit(start_address, end, || {
+                    heap.written
+                        .as_ref()
+                        .map(|written| watch_heap(written, start_address, end))
+                })
+            } else {
+                Vec::new()
+            };
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(
+                crate::copystat::C::SyncAuditSlots,
+                ranges
+                    .iter()
+                    .map(|&(a, b)| (b - a).div_ceil(step as usize) as u64)
+                    .sum(),
+            );
             let count = host.count() as usize;
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(
@@ -361,11 +366,6 @@ fn take_heap_writes(mut budget: usize) -> Vec<HeapWrites> {
                     sync_id: heap.sync_id,
                     ranges,
                 });
-            }
-            if audit {
-                let pages =
-                    limit.div_ceil(crate::watch::PAGE) - start_address / crate::watch::PAGE;
-                budget = budget.saturating_sub(pages * crate::watch::PAGE);
             }
             continue;
         }
@@ -404,10 +404,10 @@ pub(crate) fn sync_heaps() {
         let mut work = std::mem::take(&mut *ready);
         // Recheck live writes here. A queue wait can release after the
         // early round, and the title can rewrite a record while held.
-        work.extend(take_heap_writes(usize::MAX));
+        work.extend(take_heap_writes(usize::MAX, true));
         work
     } else {
-        take_heap_writes(usize::MAX)
+        take_heap_writes(usize::MAX, true)
     };
     publish_heap_writes(work);
 }
