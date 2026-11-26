@@ -649,10 +649,10 @@ impl Shared {
         if let Ok(pso) = load(&self.loads, PCWSTR(wide.as_ptr())) {
             LOADED.fetch_add(1, Ordering::Relaxed);
             self.loaded.fetch_add(1, Ordering::Relaxed);
-            let mut l = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let Some(fresh) = self.fresh.get() else {
                 return Ok((pso, CacheStatus::Loaded));
             };
+            let mut l = self.state.lock().unwrap_or_else(|e| e.into_inner());
             // A checkpoint can claim this hit only once the active library
             // has the pipeline. Another save might have preceded this load.
             // SAFETY: fresh, wide and pso are live.
