@@ -88,6 +88,8 @@ mod texback;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
+mod tiled;
+#[cfg(windows)]
 mod twin;
 #[cfg(windows)]
 mod watch;
@@ -97,8 +99,8 @@ mod widened;
 #[cfg(all(windows, test))]
 mod inplace_probe;
 
-#[cfg(all(windows, feature = "diagnostics"))]
-pub use alias::{PhysicalHeap, physical_heap};
+#[cfg(windows)]
+pub use alias::{PhysicalHeap, physical_heap, physical_tiles_enabled};
 #[cfg(windows)]
 pub use alias::{alias_region, enabled as alias_buffers, unalias_region};
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -107,6 +109,10 @@ pub use copystat::CountingAlloc;
 pub use host::{MeshSupport, host_mesh_support, on_failure};
 #[cfg(windows)]
 pub use land::{LandingPage, enabled as landing_enabled, next_mapping_epoch, use_landing_pages};
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use tiled::probe_tiled_alias;
+#[cfg(windows)]
+pub use tiled::{MAX_TILED_BUFFER, TiledAlias, with_physical_mapping};
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, fault_tracking, rosetta, stores_need_patching, title_memory_aliased,

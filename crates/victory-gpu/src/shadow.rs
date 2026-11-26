@@ -151,6 +151,7 @@ pub(crate) struct Shadow {
     /// True when the title's virtual range `[start, start + len)` is
     /// `mach_vm_remap`-aliased onto `buffer`'s physical pages (zero-copy).
     aliased: bool,
+    tiled: Option<Arc<crate::tiled::TiledBuffer>>,
 }
 
 /// A 16-byte-element host copy of a three-channel 32-bit buffer view. D3DMetal
@@ -241,16 +242,29 @@ impl Widened {
         }
         let first = (from - start) / 12;
         let last = (to - start).div_ceil(12);
-        // SAFETY: the source range is inside the shadow and the destination
-        // has one 16-byte element for each 12 source bytes.
-        unsafe {
-            let source = shadow.data.add(start - shadow.start as usize);
-            for i in first..last {
-                let at = source.add(i * 12);
-                let to = self.data.add(i * 16);
-                std::ptr::copy_nonoverlapping(at, to, 12);
-                to.add(12).cast::<u32>().write_volatile(self.w);
+        let offset = start - shadow.start as usize;
+        let expand = |source: *const u8, first, last| {
+            // SAFETY: the source has 12 bytes per element in this range
+            // and the widened destination has 16 for every element.
+            unsafe {
+                for i in first..last {
+                    let at = source.add((i - first) * 12);
+                    let to = self.data.add(i * 16);
+                    std::ptr::copy_nonoverlapping(at, to, 12);
+                    to.add(12).cast::<u32>().write_volatile(self.w);
+                }
             }
+        };
+        if let Some(tiled) = &shadow.tiled {
+            const ELEMENTS: usize = 256;
+            let mut scratch = [0; 12 * ELEMENTS];
+            for at in (first..last).step_by(ELEMENTS) {
+                let end = last.min(at + ELEMENTS);
+                tiled.read(offset + at * 12, &mut scratch[..(end - at) * 12]);
+                expand(scratch.as_ptr(), at, end);
+            }
+        } else {
+            expand(shadow.data.wrapping_add(offset + first * 12), first, last);
         }
     }
 
@@ -318,6 +332,9 @@ impl Shadow {
     pub(crate) fn read_host(&self, address: u64, n: usize) -> Vec<u32> {
         let at = (address - self.start) as usize;
         assert!(at + 4 * n <= self.len as usize);
+        if self.tiled.is_some() {
+            return self.read_tiled_words(at, n);
+        }
         // SAFETY: inside the mapping (checked); the GPU is done with it.
         unsafe { std::slice::from_raw_parts(self.data.add(at).cast::<u32>(), n).to_vec() }
     }
@@ -332,6 +349,7 @@ impl Shadow {
             .unwrap_or_else(|e| e.into_inner());
         let at = (address - self.start) as usize;
         assert!(at + bytes.len() <= self.len as usize);
+        assert!(self.tiled.is_none(), "write through a physical heap view");
         // SAFETY: inside the mapping (checked); the GPU is done with it.
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(at), bytes.len()) };
         if self.has_widened.load(Ordering::Acquire) {
@@ -345,10 +363,31 @@ impl Shadow {
     pub(crate) fn peek(&self, address: u64, len: u64) -> String {
         let at = address.saturating_sub(self.start) as usize;
         let n = (len.min(64) as usize).min((self.len as usize).saturating_sub(at)) / 4;
+        if self.tiled.is_some() {
+            let v: Vec<_> = self
+                .read_tiled_words(at, n)
+                .into_iter()
+                .map(f32::from_bits)
+                .collect();
+            return format!("tiled {:#x}+{:#x} {v:?}", self.start, self.len);
+        }
         // SAFETY: inside the mapping (checked); a racing GPU write only makes
         // the logged value stale.
         let v = unsafe { std::slice::from_raw_parts(self.data.add(at).cast::<f32>(), n) };
         format!("copy {:#x}+{:#x} {v:?}", self.start, self.len)
+    }
+
+    #[cfg(any(test, feature = "diagnostics"))]
+    fn read_tiled_words(&self, offset: usize, n: usize) -> Vec<u32> {
+        let mut bytes = vec![0; 4 * n];
+        self.tiled.as_ref().unwrap().read(offset, &mut bytes);
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .copied()
+            .map(u32::from_le_bytes)
+            .collect()
     }
 
     /// Offset of a title address from the buffer's start.
@@ -561,6 +600,7 @@ impl Shadow {
             base: slice.map_or(0, |s| s.offset),
             slice,
             aliased: false,
+            tiled: None,
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -576,6 +616,34 @@ impl Shadow {
         gpu: u64,
         start: u64,
         len: u64,
+    ) -> Arc<Shadow> {
+        Self::new_alias(buffer, data, gpu, start, len, None)
+    }
+
+    pub(crate) fn new_tiled(
+        buffer: ID3D12Resource,
+        gpu: u64,
+        start: usize,
+        len: usize,
+        tiled: Arc<crate::tiled::TiledBuffer>,
+    ) -> Arc<Shadow> {
+        Self::new_alias(
+            buffer,
+            std::ptr::null_mut(),
+            gpu,
+            start as u64,
+            len as u64,
+            Some(tiled),
+        )
+    }
+
+    fn new_alias(
+        buffer: ID3D12Resource,
+        data: *mut u8,
+        gpu: u64,
+        start: u64,
+        len: u64,
+        tiled: Option<Arc<crate::tiled::TiledBuffer>>,
     ) -> Arc<Shadow> {
         let marks = marks().take(pages(start, len));
         let shadow = Arc::new(Shadow {
@@ -594,6 +662,7 @@ impl Shadow {
             base: 0,
             slice: None,
             aliased: true,
+            tiled,
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -603,6 +672,10 @@ impl Shadow {
 
     pub(crate) fn is_aliased(&self) -> bool {
         self.aliased
+    }
+
+    pub(crate) fn is_tiled(&self) -> bool {
+        self.tiled.is_some()
     }
 
     /// The view-mark entry (`victory_shader::emit`, "Write marks") of a
@@ -1090,6 +1163,11 @@ impl Shadow {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         assert!(offset + bytes <= self.len as usize);
+        if let Some(tiled) = &self.tiled {
+            let mut data = vec![0; bytes];
+            tiled.read(offset, &mut data);
+            return data.into();
+        }
         // SAFETY: inside the persistent mapping, with the GPU still idle.
         unsafe { std::slice::from_raw_parts(self.data.add(offset), bytes) }.into()
     }
@@ -1943,6 +2021,26 @@ pub(crate) fn has_aliased_overlap(start: u64, end: u64) -> bool {
     map.range(start..end).next().is_some()
 }
 
+/// Orders first materialization of an ordinary copy against promotion of
+/// a placeholder. Cache hits and the disabled path take no new lock.
+pub(crate) fn physical_binding() -> Option<std::sync::MutexGuard<'static, ()>> {
+    static BINDING: Mutex<()> = Mutex::new(());
+    crate::alias::physical_tiles_enabled()
+        .then(|| BINDING.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// Existing native bindings cannot switch buffers in the middle of a list.
+pub(crate) fn has_materialized_overlap(start: u64, end: u64) -> bool {
+    buffers_read()
+        .range((start.saturating_sub(MAX_SPAN.load(Ordering::Relaxed)), 0)..(end, 0))
+        .any(|(_, e)| e.end > start && e.shadow.is_some())
+        || LOOSE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .range((start.saturating_sub(LOOSE_SPAN.load(Ordering::Relaxed)), 0)..(end, 0))
+            .any(|(&(at, len), _)| at + len > start)
+}
+
 pub(crate) fn register_aliased(shadow: Arc<Shadow>) {
     ALIASED_SPAN.fetch_max(shadow.len, Ordering::Relaxed);
     let mut map = ALIASED.write().unwrap_or_else(|e| e.into_inner());
@@ -1953,13 +2051,32 @@ pub(crate) fn register_aliased(shadow: Arc<Shadow>) {
 }
 
 pub(crate) fn unregister_aliased(start: u64) -> bool {
+    remove_alias(start, false)
+}
+
+pub(crate) fn unregister_unused_aliased(start: u64) -> bool {
+    remove_alias(start, true)
+}
+
+fn remove_alias(start: u64, unused_only: bool) -> bool {
     let mut map = ALIASED.write().unwrap_or_else(|e| e.into_inner());
+    if unused_only
+        && map.get(&start).is_some_and(|s| {
+            s.tiled.as_ref().is_some_and(|t| t.bound()) || Arc::strong_count(s) != 1
+        })
+    {
+        return false;
+    }
     let removed = map.remove(&start).is_some();
     if removed {
         ALIASED_COUNT.fetch_sub(1, Ordering::Release);
         changed();
     }
     removed
+}
+
+pub(crate) fn alias_coverage_changed() {
+    changed();
 }
 
 fn find_aliased(address: u64, end: u64) -> Option<Arc<Shadow>> {
@@ -1977,8 +2094,18 @@ fn find_aliased(address: u64, end: u64) -> Option<Arc<Shadow>> {
     }
     map.range(lowest..=address)
         .rev()
-        .find(|(_, s)| s.start + s.len >= end)
-        .map(|(_, s)| s.clone())
+        .find(|(_, s)| {
+            s.start + s.len >= end
+                && s.tiled
+                    .as_ref()
+                    .is_none_or(|t| t.covers(address as usize, end as usize))
+        })
+        .map(|(_, s)| {
+            if let Some(tiled) = &s.tiled {
+                tiled.bind();
+            }
+            s.clone()
+        })
 }
 
 /// Number of sets in the per-thread 2-way lookup cache (power of two).
@@ -2179,6 +2306,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 }
 
 fn find_uncached(address: u64, end: u64) -> Option<Arc<Shadow>> {
+    let _binding = physical_binding();
     if let Some(shadow) = find_aliased(address, end) {
         return Some(shadow);
     }

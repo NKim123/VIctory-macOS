@@ -523,6 +523,9 @@ impl ComputedBaselines {
             return;
         }
         for copy in &layout.copies {
+            if copy.is_tiled() {
+                continue;
+            }
             let key = Arc::as_ptr(copy) as usize;
             if copy.dirty_bit().is_some() {
                 self.tracked_copies.insert(key);
@@ -781,6 +784,17 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         } else {
             0
         };
+        // The tiled buffer already wrote the shared physical page. It
+        // only needs the texture and other view trackers notified.
+        writes.retain(|&(k, at)| {
+            let copy = &copies[k];
+            if copy.is_tiled() {
+                copy.copy_back_page(at as usize, None);
+                false
+            } else {
+                true
+            }
+        });
         if withheld > 0 {
             for &(_, at) in &writes {
                 if accept_landing {

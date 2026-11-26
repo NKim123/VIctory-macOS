@@ -372,6 +372,11 @@ pub extern "system" fn SuspendThread(thread: *mut c_void) -> u32 {
     host::suspend_thread(thread)
 }
 
+#[cfg(windows)]
+pub extern "system" fn VirtualFree(address: *mut c_void, size: usize, kind: u32) -> i32 {
+    super::xmem::release_virtual(address, size, kind)
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "kernel",
@@ -382,6 +387,7 @@ pub(crate) fn module() -> HleModule {
             "api-ms-win-core-processthreads-*",
             "api-ms-win-core-debug-*",
             "api-ms-win-core-errorhandling-*",
+            "api-ms-win-core-memory-*",
             "api-ms-win-crt-runtime-*",
         ],
         exports: vec![
@@ -405,6 +411,8 @@ pub(crate) fn module() -> HleModule {
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
             hle_export!(SuspendThread),
+            #[cfg(windows)]
+            hle_export!(VirtualFree),
         ],
     }
 }
