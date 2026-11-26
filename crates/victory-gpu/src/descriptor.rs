@@ -1043,15 +1043,8 @@ pub(crate) mod tests {
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
     }
 
-    /// A released view heap takes its title memory page table with it, also
-    /// when no heap is made at its address afterwards (else the table, its
-    /// 16.8 MiB mapping and the copies it names live on).
     #[cfg(windows)]
-    #[test]
-    fn a_released_view_heap_drops_its_page_table() {
-        let Some(host) = crate::host::host() else {
-            return; // no host GPU here
-        };
+    pub(crate) fn make_visible_test_heap() -> This {
         let desc = HeapDesc {
             kind: VIEWS_KIND,
             count: 1000,
@@ -1064,8 +1057,20 @@ pub(crate) mod tests {
         };
         let mut h = std::ptr::null();
         assert_eq!(create(desc, none, &mut h), S_OK);
-        let key = h as usize;
         assert!(heap(h).host().is_some(), "a host heap");
+        h
+    }
+
+    /// A released view heap takes its title memory page table with it (also
+    /// when no heap is made at its address afterwards).
+    #[cfg(windows)]
+    #[test]
+    fn a_released_view_heap_drops_its_page_table() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let h = make_visible_test_heap();
+        let key = h as usize;
         let list = host.new_list().unwrap();
         assert!(crate::memory::bind(&list, key).is_some(), "a page table");
         assert!(crate::memory::has_table(key));

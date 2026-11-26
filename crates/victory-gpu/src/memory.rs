@@ -569,8 +569,9 @@ impl ComputedBaselines {
             })
     }
 
-    /// Both post-fence passes use the layout that named the GPU writes,
-    /// even if the title releases the corresponding view heap meanwhile.
+    /// The opt-in post-fence passes all use the layout that named the GPU
+    /// writes, even if the title releases the view heap meanwhile. With
+    /// landing disabled, there is no captured layout.
     fn layout(&self, heap: usize) -> Arc<Layout> {
         self.heaps
             .get(&heap)
@@ -688,8 +689,8 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
     let precise: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
     let byte_for_byte = precise.clone();
     let missed_bitmap = Arc::clone(&pooled);
-    list.defer_missed(move || {
-        let l = layout(key);
+    list.defer_missed(move |baselines| {
+        let l = baselines.layout(key);
         // SAFETY: the bitmap is mapped and the list's run is over.
         let marks =
             unsafe { std::slice::from_raw_parts(missed_bitmap.data() as *const u32, BITMAP_WORDS) };
@@ -1311,20 +1312,31 @@ void main() {
     #[test]
     fn computed_write_keeps_a_section_write_without_fault_tracking() {
         if !crate::watch::fault_tracking() {
-            computed_section_write(false);
+            computed_section_write(ComputedFixture::SectionWrite);
         }
     }
 
     #[test]
     fn declared_and_computed_writes_land_a_shared_page_once() {
-        computed_section_write(true);
+        computed_section_write(ComputedFixture::SharedPage);
     }
 
-    /// Two disjoint GPU words share a page with a CPU word inside the
-    /// declared range. A second CPU write happens after declared write-back
-    /// and before the computed callback.
-    fn computed_section_write(overlap: bool) {
-        if !crate::land::enabled() {
+    #[test]
+    fn computed_marks_follow_the_submitted_layout_after_heap_release() {
+        computed_section_write(ComputedFixture::ReleasedHeap);
+    }
+
+    enum ComputedFixture {
+        SectionWrite,
+        SharedPage,
+        ReleasedHeap,
+    }
+
+    fn computed_section_write(fixture: ComputedFixture) {
+        let landing = crate::land::enabled();
+        let release_heap = matches!(fixture, ComputedFixture::ReleasedHeap);
+        let overlap = matches!(fixture, ComputedFixture::SharedPage);
+        if !landing && !release_heap {
             return;
         }
         use crate::compute::Param;
@@ -1337,7 +1349,10 @@ void main() {
             log_frame();
             log_frame();
         }
-        let host = crate::host::host().expect("the computed landing fixture needs a GPU");
+        let Some(host) = crate::host::host() else {
+            assert!(!landing, "the computed landing fixture needs a GPU");
+            return;
+        };
         let p = pool(1);
         crate::shadow::register(p, p as u64, PAGE as u64);
         let copy = crate::shadow::find(p as u64, PAGE as u64).unwrap();
@@ -1403,11 +1418,27 @@ void main() {
         let (root, pso) =
             crate::compute::pipeline(&shader, s!("computed landing"), 0, &params).unwrap();
         let list = host.new_list().unwrap();
-        let map = bind(&list, OURS).expect("a computed-address page table");
-        list.defer_missed(move || {
-            cpu_write(1);
-            false
-        });
+        if !release_heap {
+            list.defer_missed(move |_| {
+                cpu_write(1);
+                false
+            });
+        }
+        let key = if release_heap {
+            let key = crate::descriptor::tests::make_visible_test_heap() as usize;
+            list.defer_missed(move |_| {
+                use crate::object::{This, slot};
+                assert!(has_table(key));
+                let heap = key as This;
+                assert_eq!(slot::<extern "system" fn(This) -> u32>(heap, 0x10)(heap), 0);
+                assert!(!has_table(key));
+                false
+            });
+            key
+        } else {
+            OURS
+        };
+        let map = bind(&list, key).expect("a computed-address page table");
         // SAFETY: these are the live shadow, table and bitmap of an open list.
         unsafe {
             list.list.SetComputeRootSignature(&root);
@@ -1425,17 +1456,25 @@ void main() {
         let word = |offset| unsafe { ((p + offset) as *const u32).read_volatile() };
         let expected = [
             if overlap { 0x11223344 } else { 0 },
-            if overlap { 2 } else { 1 },
-            0x55667788,
+            if overlap { 2 } else { u32::from(!release_heap) },
+            if landing { 0x55667788 } else { 0 },
         ];
         assert_eq!([word(4), word(8), word(12)], expected);
-        assert_eq!(copy.read_host((p + 4) as u64, 3), expected);
+        if landing {
+            assert_eq!(copy.read_host((p + 4) as u64, 3), expected);
+        } else {
+            assert_eq!(copy.read_host((p + 12) as u64, 1), [0x55667788]);
+        }
         eprintln!(
-            "same page, {} lists, tracking {}: title and shadow words {:08x?}",
+            "same page, {} lists, released heap {release_heap}, landing {landing}, tracking {}: title words {:08x?}",
             runs.len(),
             crate::watch::fault_tracking(),
             expected
         );
+        if release_heap && withholding() {
+            log_frame();
+            log_frame();
+        }
 
         crate::shadow::unregister(p, p as u64);
         drop((declared, list, copy));

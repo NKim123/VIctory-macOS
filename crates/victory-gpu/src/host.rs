@@ -1146,6 +1146,7 @@ enum Step {
 }
 
 type AfterWork = Box<dyn Fn(&mut crate::memory::ComputedBaselines) + Send>;
+type MissedCheck = Box<dyn Fn(&crate::memory::ComputedBaselines) -> bool + Send>;
 
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
@@ -1184,7 +1185,7 @@ struct Deferred {
     /// Asked once the list has run, before anything goes back: whether its
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
-    missed: Vec<Box<dyn Fn() -> bool + Send>>,
+    missed: Vec<MissedCheck>,
 }
 
 impl Host {
@@ -1752,7 +1753,7 @@ impl Host {
         // builder in one list, run light13).
         let missed: Vec<bool> = runs
             .iter()
-            .map(|list| list.deferred().missed.iter().any(|check| check()))
+            .map(|list| list.deferred().missed.iter().any(|check| check(&computed)))
             .collect();
         crate::memory::note_submission(missed.contains(&true));
         let withholding = crate::memory::withholding();
@@ -2576,7 +2577,10 @@ impl HostList {
 
     /// After the list has run, before its writes go back: `check` says
     /// whether its shaders read title memory with no copy.
-    pub(crate) fn defer_missed(&self, check: impl Fn() -> bool + Send + 'static) {
+    pub(crate) fn defer_missed(
+        &self,
+        check: impl Fn(&crate::memory::ComputedBaselines) -> bool + Send + 'static,
+    ) {
         self.deferred().missed.push(Box::new(check));
     }
 
@@ -4626,7 +4630,7 @@ mod withholding {
             // The shader's write, after the step that keeps the range's bytes.
             list.defer_host(move || copy.write_host(address, &[value]));
         }
-        list.defer_missed(|| true);
+        list.defer_missed(|_| true);
         list.close();
         host.execute(&[&list]);
         // SAFETY: bytes of our pools.

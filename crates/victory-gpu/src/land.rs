@@ -314,7 +314,7 @@ mod tests {
         exact.gpu_writes(&list, a as u64, PAGE as u64, false);
         marked.refresh(&list, (a + PAGE) as u64, PAGE as u64);
         marked.gpu_writes(&list, (a + PAGE) as u64, PAGE as u64, true);
-        list.defer_missed(move || {
+        list.defer_missed(move |_| {
             assert_eq!(protection(b + PAGE), PAGE_READONLY);
             // SAFETY: our title alias; the guard handler opens it and saves
             // the old bytes for the armed GPU copy.

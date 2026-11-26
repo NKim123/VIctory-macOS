@@ -2321,7 +2321,7 @@ pub(crate) mod tests {
         let list = host.new_list().unwrap();
         copy.refresh(&list, pool as u64, len as u64);
         copy.gpu_writes(&list, pool as u64, len as u64, true);
-        list.defer_missed(move || {
+        list.defer_missed(move |_| {
             // SAFETY: owned pages. Ordinary stores into the pool are tracked.
             unsafe {
                 ((pool + 8) as *mut u32).write_volatile(1);
