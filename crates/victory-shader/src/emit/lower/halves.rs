@@ -76,8 +76,7 @@ impl Lower<'_> {
     /// Why a program in halves cannot run: LDS a group of one console wave
     /// shares without barriers, split across two host waves.
     pub(super) fn halves_lds(group: u32, lds_dwords: u32) -> Option<Why> {
-        (lds_dwords > 0 && group > HALF && group <= 64)
-            .then_some("LDS one console wave64 shares without barriers, on a host of 32-lane waves")
+        (lds_dwords > 0 && group > HALF && group <= 64).then_some(LDS_ACROSS)
     }
 
     /// The flat thread id, relabelled so that each host wave holds a run of
@@ -261,17 +260,30 @@ impl Lower<'_> {
         Ok(self.s.m.select(c, upper, hi, lo))
     }
 
-    /// `v_readfirstlane_b32` of `x`, in halves ([`Lower::across_here`]): the
-    /// lower half's first lane. Every lane of the group runs the block, so
-    /// the console's first lane is in the lower half.
-    pub(super) fn first_lane_across(&mut self, x: V) -> Result<V, Why> {
+    /// `v_readfirstlane_b32` in halves. An EXEC guard can mask off
+    /// the entire lower half, in which case the first lane is in the upper
+    /// half. The host waves themselves remain converged for both exchanges.
+    pub(super) fn first_lane_across(&mut self, x: V, active: Option<V>) -> Result<V, Why> {
         let c = self.cur;
         let (i32t, zero) = (self.s.t.i32, self.s.m.i32(0));
         self.s.flags |= flags::WAVE_OPS;
-        let own = self
-            .s
-            .op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[x]);
-        Ok(self.exchange_halves(own, zero, c)?.0)
+        let Some(active) = active else {
+            let own = self
+                .s
+                .op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[x]);
+            return Ok(self.exchange_halves(own, zero, c)?.0);
+        };
+
+        let (lo, hi) = self.ballot_across_halves(active, c)?;
+        let lo_set = self.s.m.cmp(c, pred::NE, lo, zero);
+        let hi_set = self.s.m.cmp(c, pred::NE, hi, zero);
+        let lo_lane = self.unary_bits(c, 32, lo);
+        let hi_lane = self.unary_bits(c, 32, hi);
+        let upper = self.s.m.i32(HALF);
+        let hi_lane = self.s.m.bin(c, Bin::Add, hi_lane, upper);
+        let hi_lane = self.s.m.select(c, hi_set, hi_lane, zero);
+        let lane = self.s.m.select(c, lo_set, lo_lane, hi_lane);
+        self.read_lane_across(x, lane)
     }
 
     /// A whole-wave reduction or prefix of `op`, in halves
