@@ -1106,26 +1106,38 @@ fn view_at(i: u32, generation: u32) -> Option<ViewPin> {
 /// Snapshot records that differ from the host slot, and the key observed
 /// there. An obsolete generation is equivalent to a null descriptor.
 #[cfg(windows)]
+struct ChangedRecord {
+    index: u32,
+    record: [u32; 3],
+    previous: u64,
+    clear: bool,
+}
+
+#[cfg(windows)]
 fn changed_records(
     made: &[u64],
     candidates: impl Iterator<Item = (u32, [u32; 3])>,
-) -> Vec<(u32, [u32; 3], u64)> {
+) -> Vec<ChangedRecord> {
     let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
     candidates
         .filter_map(|(index, record)| {
             let old = made[index as usize];
             let [tag, i, generation] = record;
-            let current = tag == VIEW_TAG
-                && views
-                    .list
-                    .get(i as usize)
-                    .is_some_and(|(_, current)| *current == generation);
+            let registered = views.list.get(i as usize).map(|(_, current)| *current);
+            let current = tag == VIEW_TAG && registered == Some(generation);
             let wanted = if current {
                 u64::from(generation) << 32 | u64::from(i)
             } else {
                 0
             };
-            (old != wanted).then_some((index, record, old))
+            (old != wanted).then_some(ChangedRecord {
+                index,
+                record,
+                previous: old,
+                // A retired generation cannot be registered again. Check
+                // missing and future generations at publication instead.
+                clear: tag != VIEW_TAG || registered.is_some_and(|live| generation < live),
+            })
         })
         .collect()
 }
