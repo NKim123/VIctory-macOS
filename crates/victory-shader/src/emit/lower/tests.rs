@@ -1664,7 +1664,7 @@ fn ds_bpermute_wave64_preserves_32_lane_half() {
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
-        let mut lowered = lower(&Parts {
+        let lowered = lower(&Parts {
             native: &native,
             p: &p,
             st: &st,
@@ -1676,7 +1676,7 @@ fn ds_bpermute_wave64_preserves_32_lane_half() {
             mesh_stride: 0,
             atomic_locks: false,
             atomic_lock_rounds: false,
-        atomic_umax: false,
+            atomic_umax: false,
             bias_as_gradients: false,
             narrow_waves: false,
             host_wave32: false,
@@ -1690,7 +1690,7 @@ fn ds_bpermute_wave64_preserves_32_lane_half() {
         if let Ok(mut v) = crate::emit::validator::Validator::load(
             crate::emit::validator::Validator::default_path().as_deref(),
         ) {
-            v.validate(&mut lowered.dxil).unwrap();
+            v.validate(&mut { lowered.dxil }).unwrap();
         }
     }
 }
@@ -1958,4 +1958,56 @@ fn a_box32_nodes_tail_reuses_its_heads_lookup() {
     assert!(table[4] == again && at(again) == 2, "{loads:?} {table:?}");
     let through_head = loads.iter().filter(|&&b| b != 0 && b < again);
     assert_eq!(through_head.count(), 4 + 3, "{loads:?} {table:?}");
+}
+
+#[test]
+fn descriptor_index_matches_ordered_search_across_large_control_flow() {
+    use super::descriptor_load_uses;
+    use crate::resource::{Descriptor, Resources, Role, Source};
+
+    let mut resources = Resources::default();
+    let blocks = 2048;
+    let loaded = |block, first| Source::Loaded {
+        load: (block, 0),
+        first,
+    };
+    resources.descriptors.push(Descriptor {
+        site: (0, 1),
+        role: Role::Sampler,
+        source: loaded(0, 3),
+    });
+    for block in 0..blocks {
+        resources.descriptors.push(Descriptor {
+            site: (block, 1),
+            role: Role::Resource,
+            source: Source::Phi {
+                block,
+                args: vec![loaded(block, 1), loaded(block.saturating_sub(1), 2)],
+            },
+        });
+    }
+    let queries = (0..=blocks).map(|b| (b, 0));
+    let start = std::time::Instant::now();
+    let searched: Vec<_> = queries
+        .clone()
+        .map(|site| {
+            resources
+                .descriptors
+                .iter()
+                .filter(|d| d.role == Role::Resource)
+                .find_map(|d| {
+                    d.source.leaves().into_iter().find_map(|leaf| match *leaf {
+                        Source::Loaded { load, first } if load == site => Some((d.site, first)),
+                        _ => None,
+                    })
+                })
+        })
+        .collect();
+    let scan_time = start.elapsed();
+    let start = std::time::Instant::now();
+    let indexed = descriptor_load_uses(&resources);
+    let found: Vec<_> = queries.map(|site| indexed.get(&site).copied()).collect();
+    let index_time = start.elapsed();
+    assert_eq!(found, searched);
+    eprintln!("{blocks} blocks: ordered scan {scan_time:?}, indexed {index_time:?}");
 }

@@ -6,6 +6,7 @@
 //! emitter cannot express is `Missing` with a reason, and only fails the
 //! program when something with an effect (an export, a branch) needs it.
 
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use super::UserData;
@@ -93,7 +94,7 @@ pub(crate) struct Lowered {
     #[cfg(test)]
     pub wave_ops: bool,
     /// Whether it declares rasterizer-ordered views.
-    #[cfg(test)]
+    #[cfg(all(windows, test))]
     pub rovs: bool,
     /// Written typed-buffer calls, for structural tests of the dynamic path.
     #[cfg(test)]
@@ -160,6 +161,7 @@ enum Stop {
     Fail(ShaderError),
 }
 
+#[cfg(any(test, all(windows, feature = "host")))]
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     lower_pruned(parts, None)
 }
@@ -261,7 +263,25 @@ type EntryAddress = (usize, u32);
 
 type HandleKey = (usize, Site, u8, bool, (u32, u32));
 
+/// First resource use of a scalar descriptor load, in descriptor and leaf order.
+fn descriptor_load_uses(resources: &Resources) -> Map<Site, (Site, u8)> {
+    let mut uses = Map::default();
+    for desc in resources
+        .descriptors
+        .iter()
+        .filter(|d| d.role == Role::Resource)
+    {
+        for leaf in desc.source.leaves() {
+            if let Source::Loaded { load, first } = *leaf {
+                uses.entry(load).or_insert((desc.site, first));
+            }
+        }
+    }
+    uses
+}
+
 struct Lower<'a> {
+    descriptor_load_uses: OnceCell<Map<Site, (Site, u8)>>,
     s: Shader,
     x: &'a Parts<'a>,
     bad: &'a HashMap<Value, Why>,
@@ -915,6 +935,7 @@ impl<'a> Lower<'a> {
                         .chain(block.phis.iter().map(move |phi| (phi.value, b)))
                 })
                 .collect(),
+            descriptor_load_uses: OnceCell::new(),
             cur_ir: 0,
             sections: HashMap::new(),
             section_out: Set::default(),
@@ -1664,7 +1685,7 @@ impl<'a> Lower<'a> {
             heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap") as u32,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
-            #[cfg(test)]
+            #[cfg(all(windows, test))]
             rovs: self.s.flags & flags::ROVS != 0,
             #[cfg(test)]
             typed_buffer_calls: TypedBufferCalls {
@@ -4720,19 +4741,10 @@ impl<'a> Lower<'a> {
         // read only as data takes it from a load of the same descriptor that
         // the program uses (the compiler loads a descriptor again rather than
         // keep it, and queries sizes in loops of their own).
-        let use_of = |site: Site| {
-            self.x
-                .res
-                .descriptors
-                .iter()
-                .filter(|d| d.role == Role::Resource)
-                .find_map(|d| {
-                    d.source.leaves().into_iter().find_map(|l| match *l {
-                        Source::Loaded { load, first } if load == site => Some((d.site, first)),
-                        _ => None,
-                    })
-                })
-        };
+        let uses = self
+            .descriptor_load_uses
+            .get_or_init(|| descriptor_load_uses(self.x.res));
+        let use_of = |site: Site| uses.get(&site).copied();
         // The VGPR a waterfall loop reads the first lane of.
         let lane_source = |v: Value| {
             let i = self.def_inst(v)?;

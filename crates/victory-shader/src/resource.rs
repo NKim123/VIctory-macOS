@@ -93,14 +93,24 @@ pub enum Source {
 impl Source {
     /// The sources this one picks from (itself unless a phi).
     pub fn leaves(&self) -> Vec<&Source> {
+        let mut out = Vec::new();
+        self.collect_leaves(&mut out);
+        out
+    }
+
+    fn collect_leaves<'a>(&'a self, out: &mut Vec<&'a Source>) {
         match self {
             Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } => {
-                args.iter().flat_map(Source::leaves).collect()
+                for arg in args {
+                    arg.collect_leaves(out);
+                }
             }
             Source::LanePhi { args, .. } => {
-                args.iter().flatten().flat_map(Source::leaves).collect()
+                for arg in args.iter().flatten() {
+                    arg.collect_leaves(out);
+                }
             }
-            s => vec![s],
+            leaf => out.push(leaf),
         }
     }
 }
