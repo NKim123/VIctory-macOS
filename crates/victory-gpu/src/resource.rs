@@ -830,6 +830,14 @@ pub(crate) struct HostTexture {
     /// A heap slot views it for unordered access (`VICTORY_EVICT_HEAP_UAV`):
     /// written by the GPU once shaders write through heaps.
     heap_writable: std::sync::atomic::AtomicBool,
+    /// Its first upload or host copy has passed the submission fence.
+    pub(crate) initialized: std::sync::atomic::AtomicBool,
+    /// Cached staging charge for the opt-in SRV gate, if supported.
+    pub(crate) gated_bytes: std::sync::OnceLock<Option<u64>>,
+    /// Verified host writes awaiting the first complete title-memory seed.
+    pub(crate) partial_writes: std::sync::Mutex<Vec<crate::texture::CopyCoverage>>,
+    /// Eviction has started. Pending SRVs must give this copy up.
+    pub(crate) evicted: std::sync::atomic::AtomicBool,
     /// Its uploads from title memory (`crate::texture`), made on first use.
     pub(crate) staging: std::sync::Mutex<Option<std::sync::Arc<crate::texture::Staging>>>,
     /// A depth texture's writable twin (`crate::twin`), made with its first
@@ -853,6 +861,17 @@ pub(crate) struct HostTexture {
 
 #[cfg(windows)]
 impl HostTexture {
+    /// Only committed color targets have a bounded standalone allocation.
+    /// Placed textures can hold a 64 MiB heap and depth textures can acquire
+    /// twins after recording.
+    pub(crate) fn submission_retained_bytes(&self) -> Option<u64> {
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        // SAFETY: this host copy owns the resource.
+        let flags = unsafe { self.texture.GetDesc() }.Flags;
+        (self.placement.is_none() && flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET))
+            .then_some(self.bytes)
+    }
+
     /// A host texture made outside the title's resources (twins).
     pub(crate) fn new(
         texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
@@ -872,6 +891,10 @@ impl HostTexture {
             host_written: false.into(),
             gpu_written: false.into(),
             heap_writable: false.into(),
+            initialized: false.into(),
+            gated_bytes: std::sync::OnceLock::new(),
+            partial_writes: std::sync::Mutex::default(),
+            evicted: false.into(),
             staging: std::sync::Mutex::new(None),
             twin: std::sync::OnceLock::new(),
             bytes,
@@ -881,6 +904,21 @@ impl HostTexture {
             placement: None,
             last: [crate::queue::presented().into(), now_ms().into()],
         }
+    }
+
+    pub(crate) fn gated_upload_bytes(&self) -> Option<u64> {
+        self.gated_bytes.get().copied().flatten()
+    }
+
+    /// Whether a placed view can still publish this copy for its memory.
+    pub(crate) fn current_for_placement(&self) -> bool {
+        let Some(key) = self.key else { return true };
+        MEMORY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|map| map.get(&key)?.upgrade())
+            .is_none_or(|live| std::ptr::eq(self, live.as_ref()))
     }
 
     /// The title used it now: a list of the title's names it, or a shader
@@ -1264,7 +1302,9 @@ fn shared_texture(
     let key = memory_key(address, desc);
     let mut map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(Default::default);
-    let live = key.and_then(|k| map.get(&k)?.upgrade());
+    let live = key
+        .and_then(|k| map.get(&k)?.upgrade())
+        .filter(|copy| !copy.evicted.load(std::sync::atomic::Ordering::Acquire));
     if let Some(t) = &live
         && takes(t, &d)
     {
@@ -1493,6 +1533,13 @@ pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     (r.desc.dimension != BUFFER).then(|| (r.data().cast_const(), r.desc))
 }
 
+/// A single-sample 2D colour texture eligible for shader write-back.
+#[cfg(windows)]
+pub(crate) fn texture_back_kind(desc: &ResourceDesc) -> Option<(u64, u32, u32)> {
+    (desc.dimension == 3 && desc.sample_count <= 1 && desc.flags & (DEPTH | UNORDERED) == UNORDERED)
+        .then_some((desc.width, desc.height, desc.format))
+}
+
 /// A texture's description as words (the layout of placed views'
 /// resource descriptions); `None` for buffers.
 pub(crate) fn texture_desc(this: This) -> Option<[u32; 14]> {
@@ -1524,7 +1571,17 @@ impl Resource {
     /// textures made on first use").
     #[cfg(windows)]
     fn host(&self) -> Option<std::sync::Arc<HostTexture>> {
-        if let Some(made) = self.host.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        let evicted = |made: &Option<std::sync::Arc<HostTexture>>| {
+            made.as_ref()
+                .is_some_and(|copy| copy.evicted.load(std::sync::atomic::Ordering::Acquire))
+        };
+        if let Some(made) = self
+            .host
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .filter(|made| !evicted(made))
+        {
             return made;
         }
         // Made without the lock held (`shared_texture` takes the memory
@@ -1533,7 +1590,11 @@ impl Resource {
         let clear = clear.as_ref().map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast());
         let made = shared_texture(self.data() as u64, &self.desc, state, clear);
         // A texture made meanwhile by another thread is the memory's too.
-        self.host.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(made).clone()
+        let mut cached = self.host.lock().unwrap_or_else(|e| e.into_inner());
+        if cached.as_ref().is_some_and(evicted) {
+            *cached = None;
+        }
+        cached.get_or_insert(made).clone()
     }
 
     fn data(&self) -> *mut u8 {
@@ -1643,6 +1704,11 @@ fn evictable(t: &HostTexture) -> bool {
         && !t.host_written.load(Relaxed)
         && !t.gpu_written.load(Relaxed)
         && !(t.heap_writable.load(Relaxed) && crate::bindless::heap_written())
+        && (t.gated_upload_bytes().is_none()
+            || t.partial_writes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty())
 }
 
 /// `VICTORY_EVICT_HEAP_UAV=1`: textures viewed for unordered access in
@@ -1683,7 +1749,7 @@ pub(crate) fn evict_unused() {
 /// the process for its next resources: on a Mac with 8 GB, unused textures
 /// filled memory into swap long before the pass would start (#135).
 #[cfg(windows)]
-fn budget_mb(device: f64) -> f64 {
+pub(crate) fn budget_mb(device: f64) -> f64 {
     static SET: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
     let set = SET.get_or_init(|| {
         let mb = budget_setting(std::env::var("VICTORY_GPU_BUDGET_MB").ok().as_deref());
@@ -1798,6 +1864,12 @@ fn give_up(gone: &[Owned], frame: u64) -> (u64, u64) {
     }
     {
         use windows::core::Interface;
+        if crate::descriptor::host::show_after() {
+            for (copy, _) in gone {
+                copy.evicted
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
         let raws = gone.iter().map(|(t, _)| t.texture.as_raw() as usize).collect();
         crate::descriptor::evict(&raws);
     }
@@ -1866,6 +1938,18 @@ fn hand_out_resource(
         // SAFETY: the title passes a whole clear value (or null).
         made_with: (state, (!clear.is_null()).then(|| unsafe { clear.cast::<[u32; 5]>().read_unaligned() })),
     });
+    #[cfg(windows)]
+    if crate::texback::enabled() && !out.is_null() && object::is(iid, &RESOURCE_IIDS) {
+        let size = if desc.dimension == BUFFER {
+            desc.width
+        } else {
+            // An unrecognized allocation at a title address can still
+            // alias tracked resources. If even its footprint is unknown,
+            // conservatively invalidate tickets extending past its start.
+            footprint(&desc).map_or(u64::MAX, |info| info.size)
+        };
+        crate::texback::remapped(resource.data() as usize, size as usize);
+    }
     #[cfg(windows)]
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
@@ -1948,6 +2032,7 @@ impl Drop for Resource {
         }
         crate::bindless::forget(std::ptr::from_ref::<Resource>(self) as usize);
         if self.desc.dimension != BUFFER {
+            crate::texback::released(std::ptr::from_ref::<Resource>(self) as usize);
             let mut map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
             let at = self.data() as u64;
             if let Some(list) = map.get_mut(&at) {
@@ -2243,7 +2328,7 @@ extern "system" fn resource_query(this: This, iid: *const Iid, out: *mut This) -
         out,
     )
 }
-extern "system" fn resource_release(this: This) -> u32 {
+pub(crate) extern "system" fn resource_release(this: This) -> u32 {
     object::release_boxed::<Resource>(this)
 }
 /// Memory is always mapped (subresources are not told apart yet); a null
@@ -2881,6 +2966,248 @@ mod tests {
             assert_eq!(sizes, [64, 32, 64, 32, 16, 8, 16, 8], "format {format}");
             assert_eq!(total, 24_072, "format {format}");
             assert!(subresource(&desc, 8).is_none(), "format {format}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn untracked_texture_commands_pin_their_resources_and_stay_synchronous() {
+        use std::sync::Arc;
+
+        if crate::host::host().is_none() {
+            return;
+        }
+        let null: This = std::ptr::null();
+        let mut allocator = null;
+        let mut list = null;
+        let iid = &PAGEABLE_IIDS[1];
+        assert_eq!(
+            crate::list::create_allocator(null, 0, iid, &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, allocator, null, iid, &mut list),
+            S_OK
+        );
+        let barrier = slot::<extern "system" fn(This, u32, *const u64) -> u32>(list, 0xd0);
+        let targets =
+            slot::<extern "system" fn(This, u32, *const u64, i32, *const u64)>(list, 0x190);
+        let close = slot::<extern "system" fn(This) -> HRESULT>(list, 0x48);
+        let reset = slot::<extern "system" fn(This, This, This) -> HRESULT>(list, 0x50);
+        let release = |object| slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+
+        let image = || {
+            let mut out = null;
+            let desc = ResourceDesc {
+                flags: 1 | 4,
+                ..texture(4, 4, 28, 1)
+            };
+            assert_eq!(
+                create_committed(
+                    null,
+                    &PROPERTIES,
+                    0,
+                    &desc,
+                    0,
+                    null.cast(),
+                    &RESOURCE_IIDS[0],
+                    &mut out
+                ),
+                S_OK
+            );
+            out
+        };
+
+        for command in ["aliasing barrier", "UAV barrier", "render target binding"] {
+            let first = image();
+            let second = if command == "aliasing barrier" {
+                image()
+            } else {
+                null
+            };
+            let resources = [first, second];
+            let weak_copies: Vec<_> = resources
+                .iter()
+                .copied()
+                .filter(|resource| !resource.is_null())
+                .map(|resource| Arc::downgrade(&host_copy(resource).unwrap()))
+                .collect();
+
+            match command {
+                "aliasing barrier" => {
+                    let args = [1, first as u64, second as u64, 0];
+                    barrier(list, 1, args.as_ptr());
+                }
+                "UAV barrier" => {
+                    let args = [2, first as u64, 0, 0];
+                    barrier(list, 1, args.as_ptr());
+                }
+                _ => {
+                    let mut record = [0u64; 14];
+                    let handle = record.as_mut_ptr() as u64;
+                    crate::descriptor::create_rtv(null, first, null.cast(), handle);
+                    targets(list, 1, &handle, 0, null.cast());
+                }
+            }
+            assert_eq!(close(list), S_OK);
+            assert_eq!(
+                crate::list::host_list(list).unwrap().submit_ahead_bytes(),
+                None,
+                "{command}"
+            );
+
+            for resource in resources.into_iter().filter(|resource| !resource.is_null()) {
+                assert_eq!(release(resource), 0);
+            }
+            assert!(
+                weak_copies.iter().all(|copy| copy.upgrade().is_some()),
+                "{command} must pin every host allocation"
+            );
+            assert_eq!(reset(list, allocator, null), S_OK);
+            assert!(
+                weak_copies.iter().all(|copy| copy.upgrade().is_none()),
+                "reset must release the allocations pinned by {command}"
+            );
+        }
+
+        let global_uav = [2, 0, 0, 0];
+        barrier(list, 1, global_uav.as_ptr());
+        assert_eq!(close(list), S_OK);
+        assert_eq!(
+            crate::list::host_list(list).unwrap().submit_ahead_bytes(),
+            Some(0)
+        );
+
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    /// Mutating the descriptor and argument storage after a clear must not
+    /// affect deferred translation. A following CPU readback must see both
+    /// clears, including when the first submission went to the worker.
+    #[cfg(windows)]
+    #[test]
+    fn recorded_clears_keep_their_views_and_reach_a_following_readback() {
+        use crate::list::CopyLocation;
+        use windows::Win32::Foundation::RECT;
+
+        if crate::host::host().is_none() {
+            return;
+        }
+        let null: This = std::ptr::null();
+        let rgba = ResourceDesc {
+            flags: 1,
+            ..texture(4, 4, 28, 1)
+        };
+        let mut image = null;
+        let mut back = null;
+        // An optimized clear value forces a committed host texture, so the
+        // first submission fits the normal async texture budget.
+        let clear = [28, 0, 0, 0, 1.0f32.to_bits()];
+        for (desc, clear, out) in [
+            (&rgba, clear.as_ptr().cast(), &mut image),
+            (&buffer(1024), null.cast(), &mut back),
+        ] {
+            assert_eq!(
+                create_committed(null, &PROPERTIES, 0, desc, 0, clear, &RESOURCE_IIDS[0], out),
+                S_OK
+            );
+        }
+
+        let queue_iid = guid(
+            0x0ec870a6,
+            0x5d7e,
+            0x4c22,
+            [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+        );
+        let allocator_iid = guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = guid(
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        let (mut queue, mut allocator, mut draw, mut readback) = (null, null, null, null);
+        let queue_desc = [0u32; 4];
+        assert_eq!(
+            crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator),
+            S_OK
+        );
+        for out in [&mut draw, &mut readback] {
+            assert_eq!(
+                crate::list::create_list(null, 0, 0, allocator, null, &list_iid, out),
+                S_OK
+            );
+        }
+
+        let mut record = [0u64; 14];
+        let handle = record.as_mut_ptr() as u64;
+        crate::descriptor::create_rtv(null, image, null.cast(), handle);
+        let clear =
+            slot::<extern "system" fn(This, u64, *const [f32; 4], u32, *const RECT)>(draw, 0x1a0);
+        clear(draw, handle, &[1.0, 0.0, 0.0, 1.0], 0, null.cast());
+        let mut color = [0.0, 1.0, 0.0, 1.0];
+        let mut rect = RECT {
+            left: 2,
+            top: 0,
+            right: 4,
+            bottom: 4,
+        };
+        clear(draw, handle, &raw const color, 1, &raw const rect);
+        crate::descriptor::create_rtv(null, null, null.cast(), handle);
+        color.fill(0.0);
+        rect.left = 0;
+        std::hint::black_box((color, rect, record));
+
+        assert_eq!(
+            slot::<extern "system" fn(This) -> HRESULT>(draw, 0x48)(draw),
+            S_OK
+        );
+        assert!(
+            host_copy(image)
+                .unwrap()
+                .submission_retained_bytes()
+                .is_some()
+        );
+        let execute = slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50);
+        execute(queue, 1, &draw);
+        slot::<extern "system" fn(This) -> u32>(draw, 0x10)(draw);
+
+        let from = CopyLocation::whole(image);
+        let to = CopyLocation::placed(back, PlacedFootprint::new(0, 28, 4, 4, 256));
+        crate::list::read_back(
+            crate::list::host_list(readback).unwrap(),
+            &to,
+            [0; 3],
+            &from,
+            null.cast(),
+        );
+        assert_eq!(
+            slot::<extern "system" fn(This) -> HRESULT>(readback, 0x48)(readback),
+            S_OK
+        );
+        execute(queue, 1, &readback);
+        let (data, _) = buffer_bytes(back).unwrap();
+        // SAFETY: the readback completed and the destination has 1024 bytes.
+        let pixels = unsafe { std::slice::from_raw_parts(data, 16) };
+        assert_eq!(
+            pixels,
+            [
+                255, 0, 0, 255, 255, 0, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255
+            ]
+        );
+
+        for this in [readback, allocator, queue, image, back] {
+            slot::<extern "system" fn(This) -> u32>(this, 0x10)(this);
         }
     }
 

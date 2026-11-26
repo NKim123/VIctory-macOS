@@ -8,15 +8,13 @@
 //! signature is version 1.1 with no flags, as Microsoft's compilers build
 //! it from an HLSL root signature string.
 
-// Tables and root shader resource views are used only by tests so far.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{Error, PCSTR, Result, s};
 
 /// A root parameter, visible to every stage.
+#[derive(Clone, Copy)]
 pub(crate) enum Param<'a> {
     /// A descriptor table of ranges, one after another.
     Table(&'a [Range]),
@@ -33,6 +31,15 @@ pub(crate) struct Range {
     kind: D3D12_DESCRIPTOR_RANGE_TYPE,
     register: u32,
     count: u32,
+    flags: D3D12_DESCRIPTOR_RANGE_FLAGS,
+}
+
+impl Range {
+    /// The descriptor may change between recording and submission.
+    pub(crate) const fn volatile(mut self) -> Self {
+        self.flags = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE;
+        self
+    }
 }
 
 /// `count` shader resource views from `t{register}`.
@@ -41,6 +48,7 @@ pub(crate) const fn srv(register: u32, count: u32) -> Range {
         kind: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
         register,
         count,
+        flags: D3D12_DESCRIPTOR_RANGE_FLAG_NONE,
     }
 }
 
@@ -50,6 +58,7 @@ pub(crate) const fn uav(register: u32, count: u32) -> Range {
         kind: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
         register,
         count,
+        flags: D3D12_DESCRIPTOR_RANGE_FLAG_NONE,
     }
 }
 
@@ -121,7 +130,7 @@ pub(crate) fn root_signature(device: &ID3D12Device, params: &[Param]) -> Result<
                     NumDescriptors: r.count,
                     BaseShaderRegister: r.register,
                     RegisterSpace: 0,
-                    Flags: D3D12_DESCRIPTOR_RANGE_FLAG_NONE,
+                    Flags: r.flags,
                     OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
                 })
                 .collect(),

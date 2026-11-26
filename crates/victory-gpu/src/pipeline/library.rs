@@ -63,6 +63,8 @@ struct Library {
     /// key, and whether that list changed since the last save.
     prebuilt: HashSet<String>,
     prebuilt_changed: bool,
+    /// Tag of the blob currently on disk, which may differ from the input blob.
+    saved_tag: Option<String>,
 }
 
 // SAFETY: D3D12 objects are free-threaded (a pipeline library with the
@@ -140,13 +142,14 @@ fn library() -> Option<&'static Shared> {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let read = |file| DIR.get().and_then(|d| crate::read_file(&d.join(file)).ok());
             let blob = read(LIBRARY_FILE).and_then(unseal).unwrap_or_default();
-            let tag = tag(&blob);
             let mut library = open(&device, blob);
             // The pre-build's list, if it was saved with these bytes.
             if let (Some(l), Some(list)) = (library.as_mut(), read(PREBUILT_FILE))
                 && !l._blob.is_empty()
             {
+                let tag = tag(&l._blob);
                 l.prebuilt = listed(&list, &tag);
+                l.saved_tag = Some(tag);
             }
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
@@ -235,6 +238,7 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
                     added: 0,
                     prebuilt: HashSet::new(),
                     prebuilt_changed: false,
+                    saved_tag: None,
                 });
             }
             Err(e) => {
@@ -251,6 +255,7 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
         added: 0,
         prebuilt: HashSet::new(),
         prebuilt_changed: false,
+        saved_tag: None,
     })
 }
 
@@ -258,14 +263,14 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
 /// names its pipelines (the translation, as the shader cache keys it; the
 /// host descriptions).
 fn tag(blob: &[u8]) -> String {
-    let limit = victory_shader::emit::loop_limit().to_le_bytes();
-    let translator = victory_shader::SOURCE_HASH.as_bytes();
+    let translator = crate::shader_cache::translation_key();
+    let link_mesh = [u8::from(super::link_mesh_outputs())];
     let mut h = blake3::Hasher::new();
     for part in [
         blob,
         translator,
-        include_bytes!("../shader_cache.rs"),
-        &limit,
+        &link_mesh,
+        include_bytes!("../pipeline.rs"),
         include_bytes!("host.rs"),
         include_bytes!("library.rs"),
     ] {
@@ -275,25 +280,50 @@ fn tag(blob: &[u8]) -> String {
     h.finalize().to_hex().to_string()
 }
 
-/// The pre-build's list as saved: the tag it holds for, then its keys.
+/// The checksum, followed by the library tag and keys it covers.
 fn list(tag: &str, keys: &HashSet<String>) -> String {
     let keys = keys.iter().map(String::as_str);
-    std::iter::once(tag).chain(keys).collect::<Vec<_>>().join("\n")
+    let body = std::iter::once(tag)
+        .chain(keys)
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{}\n{body}", blake3::hash(body.as_bytes()).to_hex())
 }
 
-/// The keys of a saved list, if it holds for `tag` (else none).
+/// A missing or damaged checksum leaves the caller to check the host library.
 fn listed(list: &[u8], tag: &str) -> HashSet<String> {
-    let list = String::from_utf8_lossy(list);
-    let mut lines = list.lines();
-    match lines.next() == Some(tag) {
-        true => lines.map(str::to_owned).collect(),
-        false => HashSet::new(),
+    let Some((checksum, body)) = str::from_utf8(list)
+        .ok()
+        .and_then(|text| text.split_once('\n'))
+    else {
+        return HashSet::new();
+    };
+    let mut lines = body.lines();
+    if lines.next() != Some(tag) || checksum != blake3::hash(body.as_bytes()).to_hex().as_str() {
+        return HashSet::new();
     }
+    lines
+        .filter(|key| super::known::valid_key(key))
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Whether the pre-build has the title pipeline `key` in the library.
 pub(crate) fn prebuilt(key: &str) -> bool {
     library().is_some_and(|l| l.state.lock().unwrap_or_else(|e| e.into_inner()).prebuilt.contains(key))
+}
+
+/// Snapshot of the validated prebuilt keys for the offline parent.
+pub(super) fn prebuilt_keys() -> Vec<String> {
+    library().map_or_else(Vec::new, |l| {
+        l.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .prebuilt
+            .iter()
+            .cloned()
+            .collect()
+    })
 }
 
 /// The pre-build has the title pipeline `key` in the library now.
@@ -319,21 +349,28 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CacheStatus {
+    Loaded,
+    Stored,
+    Uncached,
+}
+
 /// The pipeline named `name`: loaded from the library by `load` if it is
 /// there with the same description, else made by `create` and stored. A
 /// name asked for by several threads is loaded or made by one at a time
 /// (the others then find it in the library); different names overlap.
-pub(crate) fn pipeline(
+pub(super) fn pipeline(
     name: &str,
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
-) -> windows::core::Result<ID3D12PipelineState> {
+) -> windows::core::Result<(ID3D12PipelineState, CacheStatus)> {
     let wide = HSTRING::from(name);
     #[cfg(feature = "diagnostics")]
     LAST.set(Some((name.to_owned(), true)));
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
-        return create();
+        return create().map(|pso| (pso, CacheStatus::Uncached));
     };
     let _held = NAMES.hold(name);
     // Outside the lock: loads take up to seconds, and a save holds the lock
@@ -341,7 +378,7 @@ pub(crate) fn pipeline(
     // does, which is never dropped.
     if let Ok(pso) = load(&library.loads, PCWSTR(wide.as_ptr())) {
         LOADED.fetch_add(1, Ordering::Relaxed);
-        return Ok(pso);
+        return Ok((pso, CacheStatus::Loaded));
     }
     // Compiled outside the lock: compiles take up to seconds.
     #[cfg(feature = "diagnostics")]
@@ -351,10 +388,14 @@ pub(crate) fn pipeline(
     let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
-    if unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
-        l.added += 1;
-    }
-    Ok(pso)
+    let stored = unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok();
+    l.added += u64::from(stored);
+    let status = if stored {
+        CacheStatus::Stored
+    } else {
+        CacheStatus::Uncached
+    };
+    Ok((pso, status))
 }
 
 #[cfg(feature = "diagnostics")]
@@ -365,94 +406,125 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`); the early list alone if
-/// that is all that changed.
+/// Writes the library and early list if changed, at most every 20 seconds
+/// unless `now` requests an immediate save.
 pub(crate) fn save(now: bool) {
+    if let Err(e) = save_result(now) {
+        tracing::warn!(error = %e, "host pipeline library not saved");
+    }
+}
+
+pub(super) fn require_library() -> std::io::Result<()> {
+    if library().is_some() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("no host pipeline library"))
+    }
+}
+
+pub(super) fn save_result(now: bool) -> std::io::Result<()> {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else {
-        return;
+        return Ok(());
     };
-    {
-        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
-            return;
+    // Hold this across publication so saves cannot publish older bytes later.
+    let mut last = if now {
+        LAST.lock().unwrap_or_else(|e| e.into_inner())
+    } else {
+        match LAST.try_lock() {
+            Ok(last) => last,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
         }
-        *last = Some(std::time::Instant::now());
+    };
+    if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
+        return Ok(());
     }
-    let (blob, prebuilt) = {
+    *last = Some(std::time::Instant::now());
+    let (blob, prebuilt, saved_tag, added, prebuilt_changed, used_changed) = {
         let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
-        if l.added == 0 && !l.prebuilt_changed {
-            // Nothing new is in the library, so its file stays as it is, and
-            // with it the pre-build's list that holds for its bytes. A load
-            // reads the early list on its own, not from the library, so a
-            // change of it is written alone: serialising the library holds
-            // this lock against every worker's loads and stores, for a list
-            // of 270 KB at most.
-            if !USED_CHANGED.swap(false, Ordering::Relaxed) {
-                return;
-            }
-            (None, None)
+        let blob = if l.added == 0 {
+            None
         } else {
-            // SAFETY: a plain size query on a live library.
+            // SAFETY: the store lock keeps the size stable until serialisation.
             let size = unsafe { l.library.GetSerializedSize() };
             let Some(mut bytes) = zeroed(size) else {
-                // Left for a later save: the pipelines stay counted as added.
-                tracing::warn!(bytes = size, "no memory to serialise the host pipeline library; saved later");
-                return;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::OutOfMemory,
+                    format!("cannot allocate {size} bytes to serialise the host pipeline library"),
+                ));
             };
             // SAFETY: a buffer of the size the library asks for.
-            let bytes = unsafe { l.library.Serialize(&mut bytes) }.map(|()| bytes);
-            match bytes {
-                Ok(bytes) => {
-                    l.added = 0;
-                    l.prebuilt_changed = false;
-                    // The early list is written below too, so a change of it
-                    // that was waiting is saved here.
-                    USED_CHANGED.store(false, Ordering::Relaxed);
-                    // Kept beside the bytes it holds for (also when a run adds
-                    // pipelines).
-                    let prebuilt =
-                        (!l.prebuilt.is_empty()).then(|| list(&tag(&bytes), &l.prebuilt));
-                    (Some(bytes), prebuilt)
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "host pipeline library not serialised");
-                    return;
-                }
-            }
+            unsafe { l.library.Serialize(&mut bytes) }.map_err(std::io::Error::other)?;
+            Some(bytes)
+        };
+        let saved_tag = if let Some(bytes) = &blob {
+            Some(tag(bytes))
+        } else if l.prebuilt_changed && l.saved_tag.is_none() {
+            Some(tag(&l._blob))
+        } else {
+            None
+        };
+        let prebuilt = if blob.is_some() || l.prebuilt_changed {
+            saved_tag
+                .as_deref()
+                .or(l.saved_tag.as_deref())
+                .filter(|_| !l.prebuilt.is_empty())
+                .map(|tag| list(tag, &l.prebuilt))
+        } else {
+            None
+        };
+        let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
+        if blob.is_none() && prebuilt.is_none() && !used_changed {
+            return Ok(());
         }
+        let added = std::mem::take(&mut l.added);
+        let prebuilt_changed = std::mem::take(&mut l.prebuilt_changed);
+        (blob, prebuilt, saved_tag, added, prebuilt_changed, used_changed)
     };
-    let used = used().as_ref().map(Used::list).unwrap_or_default();
+    let used = used_changed.then(|| used().as_ref().map(Used::list).unwrap_or_default());
     let written = crate::make_dir(dir)
         .and_then(|()| match &blob {
             Some(blob) => write_atomically(&dir.join(LIBRARY_FILE), &[&mark(blob), blob]),
             None => Ok(()),
         })
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), &[used.join("\n").as_bytes()]))
         .and_then(|()| match &prebuilt {
             Some(list) => write_atomically(&dir.join(PREBUILT_FILE), &[list.as_bytes()]),
+            None => Ok(()),
+        })
+        .and_then(|()| match &used {
+            Some(used) => write_atomically(&dir.join(EARLY_FILE), &[used.join("\n").as_bytes()]),
             None => Ok(()),
         });
     let (created, distinct) = created();
     let (shaders_cached, shaders_translated) = crate::shader_cache::counts();
-    match written {
-        Ok(()) => tracing::info!(
-            // Zero if only the early list was written.
-            bytes = blob.as_ref().map_or(0, Vec::len),
-            early = used.len(),
-            made = MADE.load(Ordering::Relaxed),
-            loaded = LOADED.load(Ordering::Relaxed),
-            started_early = EARLY.load(Ordering::Relaxed),
-            created,
-            distinct,
-            shaders_cached,
-            shaders_translated,
-            "host pipeline library saved"
-        ),
-        Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+    if let Err(e) = written {
+        let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
+        l.added += added;
+        l.prebuilt_changed |= prebuilt_changed;
+        if used_changed {
+            USED_CHANGED.store(true, Ordering::Relaxed);
+        }
+        return Err(e);
     }
+    if let Some(tag) = saved_tag {
+        library.state.lock().unwrap_or_else(|e| e.into_inner()).saved_tag = Some(tag);
+    }
+    tracing::info!(
+        // Zero if only cache metadata was written.
+        bytes = blob.as_ref().map_or(0, Vec::len),
+        early = used.as_ref().map(Vec::len),
+        made = MADE.load(Ordering::Relaxed),
+        loaded = LOADED.load(Ordering::Relaxed),
+        started_early = EARLY.load(Ordering::Relaxed),
+        created,
+        distinct,
+        shaders_cached,
+        shaders_translated,
+        "host pipeline library saved"
+    );
+    Ok(())
 }
 
 /// `n` zero bytes, or `None` when the host has no memory for them. The
@@ -471,7 +543,7 @@ fn zeroed(n: usize) -> Option<Vec<u8>> {
 /// concurrent worker and shutdown saves do not race on the same staging file
 /// or target rename. Parts, so that a file of a mark and a large blob is
 /// written without joining them in a buffer.
-fn write_atomically(path: &std::path::Path, parts: &[&[u8]]) -> std::io::Result<()> {
+pub(super) fn write_atomically(path: &std::path::Path, parts: &[&[u8]]) -> std::io::Result<()> {
     use std::io::Write;
     use std::sync::atomic::AtomicU64;
     static WRITING: Mutex<()> = Mutex::new(());
@@ -488,6 +560,70 @@ fn write_atomically(path: &std::path::Path, parts: &[&[u8]]) -> std::io::Result<
         let _ = std::fs::remove_file(&tmp);
     }
     res
+}
+
+const SLOW_FILE: &str = "slow-pipelines.txt";
+const SLOW_TIME: std::time::Duration = std::time::Duration::from_secs(1);
+
+pub(super) fn folder() -> Option<&'static std::path::Path> {
+    DIR.get().map(PathBuf::as_path)
+}
+
+fn slow_keys(text: &str) -> HashSet<String> {
+    text.lines()
+        .filter_map(|line| {
+            let (key, ms) = line.split_once(' ')?;
+            (super::known::valid_key(key)
+                && ms.parse::<u64>().ok()? >= SLOW_TIME.as_millis() as u64)
+                .then(|| key.to_owned())
+        })
+        .collect()
+}
+
+fn slow_list() -> Option<(&'static std::path::Path, &'static Mutex<HashSet<String>>)> {
+    static ON: OnceLock<bool> = OnceLock::new();
+    static SLOW: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let dir = folder()?;
+    if !ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_SLOW").is_none_or(|v| v != "0")) {
+        return None;
+    }
+    let list = SLOW.get_or_init(|| {
+        let bytes = crate::read_file(&dir.join(SLOW_FILE)).unwrap_or_default();
+        Mutex::new(slow_keys(&String::from_utf8_lossy(&bytes)))
+    });
+    Some((dir, list))
+}
+
+pub(super) fn known_slow(key: &str) -> bool {
+    slow_list()
+        .is_some_and(|(_, list)| list.lock().unwrap_or_else(|e| e.into_inner()).contains(key))
+}
+
+pub(super) fn note_time(key: &str, elapsed: std::time::Duration) {
+    use std::io::Write;
+    if elapsed < SLOW_TIME {
+        return;
+    }
+    let Some((dir, list)) = slow_list() else {
+        return;
+    };
+    let mut list = list.lock().unwrap_or_else(|e| e.into_inner());
+    if list.contains(key) {
+        return;
+    }
+    let record = format!("\n{key} {}\n", elapsed.as_millis());
+    let written = crate::make_dir(dir)
+        .and_then(|()| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join(SLOW_FILE))
+        })
+        .and_then(|mut f| f.write_all(record.as_bytes()));
+    if let Err(e) = written {
+        tracing::warn!(error = %e, "slow pipeline timing not saved");
+    }
+    list.insert(key.to_owned());
 }
 
 /// Title pipelines created, and their distinct keys.
@@ -586,6 +722,14 @@ mod tests {
     }
 
     #[test]
+    fn slow_list_ignores_invalid_or_short_timings() {
+        let a = "a".repeat(32);
+        let b = "b".repeat(32);
+        let text = format!("\n{a} 1000\n{a} 2000\n{b} 999\n{b} missing\nxx 3000\n");
+        assert_eq!(slow_keys(&text), HashSet::from([a]));
+    }
+
+    #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
         let a = name("graphics", b"root", &[b"vs", b"ps"], "state");
         assert_eq!(a, name("graphics", b"root", &[b"vs", b"ps"], "state"));
@@ -640,6 +784,17 @@ mod tests {
         assert_eq!(listed(saved.as_bytes(), &tag(b"library")), keys);
         assert!(listed(saved.as_bytes(), &tag(b"library2")).is_empty());
         assert!(listed(b"", &tag(b"library")).is_empty());
+    }
+
+    #[test]
+    fn a_prebuilt_index_cannot_claim_a_hit_after_its_keys_change() {
+        let tag = tag(b"library");
+        let saved = list(&tag, &HashSet::from(["a".repeat(32)]));
+        let corrupt = format!("{saved}\n{}", "b".repeat(32));
+        assert!(listed(corrupt.as_bytes(), &tag).is_empty());
+
+        let (_, legacy) = saved.split_once('\n').unwrap();
+        assert!(listed(legacy.as_bytes(), &tag).is_empty());
     }
 
     #[test]
@@ -895,7 +1050,7 @@ mod tests {
         // SAFETY: D3D12 objects are free-threaded.
         unsafe impl Sync for Made {}
         impl Made {
-            fn get(&self, made: bool) -> windows::core::Result<ID3D12PipelineState> {
+            fn get(&self, made: bool) -> windows::core::Result<CacheStatus> {
                 let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                     // SAFETY: a borrowed pointer the description never releases.
                     pRootSignature: unsafe { std::mem::transmute_copy(&self.1) },
@@ -915,18 +1070,23 @@ mod tests {
                         false => panic!("made again, not loaded"),
                     },
                 )
+                .map(|(_, status)| status)
             }
         }
         let made = Made(device, root, code);
-        made.get(true).expect("made and stored");
+        assert_eq!(made.get(true).unwrap(), CacheStatus::Stored);
         let saving = library.state.lock().unwrap_or_else(|e| e.into_inner());
         let (done, loaded) = std::sync::mpsc::channel();
         std::thread::scope(|s| {
             let made = &made;
-            s.spawn(move || done.send(made.get(false).is_ok()));
+            s.spawn(move || done.send(made.get(false).unwrap()));
             let loaded = loaded.recv_timeout(std::time::Duration::from_secs(30));
             drop(saving);
-            assert_eq!(loaded, Ok(true), "the load waited for the save");
+            assert_eq!(
+                loaded,
+                Ok(CacheStatus::Loaded),
+                "the load waited for the save"
+            );
         });
     }
 

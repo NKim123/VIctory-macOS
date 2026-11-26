@@ -141,6 +141,28 @@ impl Viewed {
         }
     }
 
+    pub(crate) fn texture_resource(&self, index: u32) -> Option<usize> {
+        match self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .slots
+            .get(&index)
+        {
+            Some(Seen::Texture(resource)) => Some(*resource),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tracks_texture(&self, resource: This) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .textures
+            .contains_key(&(resource as usize))
+    }
+
     /// The buffer ranges views reach, merged per host copy and kind
     /// (shader resource, unordered access): copy, start, bytes.
     #[cfg(any(test, feature = "diagnostics"))]
@@ -197,7 +219,7 @@ fn left_kind(view: &View) -> (usize, u64, u64) {
 /// submission shows from the next one on.
 pub(crate) fn uploads(
     heaps: &[Arc<Viewed>],
-    textures: &[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)],
+    textures: &[crate::texture::UploadSource],
 ) -> Option<Uploads> {
     static LIST: Mutex<Holder> = Mutex::new(Holder(None));
     let mut guard = LIST.lock().unwrap_or_else(|e| e.into_inner());
@@ -219,7 +241,7 @@ pub(crate) fn uploads(
     // memory, detiling and making staging buffers took half the submitting
     // thread in a new shot, and title threads setting views waited on the
     // lock meanwhile (run evict5).
-    let mut work: Vec<(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)> = Vec::new();
+    let mut work = Vec::new();
     let mut staged = std::collections::HashSet::new();
     for (staging, copy) in textures {
         // A host copy wrote it in a submission made before this one (it
@@ -232,6 +254,14 @@ pub(crate) fn uploads(
         }
     }
     let mut done = std::collections::HashSet::new();
+    let is_large_first_fill = |copy: &crate::resource::HostTexture| {
+        !copy.initialized.load(Relaxed)
+            && copy
+                .gated_upload_bytes()
+                .is_some_and(|bytes| bytes > crate::descriptor::PENDING_STAGING_BYTES)
+    };
+    let mut large_first_fill = crate::descriptor::host::show_after()
+        && work.iter().any(|(_, copy)| is_large_first_fill(copy));
     for viewed in heaps {
         let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
         for &r in inner.textures.keys() {
@@ -239,7 +269,9 @@ pub(crate) fn uploads(
                 continue;
             }
             // Not made (given up, or never read): nothing to bring up.
-            let Some(texture) = crate::resource::made_copy(r as This) else {
+            let Some(texture) = crate::resource::made_copy(r as This)
+                .filter(|copy| !copy.evicted.load(std::sync::atomic::Ordering::Acquire))
+            else {
                 continue;
             };
             // Only what shaders read lately (the eviction pass's stamps):
@@ -257,9 +289,18 @@ pub(crate) fn uploads(
             if texture.host_written.load(Relaxed) {
                 continue;
             }
-            if let Some(staging) = crate::texture::staging(r as This, &texture.texture)
+            let large = is_large_first_fill(&texture);
+            // At most one new large heap-backed texture per submission.
+            // An explicit transfer may already have selected this texture.
+            if large
+                && (large_first_fill || work.iter().any(|(_, copy)| Arc::ptr_eq(copy, &texture)))
+            {
+                continue;
+            }
+            if let Some(staging) = crate::texture::staging(r as This, &texture)
                 && staged.insert(Arc::as_ptr(&staging))
             {
+                large_first_fill |= large;
                 work.push((staging, texture));
             }
         }

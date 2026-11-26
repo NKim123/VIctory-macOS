@@ -99,9 +99,22 @@ pub fn run(
     let original = patching.is_some().then_some(original);
 
     let images = cfg.cache_subdir("images")?;
+    cfg.cache_subdir("pipelines")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+    if execute && std::env::var_os("VICTORY_PIPELINE_BOOK").is_some_and(|v| v == "1") {
+        victory_gpu::pipeline::record_pipelines(cfg.cache_subdir(crate::warm::RECORDS)?);
+    }
+    #[cfg(target_arch = "x86_64")]
+    let amd_patches = execute.then(|| victory_loader::amd_patch::Patches::from_env(&prepared));
     let image = victory_loader::load(&prepared, &images)?;
-    // Mapped: the patched bytes (the exe's size, 114 MB) are not needed.
+    // Retain the prepared bytes after mapping only when write sites need them.
+    #[cfg(target_arch = "x86_64")]
+    let prepared = (execute
+        && victory_gpu::fault_tracking()
+        && (std::env::var_os("VICTORY_WRITE_SITES").is_some()
+            || std::env::var_os("VICTORY_WRITE_SITES_RECORD").is_some()))
+    .then_some(prepared);
+    #[cfg(not(target_arch = "x86_64"))]
     drop(prepared);
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
@@ -155,6 +168,24 @@ pub fn run(
             victory_loader::masked::patch(image.base() as u64, image.info(), &original, &wanted);
         println!("masked stores  {n} patched to plain stores");
     }
+    #[cfg(target_arch = "x86_64")]
+    if let Some(patches) = amd_patches {
+        // SAFETY: this is the main image, and no title code has run.
+        unsafe { patches.apply(&image) }?;
+    }
+    #[cfg(target_arch = "x86_64")]
+    let _write_sites = if let Some(prepared) = prepared {
+        let (guards, shift) = victory_gpu::write_site_guards();
+        // SAFETY: the main image stays mapped and title threads have yet to start.
+        let session =
+            unsafe { victory_loader::write_sites::start(&image, &prepared, guards, shift) }?;
+        if session.is_some() {
+            victory_gpu::observe_write_sites(victory_loader::write_sites::observe);
+        }
+        session
+    } else {
+        None
+    };
     let resolver = HleResolver::new(if strict {
         HostPolicy::none()
     } else {

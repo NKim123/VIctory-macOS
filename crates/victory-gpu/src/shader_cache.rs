@@ -180,13 +180,14 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
     }
 }
 
-/// The translation of a console shader container, from the cache when
-/// there is one, and whether it came from there.
-pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
-    let options = runtime_options();
-    let translate =
-        |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
-    let build = if options.atomic_locks || options.bias_as_gradients || options.narrow_waves {
+/// The translation key used to validate the pipeline library's prebuilt list.
+#[cfg(windows)]
+pub(crate) fn translation_key() -> &'static [u8; 32] {
+    translation_build(runtime_options())
+}
+
+fn translation_build(options: victory_shader::emit::Options) -> &'static [u8; 32] {
+    if options.atomic_locks || options.bias_as_gradients || options.narrow_waves {
         options_build(
             options.atomic_locks,
             options.bias_as_gradients,
@@ -194,7 +195,16 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
         )
     } else {
         build()
-    };
+    }
+}
+
+/// The translation of a console shader container, from the cache when
+/// there is one, and whether it came from there.
+pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
+    let options = runtime_options();
+    let translate =
+        |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
+    let build = translation_build(options);
     match CACHE.get() {
         Some(cache) => cached(cache, build, container, translate),
         None => (translate(container), false),

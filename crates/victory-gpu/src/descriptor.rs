@@ -77,6 +77,12 @@ pub(crate) fn heap<'a>(this: This) -> &'a Heap {
     unsafe { &*this.cast::<Heap>() }
 }
 
+#[cfg(all(windows, test))]
+thread_local! {
+    pub(crate) static TEST_TITLE_SLOT_CAP: std::cell::Cell<u32> =
+        const { std::cell::Cell::new(u32::MAX) };
+}
+
 impl Heap {
     /// Whether this is a sampler heap.
     pub(crate) fn samplers(&self) -> bool {
@@ -107,13 +113,27 @@ impl Heap {
         self.host
             .get_or_init(|| {
                 let step = u64::from(increment(self.desc.kind)?);
-                let h = host::HostHeap::new(self.samplers(), self.desc.count)?;
+                let count = self.desc.count;
+                #[cfg(test)]
+                let count = TEST_TITLE_SLOT_CAP.with(|cap| count.min(cap.get()));
+                let h = host::HostHeap::new(self.samplers(), count)?;
                 for i in pending.drain(..) {
                     h.mirror(i, self.start + u64::from(i) * step, false);
                 }
                 Some(h)
             })
             .as_ref()
+    }
+
+    /// Exercises the remapped-table path on a host that can fit the title heap.
+    #[cfg(all(test, windows))]
+    pub(crate) fn test_cap_host_views(&self, count: u32) {
+        assert!(count < self.desc.count);
+        assert!(
+            self.host
+                .set(Some(host::HostHeap::new(false, count).unwrap()))
+                .is_ok()
+        );
     }
 
     /// The descriptor index of `handle` in this heap, if it lies in it.
@@ -224,12 +244,15 @@ pub(crate) fn sync_heaps() {
                 let heap = unsafe { &*(at as *const Heap) };
                 // As before: ranges are taken only once the heap has its
                 // host heap, so writes before that are not lost.
-                let (Some(Some(_)), Some(written), Some(_)) =
+                let (Some(Some(host)), Some(written), Some(step)) =
                     (heap.host.get(), &heap.written, increment(heap.desc.kind))
                 else {
                     return None;
                 };
-                Some((start, at, written.take(start as usize, usize::MAX)))
+                // The remaining title slots have no direct host index.
+                // Draw recording supplies those entries in dynamic tables.
+                let end = start + u64::from(host.count()) * u64::from(step);
+                Some((start, at, written.take(start as usize, end as usize)))
             })
             .collect()
     };
@@ -240,6 +263,7 @@ pub(crate) fn sync_heaps() {
     // while its page is made: `Heap::drop` takes the write lock to leave the
     // list, so a heap still listed under the lock is alive.
     let page_size = crate::watch::PAGE;
+    let mut page_bytes = Vec::new();
     for (start, at, ranges) in work {
         for (from, to) in ranges {
             for page in (from & !(page_size - 1)..to).step_by(page_size) {
@@ -255,11 +279,6 @@ pub(crate) fn sync_heaps() {
                 };
                 let step = u64::from(step);
                 let (page, end) = (page.max(from), (page + page_size).min(to));
-                // By page: one with nothing mapped (the title unmaps heap
-                // pages too) holds no records.
-                if !crate::host::read_into(page as *const u8, &mut [0u8; 4]) {
-                    continue;
-                }
                 let (first, last) = (
                     (page as u64 - start) / step,
                     (end as u64 - start).div_ceil(step),
@@ -274,9 +293,144 @@ pub(crate) fn sync_heaps() {
                     last.min(u64::from(heap.desc.count)) as u32,
                     start,
                     step,
+                    &mut page_bytes,
                 );
             }
         }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) const PENDING_STAGING_BYTES: u64 = 32 << 20;
+
+#[cfg(all(windows, test))]
+thread_local! {
+    pub(crate) static RELEASE_AFTER_PENDING_COLLECTION: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    pub(crate) static TEST_PENDING_STAGING_BYTES: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(PENDING_STAGING_BYTES) };
+}
+
+#[cfg(windows)]
+pub(crate) type TableTextureSlots =
+    std::collections::HashMap<usize, std::collections::BTreeSet<u32>>;
+
+#[cfg(windows)]
+struct PendingUpload {
+    copy: std::sync::Arc<crate::resource::HostTexture>,
+    memory: usize,
+    layout: crate::resource::ResourceDesc,
+    bytes: u64,
+    initial: bool,
+}
+
+/// Collects uploads for pending SRVs, or publishes those whose copy has
+/// finished. Only Host::execute calls this, with submissions held off.
+#[cfg(windows)]
+pub(crate) fn service_pending(
+    tables: &TableTextureSlots,
+    heaps_read: &[std::sync::Arc<crate::bindless::Viewed>],
+    pins: &mut Vec<ViewPin>,
+    uploads: Option<&mut Vec<crate::texture::UploadSource>>,
+) {
+    #[cfg(not(test))]
+    let mut budget = PENDING_STAGING_BYTES;
+    #[cfg(test)]
+    let mut budget = TEST_PENDING_STAGING_BYTES.with(std::cell::Cell::get);
+    let mut seen = std::collections::HashSet::new();
+    if let Some(uploads) = &uploads {
+        seen.extend(uploads.iter().map(|(_, copy)| std::sync::Arc::as_ptr(copy)));
+    }
+    let collecting = uploads.is_some();
+    let mut planned = Vec::new();
+    let mut oversized = uploads.as_ref().is_some_and(|uploads| {
+        uploads.iter().any(|(_, copy)| {
+            use std::sync::atomic::Ordering::Acquire;
+            !copy.initialized.load(Acquire)
+                && !copy.host_written.load(Acquire)
+                && copy
+                    .gated_upload_bytes()
+                    .is_some_and(|bytes| bytes > PENDING_STAGING_BYTES)
+        })
+    });
+    let mut upload = |source: PendingUpload| {
+        let key = std::sync::Arc::as_ptr(&source.copy);
+        if seen.contains(&key) {
+            return;
+        }
+        if source.initial {
+            if source.bytes > PENDING_STAGING_BYTES {
+                // All optional first fills use one admission limit, whether
+                // they came from a table or a marked heap index.
+                if oversized {
+                    return;
+                }
+                oversized = true;
+            } else if let Some(left) = budget.checked_sub(source.bytes) {
+                budget = left;
+            } else {
+                return;
+            }
+        }
+        seen.insert(key);
+        planned.push(source);
+    };
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    for &(start, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live while the registry is locked.
+        let heap = unsafe { &*(at as *const Heap) };
+        if heap.desc.kind == VIEWS_KIND
+            && let Some(Some(host)) = heap.host.get()
+        {
+            host.service_pending(
+                start,
+                u64::from(increment(VIEWS_KIND).unwrap()),
+                tables.get(&(std::sync::Arc::as_ptr(&host.viewed) as usize)),
+                heaps_read.iter().any(|read| std::sync::Arc::ptr_eq(read, &host.viewed)),
+                pins,
+                collecting.then_some(&mut upload as &mut dyn FnMut(_)),
+            );
+        }
+    }
+    drop(heaps);
+
+    // The records were validated while their owners were pinned. Footprint
+    // allocation and write tracking can take Wine's memory lock, so prepare
+    // only admitted sources and do it after leaving all descriptor locks.
+    if let Some(uploads) = uploads {
+        for source in planned {
+            if !source
+                .copy
+                .evicted
+                .load(std::sync::atomic::Ordering::Acquire)
+                && let Some(staging) =
+                    crate::texture::staging_for(source.memory, &source.layout, &source.copy)
+                && crate::texture::staging_bytes(&staging) <= source.bytes
+            {
+                uploads.push((staging, source.copy));
+            }
+        }
+    }
+}
+
+/// Validates a pending slot without dereferencing its title resource.
+/// Serializes publication with record() and forget(), which take VIEWS.
+#[cfg(windows)]
+fn with_current_record(handle: u64, record: [u32; 3], f: impl FnOnce()) -> bool {
+    let views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
+    let [_, i, generation] = record;
+    let mut bytes = [0; 12];
+    if views
+        .list
+        .get(i as usize)
+        .is_some_and(|(_, current)| *current == generation)
+        && crate::host::read_into(handle as *const u8, &mut bytes)
+        && bytes == record.map(u32::to_le_bytes).as_flattened()
+    {
+        f();
+        true
+    } else {
+        false
     }
 }
 
@@ -662,6 +816,8 @@ pub(crate) fn forget(resource: usize) {
 #[cfg(any(windows, test))]
 pub(crate) struct ViewPin {
     view: View,
+    #[cfg(windows)]
+    key: u64,
     held: [usize; 2],
 }
 
@@ -721,32 +877,64 @@ fn view_at(i: u32, generation: u32) -> Option<ViewPin> {
     drop(views);
     // Dropped here, with the lock released, if a resource was already gone:
     // the references taken on the others may be their last.
-    let pin = ViewPin { view, held };
+    let pin = ViewPin {
+        view,
+        #[cfg(windows)]
+        key: (u64::from(generation) << 32) | u64::from(i),
+        held,
+    };
     all.then_some(pin)
 }
 
-/// For each record (tag, index, generation): whether it names a view that
-/// is current, as [`view_at`] would find it (one lock for them all).
-fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
+/// Snapshot records that differ from the host slot, and the key observed
+/// there. An obsolete generation is equivalent to a null descriptor.
+#[cfg(windows)]
+fn changed_records(
+    first: u32,
+    made: &[u64],
+    records: impl Iterator<Item = [u32; 3]>,
+) -> Vec<(u32, [u32; 3], u64)> {
     let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
     records
-        .iter()
-        .map(|&[tag, i, generation]| {
-            tag == VIEW_TAG && views.list.get(i as usize).is_some_and(|(_, current)| *current == generation)
+        .zip(made)
+        .enumerate()
+        .filter_map(|(index, (record, &old))| {
+            let [tag, i, generation] = record;
+            let current = tag == VIEW_TAG
+                && views
+                    .list
+                    .get(i as usize)
+                    .is_some_and(|(_, current)| *current == generation);
+            let wanted = if current {
+                u64::from(generation) << 32 | u64::from(i)
+            } else {
+                0
+            };
+            (old != wanted).then_some((first + index as u32, record, old))
         })
         .collect()
 }
 
-/// The view recorded at `handle`, if one is (and its resource is alive),
-/// pinned until the returned value is dropped.
+/// The header stored in a descriptor slot the title passes back.
 #[cfg(any(windows, test))]
-pub(crate) fn view(handle: u64) -> Option<ViewPin> {
+pub(crate) fn record_at(handle: u64) -> [u32; 3] {
     if handle == 0 {
-        return None;
+        return [0; 3];
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
-    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    unsafe { (handle as *const [u32; 3]).read_unaligned() }
+}
+
+/// The view named by a descriptor record, pinned while it is used.
+#[cfg(any(windows, test))]
+pub(crate) fn recorded_view([tag, i, generation]: [u32; 3]) -> Option<ViewPin> {
     (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten()
+}
+
+/// The view recorded at `handle`, pinned while it is used.
+#[cfg(any(windows, test))]
+pub(crate) fn view(handle: u64) -> Option<ViewPin> {
+    recorded_view(record_at(handle))
 }
 
 /// A description of `N` words, if the title passes one.
@@ -838,9 +1026,19 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
         return;
     };
     let len = u64::from(count) * step;
-    if dst != 0 && src != 0 {
-        // SAFETY: both ranges are descriptor slots the title owns.
-        unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
+    if len != 0 && dst != 0 && src != 0 {
+        // SAFETY: both ranges are initialized descriptor heap memory the
+        // title owns. Compare before writing, including for overlapping copies.
+        let same = dst == src || unsafe {
+            std::slice::from_raw_parts(src as *const u8, len as usize)
+                == std::slice::from_raw_parts(dst as *const u8, len as usize)
+        };
+        if !same {
+            // SAFETY: the same ranges; copy also handles overlap.
+            unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
+        }
+        // An equal record may still have arrived as bytes and be new to the
+        // host heap, or be from a resource since released.
         #[cfg(windows)]
         for i in 0..u64::from(count) {
             mirror(dst + i * step);
@@ -1043,15 +1241,8 @@ pub(crate) mod tests {
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
     }
 
-    /// A released view heap takes its title memory page table with it, also
-    /// when no heap is made at its address afterwards (else the table, its
-    /// 16.8 MiB mapping and the copies it names live on).
     #[cfg(windows)]
-    #[test]
-    fn a_released_view_heap_drops_its_page_table() {
-        let Some(host) = crate::host::host() else {
-            return; // no host GPU here
-        };
+    pub(crate) fn make_visible_test_heap() -> This {
         let desc = HeapDesc {
             kind: VIEWS_KIND,
             count: 1000,
@@ -1064,8 +1255,20 @@ pub(crate) mod tests {
         };
         let mut h = std::ptr::null();
         assert_eq!(create(desc, none, &mut h), S_OK);
-        let key = h as usize;
         assert!(heap(h).host().is_some(), "a host heap");
+        h
+    }
+
+    /// A released view heap takes its title memory page table with it (also
+    /// when no heap is made at its address afterwards).
+    #[cfg(windows)]
+    #[test]
+    fn a_released_view_heap_drops_its_page_table() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let h = make_visible_test_heap();
+        let key = h as usize;
         let list = host.new_list().unwrap();
         assert!(crate::memory::bind(&list, key).is_some(), "a page table");
         assert!(crate::memory::has_table(key));
@@ -1271,6 +1474,9 @@ pub(crate) mod tests {
     #[cfg(windows)]
     #[test]
     fn records_copied_as_bytes_are_made_at_the_next_sync() {
+        if !crate::watch::fault_tracking() {
+            return;
+        }
         let memory = crate::watch::tests::pool(1);
         let desc = HeapDesc {
             kind: SAMPLERS,
@@ -1379,6 +1585,44 @@ pub(crate) mod tests {
         }
         create_cbv(std::ptr::null(), &[0x3000, 1, 256, 0], address);
         assert_eq!(heap(existing.0).pending.lock().unwrap().as_slice(), [0]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_equal_copy_mirrors_the_slot_without_dirtying_its_page() {
+        let memory = crate::watch::tests::pool(1);
+        let desc = HeapDesc { kind: SAMPLERS, count: 64, flags: SHADER_VISIBLE, nodes: 1 };
+        let mut h = std::ptr::null();
+        let placement = Placement { address: memory as u64, size: 64 * 16 };
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        let heap = heap(h);
+        if let Some(host) = heap.host() {
+            let mut record = [0u64; 2];
+            let src = record.as_mut_ptr() as u64;
+            let dst = heap.start + 5 * 16;
+            create_sampler(std::ptr::null(), &[21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0], src);
+            // SAFETY: 16 bytes at each of our descriptor slots.
+            unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, 16) };
+            let written = heap.written.as_ref().expect("a tracked heap");
+            let end = memory + crate::watch::PAGE;
+            written.take(memory, end);
+            assert!(!host.made(5));
+            copy_simple(std::ptr::null(), 1, dst, src, SAMPLERS);
+            assert!(host.made(5), "the raw write was still new to the host");
+            assert!(written.take(memory, end).is_empty(), "the equal copy did not write");
+        }
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        crate::watch::tests::free(memory);
+    }
+
+    #[test]
+    fn descriptor_copies_preserve_overlap_and_the_full_record() {
+        let mut records = [[1u8; 32], [2; 32], [3; 32]];
+        let start = records.as_mut_ptr() as u64;
+        copy_simple(std::ptr::null(), 2, start + 32, start, VIEWS_KIND);
+        assert_eq!(records, [[1; 32], [1; 32], [2; 32]]);
+        copy_simple(std::ptr::null(), 2, start, start + 32, VIEWS_KIND);
+        assert_eq!(records, [[1; 32], [2; 32], [2; 32]]);
     }
 
     /// Grand Theft Auto VI places its shader-visible heap in its own memory

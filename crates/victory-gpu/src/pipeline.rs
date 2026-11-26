@@ -74,6 +74,8 @@ pub(crate) struct Shader {
     #[cfg(windows)]
     spilled: OnceLock<[u8; 32]>,
     #[cfg(windows)]
+    pub(crate) ambient: Option<crate::ambient::Role>,
+    #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
 
@@ -139,10 +141,15 @@ fn spill(shader: &Shader, full: &[u8; 32]) {
 #[cfg(windows)]
 fn spill_to(dir: &std::path::Path, shader: &Shader, full: &[u8; 32]) {
     let path = spill_path(dir, full);
-    let there = std::fs::File::open(&path).is_ok();
+    let there = std::fs::File::open(&path).is_ok_and(|file| {
+        !known::enabled()
+            || blake3::Hasher::new()
+                .update_reader(file)
+                .is_ok_and(|h| h.finalize().as_bytes() == full)
+    });
+    let mut container = shader.container.lock().unwrap_or_else(|e| e.into_inner());
     if !there {
         let Some(shard) = path.parent() else { return };
-        let mut container = shader.container.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
         let ok = crate::make_dir(shard).is_ok()
             && std::fs::write(&tmp, &*container).is_ok()
@@ -151,11 +158,10 @@ fn spill_to(dir: &std::path::Path, shader: &Shader, full: &[u8; 32]) {
             let _ = std::fs::remove_file(&tmp);
             return;
         }
-        *container = Vec::new();
-    } else {
-        *shader.container.lock().unwrap_or_else(|e| e.into_inner()) = Vec::new();
     }
+    // A recorder holding the container lock can rely on this publication.
     let _ = shader.spilled.set(*full);
+    *container = Vec::new();
 }
 
 impl Shader {
@@ -174,6 +180,10 @@ impl Shader {
             container: Mutex::new(bytes.to_vec()),
             #[cfg(windows)]
             spilled: OnceLock::new(),
+            #[cfg(windows)]
+            ambient: (stage == "compute")
+                .then(|| crate::ambient::Role::detect(bytes))
+                .flatten(),
             #[cfg(windows)]
             translated: OnceLock::new(),
         }
@@ -356,6 +366,7 @@ impl Shader {
             size: self.size,
             container: Mutex::new(Vec::new()),
             spilled: OnceLock::new(),
+            ambient: self.ambient,
             translated: cell,
         })
     }
@@ -636,6 +647,21 @@ fn hand_out(
     object::hand_out(PIPELINE, pipeline, iid, &PIPELINE_IIDS, out)
 }
 
+#[cfg(all(test, windows))]
+pub(crate) fn test_compute(shader: Arc<Shader>) -> This {
+    let mut pipeline = std::ptr::null();
+    assert_eq!(
+        hand_out(vec![shader], None, &PIPELINE_IIDS[0], &mut pipeline),
+        crate::object::S_OK
+    );
+    let start = std::time::Instant::now();
+    while host_pipeline(pipeline).is_none() {
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        std::thread::yield_now();
+    }
+    pipeline
+}
+
 /// Device method.
 pub(crate) extern "system" fn create_graphics(
     _: This,
@@ -822,6 +848,8 @@ static FUNCTIONS: Table<24> = {
 #[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
+mod known;
+#[cfg(windows)]
 mod library;
 #[cfg(windows)]
 mod make;
@@ -842,10 +870,40 @@ pub fn use_pipeline_cache(dir: std::path::PathBuf) {
     library::use_pipeline_cache(dir);
 }
 
+/// Saves title pipeline descriptions and shader containers for offline replay.
+#[cfg(windows)]
+pub fn record_pipelines(dir: std::path::PathBuf) {
+    known::enable(dir);
+}
+
+/// Whether a name identifies a recorded pipeline.
+#[cfg(windows)]
+pub fn is_pipeline_key(key: &str) -> bool {
+    known::valid_key(key)
+}
+
 /// Saves the pipeline cache now if anything was added (at the end of a run).
 #[cfg(windows)]
 pub fn save_pipeline_cache() {
     library::save(true);
+}
+
+/// Opens the host library before starting an offline build batch.
+#[cfg(windows)]
+pub fn require_pipeline_cache() -> std::io::Result<()> {
+    library::require_library()
+}
+
+/// Title pipeline keys from the prebuilt list validated against the host library.
+#[cfg(windows)]
+pub fn prebuilt_keys() -> Vec<String> {
+    library::prebuilt_keys()
+}
+
+/// Saves a batch and reports any publication error to offline callers.
+#[cfg(windows)]
+pub fn flush_pipeline_cache() -> std::io::Result<()> {
+    library::save_result(true)
 }
 
 /// The pre-build: a title pipeline made ahead of a run into the pipeline
@@ -890,6 +948,11 @@ impl Prebuild {
         }
     }
 
+    /// Loads one title pipeline previously recorded by a run.
+    pub fn recorded(dir: &std::path::Path, key: &str) -> std::io::Result<Prebuild> {
+        known::load(dir, key)
+    }
+
     /// What a run lists the pipeline by (its early list).
     pub fn key(&self) -> String {
         make::key(&self.shaders, self.graphics.as_deref())
@@ -904,6 +967,24 @@ impl Prebuild {
     /// Makes the host pipeline, or finds it in the library; why not if it
     /// gets none.
     pub fn make(&self) -> Result<(), String> {
+        let result = self.build();
+        library::save(false);
+        result.map(|_| ())
+    }
+
+    /// Warms a recorded pipeline. Returns true for a library load and false
+    /// for a newly compiled and stored pipeline.
+    pub fn make_cached(&self) -> Result<bool, String> {
+        match self.build()? {
+            library::CacheStatus::Loaded => Ok(true),
+            library::CacheStatus::Stored => Ok(false),
+            library::CacheStatus::Uncached => {
+                Err("the host library refused to store the pipeline".into())
+            }
+        }
+    }
+
+    fn build(&self) -> Result<library::CacheStatus, String> {
         let key = self.key();
         library::keep_early_list();
         // Without the run's log lines per shader and pipeline: tens of
@@ -914,18 +995,20 @@ impl Prebuild {
         });
         #[cfg(feature = "diagnostics")]
         make::log_built(&key);
-        if made.is_some() {
-            // shortcut: a pipeline the library refused to store is listed
-            // too; a run then makes it at first use.
+        if made
+            .as_ref()
+            .is_some_and(|pipeline| pipeline.cache_status != library::CacheStatus::Uncached)
+        {
             library::note_prebuilt(key);
         }
-        library::save(false);
         match made {
-            Some(_) => Ok(()),
-            None => Err(match self.shaders.iter().find(|s| s.translated().is_none()) {
-                Some(s) => format!("{} shader does not translate", s.stage),
-                None => "the host refuses it".into(),
-            }),
+            Some(pipeline) => Ok(pipeline.cache_status),
+            None => Err(
+                match self.shaders.iter().find(|s| s.translated().is_none()) {
+                    Some(s) => format!("{} shader does not translate", s.stage),
+                    None => "the host refuses it".into(),
+                },
+            ),
         }
     }
 }

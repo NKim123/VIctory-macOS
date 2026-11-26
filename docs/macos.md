@@ -123,6 +123,34 @@ Mixed, aligned page-mapping batches retain each independently mapped 64 KiB alia
 
 On 25 November 2026 two testers ran the same Series X executable (one SHA-256) with the same profile. With CrossOver 26.3's bundled D3DMetal 3.0 on an M5 Pro, the game stopped about seven seconds in at its own assert at `+0x1dac734`, a subsystem checked during start-up (#24). With D3DMetal 4.0 beta 3 on an M3 Max it never hit that assert and reached the game world (#50). D3DMetal 3.0 also names the adapter `VirtualApple @ 2.50GHz` and refuses an empty pipeline library blob (#30). Since #74 asks for an empty library with a null pointer, host pipelines are kept across runs on 3.0 too: mikebuckets171 saw a library written on a first run and loaded back on the second. Use 4.0 beta 3 or newer for the game. It is not the only cause of that assert, though: later the same day us3r40456 hit `+0x1dac734` with D3DMetal 4.0 beta 3 too, on both the Series X and Series S profiles, so something else in their setup also decides it (#24).
 
+## Opt-in AMD instruction patches
+
+`VICTORY_PATCH_CLZERO` and `VICTORY_PATCH_WAITS` each take a full BLAKE3 hash of the
+original executable followed by a colon and comma-separated hex RVAs. Use the hash
+printed on the `build` line. For `CLZERO`, supply the RVA of the `clzero` instruction
+in either of the two loop forms below. For waits, supply the RVAs of the individual
+`monitorx` and `mwaitx` instructions. Verify the instruction boundaries in a local
+disassembly, including any prefix bytes, and verify that control enters the replaced
+span only at its first instruction. Choose loop sites outside function prologues
+and epilogues. Unset either switch or set it to `0` to use normal exception emulation.
+
+```text
+clzero; add rax,64; cmp rax,limit; jb back to clzero
+mov rax,cursor; add cursor,64; clzero; cmp cursor,limit; jb back to mov
+```
+
+The loader checks the opcode, loop shape and mapped bytes and applies the patches
+after the other startup rewrites, including the CLWB and store workarounds below,
+before title threads run. It skips candidates
+with overlapping instructions, changed neighboring bytes or unsupported mappings.
+`monitorx` becomes a NOP and `mwaitx` becomes a spin hint, so the title still relies
+on its enclosing wait loop. The CLZERO stub aligns the address down to a
+64-byte line and uses eight scalar 8-byte stores, so Rosetta can resume a
+store if write tracking protects the destination. The stub restores the
+original address and flags before continuing the loop. For a data fault
+that reaches title exception dispatch, the handler restores the title's
+stack and register context at the original instruction.
+
 ## Stacks during a freeze
 
 In the loading freeze from #50 every thread stops logging, and `VICTORY_STACKS` printed nothing, not even its first line. Printing takes the stderr lock and allocates, and the thread snapshot goes through Wine, so a thread stuck while it holds one of those locks stops the dump too. With `VICTORY_STACKS_FILE=<path>` as well (in a build with `VICTORY_DIAGNOSTICS=1`), the dumps go to that file instead. The module table is written at start-up, and each dump writes a marker line before each step and raw addresses for each frame, with no allocation and no stderr lock. Where the file stops shows which step blocked.
@@ -130,6 +158,14 @@ In the loading freeze from #50 every thread stops logging, and `VICTORY_STACKS` 
 ## Presented planes
 
 On Series S the game presents two planes. Plane 0 is a 1920x1080 overlay and plane 1 is the 3840x2160 picture (#15). The window shows the plane whose first resource has the most pixels, and `VICTORY_PRESENT_PLANE=<n>` picks another one. With `VICTORY_PRESENT_COMPOSITE=1` the other plane is also blended over the shown one by a compute pass (`victory-gpu/src/composite.rs`), scaled to it and using its alpha as straight alpha. The blend is off by default until a run with the game shows that the overlay is clear where the picture should show.
+
+## Indirect light estimate
+
+`VICTORY_AMBIENT=0.8` opts into a screen-space estimate of diffuse indirect light. The number scales the estimate, and `1` uses its full strength. The pass combines the cached light from visible surfaces with scene depth and a slower average, then raises dark pixels and caps unusually bright values in the screen-probe diffuse output. `VICTORY_AMBIENT=constant:<level>` uses a fixed warm light. `VICTORY_AMBIENT_SHADE=<strength>,<radius in metres>` controls shading in creases in either mode and defaults to `1,0.6`.
+
+`VICTORY_AMBIENT_AIR=<multiple>` caps the luminance of the air-scattering volume at a multiple of the estimated light. It requires the numeric ambient mode and a completed estimate. Numeric mode uses typed UAV loads of `R11G11B10_FLOAT`. Both effects default to off. The producer and auxiliary pass use the same host descriptor slots, including ordinary shared tables. Descriptors keep late binding until submission. If a required slot was rewritten after recording, the auxiliary dispatches are skipped and the producer sees the replacement normally. For eligible pairs the host holds those descriptor versions stable through the submission fence.
+
+Numeric mode gathers a 64 × 36 radiance grid at 80 × 45 points. Once the history is ready, each resolve does 8,294,400 fixed source-point iterations, then a full-resolution depth-aware resolve. Crease shading can add 12 depth taps per output texel, and the air cap adds a pass over the volume. The gather grid trades spatial resolution for less work. Frame cost and image quality in the title have not been measured. Each participating host list reuses a 4 KiB upload buffer for up to 64 auxiliary passes per recording. The passes use the producer’s existing descriptor heap.
 
 ## D3DMetal's shader cache needs unique shader hashes
 
@@ -154,6 +190,12 @@ The merge of VIctory's changes up to 70564ae on 25 November 2026 brought new sha
 
 Run-time compute shaders are built with explicit root signatures (`compute.rs`, PR #6), which Wine's compiler can build. The one exception is the memory test's shader, which needs shader model 5.1 resource arrays, so that test skips under Wine.
 
+## Shader texture write-back
+
+`VICTORY_TEXTURE_BACK=1` enables write-back for the ocean texture kinds identified on the Windows fork. Set a comma-separated list of `<width>x<height>f<DXGI format number>` entries to choose other kinds. The setting defaults to off. Under Wine, write-back also requires the submission marker. Creating another resource over any of the recorded allocation’s bytes cancels its pending write-back.
+
+The host copies the mip and array slices named by texture UAVs used by direct shader commands. Rewriting a shared slot cancels write-back for the subresources recorded through that slot, even if the slot is later restored. A list-owned table keeps its original UAV, including when the table is reused or the title rewrites its slot. Indirect commands are outside this path. It retiles single-sample, single-plane 2D colour textures into console memory after the host fence and before the title's completion writes. It skips recycled allocations and limits reads to 8 MiB per texture and 32 MiB of live GPU read-back buffers across lists. This copy samples each selected subresource at the end of the command list.
+
 ## Host view heaps are filled with other threads' submissions held off
 
 Under Wine on D3DMetal, a list that one thread submits while another thread fills a new host view heap can lose its views: its shaders' writes are dropped and its reads give zeros, whatever heap the list binds (issue #31). Each host view heap has 2,359,296 slots, and `HostHeap::fill_null` makes every one null with 36 copies of 65,536 null views. On an M5 Pro with D3DMetal 4.0 beta 3 that takes 30 to 50 ms, and the victory-gpu tests fill several at once when they start.
@@ -166,6 +208,18 @@ A standalone D3D12 program did not reproduce it: 16 threads writing and reading 
 
 Buffers are another matter, still open. `root_views_reach_their_copy_and_read_zeros_past_it` and the two `heap_views_` tests still fail in a few runs in a hundred, with or without the change. In a failed `root_views` run the source's host copy held the title's values while the output stayed zero, when run again at once, 100 ms later and with its view written again, so it does not come back by itself as the textures do.
 
+## Texture SRV publication after upload
+
+`VICTORY_SHOW_AFTER=1` is an opt-in experiment for title-memory textures in shared shader-visible slots. While the host texture is waiting for its first upload, table reads and heap-indexed reads through the slot see a null SRV of the same dimension and format. The upload runs on the normal submission queue. The slot begins showing the texture after the submission fence confirms completion, so draws in the uploading submission read zeros. On the synchronous queue, an ordinary shared table requests the texture in its current slot at submission, including when the title rebound the slot after recording. A heap-indexed read that discovers a new slot first marks demand. The next submission that uploads it still reads zeros, and the texture becomes visible on following submissions. Superseded slots are checked against the current title descriptor before publication.
+
+The option defaults to off. Registration covers single-sample, single-plane title-fed textures with a supported console layout and host copy footprint. Other textures and list-owned descriptors follow their usual paths. A first partial host copy requests a full initial upload. If staging fails, a later upload fills the untouched regions and preserves verified partial copies. Only pending slots requested by a submitted table or marked by a heap-indexed read add uploads. Those additional uploads use up to 32 MiB per submission. Larger textures stay pending until a whole host copy or an ordinary texture upload completes. Table demand and heap-read feedback share admission for one new large fill per submission. Under Wine, publication requires the submission marker as well as the fence. The synthetic GPU regression runs with `VICTORY_SHOW_AFTER=1` and the test filter `shared_texture_slot -- --ignored`.
+
+## Look-first writes to guarded RAM
+
+Set `VICTORY_WRITE_SITES_RECORD` to a profile path outside the repository and run the title with write tracking enabled. On Rosetta, set `VICTORY_FAULT_TRACKING=1` and leave the loader’s Rosetta store workarounds enabled. The recording run finds main executable sites that repeatedly fault on our write-watched RAM guards while setting a bit that is already set. Set `VICTORY_WRITE_SITES` to that profile on a later run to apply it after validating the original image hash and the instruction at each recorded offset. Applying requires an existing profile. When both variables are set, the loader warns and applies the selected profile. Each profile allows one recording process at a time. The recorder keeps a companion `.lock` file and releases its exclusive handle when recording ends. The loader also checks adjacent code for changes made by earlier startup rewrites, including the CLWB and store workarounds below.
+
+This is experimental and opt-in. Use a profile generated by your own run for the same title build. Use it only for ordinary flag updates whose same-value writes have no observable side effects. An unlocked instruction carries no indication that its source used a volatile access. The supported instruction is a single-bit byte `or` with a base register and displacement. The fast path reads one byte and sets the flags that the original instruction defines. Changed writes and targets outside the eligible guards take the original instruction. Data faults that reach title exception dispatch use the original instruction address and register context. Applying patches requires a process with hardware shadow-stack protection disabled. Locked instructions and wide stores are outside the supported set. The fast path assumes write-watched pools stay allocated or that their removal is reported to the GPU tracker before their addresses are reused.
+
 ## Masked stores into protected pages hang Rosetta
 
 On macOS 27.3 (M3 Max) the game stops at start-up with `rosetta error: unexpectedly need to EmulateForward on a synchronous exception` and the process hangs (issue #1). The faulting instruction is `vpmaskmovd [rax], ymm6, ymm4`, an AVX2 masked store in a loop that steps 32 bytes at a time.
@@ -175,6 +229,8 @@ The reproducer from issue #1, extended with `vpmaskmovd`, shows the cause withou
 VIctory uses both kinds of protection to see which title GPU memory changed. Without them, host copies of title memory take it whole every time, as they already do for memory that is not the runtime's, which came to 55 to 115 GB per world frame (#50). Under Rosetta, which `victory_gpu::fault_tracking` detects as Wine on Darwin, tracking is off by default, because Rosetta on macOS 26.6 also stops on a plain 32-byte `vmovups` that crosses into a protected page (#1), and #144 hung on an M1 with both switches on. `VICTORY_FAULT_TRACKING=1` turns tracking on, and the stores Rosetta cannot resume are then patched at load time (below). `0` turns it off anywhere. `victory` prints `fault tracking on` or `off` at start-up, with the variable that turns it on when it is off under Rosetta.
 
 Which stores Rosetta resumes after a write fault was measured on macOS 27.0.1 (M5 Pro) with a native x86-64 test that stores against a no-access page, with the whole store inside it or starting before it, from code translated both ahead of time and at run time. Plain stores of every width (`mov`, `movups`, `vmovups`, `vmovdqu`, `vmovntdq`, `movnti`, `vmovq`, `vpextrq`, `vextractf128`), adjacent pairs of them, `rep stosb`, `rep movsq` and locked atomics all resume. Every AVX masked store (`vpmaskmovd`, `vpmaskmovq`, `vmaskmovps` and `vmaskmovpd`, at 128 and 256 bits) stops Rosetta when it starts before the page, and resumes when it is wholly inside it or its lanes in the page are masked off. `vcvtps2ph` to memory stops Rosetta even wholly inside the page. The store patch below rewrites exactly those.
+
+When tracking is enabled, refreshes can use the 4 KiB parts reported by the write watch of a guarded pool. The 64 KiB guard is rearmed before collecting the parts, and every tracker of that page receives the result. New copies, aliases, remappings, reported writes that bypass the guard, and pages without a usable write-watch answer are refreshed at 64 KiB granularity. Physical section views use whole-page refreshes without collecting write-watch bits. The first refresh after a page was filled can include writes from initialization. The runtime collects and resets those bits on the first eligible dirty refresh, avoiding an extra kernel call for every page at startup. `VICTORY_PAGE_PARTS=0` makes tracked refreshes use 64 KiB throughout.
 
 
 The game's executable holds 1130 masked stores (789 `vpmaskmovd`, 160 `vpmaskmovq`, 180 `vmaskmovps` and 1 `vmaskmovpd`), which `victory` reports at start-up. `VICTORY_PATCH_MASKED=all` (or a comma list of hex RVAs) rewrites each one at load time as a jump to a small trampoline that does the same stores one lane at a time with plain `mov`s, which Rosetta can resume after a fault (`victory-loader/src/masked.rs`). With that, fault tracking can run under Rosetta, so copies of title memory no longer have to be taken whole (about 129 GB per frame once the world streams in, #50). Whenever tracking runs under Rosetta and `VICTORY_PATCH_MASKED` is unset, `all` is the default, and `none` turns the patch off. Runs with both on in #50, on macOS 27.2.1 with an M2 Pro and an M5 Pro, lasted 6 to 35 minutes and copied 100 to 200 MB per frame in the intro and the world. None ended in Rosetta: each ended when the game itself wrote to address 0, which one tester traced to the game's watchdog. The scan reads bytes, so a rare false match could be patched with `all`, and naming RVAs avoids that. Run 11 in #50 showed that `vcvtps2ph` stores to memory hang Rosetta the same way, so the scan and the patch also cover `vcvtps2ph`, `vextractf128` and `vextracti128` stores. Those are redone into the stack and then copied out with plain `mov`s. With the masked stores patched, copies during loading fell from 158.7 MB to 0.7 MB per frame and frames from 125.7 ms to 38.3 ms.
@@ -206,3 +262,48 @@ So every submission now ends with a small list that copies the submission's numb
 ## The clwb write-back loops
 
 The title has eight loops that write cache lines back with `clwb`, which faults under Rosetta and costs an exception each time (#135). Under Rosetta, the same check that decides fault tracking, `victory` turns the `clwb` of each loop into a NOP when it loads the image. It patches only when it finds exactly eight loops and logs the number it found otherwise. `VICTORY_NOP_CLWB=0` leaves the loops alone and `VICTORY_NOP_CLWB=1` patches them where Rosetta is not detected.
+
+## GPU write-back through physical sections
+
+`VICTORY_LAND=1` enables post-fence buffer write-back through xmem's writable section views. The title's read-only write monitors stay in place. Other copies of the same physical page are dirtied, and only GPU-changed bytes are stored, so unrelated CPU writes survive. While landing is enabled, DirectStorage section writes and GPU write-back wait for overlapping writes to finish. Each GPU submission checks that its physical destination still has the same mapping, including when fault tracking is disabled. Computed-address writes without fault tracking use a pre-submit snapshot of the GPU shadow to distinguish GPU changes from concurrent CPU writes. An overlapping declared range also gets a complete page snapshot when it fits. Before any post-fence merge, computed marks with a complete snapshot take ownership of the whole shadow page, including its declared GPU writes. These snapshots share a 64 MiB budget per submission. Snapshot copying can reach that budget even when the shaders leave no computed-write marks. The opt-in path accepts this preparation cost and may omit shader outputs when it cannot determine which bytes the GPU wrote. If an untracked or overlapping computed write lacks a complete snapshot, the computed write is withheld and the shadow refreshes from title memory again. View marks on a shadow that straddles tracked and untracked pages also need a complete baseline for each untracked page before they can land.
+
+`VICTORY_LAND_BESIDE=0` selects the checked title-address fallback, which is also used if xmem cannot provide a writable view. `VICTORY_LAND_ECHO=0` keeps the originating copy dirty after landing. Otherwise a copy that matches a complete guarded block skips refreshing that block. `VICTORY_RELAY=0` runs the merge on the submitting thread. The relay has one worker and waits for each merge before the title receives its completion writes. The feature is opt-in while game performance is being evaluated.
+
+With `VICTORY_LAND`, `VICTORY_TEXTURE_BACK` or `VICTORY_SHOW_AFTER` enabled, a submission that lacks completion evidence for any group withholds its shared shadow and computed results. Groups can write the same host copy, and their page marks do not identify which group wrote a byte. The runtime clears those marks, refreshes affected host copies from title memory on their next use, and still delivers title completion writes in order. Turning all three options off preserves the default buffer path.
+
+Declared and view-marked buffer merges can run on the relay. Computed-address merges run on the submitting thread and can use the writable section view. Texture retiling runs on the submitting thread through the normal watched title-memory writer. A closed list replay uses the same texture read-back buffer, so a missed mark for any group that names the list withholds its texture results.
+
+## Experimental command recording and submission
+
+By default, command recording is immediate and ready submissions run
+synchronously. Each switch below is opt-in for Windows builds, including
+those running on macOS under Wine.
+
+- `VICTORY_THIN=1` records fixed-function state, root arguments, and
+  color clears in a bounded stream. A recording worker translates chunks
+  of 32 commands and finishes short streams when the list closes. If the
+  worker queue is full, the calling thread translates the chunk. Color
+  clears keep the host texture and copy the view description, color, and
+  rectangles at the call. Clear recording reserves one CPU descriptor
+  until D3D12 consumes it. Draws, dispatches and other operations that need
+  live descriptors or title memory flush the stream first. Submission
+  waits until the list has closed.
+- `VICTORY_ASYNC_SUBMIT=1` lets title threads continue recording while one
+  submission worker builds host state transitions, submits and waits for
+  self-contained work. The worker holds up to four host lists including
+  those on the GPU. It retains only committed color targets up to 16 MiB
+  total or 1% of the texture budget when that is lower. The budget comes
+  from `VICTORY_GPU_BUDGET_MB` or the local DXGI budget. Lists with uploads,
+  live descriptors, title memory work, readbacks, render target bindings,
+  or resource-specific aliasing and UAV barriers stay synchronous.
+  Guest heap sync, texture eviction, copy-back, and retirement also stay
+  on the synchronous path. Queue signals, waits, mapping changes, and
+  presents drain the worker in order. Completed lists that the title reset
+  early can return their allocators to the existing spare pool after dropping
+  their texture references.
+- `VICTORY_JOIN_PARTS=2` through `4` enables the submission worker and
+  runs adjacent eligible submissions on the same queue under one hold
+  of the host submission lock. Each keeps its own host submission and
+  fence. Larger limits are clamped to four.
+
+The switches add no allocator, staging, or snapshot pools.

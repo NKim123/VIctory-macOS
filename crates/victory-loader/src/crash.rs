@@ -29,6 +29,8 @@ use windows_sys::Win32::System::LibraryLoader::{
 };
 use windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits;
 
+use crate::amd_patch::{clzero_backward_registers, clzero_forward_limit, compare_registers};
+
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 /// Frames listed per report.
 pub(crate) const MAX_FRAMES: usize = 40;
@@ -390,13 +392,10 @@ fn clwb_loop(code: &[u8]) -> Option<ClwbLoop> {
     }
     // cmp base, limit: REX.W 39 /r with base in r/m.
     let cmp = add + 4;
-    let &[cmp_rex @ 0x48..=0x4f, 0x39, cmp_modrm] = code.get(cmp..cmp + 3)? else {
-        return None;
-    };
-    if cmp_modrm >> 6 != 3 || (cmp_modrm & 7 | (cmp_rex & 1) << 3) != base {
+    let (cursor, limit) = compare_registers(code.get(cmp..cmp + 3)?)?;
+    if cursor != base {
         return None;
     }
-    let limit = (cmp_modrm >> 3) & 7 | (cmp_rex & 4) << 1;
     // jbe top.
     let jump = cmp + 3;
     let len = jump + 2;
@@ -504,10 +503,7 @@ unsafe fn clzero(context: &mut CONTEXT) -> bool {
     if page + 12 <= 0x1000 {
         // SAFETY: inside the page the CPU fetched the instruction from.
         let after = unsafe { &*((at + 3) as *const [u8; 9]) };
-        if let [0x48, 0x83, 0xc0, 0x40, cmp @ .., 0x72, 0xf4] = after
-            && let Some((0, limit)) = compare_registers(cmp)
-            && limit != 0
-        {
+        if let Some(limit) = clzero_forward_limit(after) {
             let limit = *gpr(context, limit);
             loop {
                 zero(context.Rax);
@@ -525,16 +521,7 @@ unsafe fn clzero(context: &mut CONTEXT) -> bool {
         // SAFETY: inside the page the CPU fetched the instruction from.
         let (before, after) =
             unsafe { (&*((at - 7) as *const [u8; 7]), &*((at + 3) as *const [u8; 5])) };
-        if let [rex @ (0x48 | 0x4c), 0x89, load, add_rex @ (0x48 | 0x49), 0x83, add, 0x40] = *before
-            && let [cmp @ .., 0x72, 0xf1] = after
-            && let Some((a, b)) = compare_registers(cmp)
-            && load & 0xc7 == 0xc0
-            && a == (load >> 3) & 7 | (rex & 4) << 1
-            && add & 0xf8 == 0xc0
-            && a == add & 7 | (add_rex & 1) << 3
-            && a != 0
-            && b != 0
-        {
+        if let Some((a, b)) = clzero_backward_registers(before, after) {
             let limit = *gpr(context, b);
             loop {
                 zero(context.Rax);
@@ -554,14 +541,6 @@ unsafe fn clzero(context: &mut CONTEXT) -> bool {
     zero(context.Rax);
     context.Rip += 3;
     true
-}
-
-/// `cmp rm, reg` between 64-bit registers (`REX.W 39 /r`): (`rm`, `reg`).
-fn compare_registers(code: &[u8]) -> Option<(u8, u8)> {
-    let &[rex @ 0x48..=0x4f, 0x39, modrm] = code else {
-        return None;
-    };
-    (modrm >> 6 == 3).then_some((modrm & 7 | (rex & 1) << 3, (modrm >> 3) & 7 | (rex & 4) << 1))
 }
 
 /// The general register numbered `n` as instructions encode it.

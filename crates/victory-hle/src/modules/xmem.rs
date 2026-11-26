@@ -11,7 +11,7 @@ use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, OnceLock};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
@@ -428,11 +428,13 @@ struct Physical {
     next_page: usize,
     pages: HashMap<usize, Slice>,
     /// Mapped views by address: their length and what they show.
-    views: BTreeMap<usize, (usize, Slice)>,
+    views: BTreeMap<usize, (usize, Slice, u64)>,
     /// Where each slice (section, page index) is mapped: the addresses of
     /// its page in every view showing it (the GPU side's change tracking
     /// follows writes through one view to the others, `aliases`).
     shown: HashMap<(usize, usize), Vec<usize>>,
+    next_write: usize,
+    writes: HashMap<usize, SectionWrite>,
 }
 
 impl Slice {
@@ -453,11 +455,11 @@ pub fn aliases(at: usize, len: usize, out: &mut Vec<(usize, usize)>) {
         .views
         .range(..=at)
         .next_back()
-        .filter(|(base, (size, _))| *base + size > at)
+        .filter(|(base, (size, _, _))| *base + size > at)
         .map(|(base, _)| *base);
     let starts = first.into_iter().chain(physical.views.range(at.saturating_add(1)..end).map(|(b, _)| *b));
     for base in starts.collect::<Vec<_>>() {
-        let (size, slice) = &physical.views[&base];
+        let (size, slice, _) = &physical.views[&base];
         let (from, to) = (at.max(base), end.min(base + size));
         for page in (from / PAGE..to.div_ceil(PAGE)).map(|p| p * PAGE) {
             let k = (page - base) / PAGE;
@@ -488,6 +490,122 @@ fn report_written(shown: &[usize]) {
         #[cfg(test)]
         REPORTED.with(|r| r.borrow_mut().push(page));
         drop(victory_gpu::kernel_will_write(page, PAGE));
+    }
+}
+
+/// A CPU write through the section's own view. Its title aliases are kept
+/// busy for write tracking, including any mapped during the decode.
+struct SectionWrite {
+    slice: Slice,
+    pages: usize,
+    guards: HashMap<usize, victory_gpu::KernelWrite>,
+}
+
+impl SectionWrite {
+    fn covers(&self, section: &Arc<Section>, index: usize) -> bool {
+        Arc::ptr_eq(&self.slice.section, section)
+            && (self.slice.index..self.slice.index + self.pages).contains(&index)
+    }
+
+    fn overlaps(&self, slice: &Slice, count: usize) -> bool {
+        Arc::ptr_eq(&self.slice.section, &slice.section)
+            && self.slice.index < slice.index + count
+            && slice.index < self.slice.index + self.pages
+    }
+
+    fn aliases<'a>(&'a self, physical: &'a Physical) -> impl Iterator<Item = usize> + 'a {
+        (0..self.pages)
+            .filter_map(|k| physical.shown.get(&self.slice.key(k)))
+            .flatten()
+            .copied()
+    }
+}
+
+static PHYSICAL_WRITTEN: Condvar = Condvar::new();
+
+struct PhysicalWrite(usize);
+
+impl PhysicalWrite {
+    fn begin(slice: &Slice, pages: usize) -> Self {
+        let mut physical = physical();
+        while physical.writes.values().any(|w| w.overlaps(slice, pages)) {
+            physical = PHYSICAL_WRITTEN
+                .wait(physical)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        let mut write = SectionWrite {
+            slice: slice.clone(),
+            pages,
+            guards: HashMap::new(),
+        };
+        write.guards = write
+            .aliases(&physical)
+            .map(|at| (at, victory_gpu::kernel_will_write_beside(at, PAGE)))
+            .collect();
+        let id = physical.next_write;
+        physical.next_write += 1;
+        physical.writes.insert(id, write);
+        Self(id)
+    }
+}
+
+impl Drop for PhysicalWrite {
+    fn drop(&mut self) {
+        let mut physical = physical();
+        let write = physical.writes.remove(&self.0).expect("live section write");
+        #[cfg(test)]
+        REPORTED.with(|r| r.borrow_mut().extend(write.aliases(&physical)));
+        drop(write);
+        PHYSICAL_WRITTEN.notify_all();
+    }
+}
+
+/// Runs a GPU merge with the current physical view pinned. Waiting for an
+/// overlapping DirectStorage decode releases the map lock. A replacement
+/// may occur during that wait, so check the mapping again afterwards.
+pub(crate) fn landing_page(
+    at: usize,
+    epoch: u64,
+    beside: bool,
+    apply: &mut dyn FnMut(victory_gpu::LandingPage),
+) {
+    use victory_gpu::LandingPage;
+    let mut physical = physical();
+    loop {
+        let Some((&base, (_, slice, mapped))) = physical
+            .views
+            .range(..=at)
+            .next_back()
+            .filter(|(base, (size, _, _))| at < *base + size)
+        else {
+            apply(LandingPage::Direct);
+            return;
+        };
+        if *mapped > epoch {
+            apply(LandingPage::Replaced);
+            return;
+        }
+        let within = at - base;
+        let slice = Slice {
+            section: slice.section.clone(),
+            index: slice.index + within / PAGE,
+        };
+        if physical.writes.values().any(|w| w.overlaps(&slice, 1)) {
+            physical = PHYSICAL_WRITTEN
+                .wait(physical)
+                .unwrap_or_else(|e| e.into_inner());
+            continue;
+        }
+        let page = if beside {
+            slice
+                .section
+                .whole()
+                .map(|base| base + slice.index * PAGE + within % PAGE)
+        } else {
+            None
+        };
+        apply(page.map_or(LandingPage::Direct, LandingPage::Beside));
+        return;
     }
 }
 
@@ -699,17 +817,24 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     let Some(runs) = runs(pages, offset, data.len()) else {
         return false;
     };
+    let landing = victory_gpu::landing_enabled();
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
         let Some(mut view) = View::map(slice, *n) else {
             return false;
         };
+        let _writing = landing.then(|| PhysicalWrite::begin(slice, *n));
         let k = (n * PAGE - within).min(data.len() - done);
         view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
         (within, done) = (0, done + k);
     }
-    // Where the pages show once written (see `PageWindow`).
-    report_written(&shown_at(pages.get(offset / PAGE..(offset + data.len()).div_ceil(PAGE)).unwrap_or(&[])));
+    if !landing {
+        report_written(&shown_at(
+            pages
+                .get(offset / PAGE..(offset + data.len()).div_ceil(PAGE))
+                .unwrap_or(&[]),
+        ));
+    }
     true
 }
 
@@ -720,18 +845,17 @@ pub(crate) struct PageWindow {
     view: View,
     within: usize,
     len: usize,
-    /// The pages (page numbers) the bytes reach: the title views showing
-    /// them when the window is done are told. Looked up then, not when the
-    /// window opens: a decode takes milliseconds, and the title may map a
-    /// page at another address meanwhile (its GPU heap); a copy that took
-    /// the page there before the bytes landed would never hear of them. An
-    /// address that stops showing a page meanwhile was told by the unmap.
+    writing: Option<PhysicalWrite>,
+    /// When landing is disabled, report the views showing these pages at
+    /// the end of the decode, including views mapped during it.
     pages: Vec<usize>,
 }
 
 impl Drop for PageWindow {
     fn drop(&mut self) {
-        report_written(&shown_at(&self.pages));
+        if self.writing.is_none() {
+            report_written(&shown_at(&self.pages));
+        }
     }
 }
 
@@ -752,11 +876,21 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     let [(slice, n)] = runs.as_slice() else {
         return None;
     };
+    let view = View::map(slice, *n)?;
+    let landing = victory_gpu::landing_enabled();
     Some(PageWindow {
-        view: View::map(slice, *n)?,
+        view,
         within: offset % PAGE,
         len,
-        pages: pages.get(offset / PAGE..(offset + len).div_ceil(PAGE)).unwrap_or(&[]).to_vec(),
+        writing: landing.then(|| PhysicalWrite::begin(slice, *n)),
+        pages: if landing {
+            Vec::new()
+        } else {
+            pages
+                .get(offset / PAGE..(offset + len).div_ceil(PAGE))
+                .unwrap_or(&[])
+                .to_vec()
+        },
     })
 }
 
@@ -896,11 +1030,11 @@ fn has_multi_page_view(physical: &Physical, base: usize, len: usize) -> bool {
         .views
         .range(..=base)
         .next_back()
-        .filter(|(at, (size, _))| *at + size > base);
+        .filter(|(at, (size, _, _))| *at + size > base);
     first
         .into_iter()
         .chain(physical.views.range(base + 1..base + len))
-        .any(|(_, (size, _))| *size > PAGE)
+        .any(|(_, (size, _, _))| *size > PAGE)
 }
 
 fn alias_changed_pages(physical: &mut Physical, to: usize, from: usize, len: usize) -> bool {
@@ -931,8 +1065,8 @@ fn slice_at(physical: &Physical, at: usize) -> Option<Slice> {
         .views
         .range(..=at)
         .next_back()
-        .filter(|(base, (size, _))| at < *base + size)
-        .map(|(base, (_, s))| Slice {
+        .filter(|(base, (size, _, _))| at < *base + size)
+        .map(|(base, (_, s, _))| Slice {
             index: s.index + (at - base) / PAGE,
             section: s.section.clone(),
         })
@@ -950,6 +1084,16 @@ fn shows(physical: &Physical, at: usize, slice: &Slice) -> bool {
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
+    map_view(physical, base, len, slice, None)
+}
+
+fn map_view(
+    physical: &mut Physical,
+    base: usize,
+    len: usize,
+    slice: Slice,
+    epoch: Option<u64>,
+) -> bool {
     #[cfg(test)]
     tests::MAPS.with(|m| m.set(m.get() + 1));
     // SAFETY: splits the placeholder around the range (failing harmlessly
@@ -987,15 +1131,29 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
     }
-    // New contents, read-write: the GPU side's copies no longer guard it.
-    victory_gpu::title_memory_remapped(base, len);
+    // The host view is read-write. A split keeps tickets for the same
+    // physical pages, even though the GPU's guard links must be rebuilt.
+    if epoch.is_some() {
+        victory_gpu::title_memory_restored(base, len);
+    } else {
+        victory_gpu::title_memory_remapped(base, len);
+    }
     for k in 0..len / PAGE {
+        let at = base + k * PAGE;
+        for write in physical.writes.values_mut() {
+            if write.covers(&slice.section, slice.index + k) {
+                write
+                    .guards
+                    .insert(at, victory_gpu::kernel_will_write_beside(at, PAGE));
+            }
+        }
         let shown = physical.shown.entry(slice.key(k)).or_default();
         // Pages shown elsewhere already: guarded here too if they are there.
-        victory_gpu::title_memory_aliased(base + k * PAGE, shown);
-        shown.push(base + k * PAGE);
+        victory_gpu::title_memory_aliased(at, shown);
+        shown.push(at);
     }
-    physical.views.insert(base, (len, slice));
+    let epoch = epoch.unwrap_or_else(victory_gpu::next_mapping_epoch);
+    physical.views.insert(base, (len, slice, epoch));
     true
 }
 
@@ -1107,17 +1265,21 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         .views
         .range(..=base)
         .next_back()
-        .filter(|(at, (size, _))| *at + size > base)
+        .filter(|(at, (size, _, _))| *at + size > base)
         .map(|(at, _)| *at);
     let hit: Vec<usize> = first
         .into_iter()
         .chain(physical.views.range(base + 1..end).map(|(at, _)| *at))
         .collect();
     for at in hit {
-        let Some((size, slice)) = physical.views.remove(&at) else {
+        let Some((size, slice, epoch)) = physical.views.remove(&at) else {
             continue;
         };
         for k in 0..size / PAGE {
+            let page = at + k * PAGE;
+            for write in physical.writes.values_mut() {
+                write.guards.remove(&page);
+            }
             let key = slice.key(k);
             if let Some(addresses) = physical.shown.get_mut(&key) {
                 addresses.retain(|&a| a != at + k * PAGE);
@@ -1126,7 +1288,27 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 }
             }
         }
-        victory_gpu::title_memory_remapped(at, size);
+        if victory_gpu::landing_enabled() {
+            if at < base {
+                victory_gpu::title_memory_moving(at, base - at);
+            }
+            if at + size > end {
+                victory_gpu::title_memory_moving(end, at + size - end);
+            }
+        }
+        let end_of_view = at + size;
+        let split = if at < base || end_of_view > end {
+            let removed = at.max(base);
+            Some(victory_gpu::title_memory_splitting(
+                at,
+                size,
+                removed,
+                end_of_view.min(end) - removed,
+            ))
+        } else {
+            victory_gpu::title_memory_remapped(at, size);
+            None
+        };
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
             UnmapViewOfFile2(
@@ -1137,12 +1319,17 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 MEM_PRESERVE_PLACEHOLDER,
             )
         };
-        if at < base {
-            map(physical, at, base - at, slice.clone());
-        }
-        if at + size > end {
-            let index = slice.index + (end - at) / PAGE;
-            map(physical, end, at + size - end, Slice { index, ..slice });
+        if let Some(mut split) = split {
+            if at < base && !map_view(physical, at, base - at, slice.clone(), Some(epoch)) {
+                split.discard(at, base - at);
+            }
+            if end_of_view > end {
+                let index = slice.index + (end - at) / PAGE;
+                let tail = end_of_view - end;
+                if !map_view(physical, end, tail, Slice { index, ..slice }, Some(epoch)) {
+                    split.discard(end, tail);
+                }
+            }
         }
     }
 }
@@ -1832,6 +2019,7 @@ mod tests {
         assert_eq!(XMemMapPhysicalPages(a, 1, pages.as_ptr()), a);
         REPORTED.with(|r| r.borrow_mut().clear());
         let mut window = page_window(&pages, 0, 16).expect("one run");
+        assert_eq!(window.writing.is_some(), victory_gpu::landing_enabled());
         // Mapped at `b`, unmapped from `a`, while the bytes are written.
         assert_eq!(XMemMapPhysicalPages(b, 1, pages.as_ptr()), b);
         assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
@@ -1868,6 +2056,97 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn landing_view_follows_the_section_and_rejects_replacements() {
+        use victory_gpu::LandingPage;
+        use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+        let pages = allocate(4);
+        let reserve = || {
+            XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                3 * PAGE,
+                MEM_RESERVE | PAGES_64K,
+                0,
+                PAGE_READWRITE,
+            )
+        };
+        let (a, b) = (reserve(), reserve());
+        assert!(!a.is_null() && !b.is_null());
+        let at = a as usize;
+        assert_eq!(XMemMapPhysicalPages(a, 3, pages.as_ptr()), a);
+        assert_eq!(XMemMapPhysicalPages(b, 1, pages.as_ptr()), b);
+        let epoch = victory_gpu::next_mapping_epoch();
+        let mut old = 0;
+        for view in [a, b] {
+            // SAFETY: writable OS section views allocated by the test.
+            let protected = unsafe { VirtualProtect(view, PAGE, PAGE_READONLY, &mut old) };
+            assert_ne!(protected, 0);
+        }
+        landing_page(at + 19, epoch, true, &mut |page| {
+            let LandingPage::Beside(address) = page else {
+                panic!("missing writable section alias")
+            };
+            // SAFETY: xmem pins the alternate section view for this callback.
+            unsafe { (address as *mut u8).write_volatile(0xb1) };
+        });
+        for view in [a, b] {
+            assert_eq!(query(view).host.Protect, PAGE_READONLY);
+            // SAFETY: the views remain readable.
+            assert_eq!(unsafe { view.cast::<u8>().add(19).read_volatile() }, 0xb1);
+        }
+        landing_page(at, epoch, false, &mut |p| {
+            assert!(matches!(p, LandingPage::Direct))
+        });
+
+        // The section view may also be the target of a DirectStorage
+        // decode. A landing against that slice waits for the bytes.
+        let slice = physical().pages[&pages[0]].clone();
+        let mut view = View::map(&slice, 1).expect("a section view");
+        let writing = PhysicalWrite::begin(&slice, 1);
+        let (send, recv) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            landing_page(at + 19, epoch, true, &mut |page| {
+                let LandingPage::Beside(address) = page else {
+                    panic!("missing writable section alias");
+                };
+                // SAFETY: the callback pins the view after the decoder.
+                send.send(unsafe { (address as *const u8).read_volatile() })
+                    .unwrap();
+            });
+        });
+        assert_eq!(
+            recv.recv_timeout(std::time::Duration::from_millis(20)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+        view.bytes()[19] = 0xc2;
+        drop(writing);
+        assert_eq!(
+            recv.recv_timeout(std::time::Duration::from_secs(5)),
+            Ok(0xc2)
+        );
+        worker.join().unwrap();
+
+        // Replacing the middle page splits the view. The neighbours still
+        // show their original section slices and take the in-flight writes.
+        let middle = a.wrapping_byte_add(PAGE);
+        assert_eq!(XMemMapPhysicalPages(middle, 1, pages[3..].as_ptr()), middle);
+        for beside in [true, false] {
+            landing_page(at + PAGE, epoch, beside, &mut |p| {
+                assert!(matches!(p, LandingPage::Replaced))
+            });
+        }
+        let after_replacement = victory_gpu::next_mapping_epoch();
+        landing_page(at + PAGE, after_replacement, false, &mut |p| {
+            assert!(matches!(p, LandingPage::Direct))
+        });
+        landing_page(at + 2 * PAGE, epoch, true, &mut |p| {
+            assert!(matches!(p, LandingPage::Beside(_)))
+        });
+        assert_eq!(XMemMapPhysicalPages(a, 3, std::ptr::null()), a);
+        assert_eq!(XMemMapPhysicalPages(b, 1, std::ptr::null()), b);
+        assert_eq!(XMemFreePhysicalPages(pages.len(), pages.as_ptr()), 1);
     }
 
     #[test]
