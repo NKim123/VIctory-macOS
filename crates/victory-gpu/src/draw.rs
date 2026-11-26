@@ -119,6 +119,19 @@ struct IndirectBatch {
     signature: (u32, u32),
 }
 
+fn may_write_buffers(pipeline: &HostPipeline) -> bool {
+    pipeline.stages.iter().any(|stage| {
+        let shader = stage.translated();
+        shader.host.memory_writes
+            || shader.host.heap_writes
+            || !shader.host.root_uavs.is_empty()
+            || shader
+                .used
+                .iter()
+                .any(|resource| resource.kind == ResourceType::Uav)
+    })
+}
+
 type TableRecords = (u64, Vec<[u32; 3]>);
 
 struct FreshTable {
@@ -649,6 +662,11 @@ impl State {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
             not_run("another kind of pipeline");
             return false;
+        }
+        // Graphics targets are textures. Only a shader with writable
+        // views can change argument buffers and end an open clamp batch.
+        if self.indirect.is_some() && may_write_buffers(p) {
+            self.indirect = None;
         }
         if !self.bind(list, p, false) {
             return false;
@@ -1500,7 +1518,6 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
-        self.indirect = None;
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let texture_writes = list.capture_texture_writes();
@@ -1953,7 +1970,6 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
-        self.indirect = None;
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         // Rectangles: completed by the pipeline's geometry shader, else
@@ -2066,7 +2082,6 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
-        self.indirect = None;
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         let rects = self.topology == RECTANGLES && !self.completes_rectangles();
@@ -2246,15 +2261,8 @@ impl State {
         let keep_readable = clamp && (mode != 0 || window);
         let aliased = args.is_aliased() || args.is_tiled();
         let batch_aliased = aliased && mode != 0 && crate::indirect::batch_aliased();
-        let may_write = keep_readable
-            && (kind != DISPATCH || batch_aliased)
-            && p.stages.iter().any(|stage| {
-                let t = stage.translated();
-                t.host.memory_writes
-                    || t.host.heap_writes
-                    || !t.host.root_uavs.is_empty()
-                    || t.used.iter().any(|u| u.kind == ResourceType::Uav)
-            });
+        let may_write =
+            keep_readable && (kind != DISPATCH || batch_aliased) && may_write_buffers(p);
         let offset = args.offset(arguments);
         let gpu = args.gpu(arguments);
         let source_window = if batch_aliased {
