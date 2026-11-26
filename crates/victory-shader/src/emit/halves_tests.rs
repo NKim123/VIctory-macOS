@@ -722,6 +722,17 @@ fn whole_group_reads_first_active_lane_under_divergent_masks() {
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
+/// The group exchanges LDS values before a mask selects the first active
+/// lane. With only the upper half active in the branch, the lower half
+/// must still take the branch and receive the value read by that lane.
+#[test]
+fn whole_group_reads_first_lane_after_lds() {
+    let host = super::tests::translate_group_with_lds(true)
+        .expect("the group can synchronize its LDS and vote across halves");
+    let failed = check_differences(&[("LDS and group vote", host)], 64, 1, &[13; 64]);
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
 /// What the console gives [`reduction`] of `f` (folding the inputs of a
 /// console wave's lanes) in lane `l` of a group of `threads`.
 fn console_reduction(

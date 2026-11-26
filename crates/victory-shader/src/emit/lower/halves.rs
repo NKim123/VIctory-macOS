@@ -33,9 +33,10 @@
 //! * whole-wave reductions and prefix sums: each half reduces its own lanes,
 //!   and they pass each other the result; a prefix in the upper half adds
 //!   the lower half's total ([`Lower::reduce_across`]). A group of one
-//!   full console wave with no guest LDS can retry a refused reduction by
-//!   restoring the console's wave-wide mask branches. Both halves take
-//!   the same edges and mask their contributions with EXEC;
+//!   full console wave can retry a refused reduction by restoring the
+//!   console's wave-wide mask branches, if lowering can also synchronize
+//!   any guest LDS. Both halves follow the same edges and mask their
+//!   contributions with EXEC;
 //! * `v_readfirstlane_b32` reads the host wave's first lane, which in the
 //!   upper half is console lane 32 or later: kept as it is for a value the
 //!   same in every lane of the console wave ([`lane_uniform`], what the

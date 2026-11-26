@@ -830,10 +830,12 @@ pub fn emit_with(
         }
         // A full console wave can vote on its mask branches as a group,
         // with a host thread for each bit of EXEC and VCC. Both halves then
-        // reach the exchange for the reduction or first active lane.
+        // reach the exchange for the reduction or first active lane. With
+        // narrow waves, lowering must also be able to synchronize guest LDS.
         if matches!(*what, lower::REDUCTION_ACROSS | lower::FIRST_ACROSS)
             && matches!(native.io, crate::native::StageIo::Cs(cs)
-                if cs.lds_bytes() == 0 && cs.threads.iter().product::<u32>() == 64)
+                if cs.threads.iter().product::<u32>() == 64
+                    && (cs.lds_bytes() == 0 || options.narrow_waves))
             && let Ok(st) = structure::with_group_branches(p)
             && !st.group_branches.is_empty()
             && let Ok(res) = resource::track(p, &native.layout, native.stage, Some(&st))
@@ -1105,6 +1107,111 @@ mod tests {
         mesh_outputs(dxil).map(|o| o.bytes())
     }
     use crate::native::{ComputeIo, StageIo};
+
+    // Each lane writes its ID, reads the opposite half's ID, then broadcasts
+    // the value for lane 45 under EXEC. The output must be 13 in every lane.
+    pub(super) fn translate_group_with_lds(narrow_waves: bool) -> Result<HostShader, ShaderError> {
+        use crate::native::{ResourceType, RootParam, UsedResource};
+
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+            0xD765_0001,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+            0xD766_0001,
+            0x0002_02C1, // v_mbcnt_hi_u32_b32 v1, -1, v1
+            0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+            0xD834_0000,
+            0x0000_0104, // ds_write_b32 v4, v1
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x3A08_00A0, // v_xor_b32 v4, 32, v0
+            0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+            0xD8D8_0000,
+            0x0300_0004, // ds_read_b32 v3, v4
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xBE94_047E, // s_mov_b64 s[20:21], exec
+            0xBE88_03FF,
+            0x0000_0000, // s_mov_b32 s8, 0
+            0xBE89_03FF,
+            0x0000_2000, // s_mov_b32 s9, 1 << 13 (lane 45)
+            0x7D88_00A0, // v_cmp_gt_u32 vcc, 32, v0
+            0xD501_0002,
+            0x01A8_1009, // v_cndmask_b32 v2, s9, s8, vcc
+            0x2C04_0500, // v_lshrrev_b32 v2, v0, v2
+            0x3604_0481, // v_and_b32 v2, 1, v2
+            0x7DAA_0480, // v_cmpx_ne_u32 exec, 0, v2
+            0xBF88_0002, // s_cbranch_execz fallback
+            0x7E1E_0503, // v_readfirstlane_b32 s15, v3
+            0xBF82_0001, // s_branch join
+            0xBE8F_03A5, // fallback: s_mov_b32 s15, 37
+            0xBEFE_0414, // join: s_mov_b64 exec, s[20:21]
+            0x7E02_020F, // v_mov_b32 v1, s15
+            0xE070_1000,
+            0x800A_0110, // buffer_store_dword v1, v16, s[40:43], 0 offen
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 32,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 16,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 1 | 1 << 15,
+                threads: [64, 1, 1],
+            }),
+            code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
+        };
+        let bytes = container::build(&[]);
+        let container = Container::parse(&bytes).unwrap();
+        let program = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let structured = structure::structure(&program).unwrap();
+        let resources =
+            resource::track(&program, &native.layout, native.stage, Some(&structured)).unwrap();
+        let io = io::raise(&program, &native).unwrap();
+        let options = Options {
+            host_wave32: true,
+            narrow_waves,
+            ..Options::default()
+        };
+        emit_with(
+            &container,
+            &native,
+            &program,
+            &structured,
+            &io,
+            &resources,
+            options,
+        )
+    }
+
+    #[test]
+    fn group_first_lane_retry_accepts_synchronized_lds() {
+        let error = translate_group_with_lds(false).expect_err("unsynchronized LDS is refused");
+        assert!(error.to_string().contains(lower::LDS_ACROSS));
+        translate_group_with_lds(true)
+            .expect("the group can synchronize LDS and read the first active lane");
+    }
 
     #[test]
     fn indexed_move_initializes_an_input_before_its_first_use() {
