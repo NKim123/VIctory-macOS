@@ -4,7 +4,7 @@ This file tracks the work to run VIctory on Apple Silicon Macs. No game files ar
 
 ## Done on 24 November 2026
 
-The whole workspace builds natively on macOS (aarch64, Homebrew Rust 1.100). The Windows-only parts are gated with `cfg(windows)`, and a few small stubs stand in for them. The text entry dialog is cancelled on other hosts, a relaunch request stops the process, and the `translate` command reports that it needs Windows. On a Mac M4 the test suite gives 162 passed, 0 failed and 10 ignored. The ignored tests read their own test binary as a PE file or use Windows paths, so they only run on Windows.
+The whole workspace builds natively on macOS (aarch64, Homebrew Rust 1.100). The Windows-only parts are gated with `cfg(windows)`, and a few small stubs stand in for them. The text entry dialog is cancelled on other hosts, a relaunch request stops the process, and the original `translate` command required Windows. On a Mac M4 the test suite gives 162 passed, 0 failed and 10 ignored. The ignored tests read their own test binary as a PE file or use Windows paths, so they only run on Windows.
 
 A native build proves that the platform code (formats, shader recompiler, PE analysis and most of the HLE layer) is portable. It does not run a title, because the loader maps a Windows PE image into the process and calls Windows APIs.
 
@@ -168,7 +168,15 @@ In the loading freeze from #50 every thread stops logging, and `VICTORY_STACKS` 
 
 ## Presented planes
 
-On Series S the game presents two planes. Plane 0 is a 1920x1080 overlay and plane 1 is the 3840x2160 picture (#15). The window shows the plane whose first resource has the most pixels, and `VICTORY_PRESENT_PLANE=<n>` picks another one. With `VICTORY_PRESENT_COMPOSITE=1` the other plane is also blended over the shown one by a compute pass (`victory-gpu/src/composite.rs`), scaled to it and using its alpha as straight alpha. The blend is off by default until a run with the game shows that the overlay is clear where the picture should show.
+On Series S the game presents two planes. Plane 0 is a 1920x1080 overlay and plane 1 is the 3840x2160 picture (#15). The window shows the plane whose first resource has the most pixels, and `VICTORY_PRESENT_PLANE=<n>` picks another one. Series S blends the second plane over the picture by default. The compute pass scales and blends it with straight alpha. `VICTORY_PRESENT_COMPOSITE=0` disables blending, and `1` enables it on either console.
+
+## Frame pacing
+
+`VICTORY_FRAME_INTERVAL_MS=16.667` requests a 60 Hz pacing interval
+and `0` removes the frame wait. Unset uses the title's interval. For
+Series 1.0.2.1, all three instruction windows must match before the title's
+limiter and simulation read the corresponding rate. `VICTORY_TITLE_FPS=off`
+leaves the title's own rate in effect.
 
 ## Indirect light estimate
 
@@ -176,7 +184,36 @@ On Series S the game presents two planes. Plane 0 is a 1920x1080 overlay and pla
 
 `VICTORY_AMBIENT_AIR=<multiple>` caps the luminance of the air-scattering volume at a multiple of the estimated light. It requires the numeric ambient mode and a completed estimate. Numeric mode uses typed UAV loads of `R11G11B10_FLOAT`. Both effects default to off. The producer and auxiliary pass use the same host descriptor slots, including ordinary shared tables. Descriptors keep late binding until submission. If a required slot was rewritten after recording, the auxiliary dispatches are skipped and the producer sees the replacement normally. For eligible pairs the host holds those descriptor versions stable through the submission fence.
 
+`VICTORY_AMBIENT_SETTLE=<milliseconds>[,<jump factor>[,<fresh seconds>]]`
+controls the numeric mode's history. The default `250,3` follows a
+250 ms time constant and snaps to light changes by more than a factor of
+three. `0` restores the per-frame blend. A positive third argument ramps the
+cap on the title's own light output back up after a jump.
+
 Numeric mode gathers a 64 × 36 radiance grid at 80 × 45 points. Once the history is ready, each resolve does 8,294,400 fixed source-point iterations, then a full-resolution depth-aware resolve. Crease shading can add 12 depth taps per output texel, and the air cap adds a pass over the volume. The gather grid trades spatial resolution for less work. Frame cost and image quality in the title have not been measured. Each participating host list reuses a 4 KiB upload buffer for up to 64 auxiliary passes per recording. The passes use the producer’s existing descriptor heap.
+
+## Warming the shader cache on ARM64
+
+Build `victory` on the Mac and run it against the shader packs or title
+directory. Use the same checkout and Rust toolchain for the native and
+Windows binaries.
+
+```sh
+cargo build --release --locked -p victory
+VICTORY_CACHE_DIR="/absolute/path/to/the/launch/cache" \
+  target/release/victory translate --cache --wine-defaults --jobs 8 "/path/to/title"
+```
+
+`--wine-defaults` targets D3DMetal's 32-lane waves and uses the same
+`VICTORY_ATOMIC_LOCKS`, `VICTORY_ATOMIC_LOCK_ROUNDS`,
+`VICTORY_ATOMIC_UMAX`, `VICTORY_NARROW_WAVES`,
+`VICTORY_BIAS_AS_GRADIENTS` and `VICTORY_PORT_CBV` settings as the Windows
+runtime. Set the same overrides for warm-up and launch. If you use
+`VICTORY_SHADER_LOOP_LIMIT`, build both binaries with diagnostics and pass
+the same value. The Windows launcher must point at the same cache via its
+Wine path. Native warm-up writes DXIL and its binding metadata. D3D12 PSO
+creation, DXIL validation with `dxil.dll` and pipeline-specific mesh/pixel
+linking run separately on the Windows side.
 
 ## D3DMetal's shader cache needs unique shader hashes
 
