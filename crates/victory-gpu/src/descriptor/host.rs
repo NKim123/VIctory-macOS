@@ -2326,12 +2326,25 @@ fn raw_structured_alignment() -> u64 {
     }
 }
 
+fn direct_widen_source(shadow: &crate::shadow::Shadow, address: u64) -> bool {
+    // The compute path for UAV writes uses a raw root SRV at this address.
+    shadow.is_aliased() && shadow.offset(address).is_multiple_of(16)
+}
+
 /// The exact copy the host view reads, including an alignment copy when needed.
 pub(crate) fn align_view_copy(
     view: &View,
     (owner, address, len): BufferView,
 ) -> Option<BufferView> {
     let (format, stride, raw) = buffer_layout(view)?;
+    if crate::under_wine()
+        && typed_buffer(stride, raw)
+        && matches!(view, View::Shader(..) | View::Placed(false, ..))
+        && widened_w(format.0).is_some()
+        && direct_widen_source(&owner, address)
+    {
+        return Some((owner, address, len));
+    }
     let alignment = if structured_as_raw(format, stride) {
         raw_structured_alignment()
     } else {
@@ -2484,7 +2497,35 @@ fn buffer_srv(
     } else {
         element
     };
-    let Some((shadow, own)) = descriptor_shadow(start, bytes, alignment, backing) else {
+    let host = host()?;
+    let widening = crate::under_wine()
+        && typed_buffer(
+            buffer.StructureByteStride,
+            buffer.Flags == D3D12_BUFFER_SRV_FLAG_RAW,
+        )
+        && widened_w(desc.Format.0).is_some();
+    // Widen straight from a suitably aligned alias. Only the widened
+    // destination needs a typed descriptor.
+    let owner = backing
+        .cloned()
+        .or_else(|| crate::shadow::find(start, bytes));
+    if widening
+        && let Some(source) = owner
+            .as_ref()
+            .filter(|source| direct_widen_source(source, start))
+    {
+        if bytes == 0 || bytes > source.left(start) {
+            return None;
+        }
+        return widen_srv(&host.device, source, start, count, desc, at);
+    }
+    let Some((shadow, own)) = owner.and_then(|owner| {
+        if backing.is_some() {
+            Some((owner, true))
+        } else {
+            crate::shadow::view_in(owner, start, bytes, alignment)
+        }
+    }) else {
         #[cfg(feature = "diagnostics")]
         if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
             tracing::info!(
@@ -2528,14 +2569,7 @@ fn buffer_srv(
         );
         return None;
     }
-    let host = host()?;
-    if crate::under_wine()
-        && typed_buffer(
-            buffer.StructureByteStride,
-            buffer.Flags == D3D12_BUFFER_SRV_FLAG_RAW,
-        )
-        && let Some(widened) = widen_srv(&host.device, &shadow, start, count, desc, at)
-    {
+    if widening && let Some(widened) = widen_srv(&host.device, &shadow, start, count, desc, at) {
         return Some(widened);
     }
     // SAFETY: a live buffer and a slot of our heap.
@@ -3489,6 +3523,74 @@ mod tests {
             dest.read_host(dest.range().0, 7),
             [u32::MAX, 20, 30, 40, 0, u32::MAX, u32::MAX]
         );
+    }
+
+    #[test]
+    fn off_element_rgb32_reads_the_alias_directly_when_widening() {
+        if !crate::under_wine() {
+            return;
+        }
+        let Some(host) = host() else { return };
+        let (buffer, data) = host.shared_buffer(65536).expect("a mapped buffer");
+        let base = data as u64;
+        // SAFETY: a live buffer and three mapped dwords at offset 16.
+        let gpu = unsafe {
+            data.add(16).cast::<[u32; 3]>().write([11, 22, 33]);
+            buffer.GetGPUVirtualAddress()
+        };
+        let alias = crate::shadow::Shadow::new_aliased(buffer, data, gpu, base, 65536);
+        let address = base + 16;
+        let view = View::Placed(
+            false,
+            [1, 0, 0, 0, 65536, 0, 1, 0, 0, 1, 0, 0, 0, 0],
+            [
+                7,
+                1,
+                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                address as u32,
+                (address >> 32) as u32,
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+        let (backing, start, len) =
+            align_view_copy(&view, (alias.clone(), address, 12)).expect("a buffer source");
+        assert!(std::sync::Arc::ptr_eq(&backing, &alias));
+        assert_eq!((start, len), (address, 12));
+        // SAFETY: plain descriptor-heap creation and handle query.
+        let (heap, at) = unsafe {
+            let heap: ID3D12DescriptorHeap = host
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 1,
+                    ..Default::default()
+                })
+                .expect("a descriptor heap");
+            let at = heap.GetCPUDescriptorHandleForHeapStart();
+            (heap, at)
+        };
+        let Some((_, Some(HeldSource::Widened(widened, source)))) =
+            make(&view, at, Some(&backing)).flatten()
+        else {
+            panic!("the descriptor should read a widened buffer");
+        };
+        assert!(std::sync::Arc::ptr_eq(&source, &alias));
+        assert_eq!(widened.read_host(4), [11, 22, 33, 1]);
+        // SAFETY: the same live, mapped element before the next refresh.
+        unsafe { data.add(16).cast::<[u32; 3]>().write([44, 55, 66]) };
+        assert_eq!(source.update(address as usize, 12), 0);
+        assert_eq!(widened.read_host(4), [44, 55, 66, 1]);
+        drop(heap);
     }
 
     /// Three-channel 32-bit SRVs are backed by a widened copy on hosts that
