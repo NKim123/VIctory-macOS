@@ -590,6 +590,14 @@ impl HostHeap {
         self.marks.as_ref().map(|(buffer, _)| buffer)
     }
 
+    pub(crate) fn keeps_texture(&self, index: u32, texture: &ID3D12Resource) -> bool {
+        self.kept
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(index as usize)
+            .is_some_and(|(resource, _)| resource == texture)
+    }
+
     /// Watches the exact shared slot and host texture used by a recorded
     /// UAV. The mirror lock serializes the snapshot with descriptor writes.
     pub(crate) fn watch_texture_binding(
@@ -602,11 +610,7 @@ impl HostHeap {
         if self.ready.get(index as usize)?.load(Ordering::Acquire) != view.key {
             return None;
         }
-        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        if !kept
-            .get(index as usize)
-            .is_some_and(|(res, _)| res == texture)
-        {
+        if !self.keeps_texture(index, texture) {
             return None;
         }
         let mut bindings = self

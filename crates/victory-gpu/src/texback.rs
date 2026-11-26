@@ -133,9 +133,10 @@ pub(crate) fn remapped(at: usize, len: usize) {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct Wanted(BTreeMap<usize, Target>);
 
+#[derive(Clone)]
 struct Target {
     copy: Arc<HostTexture>,
     layout: Layout,
@@ -144,6 +145,7 @@ struct Target {
 }
 
 /// Only shared slots that could write this mip and array slice.
+#[derive(Clone)]
 struct Subresource {
     format: DXGI_FORMAT,
     bindings: Vec<Arc<Binding>>,
@@ -254,8 +256,48 @@ impl Wanted {
         target.mark(resource, words, binding.as_ref());
     }
 
+    /// Capture the texture in an immutable slot while its original title
+    /// object is still available. Keep the host texture and allocation
+    /// ticket, never a title reference that would defer its release.
+    pub(crate) fn dynamic(
+        heap: &crate::descriptor::host::HostHeap,
+        index: u32,
+        view: &crate::descriptor::View,
+    ) -> Option<Self> {
+        use crate::descriptor::View;
+        let placed = match view {
+            View::Placed(true, ..) => crate::descriptor::host::placed_texture(view),
+            View::Unordered(..) => None,
+            _ => return None,
+        };
+        let View::Unordered(resource, _, words) = placed.as_ref().unwrap_or(view) else {
+            return None;
+        };
+        let mut wanted = Self::default();
+        wanted.mark(*resource as This, words.as_ref(), None);
+        let target = wanted.0.get(resource)?;
+        (!target.subresources.is_empty() && heap.keeps_texture(index, &target.copy.texture))
+            .then_some(wanted)
+    }
+
+    /// The dynamic descriptor still names this copy even if the original
+    /// title slot can no longer supply its state during table preparation.
+    pub(crate) fn prepare_dynamic(&self, list: &HostList) {
+        for target in self.0.values() {
+            if let Some(barrier) =
+                list.move_texture(&target.copy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32)
+            {
+                // SAFETY: an open list holding this live texture.
+                unsafe { list.list.ResourceBarrier(&[barrier]) };
+            }
+        }
+    }
+
     pub(crate) fn commit(&mut self, attempted: Self) {
         for (owner, target) in attempted.0 {
+            if !target.ticket.valid.load(Ordering::Relaxed) {
+                continue;
+            }
             if let Some(current) = self.0.get_mut(&owner)
                 && current.ticket.valid.load(Ordering::Relaxed)
                 && Arc::ptr_eq(&current.copy, &target.copy)

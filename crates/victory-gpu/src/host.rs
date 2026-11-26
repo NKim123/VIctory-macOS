@@ -2525,6 +2525,17 @@ impl HostList {
         }
     }
 
+    pub(crate) fn dynamic_texture_written(&self, write: &crate::texback::Wanted) {
+        {
+            let mut deferred = self.deferred();
+            let Some(writes) = &mut deferred.attempted_texture_writes else {
+                return;
+            };
+            writes.commit(write.clone());
+        }
+        write.prepare_dynamic(self);
+    }
+
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
         let mut deferred = self.deferred();

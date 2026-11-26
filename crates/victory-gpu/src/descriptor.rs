@@ -77,6 +77,12 @@ pub(crate) fn heap<'a>(this: This) -> &'a Heap {
     unsafe { &*this.cast::<Heap>() }
 }
 
+#[cfg(all(windows, test))]
+thread_local! {
+    pub(crate) static TEST_TITLE_SLOT_CAP: std::cell::Cell<u32> =
+        const { std::cell::Cell::new(u32::MAX) };
+}
+
 impl Heap {
     /// Whether this is a sampler heap.
     pub(crate) fn samplers(&self) -> bool {
@@ -107,7 +113,10 @@ impl Heap {
         self.host
             .get_or_init(|| {
                 let step = u64::from(increment(self.desc.kind)?);
-                let h = host::HostHeap::new(self.samplers(), self.desc.count)?;
+                let count = self.desc.count;
+                #[cfg(test)]
+                let count = TEST_TITLE_SLOT_CAP.with(|cap| count.min(cap.get()));
+                let h = host::HostHeap::new(self.samplers(), count)?;
                 for i in pending.drain(..) {
                     h.mirror(i, self.start + u64::from(i) * step, false);
                 }

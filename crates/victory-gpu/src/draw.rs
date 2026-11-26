@@ -74,8 +74,8 @@ pub(crate) struct State {
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
     /// Tables made afresh in this list: (table, what it holds) → first
-    /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u64), u32>,
+    /// dynamic slot and any texture write-back metadata.
+    fresh_tables: std::collections::HashMap<(u64, u64), FreshTable>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -106,6 +106,27 @@ struct Fixed {
     /// Render target and depth view handles.
     targets: Option<(Vec<u64>, u64)>,
     topology: bool,
+}
+
+struct FreshTable {
+    first: u32,
+    writes: Vec<(u32, crate::texback::Wanted)>,
+}
+
+impl FreshTable {
+    fn record_writes(&self, list: &HostList, entries: &[&UsedResource]) {
+        if self.writes.is_empty() {
+            return;
+        }
+        for u in entries.iter().filter(|u| u.kind == ResourceType::Uav) {
+            if let Ok(index) = self
+                .writes
+                .binary_search_by_key(&(u.table_offset_dwords / 8), |entry| entry.0)
+            {
+                list.dynamic_texture_written(&self.writes[index].1);
+            }
+        }
+    }
 }
 
 impl Drop for State {
@@ -1357,14 +1378,15 @@ impl State {
                 }
                 (table, h.finish())
             };
-            if let Some(&first) = self.fresh_tables.get(&key) {
+            if let Some(fresh) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         readable(list, u, &view, true);
                     }
                 }
-                made.push((slot, first * 32));
+                fresh.record_writes(list, &entries);
+                made.push((slot, fresh.first * 32));
                 continue;
             }
             let Some(first) = host.dynamic(n) else {
@@ -1376,7 +1398,11 @@ impl State {
                 self.table_failed = true;
                 continue;
             };
-            self.fresh_tables.insert(key, first);
+            let mut fresh = FreshTable {
+                first,
+                writes: Vec::new(),
+            };
+            let write_back = crate::texback::enabled();
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The whole range: a shader may index past the entries its
@@ -1388,6 +1414,11 @@ impl State {
                 match view.as_deref() {
                     Some(view) => {
                         host.make_at(index, view);
+                        if write_back
+                            && let Some(write) = crate::texback::Wanted::dynamic(host, index, view)
+                        {
+                            fresh.writes.push((k, write));
+                        }
                         if let Some(u) = used {
                             readable(list, u, view, true);
                         }
@@ -1400,6 +1431,8 @@ impl State {
                     }
                 }
             }
+            fresh.record_writes(list, &entries);
+            self.fresh_tables.insert(key, fresh);
             made.push((slot, first * 32));
         }
         made
@@ -4263,6 +4296,111 @@ void main(uint3 id : SV_DispatchThreadID) { o[id.xy] = 13.5; }",
             check(&expected(&[1]));
         }
         for object in [heap, a, b] {
+            assert_eq!(crate::object::release_ref(object), 0);
+        }
+    }
+
+    #[test]
+    fn texture_write_back_follows_new_and_reused_dynamic_uavs() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 2, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        assert_eq!(
+            crate::descriptor::create_heap(
+                null,
+                heap_desc.as_ptr().cast(),
+                &crate::object::IUNKNOWN,
+                &mut heap,
+            ),
+            S_OK,
+        );
+        let title = crate::descriptor::heap(heap);
+        crate::descriptor::TEST_TITLE_SLOT_CAP.set(1);
+        let visible = title.host().unwrap();
+        crate::descriptor::TEST_TITLE_SLOT_CAP.set(u32::MAX);
+        assert_eq!(visible.count(), 1);
+        // SAFETY: a plain descriptor-size query on a live device.
+        let step = unsafe {
+            host.device
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+        };
+        let slots = Slots(visible.heap.clone(), step);
+        let handle = title.start + u64::from(crate::descriptor::increment_size(null, 0));
+        assert_eq!(title.index(handle), Some(1));
+
+        let address = title_memory(1 << 20);
+        let mut words = texture_words(64, 64, 41, 0, 4);
+        words[7] = 2 | 1 << 16;
+        let original = texture_at_address(address, &words);
+        let replacement = texture_at_address(title_memory(1 << 20), &words);
+        let (_, desc) = crate::resource::texture_memory(original).unwrap();
+        let layout = crate::resource::texture_layout(&desc)
+            .unwrap()
+            .planes
+            .remove(0)
+            .layout;
+        let array_uav = [41u32, 5, 0, 1, u32::MAX, 0, 0, 0, 0, 0];
+        let bind = |resource| {
+            crate::descriptor::create_uav(null, resource, null, &array_uav, handle);
+        };
+        let used = [used(ResourceType::Uav)];
+        for (reuse, value) in [(false, 13.5f32), (true, 23.5f32)] {
+            bind(original);
+            let mut expected = vec![0xa5; layout.size as usize];
+            // SAFETY: the test owns the whole title allocation.
+            unsafe { std::ptr::write_bytes(address as *mut u8, 0xa5, expected.len()) };
+            let linear: Vec<_> = (0..64 * 64).flat_map(|_| value.to_le_bytes()).collect();
+            layout
+                .tile(&mut expected, 0, 1, &linear, 64 * 4, linear.len())
+                .unwrap();
+            let shader = compile_cs(
+                &format!(
+                    "RWTexture2DArray<float> o : register(u0);
+                     [numthreads(8, 8, 1)]
+                     void main(uint3 id : SV_DispatchThreadID) {{ o[id] = {value}; }}"
+                ),
+                WRITES,
+            );
+            let list = host.new_list().unwrap();
+            let mut state = State::default();
+            state.set_heaps(&[heap]);
+            state.set_table(true, 0, handle);
+            crate::texback::TEST_KINDS.set(&[(64, 64, 41)]);
+            let first = reuse.then(|| {
+                // A zero-work command may build a table but cannot commit writes.
+                let _writes = list.capture_texture_writes().unwrap();
+                let made = state.tables(&list, &used, true);
+                assert_eq!(made.len(), 1);
+                run(&list, &slots, &shader, made[0].1 / 32, None, (0, 8));
+                made[0].1
+            });
+            let writes = list.capture_texture_writes().unwrap();
+            let made = state.tables(&list, &used, true);
+            assert_eq!(made.len(), 1);
+            let dynamic = made[0].1 / 32;
+            assert!(dynamic >= visible.count());
+            if let Some(first) = first {
+                assert_eq!(made[0].1, first, "second command must reuse the table");
+            }
+            run(&list, &slots, &shader, dynamic, None, (8, 8));
+            writes.commit();
+            crate::texback::TEST_KINDS.set(&[]);
+            list.close();
+            bind(replacement);
+            host.execute(&[&list]);
+            // SAFETY: the live allocation spans the console layout.
+            let actual =
+                unsafe { std::slice::from_raw_parts(address as *const u8, expected.len()) };
+            let mismatch = actual.iter().zip(&expected).position(|(a, b)| a != b);
+            assert_eq!(
+                mismatch, None,
+                "dynamic UAV bytes and untouched padding (reuse={reuse})"
+            );
+        }
+        for object in [heap, original, replacement] {
             assert_eq!(crate::object::release_ref(object), 0);
         }
     }
