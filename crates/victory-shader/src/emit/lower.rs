@@ -541,6 +541,7 @@ pub(super) const LDS_ACROSS: Why =
 pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
 pub(super) const REDUCTION_ACROSS: Why =
     "a wave reduction over both 32-lane halves (wave64 on a 32-lane host)";
+pub(super) const FIRST_ACROSS: Why = "a first-lane read of a value that may differ between 32-lane halves (wave64 on a 32-lane host)";
 const LANE_MASK: Why = "a lane mask read as data";
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
@@ -7639,7 +7640,7 @@ impl<'a> Lower<'a> {
                         if !inst.read(Reg::V(reg)).is_some_and(|x| self.alike.contains(&x)))
                 {
                     if !self.across_here() {
-                        return Err(halves::FIRST_ACROSS);
+                        return Err(FIRST_ACROSS);
                     }
                     let a = s(self, 0)?;
                     let r = self.first_lane_across(a, guard)?;

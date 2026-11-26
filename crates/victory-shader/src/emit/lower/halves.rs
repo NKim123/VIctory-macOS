@@ -42,7 +42,7 @@
 //!   compiler reads first lanes for) and in a group of 32 threads or fewer
 //!   (one host wave holds the whole console wave); otherwise the lower
 //!   half's first lane ([`Lower::first_lane_across`]); refused where no
-//!   exchange can go ([`FIRST_ACROSS`]).
+//!   exchange can go ([`super::FIRST_ACROSS`]).
 //!
 //! A refusal in a value no instruction ends up needing costs nothing (the
 //! lowering retries with that value missing), so a program is refused only
@@ -388,10 +388,6 @@ pub(super) const MASK_ACROSS: Why = "a lane mask read as data (wave64 on a 32-la
 /// The group-shared dwords a D3D12 compute program may declare, at most
 /// (32 KiB).
 const GROUP_SHARED_DWORDS: u32 = 8192;
-
-/// Why a first-lane read stops in halves: the console's first lane may be
-/// in the other half, and the value is not known to be the same there.
-pub(super) const FIRST_ACROSS: Why = "a first-lane read of a value that may differ between 32-lane halves (wave64 on a 32-lane host)";
 
 /// Every branch (by its block) with its region: the blocks reachable from
 /// it that do not post-dominate it, which only the lanes taking one side may
