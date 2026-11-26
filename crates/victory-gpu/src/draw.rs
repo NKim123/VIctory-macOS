@@ -439,21 +439,24 @@ impl State {
                 );
                 continue;
             };
-            let Some(texture) = crate::resource::host_resource(record.resource) else {
+            let Some(texture) = crate::resource::host_copy(record.resource) else {
                 continue;
             };
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
-            rtvs.push(host.rtv(&texture, record.desc().as_ref()));
+            rtvs.push(host.rtv(&texture.texture, record.desc().as_ref()));
+            list.keep_untracked_texture(texture);
         }
         self.depth = 0;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
-            let texture = crate::resource::host_resource(record.resource)?;
+            let texture = crate::resource::host_copy(record.resource)?;
             self.depth = record.resource as usize;
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
-            Some(host.dsv(&texture, record.depth_desc().as_ref()))
+            let view = host.dsv(&texture.texture, record.depth_desc().as_ref());
+            list.keep_untracked_texture(texture);
+            Some(view)
         });
         // SAFETY: an open list; the views were just made.
         unsafe {

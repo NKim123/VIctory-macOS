@@ -225,7 +225,8 @@ those running on macOS under Wine.
   those on the GPU. It retains only committed color targets up to 16 MiB
   total or 1% of the texture budget when that is lower. The budget comes
   from `VICTORY_GPU_BUDGET_MB` or the local DXGI budget. Lists with uploads,
-  live descriptors, title memory work, or readbacks stay synchronous.
+  live descriptors, title memory work, readbacks, render target bindings,
+  or resource-specific aliasing and UAV barriers stay synchronous.
   Guest heap sync, texture eviction, copy-back, and retirement also stay
   on the synchronous path. Queue signals, waits, mapping changes, and
   presents drain the worker in order.

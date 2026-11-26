@@ -1157,6 +1157,11 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// Aliasing and UAV barriers, and render target bindings, can name
+    /// textures without recording a state transition. Keep their allocations
+    /// alive until reset and keep these lists off the async submission lane.
+    untracked_textures:
+        std::collections::HashMap<usize, std::sync::Arc<crate::resource::HostTexture>>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -2617,6 +2622,7 @@ impl HostList {
             || !deferred.copies.is_empty()
             || !deferred.uploads.is_empty()
             || !deferred.kept.is_empty()
+            || !deferred.untracked_textures.is_empty()
             || !deferred.after.is_empty()
             || !deferred.missed.is_empty()
             || !deferred.writes.is_empty()
@@ -2779,6 +2785,14 @@ impl HostList {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
             self.deferred().kept.push(object);
         }
+    }
+
+    pub(crate) fn keep_untracked_texture(
+        &self,
+        texture: std::sync::Arc<crate::resource::HostTexture>,
+    ) {
+        let key = std::sync::Arc::as_ptr(&texture) as usize;
+        self.deferred().untracked_textures.insert(key, texture);
     }
 
     /// Whether this is the first time since the reset that the list asks

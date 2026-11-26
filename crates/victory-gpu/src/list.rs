@@ -560,7 +560,6 @@ pub(crate) struct Barrier {
 #[cfg(windows)]
 fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
     use windows::core::Interface;
-    let host = |r: This| crate::resource::host_resource(r).map(|h| h.as_raw().cast_const().cast());
     match b.kind {
         0 => {
             // A split barrier's first half: its second half transitions.
@@ -580,27 +579,31 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
                 last: u64::from(crate::host::legal_state(&texture, wanted)),
             })
         }
-        1 => Some(Barrier {
-            first: if b.first.is_null() {
-                b.first
+        1 | 2 => {
+            let copy = |resource: This| {
+                if resource.is_null() {
+                    Some(None)
+                } else {
+                    crate::resource::host_copy(resource).map(Some)
+                }
+            };
+            let first = copy(b.first)?;
+            let second = if b.kind == 1 {
+                copy(b.second as This)?
             } else {
-                host(b.first)?
-            },
-            second: if b.second == 0 {
-                0
-            } else {
-                host(b.second as This)? as u64
-            },
-            ..*b
-        }),
-        2 => Some(Barrier {
-            first: if b.first.is_null() {
-                b.first
-            } else {
-                host(b.first)?
-            },
-            ..*b
-        }),
+                None
+            };
+            let pin = |texture: std::sync::Arc<crate::resource::HostTexture>| {
+                let raw: This = texture.texture.as_raw().cast_const().cast();
+                list.keep_untracked_texture(texture);
+                raw
+            };
+            Some(Barrier {
+                first: first.map_or(std::ptr::null(), pin),
+                second: second.map_or(0, |texture| pin(texture) as u64),
+                ..*b
+            })
+        }
         _ => None,
     }
 }

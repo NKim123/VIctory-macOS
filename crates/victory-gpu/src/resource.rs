@@ -2895,6 +2895,119 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn untracked_texture_commands_pin_their_resources_and_stay_synchronous() {
+        use std::sync::Arc;
+
+        if crate::host::host().is_none() {
+            return;
+        }
+        let null: This = std::ptr::null();
+        let mut allocator = null;
+        let mut list = null;
+        let iid = &PAGEABLE_IIDS[1];
+        assert_eq!(
+            crate::list::create_allocator(null, 0, iid, &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, allocator, null, iid, &mut list),
+            S_OK
+        );
+        let barrier = slot::<extern "system" fn(This, u32, *const u64) -> u32>(list, 0xd0);
+        let targets =
+            slot::<extern "system" fn(This, u32, *const u64, i32, *const u64)>(list, 0x190);
+        let close = slot::<extern "system" fn(This) -> HRESULT>(list, 0x48);
+        let reset = slot::<extern "system" fn(This, This, This) -> HRESULT>(list, 0x50);
+        let release = |object| slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+
+        let image = || {
+            let mut out = null;
+            let desc = ResourceDesc {
+                flags: 1 | 4,
+                ..texture(4, 4, 28, 1)
+            };
+            assert_eq!(
+                create_committed(
+                    null,
+                    &PROPERTIES,
+                    0,
+                    &desc,
+                    0,
+                    null.cast(),
+                    &RESOURCE_IIDS[0],
+                    &mut out
+                ),
+                S_OK
+            );
+            out
+        };
+
+        for command in ["aliasing barrier", "UAV barrier", "render target binding"] {
+            let first = image();
+            let second = if command == "aliasing barrier" {
+                image()
+            } else {
+                null
+            };
+            let resources = [first, second];
+            let weak_copies: Vec<_> = resources
+                .iter()
+                .copied()
+                .filter(|resource| !resource.is_null())
+                .map(|resource| Arc::downgrade(&host_copy(resource).unwrap()))
+                .collect();
+
+            match command {
+                "aliasing barrier" => {
+                    let args = [1, first as u64, second as u64, 0];
+                    barrier(list, 1, args.as_ptr());
+                }
+                "UAV barrier" => {
+                    let args = [2, first as u64, 0, 0];
+                    barrier(list, 1, args.as_ptr());
+                }
+                _ => {
+                    let mut record = [0u64; 14];
+                    let handle = record.as_mut_ptr() as u64;
+                    crate::descriptor::create_rtv(null, first, null.cast(), handle);
+                    targets(list, 1, &handle, 0, null.cast());
+                }
+            }
+            assert_eq!(close(list), S_OK);
+            assert_eq!(
+                crate::list::host_list(list).unwrap().submit_ahead_bytes(),
+                None,
+                "{command}"
+            );
+
+            for resource in resources.into_iter().filter(|resource| !resource.is_null()) {
+                assert_eq!(release(resource), 0);
+            }
+            assert!(
+                weak_copies.iter().all(|copy| copy.upgrade().is_some()),
+                "{command} must pin every host allocation"
+            );
+            assert_eq!(reset(list, allocator, null), S_OK);
+            assert!(
+                weak_copies.iter().all(|copy| copy.upgrade().is_none()),
+                "reset must release the allocations pinned by {command}"
+            );
+        }
+
+        let global_uav = [2, 0, 0, 0];
+        barrier(list, 1, global_uav.as_ptr());
+        assert_eq!(close(list), S_OK);
+        assert_eq!(
+            crate::list::host_list(list).unwrap().submit_ahead_bytes(),
+            Some(0)
+        );
+
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
     /// Mutating the descriptor and argument storage after a clear must not
     /// affect deferred translation. A following CPU readback must see both
     /// clears, including when the first submission went to the worker.
