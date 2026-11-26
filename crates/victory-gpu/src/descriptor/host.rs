@@ -57,6 +57,19 @@ struct Mirrored {
     pending: BTreeMap<u32, PendingTexture>,
 }
 
+/// Header and index captured in one scan. The x86-64 scanner writes this layout.
+#[repr(C)]
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct Candidate {
+    pub(super) index: u32,
+    pub(super) record: [u32; 3],
+}
+
+struct SlotScan {
+    candidates: Vec<Candidate>,
+    forgot: u64,
+}
+
 const SYNC_BLOCK_SLOTS: u32 = 128;
 
 pub(crate) struct HostHeap {
@@ -421,7 +434,11 @@ impl HostHeap {
             strides,
             marks,
             addresses: std::sync::OnceLock::new(),
-            viewed: Default::default(),
+            viewed: Arc::new(crate::bindless::Viewed::new(if sampler {
+                0
+            } else {
+                count
+            })),
             widened: Default::default(),
         };
         if !sampler {
@@ -1163,49 +1180,103 @@ impl HostHeap {
         if first >= last {
             return;
         }
+        static FINE: OnceLock<bool> = OnceLock::new();
+        if last - first > SYNC_BLOCK_SLOTS
+            && *FINE.get_or_init(|| std::env::var_os("VICTORY_SYNC_FINE").is_some_and(|v| v == "1"))
+        {
+            self.sync_slots_fine(first, last, start, step, bytes);
+        } else {
+            self.sync_slots_serial(first, last, start, step, bytes);
+        }
+    }
+
+    fn sync_slots_fine(&self, first: u32, last: u32, start: u64, step: u64, bytes: &mut Vec<u8>) {
+        const SLOTS_PER_JOB: u32 = SYNC_BLOCK_SLOTS;
+        // Only capture headers on the workers; publication and host view
+        // creation stay on the submitting thread under the same locks.
+        let results: Vec<OnceLock<Option<SlotScan>>> = (first / SLOTS_PER_JOB
+            ..last.div_ceil(SLOTS_PER_JOB))
+            .map(|_| OnceLock::new())
+            .collect();
+        let range = |i| {
+            let block = first / SLOTS_PER_JOB + i as u32;
+            (
+                (block * SLOTS_PER_JOB).max(first),
+                ((block + 1) * SLOTS_PER_JOB).min(last),
+            )
+        };
+        crate::texture::in_parallel(results.len(), |i| {
+            let (lo, hi) = range(i);
+            let scan = self.capture_slots(lo, hi, start, step, &mut Vec::new());
+            let _ = results[i].set(scan);
+        });
+        for (i, result) in results.into_iter().enumerate() {
+            let (lo, hi) = range(i);
+            if let Some(scan) = result.into_inner().flatten() {
+                self.publish_slots(lo, hi, start, step, scan);
+            } else {
+                self.sync_slots_serial(lo, hi, start, step, bytes);
+            }
+        }
+    }
+
+    fn sync_slots_serial(&self, first: u32, last: u32, start: u64, step: u64, bytes: &mut Vec<u8>) {
+        if let Some(scan) = self.capture_slots(first, last, start, step, bytes) {
+            self.publish_slots(first, last, start, step, scan);
+        } else {
+            // A failed read can cover multiple Windows pages. Retry
+            // smaller ranges so a hole does not hide readable neighbors.
+            const WINDOWS_PAGE: u64 = 4096;
+            let address = start + u64::from(first) * step;
+            let end = start + u64::from(last - 1) * step + 12;
+            if last - first > 1 && address / WINDOWS_PAGE != (end - 1) / WINDOWS_PAGE {
+                let middle = first + (last - first) / 2;
+                self.sync_slots_serial(first, middle, start, step, bytes);
+                self.sync_slots_serial(middle, last, start, step, bytes);
+            }
+        }
+    }
+
+    fn capture_slots(
+        &self,
+        first: u32,
+        last: u32,
+        start: u64,
+        step: u64,
+        bytes: &mut Vec<u8>,
+    ) -> Option<SlotScan> {
         let at = |i: u32| start + u64::from(i) * step;
+        let forgot = views_forgot();
+        let blocks_verified = (first / SYNC_BLOCK_SLOTS..=(last - 1) / SYNC_BLOCK_SLOTS)
+            .all(|b| self.block_forgot[b as usize].load(Ordering::Acquire) == forgot);
+
+        #[cfg(target_arch = "x86_64")]
+        if step == 32
+            && blocks_verified
+            && super::scan::on()
+            && let Some(candidates) = super::scan::changed(
+                at(first) as *const u8,
+                &self.ready,
+                &self.made_nonzero,
+                first,
+                last,
+            )
+        {
+            return Some(SlotScan { candidates, forgot });
+        }
         // Snapshot the record headers through the kernel. The title can
         // unmap placed heap pages, and a slot can straddle a tracked page.
         let address = at(first);
         let end = at(last - 1) + 12;
         bytes.resize((end - address) as usize, 0);
         if !crate::host::read_into(address as *const u8, bytes) {
-            // The write watch's 64 KiB regions can cover multiple Windows
-            // pages. Discard a failed read, then retry its smaller ranges so
-            // an inaccessible page does not hide its readable neighbors.
-            const WINDOWS_PAGE: u64 = 4096;
-            if last - first > 1 && address / WINDOWS_PAGE != (end - 1) / WINDOWS_PAGE {
-                let middle = first + (last - first) / 2;
-                self.sync_slots(first, middle, start, step, bytes);
-                self.sync_slots(middle, last, start, step, bytes);
-            }
-            return;
+            return None;
         }
-        self.sync_slots_bytes(first, last, start, step, address, bytes);
-    }
-
-    /// Compare a complete header snapshot to the host mirror. Empty slots
-    /// and current slots in verified blocks avoid the slot and view locks.
-    fn sync_slots_bytes(
-        &self,
-        first: u32,
-        last: u32,
-        start: u64,
-        step: u64,
-        buf_start: u64,
-        buf: &[u8],
-    ) {
-        let at = |i| start + u64::from(i) * step;
-        let forgot = views_forgot();
-        let b_first = first / SYNC_BLOCK_SLOTS;
-        let b_last = (last - 1) / SYNC_BLOCK_SLOTS;
-        let blocks_verified = (b_first..=b_last)
-            .all(|b| self.block_forgot[b as usize].load(Ordering::Acquire) == forgot);
 
         let candidates: Vec<_> = (first..last)
             .filter_map(|index| {
-                let offset = (at(index) - buf_start) as usize;
-                let bytes = &buf[offset..offset + 12];
+                let offset = (at(index) - address) as usize;
+                let bytes = &bytes[offset..offset + 12];
                 let record = std::array::from_fn(|i| {
                     u32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap())
                 });
@@ -1215,20 +1286,29 @@ impl HostHeap {
                     !blocks_verified
                         || self.ready[index as usize].load(Ordering::Acquire) != record_key(record)
                 };
-                needed.then_some((index, record))
+                needed.then_some(Candidate { index, record })
             })
             .collect();
+        Some(SlotScan { candidates, forgot })
+    }
+
+    fn publish_slots(&self, first: u32, last: u32, start: u64, step: u64, scan: SlotScan) {
+        let SlotScan { candidates, forgot } = scan;
         if !candidates.is_empty() {
             let stale = {
                 let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-                changed_records(&made.keys, candidates.into_iter())
+                changed_records(
+                    &made.keys,
+                    candidates.into_iter().map(|c| (c.index, c.record)),
+                )
             };
             for (index, record, previous) in stale {
-                let _ = self.mirror_record(index, false, Some((previous, at(index))), || record);
+                let address = start + u64::from(index) * step;
+                let _ = self.mirror_record(index, false, Some((previous, address)), || record);
             }
         }
 
-        for b in b_first..=b_last {
+        for b in first / SYNC_BLOCK_SLOTS..=(last - 1) / SYNC_BLOCK_SLOTS {
             let b_start = b * SYNC_BLOCK_SLOTS;
             let b_end = ((b + 1) * SYNC_BLOCK_SLOTS).min(self.count);
             if first <= b_start && last >= b_end {
@@ -4399,8 +4479,8 @@ mod tests {
             [victory_shader::emit::VIEW_MARK_NONE, 0],
             "a refused UAV has no write mark"
         );
-        // SAFETY: a plain device query.
         assert!(
+            // SAFETY: a plain device query.
             unsafe { host.device.GetDeviceRemovedReason() }.is_ok(),
             "the null fallback leaves the device alive"
         );
@@ -4605,22 +4685,23 @@ mod tests {
         assert_eq!(made, S_OK);
 
         let mut title_heap = vec![0u8; 256 * 32];
+        let mut bytes = Vec::new();
         let start = title_heap.as_ptr() as u64;
         crate::descriptor::create_srv(std::ptr::null(), resource, std::ptr::null(), start);
-        host.sync_slots_bytes(0, 128, start, 32, start, &title_heap[..128 * 32]);
+        host.sync_slots(0, 256, start, 32, &mut bytes);
         assert!(host.made(0));
         assert!(host.made_is_nonzero(0));
         assert!(!host.made(1));
         assert!(!host.made_is_nonzero(1));
 
         // Second sync over the verified block keeps slot 0 live and skips empty slots.
-        host.sync_slots_bytes(0, 128, start, 32, start, &title_heap[..128 * 32]);
+        host.sync_slots(0, 256, start, 32, &mut bytes);
         assert!(host.made(0));
 
         // Forgetting the resource bumps VIEWS_FORGOT so the verified block re-checks
         // and clears slot 0 even though the title memory bytes didn't change.
         crate::descriptor::forget(resource as usize);
-        host.sync_slots_bytes(0, 128, start, 32, start, &title_heap[..128 * 32]);
+        host.sync_slots(0, 256, start, 32, &mut bytes);
         assert!(!host.made(0));
         assert!(!host.made_is_nonzero(0));
 

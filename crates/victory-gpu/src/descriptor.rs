@@ -12,6 +12,8 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
 pub(crate) mod host;
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod scan;
 // Also built for tests, which run where `host` cannot.
 #[cfg(any(windows, test))]
 mod paged;

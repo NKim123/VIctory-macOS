@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::descriptor::View;
 use crate::host::HostList;
@@ -40,6 +40,7 @@ const KINDS: [&str; 4] = ["buffer", "unordered buffer", "placed texture", "other
 #[derive(Default)]
 pub(crate) struct Viewed {
     inner: Mutex<Inner>,
+    occupied: Box<[AtomicU64]>,
 }
 
 type Range = (usize, u64, u64, bool);
@@ -137,7 +138,19 @@ impl Inner {
     }
 }
 
+fn spans_quick() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_SPANS_QUICK").is_none_or(|v| v != "0"))
+}
+
 impl Viewed {
+    pub(crate) fn new(slots: u32) -> Self {
+        Self {
+            inner: Mutex::default(),
+            occupied: (0..slots.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+
     /// Title slot `index` now holds `view` (none: no view), made on the
     /// host (`made`) or left without a host view.
     pub(crate) fn set(&self, index: u32, view: Option<&View>, made: bool) {
@@ -148,6 +161,16 @@ impl Viewed {
                 Some(Seen::Left(left_kind(v)))
             }
         });
+        let word = self.occupied.get(index as usize / 64);
+        let bit = 1 << (index % 64);
+        // HostHeap serializes changes to a title slot with its made lock.
+        // Outside the bitmap, always use the map.
+        if seen.is_none()
+            && spans_quick()
+            && word.is_some_and(|word| word.load(std::sync::atomic::Ordering::Acquire) & bit == 0)
+        {
+            return;
+        }
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(old) = inner.slots.remove(&index) {
             inner.count(&old, false);
@@ -155,6 +178,11 @@ impl Viewed {
         if let Some(seen) = seen {
             inner.count(&seen, true);
             inner.slots.insert(index, seen);
+            if let Some(word) = word {
+                word.fetch_or(bit, std::sync::atomic::Ordering::Release);
+            }
+        } else if let Some(word) = word {
+            word.fetch_and(!bit, std::sync::atomic::Ordering::Release);
         }
     }
 
@@ -687,7 +715,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             crate::shadow::unregister(at as usize, at);
             return; // no host GPU here
         };
-        let viewed = Viewed::default();
+        let viewed = Viewed::new(1);
         let set = |slot: u32, range: Option<(u64, u64)>| {
             let mut inner = viewed.inner.lock().unwrap();
             if let Some(old) = inner.slots.remove(&slot) {
@@ -842,4 +870,20 @@ void main(uint3 id : SV_DispatchThreadID) {
             }
         }
     }
+}
+
+#[test]
+fn spans_quick_tracks_insertion_and_removal() {
+    let viewed = Viewed::new(128);
+    // Holding the lock proves an empty slot can be forgotten without it.
+    if spans_quick() {
+        let _locked = viewed.inner.lock().unwrap();
+        viewed.set(65, None, false);
+    }
+    viewed.set(65, Some(&View::Constant(0, 0)), false);
+    assert_ne!(viewed.occupied[1].load(Relaxed) & 2, 0);
+    assert!(viewed.inner.lock().unwrap().slots.contains_key(&65));
+    viewed.set(65, None, false);
+    assert_eq!(viewed.occupied[1].load(Relaxed) & 2, 0);
+    assert!(!viewed.inner.lock().unwrap().slots.contains_key(&65));
 }
