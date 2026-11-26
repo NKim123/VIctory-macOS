@@ -17,7 +17,7 @@
 //! (`crate::bindless`).
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -142,7 +142,7 @@ pub(crate) struct Shadow {
     /// only `widened`; none of them calls another that takes it again, as
     /// the mutex is not reentrant.
     widened_source: Mutex<()>,
-    has_widened: AtomicBool,
+    live_widened: AtomicUsize,
     /// Where it starts in `buffer` (0 but for copies sharing a buffer), and
     /// the run of the shared buffer it holds ([`Arena`]), given back when it
     /// goes.
@@ -276,6 +276,15 @@ impl Widened {
     }
 }
 
+impl Drop for Widened {
+    fn drop(&mut self) {
+        self.source.live_widened.fetch_sub(1, Ordering::Release);
+        if self.source.aliased && self.source.marked() {
+            WIDENED_MARKS.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
 /// Snapshot segments (offset, bytes) and the pieces compared.
 type Snapshot = (Vec<(usize, Vec<u8>)>, std::collections::HashSet<usize>);
 
@@ -352,7 +361,7 @@ impl Shadow {
         assert!(self.tiled.is_none(), "write through a physical heap view");
         // SAFETY: inside the mapping (checked); the GPU is done with it.
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(at), bytes.len()) };
-        if self.has_widened.load(Ordering::Acquire) {
+        if self.has_widened() {
             self.refresh_widened(address as usize, address as usize + bytes.len());
         }
     }
@@ -429,6 +438,10 @@ impl Shadow {
         }
         let count = len / 12;
         let (buffer, data) = host()?.shared_buffer(count * 16)?;
+        if self.aliased && self.marked() {
+            WIDENED_MARKS.fetch_add(1, Ordering::AcqRel);
+        }
+        self.live_widened.fetch_add(1, Ordering::AcqRel);
         let widened = Arc::new(Widened {
             buffer,
             data,
@@ -470,10 +483,11 @@ impl Shadow {
         }
         ranges.push((address, len, Arc::downgrade(&widened)));
         WIDENED_ANY.store(true, Ordering::Release);
-        if !self.has_widened.swap(true, Ordering::AcqRel) && self.aliased && self.marked() {
-            COPY_BACK_MARKS.fetch_add(1, Ordering::Release);
-        }
         Some(widened)
+    }
+
+    fn has_widened(&self) -> bool {
+        self.live_widened.load(Ordering::Acquire) != 0
     }
 
     fn refresh_widened(&self, from: usize, to: usize) {
@@ -506,7 +520,7 @@ impl Shadow {
             return 0;
         }
         if self.aliased {
-            if self.has_widened.load(Ordering::Acquire) {
+            if self.has_widened() {
                 let _source = self
                     .widened_source
                     .lock()
@@ -528,7 +542,7 @@ impl Shadow {
         }
         // The normal shadow holds the GPU's bytes even when title memory
         // already matches or cannot be written; widened views still need them.
-        if self.has_widened.load(Ordering::Acquire) {
+        if self.has_widened() {
             self.refresh_widened(from, to);
         }
         if let Some(t) = &self.tracked
@@ -598,7 +612,7 @@ impl Shadow {
             marks,
             widened: Mutex::default(),
             widened_source: Mutex::default(),
-            has_widened: AtomicBool::new(false),
+            live_widened: AtomicUsize::new(0),
             base: slice.map_or(0, |s| s.offset),
             slice,
             aliased: false,
@@ -606,7 +620,9 @@ impl Shadow {
         });
         if let Some(base) = marks {
             COPY_BACK_MARKS.fetch_add(1, Ordering::Release);
-            self::marks().owners.insert(base, Arc::downgrade(&shadow));
+            self::marks()
+                .owners
+                .insert(base, (pages(start, len), Arc::downgrade(&shadow)));
         }
         shadow
     }
@@ -661,14 +677,16 @@ impl Shadow {
             marks,
             widened: Mutex::default(),
             widened_source: Mutex::default(),
-            has_widened: AtomicBool::new(false),
+            live_widened: AtomicUsize::new(0),
             base: 0,
             slice: None,
             aliased: true,
             tiled,
         });
         if let Some(base) = marks {
-            self::marks().owners.insert(base, Arc::downgrade(&shadow));
+            self::marks()
+                .owners
+                .insert(base, (pages(start, len), Arc::downgrade(&shadow)));
         }
         shadow
     }
@@ -860,7 +878,7 @@ impl Shadow {
             let (from, to) = self.inside(address, len);
             if from < to {
                 let start = self.start as usize;
-                if self.has_widened.load(Ordering::Acquire) {
+                if self.has_widened() {
                     let _source = self
                         .widened_source
                         .lock()
@@ -926,7 +944,7 @@ impl Shadow {
                         // bytes merged into the copy for new GPU writes.
                         old.copy_from_slice(host);
                     }
-                    if self.has_widened.load(Ordering::Acquire) {
+                    if self.has_widened() {
                         self.refresh_widened(start + at, start + at + n);
                     }
                     at += n;
@@ -951,7 +969,7 @@ impl Shadow {
                     }
                     synced.push((start + at) / PAGE);
                 }
-                if self.has_widened.load(Ordering::Acquire) {
+                if self.has_widened() {
                     self.refresh_widened(start + at, start + at + n);
                 }
                 at += n;
@@ -970,7 +988,7 @@ impl Shadow {
         }
         // Kept GPU writes stay in the normal shadow for later submissions;
         // their widened readers must follow even though nothing goes back.
-        if !back && from < to && self.has_widened.load(Ordering::Acquire) {
+        if !back && from < to && self.has_widened() {
             self.refresh_widened(start + from, start + to);
         }
         // Every submitted step that declared the range is done with it (one
@@ -1009,7 +1027,7 @@ impl Shadow {
             let (start, end) = (self.start as usize, (self.start + self.len) as usize);
             let mut run: Option<(usize, usize)> = None;
             let flush = |from: usize, to: usize| {
-                if self.has_widened.load(Ordering::Acquire) {
+                if self.has_widened() {
                     let _source = self
                         .widened_source
                         .lock()
@@ -1090,7 +1108,7 @@ impl Shadow {
                     _ => writes.push((from, to)),
                 }
             }
-            if self.has_widened.load(Ordering::Acquire) {
+            if self.has_widened() {
                 self.refresh_widened(from, to);
             }
             // Equal to title memory now: taken, unless it holds the page in part.
@@ -1125,7 +1143,7 @@ impl Shadow {
         let mut scratch = vec![0; PAGE];
         let mut written = 0;
         debug_assert!(pages.is_sorted());
-        let widened = self.has_widened.load(Ordering::Acquire);
+        let widened = self.has_widened();
         let mut batch = Vec::with_capacity(pages.len().min(crate::watch::LAND_BATCH));
         for group in pages.chunks(crate::watch::LAND_BATCH) {
             let mut next = start;
@@ -1175,7 +1193,7 @@ impl Shadow {
     /// it (tracked memory only): [`Shadow::update`] would copy nothing.
     pub(crate) fn clean(&self) -> bool {
         if self.aliased {
-            return !self.has_widened.load(Ordering::Acquire);
+            return !self.has_widened();
         }
         self.tracked
             .as_ref()
@@ -1191,7 +1209,7 @@ impl Shadow {
         if !self.aliased {
             return (!self.clean()).then_some((from, to));
         }
-        if !self.has_widened.load(Ordering::Acquire) {
+        if !self.has_widened() {
             return None;
         }
         let widened = self.widened.lock().unwrap_or_else(|e| e.into_inner());
@@ -1239,7 +1257,7 @@ impl Shadow {
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
         if self.aliased {
-            if self.has_widened.load(Ordering::Acquire) {
+            if self.has_widened() {
                 let (start, end) = (self.start as usize, (self.start + self.len) as usize);
                 let (from, to) = (address.max(start), address.saturating_add(len).min(end));
                 if from < to {
@@ -1355,7 +1373,7 @@ impl Shadow {
         for (a, b) in unmapped {
             // SAFETY: inside the mapping (`take_split` cuts to the buffer).
             unsafe { self.data.add(a - start).write_bytes(0, b - a) };
-            if self.has_widened.load(Ordering::Acquire) {
+            if self.has_widened() {
                 self.refresh_widened(a, b);
             }
             if let Some(before) = &mut before {
@@ -1464,7 +1482,7 @@ impl Shadow {
                 put_under(offset + at, title, dst, before);
             }
         });
-        if self.has_widened.load(Ordering::Acquire) {
+        if self.has_widened() {
             self.refresh_widened(from, to);
         }
         if let Some(t) = &self.tracked {
@@ -1480,7 +1498,7 @@ impl Shadow {
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
-        if self.has_widened.load(Ordering::Acquire) {
+        if self.has_widened() {
             self.refresh_widened(from, to);
         }
         if let Some(t) = &self.tracked {
@@ -1500,7 +1518,7 @@ impl Drop for Shadow {
             let mut m = marks();
             m.owners.remove(&base);
             m.give_back(base, pages(self.start, self.len));
-            if !self.aliased || self.has_widened.load(Ordering::Acquire) {
+            if !self.aliased {
                 COPY_BACK_MARKS.fetch_sub(1, Ordering::Release);
             }
         }
@@ -1522,13 +1540,21 @@ struct Marks {
     /// Bits handed out at some time: those past it are clear.
     end: u32,
     /// The copy holding each run, by its first bit.
-    owners: BTreeMap<u32, std::sync::Weak<Shadow>>,
+    owners: BTreeMap<u32, (u32, std::sync::Weak<Shadow>)>,
 }
 
-static COPY_BACK_MARKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static COPY_BACK_MARKS: AtomicUsize = AtomicUsize::new(0);
+static WIDENED_MARKS: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn mark_landing_owners() -> (usize, usize) {
+    (
+        COPY_BACK_MARKS.load(Ordering::Acquire),
+        WIDENED_MARKS.load(Ordering::Acquire),
+    )
+}
 
 pub(crate) fn has_copy_back_marks() -> bool {
-    COPY_BACK_MARKS.load(Ordering::Acquire) != 0
+    mark_landing_owners() != (0, 0)
 }
 
 static MARKS: Mutex<Marks> = Mutex::new(Marks {
@@ -1542,6 +1568,17 @@ fn marks() -> std::sync::MutexGuard<'static, Marks> {
 }
 
 impl Marks {
+    fn page_of(&self, bit: u32) -> Option<(Arc<Shadow>, usize)> {
+        let (&base, (count, copy)) = self.owners.range(..=bit).next_back()?;
+        let index = bit - base;
+        if index >= *count {
+            return None;
+        }
+        let copy = copy.upgrade()?;
+        let page = (((copy.start >> 16) + u64::from(index)) << 16) as usize;
+        Some((copy, page))
+    }
+
     /// A run of `n` bits: its first. None when the bitmap is full (the last
     /// bit takes the marks of offsets past it, so it is never handed out).
     fn take(&mut self, n: u32) -> Option<u32> {
@@ -1579,7 +1616,7 @@ impl Marks {
 /// The buffer views' written-pages bitmap: the buffer, its mapping (bits
 /// as dwords) and host GPU address.
 struct Bitmap {
-    _buffer: ID3D12Resource,
+    buffer: ID3D12Resource,
     data: usize,
     gpu: u64,
 }
@@ -1610,7 +1647,7 @@ fn bitmap(memory: bool) -> Option<&'static Bitmap> {
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
             Some(Bitmap {
-                _buffer: buffer,
+                buffer,
                 data: data as usize,
                 gpu,
             })
@@ -1623,6 +1660,45 @@ fn bitmap(memory: bool) -> Option<&'static Bitmap> {
 /// title memory, see [`bitmap`]).
 pub(crate) fn view_writes(memory: bool) -> Option<u64> {
     bitmap(memory).map(|b| b.gpu)
+}
+
+pub(crate) const WRITE_MARK_BYTES: u64 = victory_shader::emit::VIEW_WRITE_BITS as u64 / 8;
+
+/// Both page-mark sources. Later flights still use the same shader bindings.
+pub(crate) fn write_mark_buffers() -> Option<[&'static ID3D12Resource; 2]> {
+    Some([&bitmap(false)?.buffer, &bitmap(true)?.buffer])
+}
+
+/// Applies one fence's page feedback, without touching any GPU-writable bitmap
+/// or reading the contents of an alias that a younger flight can still write.
+pub(crate) fn notify_aliased_marks(words: &[u32]) {
+    let marked = {
+        let owners = marks();
+        let used = (owners.end as usize).div_ceil(32);
+        let mut marked = Vec::new();
+        for (word, &bits) in words.iter().take(used).enumerate() {
+            let mut bits = bits;
+            while bits != 0 {
+                let bit = (word * 32) as u32 + bits.trailing_zeros();
+                bits &= bits - 1;
+                marked.extend(owners.page_of(bit));
+            }
+        }
+        marked
+    };
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for (copy, page) in marked.iter().filter(|(copy, _)| copy.aliased) {
+        let start = (*page).max(copy.start as usize);
+        let end = (page + PAGE).min((copy.start + copy.len) as usize);
+        if let Some(last) = runs.last_mut().filter(|last| last.1 == start) {
+            last.1 = end;
+        } else {
+            runs.push((start, end));
+        }
+    }
+    for (start, end) in runs {
+        crate::watch::notify_written(start, end - start);
+    }
 }
 
 /// Frees the lock words of emulated 64-bit atomics (`victory_shader::emit`,
@@ -1866,19 +1942,18 @@ fn copy_back_marks_inner(
     let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarkedUs);
     marked.sort_unstable();
     marked.dedup();
-    let page_of = |m: &Marks, n: u32| {
-        let (&base, copy) = m.owners.range(..=n).next_back()?;
-        let copy = copy.upgrade()?;
-        let k = n - base;
-        (k < pages(copy.start, copy.len) && (!aliases_only || copy.aliased)).then(|| {
-            let page = (((copy.start >> 16) + u64::from(k)) << 16) as usize;
-            (copy, page)
-        })
+    let resolve = |bits: Vec<u32>| {
+        let owners = marks();
+        bits.into_iter()
+            .filter_map(|n| owners.page_of(n))
+            .collect::<Vec<_>>()
     };
     // Held back: dropped from the copies (`crate::memory::drop_withheld`).
     if !held.is_empty() {
-        let m = marks();
-        for (_, page) in held.into_iter().filter_map(|n| page_of(&m, n)) {
+        for (copy, page) in resolve(held) {
+            if aliases_only && !copy.aliased {
+                continue;
+            }
             if accept_landing {
                 crate::memory::drop_withheld(page, PAGE);
             } else {
@@ -1889,13 +1964,13 @@ fn copy_back_marks_inner(
     if marked.is_empty() {
         return;
     }
-    let pages: Vec<(Arc<Shadow>, usize)> = {
-        let m = marks();
-        marked.iter().filter_map(|&n| page_of(&m, n)).collect()
-    };
+    let pages = resolve(marked);
     // Per copy, in page order, so its pages go back together.
     let mut by_copy: Vec<(Arc<Shadow>, Vec<usize>)> = Vec::new();
     for (copy, page) in pages {
+        if aliases_only && !copy.aliased {
+            continue;
+        }
         if withheld
             .iter()
             .any(|(c, a, n)| Arc::ptr_eq(c, &copy) && *a < page + PAGE && page < a + n)

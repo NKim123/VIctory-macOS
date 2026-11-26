@@ -24,14 +24,19 @@ const MAX_BUFFERS: usize = 128;
 static BUFFERS: Mutex<Vec<Weak<TiledBuffer>>> = Mutex::new(Vec::new());
 
 /// Orders XMem's CPU view changes and GPU tile edits against preparation,
-/// execution and copy-back. A caller must acquire its XMem lock inside this
-/// boundary. The disabled path takes no GPU lock.
-pub fn with_physical_mapping<T>(edit: impl FnOnce() -> T) -> T {
+/// execution and copy-back. The classification and edit both run under
+/// the submission lock. Acquire the XMem lock within each and release it
+/// before waiting for flights. Additive edits reach the GPU in the next
+/// queue-ordered tile update.
+pub fn with_physical_mapping<T>(destructive: impl FnOnce() -> bool, edit: impl FnOnce() -> T) -> T {
     if !crate::host::inflight_enabled() && physical_tiles_enabled() {
         let _quiet = host().and_then(|h| h.quiet());
         return edit();
     }
-    with_inflight_mapping(edit)
+    let _quiet = crate::host::inflight_enabled()
+        .then(|| host()?.quiet_mapping_if(destructive))
+        .flatten();
+    edit()
 }
 
 /// Allows CPU memory release paths to synchronize with the opt-in ring

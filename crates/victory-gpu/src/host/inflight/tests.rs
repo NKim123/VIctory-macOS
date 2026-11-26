@@ -146,6 +146,235 @@ fn capacity_waits_for_the_oldest_fence_only() {
 }
 
 #[test]
+fn shared_uav_page_marks_retire_before_a_younger_flight() {
+    let Some(host) = host_for_ring() else { return };
+    if limit() < 2 {
+        return;
+    }
+    use crate::watch::PAGE;
+    host.present_boundary();
+    let title = crate::watch::tests::pool(1);
+    let tracker = crate::watch::track_copy(title, PAGE, true).expect("tracked title memory");
+    let (resource, data) = host.shared_buffer(PAGE as u64).unwrap();
+    // SAFETY: the mapped buffer and its native GPU address are live.
+    let gpu = unsafe { resource.GetGPUVirtualAddress() };
+    let alias = crate::shadow::Shadow::new_aliased(resource, data, gpu, title as u64, PAGE as u64);
+    let (bit, _) = alias.mark_entry(title as u64).unwrap();
+    let (root, pso) = crate::compute::pipeline(
+        "cbuffer Params : register(b0) { uint address; uint bits; uint value; };
+         RWByteAddressBuffer target : register(u0);
+         RWByteAddressBuffer marks : register(u1);
+         [numthreads(1, 1, 1)] void main(uint3 id : SV_DispatchThreadID) {
+             target.Store(0, value);
+             if (bits != 0) marks.Store(address, bits);
+         }",
+        windows::core::s!("test shared page feedback"),
+        0,
+        &[
+            crate::compute::Param::Constants {
+                register: 0,
+                count: 3,
+            },
+            crate::compute::Param::Uav { register: 0 },
+            crate::compute::Param::Uav { register: 1 },
+        ],
+    )
+    .unwrap();
+    let record = |memory, value, mark| {
+        let list = host.new_list().unwrap();
+        let constants = [4 * (bit / 32), u32::from(mark) << (bit % 32), value];
+        let marks = crate::shadow::view_writes(memory).unwrap();
+        list.note_view_writes();
+        list.keep_shadow(&alias);
+        // SAFETY: an open list and live resources owned through both fences.
+        unsafe {
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pso);
+            list.list
+                .SetComputeRoot32BitConstants(0, 3, constants.as_ptr().cast(), 0);
+            list.list.SetComputeRootUnorderedAccessView(1, gpu);
+            list.list.SetComputeRootUnorderedAccessView(2, marks);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        Arc::new(list)
+    };
+    let reset_tracker = || {
+        tracker.take(title, title + PAGE);
+        assert!(tracker.clean());
+    };
+    reset_tracker();
+    let before = FALLBACKS[Boundary::MarkedBack as usize].load(Ordering::Relaxed);
+    let overlaps = OVERLAPPED.load(Ordering::Relaxed);
+    for memory in [false, true] {
+        let mut first = Gate::new(host);
+        assert!(host.execute_title(&[record(memory, 11, true)]));
+        let mut second = Gate::new(host);
+        assert!(host.execute_title(&[record(memory, 22, true)]));
+        first.open();
+        {
+            let mut submitted = host.submitted.lock().unwrap();
+            let _holding = Holding::enter();
+            let younger = submitted.flights.back().unwrap().value;
+            host.wait_inflight(&mut submitted, younger - 1, Boundary::Fence);
+            assert_eq!(submitted.flights.len(), 1);
+            assert!(
+                !tracker.clean(),
+                "the first flight dirtied the page before the second ran"
+            );
+            // SAFETY: the first GPU write completed; the next is gated.
+            assert_eq!(unsafe { data.cast::<u32>().read() }, 11);
+        }
+        reset_tracker();
+        second.open();
+        host.present_boundary();
+        assert!(
+            !tracker.clean(),
+            "the same bit was marked again by the second flight"
+        );
+        // SAFETY: both GPU writes completed before the present boundary.
+        assert_eq!(unsafe { data.cast::<u32>().read() }, 22);
+        reset_tracker();
+        host.execute_title(&[record(memory, 33, false)]);
+        host.present_boundary();
+        assert!(tracker.clean(), "readback must not report a stale mark");
+    }
+    assert_eq!(
+        FALLBACKS[Boundary::MarkedBack as usize].load(Ordering::Relaxed),
+        before
+    );
+    assert!(OVERLAPPED.load(Ordering::Relaxed) >= overlaps + 2);
+    let widened = alias.widened(title as u64, 12, 1).unwrap();
+    assert!(!alias.clean());
+    assert!(!host.execute_title(&[record(false, 44, true)]));
+    assert_eq!(widened.read_host(4)[0], 44);
+    assert_eq!(
+        FALLBACKS[Boundary::MarkedBack as usize].load(Ordering::Relaxed),
+        before + 1
+    );
+    drop(widened);
+    assert!(alias.clean(), "only live widened views require retirement");
+    assert!(host.execute_title(&[record(false, 55, true)]));
+    host.present_boundary();
+    drop((tracker, alias));
+    crate::watch::tests::free(title);
+}
+
+#[test]
+fn additive_mapping_can_proceed_while_a_destructive_edit_waits() {
+    let Some(host) = host_for_ring() else { return };
+    host.present_boundary();
+    let (out, data) = host.mapped_buffer(8, true).unwrap();
+    let before = DRAINS[Boundary::Mapping as usize].load(Ordering::Relaxed);
+    let mut gate = Gate::new(host);
+    assert!(host.execute_title(&[record_copy(host, &out, 4, 0x1234)]));
+    crate::tiled::with_physical_mapping(
+        || false,
+        || {
+            assert_eq!(
+                DRAINS[Boundary::Mapping as usize].load(Ordering::Relaxed),
+                before
+            );
+        },
+    );
+    assert!(host.submitted.lock().unwrap().busy());
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(20));
+        gate.open();
+    });
+    crate::tiled::with_physical_mapping(
+        || true,
+        || {
+            // SAFETY: the destructive boundary has fenced the GPU write.
+            assert_eq!(unsafe { data.cast::<u32>().add(1).read() }, 0x1234);
+        },
+    );
+    release.join().unwrap();
+    assert_eq!(
+        DRAINS[Boundary::Mapping as usize].load(Ordering::Relaxed),
+        before + 1
+    );
+}
+
+#[test]
+fn computed_writes_to_tiles_retire_with_their_captured_layout() {
+    let Some(host) = host_for_ring() else { return };
+    if !crate::switch::on("VICTORY_PHYSICAL_TILES") {
+        return;
+    }
+    assert!(
+        crate::alias::physical_tiles_enabled(),
+        "physical tile support"
+    );
+    use crate::compute::Param;
+    use crate::watch::PAGE;
+    host.present_boundary();
+    let title = crate::watch::tests::pool(1);
+    let heap = Arc::new(crate::alias::physical_heap(PAGE).expect("CPU-visible physical tiles"));
+    let tiled = crate::tiled::TiledAlias::new(title, PAGE).expect("a tiled title reservation");
+    tiled.map(title, PAGE, Some((&heap, 0)));
+    let copy = crate::shadow::find(title as u64, PAGE as u64).unwrap();
+    assert!(copy.is_tiled());
+    let tracker = crate::watch::track_copy(title, PAGE, true).unwrap();
+    tracker.take(title, title + PAGE);
+    assert!(tracker.clean());
+    let (root, pso) = crate::compute::pipeline(
+        &format!(
+            "StructuredBuffer<uint> table : register(t0);
+             RWByteAddressBuffer data : register(u0);
+             RWByteAddressBuffer dirty : register(u1);
+             [numthreads(1, 1, 1)] void main() {{
+                 uint entry = (table[{}] << 12) | {};
+                 data.Store(0, 0x55667788);
+                 dirty.Store((entry >> 5) * 4, 1u << (entry & 31));
+             }}",
+            title >> 28,
+            (title >> 16) & 0xfff,
+        ),
+        windows::core::s!("tiled computed feedback"),
+        0,
+        &[
+            Param::Srv {
+                register: 0,
+                space: 0,
+            },
+            Param::Uav { register: 0 },
+            Param::Uav { register: 1 },
+        ],
+    )
+    .unwrap();
+    let list = host.new_list().unwrap();
+    let map = crate::memory::bind(&list, crate::memory::OURS).unwrap();
+    // SAFETY: a fresh recording with a live page table, tile VA and bitmap.
+    unsafe {
+        list.list.SetComputeRootSignature(&root);
+        list.list.SetPipelineState(&pso);
+        list.list.SetComputeRootShaderResourceView(0, map.table);
+        list.list
+            .SetComputeRootUnorderedAccessView(1, copy.gpu(title as u64));
+        list.list.SetComputeRootUnorderedAccessView(2, map.dirty);
+        list.list.Dispatch(1, 1, 1);
+    }
+    list.close();
+    let before = QUEUED_COMPUTED.load(Ordering::Relaxed);
+    let mut gate = Gate::new(host);
+    assert!(host.execute_title(&[Arc::new(list)]));
+    assert!(tracker.clean());
+    gate.open();
+    host.present_boundary();
+    assert_eq!(QUEUED_COMPUTED.load(Ordering::Relaxed), before + 1);
+    assert!(
+        !tracker.clean(),
+        "computed tile marks notified the title tracker"
+    );
+    // SAFETY: the native fence completed; this is the physical tile backing.
+    let physical_value = unsafe { (heap.cpu_address() as *const u32).read() };
+    assert_eq!(physical_value, 0x55667788);
+    drop((tiled, copy, tracker));
+    crate::watch::tests::free(title);
+}
+
+#[test]
 fn reset_uses_another_allocator_while_the_title_recording_is_in_flight() {
     use crate::object::guid;
     let Some(host) = host_for_ring() else { return };
@@ -407,7 +636,7 @@ fn a_native_copy_sees_an_earlier_label_through_a_zero_copy_buffer() {
     let first = record_copy(host, &out, 4, 1);
     first.defer_gpu_write(&shadow, src as usize, 4, false);
     first.defer_write(src, crate::queue::Written::Value(91), 4);
-    assert_eq!(first.inflight_barrier(true), None);
+    assert_eq!(first.inflight_barrier(Some(&Default::default())), None);
     assert!(host.execute_title(&[first]));
     let next = host.new_list().unwrap();
     // SAFETY: both buffers are retained through the submission's fence.

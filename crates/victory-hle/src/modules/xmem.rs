@@ -607,7 +607,7 @@ pub(crate) fn release_virtual(address: *mut c_void, size: usize, kind: u32) -> B
         // SAFETY: forwards the title's arguments to the host API.
         return victory_gpu::with_inflight_mapping(|| unsafe { VirtualFree(address, size, kind) });
     }
-    victory_gpu::with_physical_mapping(|| {
+    let release = || {
         let mut physical = physical();
         let at = address as usize;
         let reservation = physical
@@ -641,7 +641,8 @@ pub(crate) fn release_virtual(address: *mut c_void, size: usize, kind: u32) -> B
             physical.reservations.remove(&base);
         }
         released
-    })
+    };
+    victory_gpu::with_physical_mapping(|| true, release)
 }
 
 impl Slice {
@@ -1166,26 +1167,41 @@ pub extern "system" fn XMemMapPhysicalPages(
     }
     // SAFETY: the title passes a null pointer or `n` page numbers.
     let pages = (!pages.is_null()).then(|| unsafe { std::slice::from_raw_parts(pages, n) });
-    victory_gpu::with_physical_mapping(|| {
-        let mut physical = physical();
-        if map_physical(&mut physical, base, len, pages) {
-            address
-        } else {
-            std::ptr::null_mut()
-        }
-    })
+    victory_gpu::with_physical_mapping(
+        || {
+            let physical = physical();
+            match pages {
+                None => overlaps_view(&physical, base, len),
+                Some(pages) => {
+                    if overlaps_view(&physical, base, len) {
+                        return !same_physical_pages(&physical, base, pages);
+                    }
+                    // File pages can demote a whole tiled chunk, even
+                    // when the destination itself is a placeholder.
+                    pages.iter().any(|page| {
+                        physical
+                            .pages
+                            .get(page)
+                            .is_none_or(|s| s.section.shared.is_none())
+                    })
+                }
+            }
+        },
+        || {
+            if map_physical(&mut physical(), base, len, pages) {
+                address
+            } else {
+                std::ptr::null_mut()
+            }
+        },
+    )
 }
 
 fn map_physical(physical: &mut Physical, base: usize, len: usize, pages: Option<&[usize]>) -> bool {
     let Some(pages) = pages else {
         return unmap(physical, base, len);
     };
-    if pages.iter().zip((base..).step_by(PAGE)).all(|(page, at)| {
-        physical
-            .pages
-            .get(page)
-            .is_some_and(|slice| shows(physical, at, slice))
-    }) {
+    if same_physical_pages(physical, base, pages) {
         return true;
     }
     // Validate the complete request before demoting a tiled chunk or
@@ -1229,6 +1245,15 @@ fn map_physical(physical: &mut Physical, base: usize, len: usize, pages: Option<
         i += run;
     }
     true
+}
+
+fn same_physical_pages(physical: &Physical, base: usize, pages: &[usize]) -> bool {
+    pages.iter().zip((base..).step_by(PAGE)).all(|(page, at)| {
+        physical
+            .pages
+            .get(page)
+            .is_some_and(|slice| shows(physical, at, slice))
+    })
 }
 
 /// One page at each address; null `pages`, or a page number 0, unmaps
@@ -1277,7 +1302,26 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     if to.checked_add(len).is_none() || from.checked_add(len).is_none() {
         return false;
     }
-    victory_gpu::with_physical_mapping(|| alias_pages(&mut physical(), to, from, len))
+    victory_gpu::with_physical_mapping(
+        || {
+            let physical = physical();
+            if from == 0 {
+                return overlaps_view(&physical, to, len);
+            }
+            (from..from + len).step_by(PAGE).any(|at| {
+                slice_at(&physical, at).is_none_or(|slice| slice.section.shared.is_none())
+            }) || overlaps_view(&physical, to, len) && !same_alias_pages(&physical, to, from, len)
+        },
+        || alias_pages(&mut physical(), to, from, len),
+    )
+}
+
+fn overlaps_view(physical: &Physical, base: usize, len: usize) -> bool {
+    physical
+        .views
+        .range(..base + len)
+        .next_back()
+        .is_some_and(|(&start, (size, ..))| start + size > base)
 }
 
 fn alias_pages(physical: &mut Physical, to: usize, from: usize, len: usize) -> bool {
@@ -1302,11 +1346,7 @@ fn alias_pages(physical: &mut Physical, to: usize, from: usize, len: usize) -> b
     // A direct XMem mapping can span multiple pages in one host view.
     // Keep the original single unmap of the range in that case, as well as
     // for overlapping, unaligned, and unmap-only requests.
-    if from != 0
-        && (0..len).step_by(PAGE).all(|k| {
-            slice_at(physical, from + k).is_some_and(|slice| shows(physical, to + k, &slice))
-        })
-    {
+    if from != 0 && same_alias_pages(physical, to, from, len) {
         return true;
     }
     if !unmap(physical, to, len) {
@@ -1324,6 +1364,12 @@ fn alias_pages(physical: &mut Physical, to: usize, from: usize, len: usize) -> b
         }
     }
     true
+}
+
+fn same_alias_pages(physical: &Physical, to: usize, from: usize, len: usize) -> bool {
+    (0..len)
+        .step_by(PAGE)
+        .all(|k| slice_at(physical, from + k).is_some_and(|slice| shows(physical, to + k, &slice)))
 }
 
 fn has_multi_page_view(physical: &Physical, base: usize, len: usize) -> bool {

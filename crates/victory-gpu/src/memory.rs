@@ -527,6 +527,12 @@ pub(crate) struct ComputedBaselines {
 }
 
 impl ComputedBaselines {
+    /// The page table's layout is needed for retirement even when the
+    /// submission has no copied pages or CPU baseline.
+    pub(crate) fn capture_layout(&mut self, heap: usize) {
+        self.heaps.entry(heap).or_insert_with(|| layout(heap));
+    }
+
     /// Capture after the last refresh and before executing the GPU lists.
     pub(crate) fn capture(&mut self, heap: usize) {
         if self.heaps.contains_key(&heap) {
@@ -692,71 +698,67 @@ fn has_missed(marks: &[u32], l: &Layout) -> bool {
     false
 }
 
-/// `list` uses title memory with view heap `key` bound: the heap's page
-/// table (made on first use) and a page bitmap of the list's, the table
-/// brought up to date at each submission of the list, its written pages
-/// copied back after.
-pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
-    let table = with_heap(key, |heap| {
-        let mut shared = shared();
-        let host = std::ptr::from_ref(heap) as usize;
-        if let Some((_, s)) = shared.iter().find(|(k, s)| *k == key && s.host == host) {
-            list.keep(&s.table);
-            return Some(s.gpu);
-        }
-        // A released heap's table goes with it (lists that name it hold it).
-        shared.retain(|(k, _)| *k != key);
-        let s = Shared::new(heap)?;
-        list.keep(&s.table);
-        let gpu = s.gpu;
-        shared.push((key, s));
-        Some(gpu)
-    })
-    .flatten()?;
-    let pooled = Arc::new(PooledBitmap::new(Bitmap::acquire()?));
-    let dirty = pooled.gpu();
-    list.defer_memory(key);
-    let precise: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
-    let byte_for_byte = precise.clone();
-    let missed_bitmap = Arc::clone(&pooled);
-    list.defer_missed(move |baselines| {
-        let l = baselines.layout(key);
-        // SAFETY: the bitmap is mapped and the list's run is over.
+/// A recording's private computed-page bitmap and its landing metadata.
+pub(crate) struct Feedback {
+    key: usize,
+    bitmap: Arc<PooledBitmap>,
+    precise: Arc<Mutex<Vec<(u64, u64)>>>,
+}
+
+impl Feedback {
+    pub(crate) fn only_plain_tiles(&self, baselines: &ComputedBaselines) -> bool {
+        baselines
+            .layout(self.key)
+            .copies
+            .iter()
+            .all(|copy| copy.is_tiled() && copy.clean())
+    }
+
+    pub(crate) fn missed(&self, baselines: &ComputedBaselines) -> bool {
+        let layout = baselines.layout(self.key);
+        // SAFETY: the mapping belongs to this recording and its fence completed.
         let marks =
-            unsafe { std::slice::from_raw_parts(missed_bitmap.data() as *const u32, BITMAP_WORDS) };
-        has_missed(marks, &l)
-    });
-    if crate::land::enabled() {
-        let landing_bitmap = Arc::clone(&pooled);
-        list.defer_computed_ownership(move |baselines| {
-            let l = baselines.layout(key);
-            // SAFETY: the GPU fence has completed and the bitmap is still live.
-            let marks = unsafe {
-                std::slice::from_raw_parts(landing_bitmap.data() as *const u32, BITMAP_WORDS)
-            };
-            for (word, &mark) in marks.iter().enumerate() {
-                let mut bits = mark;
-                while bits != 0 {
-                    let entry = word * 32 + bits.trailing_zeros() as usize;
-                    bits &= bits - 1;
-                    let Some(&block) = l.blocks.get(entry / BLOCK).filter(|_| entry >= BLOCK)
-                    else {
-                        continue;
-                    };
-                    if let Some(&Some(k)) = l.owner.get(entry) {
-                        let page = block << 28 | (entry % BLOCK) << 16;
-                        baselines.plan(&l.copies[k], page);
-                    }
+            unsafe { std::slice::from_raw_parts(self.bitmap.data() as *const u32, BITMAP_WORDS) };
+        has_missed(marks, &layout)
+    }
+
+    pub(crate) fn plan_ownership(&self, baselines: &mut ComputedBaselines) {
+        let l = baselines.layout(self.key);
+        // SAFETY: the GPU fence has completed and the bitmap is still live.
+        let marks =
+            unsafe { std::slice::from_raw_parts(self.bitmap.data() as *const u32, BITMAP_WORDS) };
+        for (word, &mark) in marks.iter().enumerate() {
+            let mut bits = mark;
+            while bits != 0 {
+                let entry = word * 32 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let Some(&block) = l.blocks.get(entry / BLOCK).filter(|_| entry >= BLOCK) else {
+                    continue;
+                };
+                if let Some(&Some(k)) = l.owner.get(entry) {
+                    let page = block << 28 | (entry % BLOCK) << 16;
+                    baselines.plan(&l.copies[k], page);
                 }
             }
-        });
+        }
     }
-    list.defer_after_with_baselines(move |baselines, accept_landing| {
-        let Layout { copies, blocks, owner, .. } = &*baselines.layout(key);
-        let precise = byte_for_byte.lock().unwrap_or_else(|e| e.into_inner());
+
+    pub(crate) fn finish(
+        &self,
+        baselines: &mut ComputedBaselines,
+        accept_landing: bool,
+        notify_only: bool,
+    ) {
+        let Layout {
+            copies,
+            blocks,
+            owner,
+            ..
+        } = &*baselines.layout(self.key);
+        let precise = self.precise.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the bitmap is mapped and the list's run is over.
         let marks =
-            unsafe { std::slice::from_raw_parts_mut(pooled.data() as *mut u32, BITMAP_WORDS) };
+            unsafe { std::slice::from_raw_parts_mut(self.bitmap.data() as *mut u32, BITMAP_WORDS) };
         let (mut pages, mut regions, mut missed) = (0, 0, Vec::new());
         let mut writes = Vec::new();
         for (w, mark) in marks.iter_mut().enumerate() {
@@ -803,7 +805,14 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         // only needs the texture and other view trackers notified.
         writes.retain(|&(k, at)| {
             let copy = &copies[k];
-            if copy.is_tiled() {
+            if notify_only {
+                assert!(
+                    copy.is_tiled(),
+                    "in-flight computed feedback needs zero-copy tiles"
+                );
+                crate::watch::notify_written(at as usize, crate::watch::PAGE);
+                false
+            } else if copy.is_tiled() {
                 copy.copy_back_page(at as usize, None);
                 false
             } else {
@@ -860,6 +869,38 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
             let room = 4usize.saturating_sub(s.first_missed.len());
             s.first_missed.extend(missed.into_iter().take(room));
         });
+    }
+}
+
+/// `list` uses title memory with view heap `key` bound: the heap's page
+/// table (made on first use) and a page bitmap of the list's, the table
+/// brought up to date at each submission of the list, its written pages
+/// copied back after.
+pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
+    let table = with_heap(key, |heap| {
+        let mut shared = shared();
+        let host = std::ptr::from_ref(heap) as usize;
+        if let Some((_, s)) = shared.iter().find(|(k, s)| *k == key && s.host == host) {
+            list.keep(&s.table);
+            return Some(s.gpu);
+        }
+        // A released heap's table goes with it (lists that name it hold it).
+        shared.retain(|(k, _)| *k != key);
+        let s = Shared::new(heap)?;
+        list.keep(&s.table);
+        let gpu = s.gpu;
+        shared.push((key, s));
+        Some(gpu)
+    })
+    .flatten()?;
+    let pooled = Arc::new(PooledBitmap::new(Bitmap::acquire()?));
+    let dirty = pooled.gpu();
+    list.defer_memory(key);
+    let precise: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
+    list.defer_memory_feedback(Feedback {
+        key,
+        bitmap: pooled,
+        precise: precise.clone(),
     });
     Some(Map {
         table,
