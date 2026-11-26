@@ -270,6 +270,24 @@ fn shared_uav_page_marks_retire_before_a_younger_flight() {
 }
 
 #[test]
+fn retained_recording_storage_returns_after_the_fence() {
+    let Some(host) = host_for_ring() else { return };
+    let storage = Arc::new(());
+    let weak = Arc::downgrade(&storage);
+    let list = host.new_list().unwrap();
+    let size = 128;
+    list.keep_recording_storage(storage, size);
+    assert!(list.inflight_bytes() >= size);
+    list.close();
+    let mut gate = Gate::new(host);
+    assert!(host.execute_title(&[Arc::new(list)]));
+    assert!(weak.upgrade().is_some());
+    gate.open();
+    host.present_boundary();
+    assert!(weak.upgrade().is_none());
+}
+
+#[test]
 fn copied_shadow_lands_before_the_bottom_label() {
     let Some(host) = host_for_ring() else { return };
     use crate::watch::PAGE;

@@ -181,11 +181,11 @@ impl BottomWrite {
             && start < self.address.saturating_add(self.bytes)
     }
 
-    fn may_alias(&self) -> bool {
+    fn directly_mapped(&self) -> bool {
         crate::shadow::has_aliased_overlap(
             self.address as u64,
             self.address.saturating_add(self.bytes) as u64,
-        ) || crate::watch::aliased(self.address, self.bytes)
+        )
     }
 }
 
@@ -210,6 +210,8 @@ pub(super) enum Boundary {
     MarkedBack,
     ShadowBack,
     BottomOfPipe,
+    NativeBottomOfPipe,
+    BottomOfPipeRead,
     CpuAccess,
     Descriptors,
     Quiet,
@@ -247,6 +249,9 @@ pub(super) fn log(frames: f64) {
     ];
     let [texture_back, computed_back, marked_back, shadow_back] = back.map(sync);
     let (mark_copies, mark_widened) = crate::shadow::mark_landing_owners();
+    let bottom_cpu = count(Boundary::BottomOfPipe);
+    let bottom_native = count(Boundary::NativeBottomOfPipe);
+    let bottom_read = count(Boundary::BottomOfPipeRead);
     tracing::info!(
         frames,
         queued = QUEUED.swap(0, Ordering::Relaxed),
@@ -273,7 +278,10 @@ pub(super) fn log(frames: f64) {
         capacity = count(Boundary::Capacity),
         reused_list = count(Boundary::ReusedList),
         copy_back = back.into_iter().map(count).sum::<u64>(),
-        bottom_of_pipe = count(Boundary::BottomOfPipe),
+        bottom_of_pipe = bottom_cpu + bottom_native + bottom_read,
+        bottom_cpu,
+        bottom_native,
+        bottom_read,
         diagnostics = count(Boundary::Diagnostics),
         cpu_access = count(Boundary::CpuAccess),
         descriptors = count(Boundary::Descriptors),
@@ -353,6 +361,7 @@ impl Host {
     pub(super) fn wait_bottom_writes(
         &self,
         s: &mut Submission,
+        why: Boundary,
         touches: impl Fn(&BottomWrite, bool) -> bool,
     ) -> bool {
         if let Some(flight) = s.flights.iter().rev().find(|f| {
@@ -360,7 +369,7 @@ impl Host {
                 .iter()
                 .any(|(write, may_alias)| touches(write, *may_alias))
         }) {
-            self.wait_inflight(s, flight.value, Boundary::BottomOfPipe);
+            self.wait_inflight(s, flight.value, why);
             return true;
         }
         false
@@ -372,7 +381,7 @@ impl Host {
     /// here would prevent synchronous callers from retiring the ring.
     pub(super) fn order_shared_bottom_writes(&self, s: &mut Submission) {
         if let Some(flight) = s.flights.iter().rev().find(|f| f.shared_writes) {
-            self.wait_inflight(s, flight.value, Boundary::BottomOfPipe);
+            self.wait_inflight(s, flight.value, Boundary::NativeBottomOfPipe);
         }
     }
 
@@ -384,7 +393,7 @@ impl Host {
         }
         let mut s = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let _holding = Holding::enter();
-        self.wait_bottom_writes(&mut s, |write, may_alias| {
+        self.wait_bottom_writes(&mut s, Boundary::BottomOfPipeRead, |write, may_alias| {
             may_alias || write.overlaps(address, bytes)
         });
     }
@@ -647,10 +656,12 @@ impl Host {
                 list.deferred()
                     .writes
                     .iter()
-                    .map(|&write| (write, write.may_alias())),
+                    .map(|&write| (write, crate::watch::aliased(write.address, write.bytes))),
             );
         }
-        let shared_writes = writes.iter().any(|&(_, may_alias)| may_alias);
+        let shared_writes = writes
+            .iter()
+            .any(|(write, may_alias)| *may_alias || write.directly_mapped());
         s.value += 1;
         let value = s.value;
         let queue = self.queue();

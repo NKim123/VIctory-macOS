@@ -1717,6 +1717,9 @@ struct Deferred {
     uploads: Vec<ID3D12Resource>,
     /// Host objects whose contents or descriptors can depend on title work.
     kept: Vec<windows::core::IUnknown>,
+    /// Uploads and root bindings transferred by an early title-list reset.
+    /// They live with the old recording and need no CPU completion callback.
+    recording_storage: Option<(Box<dyn Send>, u64)>,
     ambient: Vec<crate::ambient::Candidate>,
     /// Aliasing and UAV barriers, and render target bindings, can name
     /// textures without recording a state transition. Keep their allocations
@@ -2621,7 +2624,7 @@ impl Host {
                 let private = owned.and_then(|_| submission.upload_list(self));
                 crate::bindless::uploads_for(&heaps, &textures, private, |sources| {
                     if !sources.is_empty() {
-                        self.wait_bottom_writes(submission, |_, _| true);
+                        self.wait_bottom_writes(submission, Boundary::BottomOfPipe, |_, _| true);
                     }
                     if submission.busy()
                         && sources.iter().any(|(staging, _)| staging.may_read_alias())
@@ -2679,9 +2682,11 @@ impl Host {
                 let planned = plans.get(i).map_or(&[][..], |plan| &plan.skip);
                 list.run_deferred_planned(&mut batch, planned, |batch, step| {
                     if pending_bottom_writes
-                        && self.wait_bottom_writes(submission, |write, may_alias| {
-                            step.touches_bottom_write(write, may_alias)
-                        })
+                        && self.wait_bottom_writes(
+                            submission,
+                            Boundary::BottomOfPipe,
+                            |write, may_alias| step.touches_bottom_write(write, may_alias),
+                        )
                     {
                         pending_bottom_writes = submission.has_bottom_writes();
                     }
@@ -4426,6 +4431,12 @@ impl HostList {
         self.deferred().texture_fills.push(fill);
     }
 
+    pub(crate) fn keep_recording_storage(&self, storage: impl Send + 'static, bytes: u64) {
+        let mut deferred = self.deferred();
+        debug_assert!(deferred.recording_storage.is_none());
+        deferred.recording_storage = Some((Box::new(storage), bytes));
+    }
+
     /// Runs `work` once the list has run (each submission), before its
     /// bottom-of-pipe writes.
     pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
@@ -4546,6 +4557,12 @@ impl HostList {
             .sum::<u64>();
         let arguments = self.arguments.lock().unwrap_or_else(|e| e.into_inner());
         let deferred = self.deferred();
+        let bytes = bytes.saturating_add(
+            deferred
+                .recording_storage
+                .as_ref()
+                .map_or(0, |(_, bytes)| *bytes),
+        );
         deferred
             .uploads
             .iter()
@@ -4607,6 +4624,7 @@ impl HostList {
             || !deferred.copies.is_empty()
             || !deferred.uploads.is_empty()
             || !deferred.kept.is_empty()
+            || deferred.recording_storage.is_some()
             || !deferred.ambient.is_empty()
             || !deferred.after.is_empty()
             || !deferred.texture_backs.is_empty()
@@ -4647,6 +4665,7 @@ impl HostList {
         let d = self.deferred();
         let deferred_empty = d.copies.is_empty()
             && d.uploads.is_empty()
+            && d.recording_storage.is_none()
             && d.writes.is_empty()
             && d.after.is_empty()
             && d.texture_backs.is_empty()

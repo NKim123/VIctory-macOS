@@ -358,10 +358,8 @@ fn leave(to: Option<std::sync::Arc<crate::host::HostList>>, uploads: Vec<Upload>
     // SAFETY: only dropped, with the host list, after it has run.
     unsafe impl Send for Kept {}
     if let Some(held) = to {
-        let kept = Kept(uploads, state);
-        held.defer_after(move || {
-            let _ = &kept;
-        });
+        let bytes = uploads.iter().map(|upload| upload.len as u64).sum();
+        held.keep_recording_storage(Kept(uploads, state), bytes);
     }
 }
 
