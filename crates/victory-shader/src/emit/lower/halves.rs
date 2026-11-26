@@ -453,6 +453,7 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
     let (p, st) = (x.p, x.st);
     let wave_tid = wave_tid(x);
     let regions = branch_regions(st);
+    let order = crate::ir::reverse_postorder(&p.blocks);
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let per_lane = |v: Value| x.res.waterfall.reads.contains(&v);
     let mut same: HashSet<Value> = HashSet::new();
@@ -487,7 +488,7 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
             None => vec![false; st.exits.len()],
         };
         let mut next: HashSet<Value> = HashSet::new();
-        for b in crate::ir::reverse_postorder(&p.blocks) {
+        for &b in &order {
             let block = &p.blocks[b];
             let whole = block
                 .preds
@@ -561,9 +562,11 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
                     addr: Some(Operand::Vector { reg, .. }),
                     dst: Some(_),
                     data,
+                    gds: false,
                     ..
                 } = &inst.fields
                     && name.starts_with("ds_read")
+                    && !name.contains("_d16")
                     && data.is_empty()
                 {
                     if inst.read(Reg::V(*reg)).is_some_and(|a| known(&next, &a)) {
@@ -576,15 +579,18 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
                     }
                     continue;
                 }
-                let ops: Vec<Operand> = match &inst.fields {
+                let ops = match &inst.fields {
                     Fields::Valu(v)
                         if v.dpp.is_none()
                             && v.sdwa.is_none()
                             && !name.starts_with("v_mbcnt")
                             && !name.starts_with("v_cmpx")
+                            && !name.starts_with("v_movrel")
+                            && !name.starts_with("v_swaprel")
+                            && !name.starts_with("v_div_fmas")
                             && !name.contains("lane") =>
                     {
-                        v.src.clone()
+                        v.src.as_slice()
                     }
                     _ => continue,
                 };
@@ -598,32 +604,39 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
                         Operand::Vector { reg, .. },
                         ..,
                     ],
-                ) = (wave_tid, name, ops.as_slice())
+                ) = (wave_tid, name, ops)
                     && ((k - 128) & 31) >= 6
                     && inst.read(Reg::V(*reg)) == Some(tid)
                 {
                     next.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
                     continue;
                 }
-                let alike = ops.iter().all(|op| match *op {
-                    Operand::Vector { reg, .. } => {
-                        // every dword the instruction reads from that register on
-                        let read: Vec<Value> = inst
-                            .reads
-                            .iter()
-                            .filter(|r| matches!(r.0, Reg::V(x) if x >= reg))
-                            .map(|r| r.1)
-                            .collect();
-                        !read.is_empty() && read.iter().all(|x| known(&next, x))
-                    }
-                    // A scalar is one value; a lane mask is not, unless a
-                    // compare of alike values made it.
-                    Operand::Scalar { code, .. } if code != NULL => inst
-                        .read(Reg::S(code))
-                        .is_none_or(|x| !is_mask(x) && !per_lane(x) || known(&next, &x)),
+                // Accumulators and swaps also read a destination as input.
+                let implicit_alike = !(name == "v_swap_b32" || name.contains("mac_"))
+                    || inst.reads.iter().all(|(reg, v)| {
+                        !matches!(reg, Reg::V(_)) || known(&next, v)
+                    });
+                let mask_alike = name != "v_cndmask_b32"
+                    || matches!(ops.get(2), Some(Operand::Scalar { code, .. })
+                        if inst.read(Reg::S(*code))
+                            .and_then(|v| st.masks.get(&v))
+                            .is_some_and(|&b| alike_bool(&same, b)));
+                let operands_alike = ops.iter().all(|op| match *op {
+                    Operand::Vector { reg, dwords } => (0..dwords).all(|i| {
+                        reg.checked_add(i)
+                            .and_then(|r| inst.read(Reg::V(r)))
+                            .is_some_and(|v| known(&next, &v))
+                    }),
+                    // Waterfall reads and lane masks can differ between lanes.
+                    Operand::Scalar { code, dwords } if code != NULL => (0..dwords).all(|i| {
+                        code.checked_add(i)
+                            .and_then(|r| inst.read(Reg::S(r)))
+                            .is_some_and(|v| !is_mask(v) && !per_lane(v) || known(&next, &v))
+                    }),
+                    Operand::Const(251..=254) | Operand::Attr { .. } => false,
                     _ => true,
                 });
-                if alike {
+                if implicit_alike && mask_alike && operands_alike {
                     next.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
                 }
             }
