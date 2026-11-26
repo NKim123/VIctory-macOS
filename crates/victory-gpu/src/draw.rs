@@ -6489,10 +6489,14 @@ void main(uint3 id : SV_DispatchThreadID) { o[id.xy] = 13.5; }",
             // SAFETY: a live buffer.
             unsafe { made.GetDesc() }.Width
         };
-        assert_eq!(width(start + 456), 1 << 16, "on an element: the buffer's copy");
-        assert_ne!(width(start + 100), 1 << 16, "off: a copy of its own bytes (in a shared buffer)");
-        let (copy, address, len) = crate::descriptor::host::view_copy(&view(start + 100)).unwrap();
-        assert_eq!((copy.range(), address, len), ((start + 100, 4 * 456), start + 100, 4 * 456));
+        assert_eq!(width(start + 2 * 456), 1 << 16, "the buffer's copy");
+        let off_element = start + 102; // Off a dword even with raw views.
+        assert_ne!(width(off_element), 1 << 16, "a copy in a shared buffer");
+        let (copy, address, len) = crate::descriptor::host::view_copy(&view(off_element)).unwrap();
+        assert_eq!(
+            (copy.range(), address, len),
+            ((off_element, 4 * 456), off_element, 4 * 456)
+        );
         drop(copy);
         // A slot made from the view holds its copy: after more than a
         // thousand other views' copies, draws still find (and refresh) the
@@ -6504,14 +6508,14 @@ void main(uint3 id : SV_DispatchThreadID) { o[id.xy] = 13.5; }",
         let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
         assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
         let slots = crate::descriptor::heap(heap).host().expect("a host view heap");
-        slots.make_at(0, &view(start + 100));
-        let shown = std::sync::Arc::downgrade(&crate::descriptor::host::view_copy(&view(start + 100)).unwrap().0);
+        slots.make_at(0, &view(off_element));
+        let shown = std::sync::Arc::downgrade(
+            &crate::descriptor::host::view_copy(&view(off_element)).unwrap().0,
+        );
         for k in 1..1200 {
-            if (100 + 4 * k) % 456 != 0 {
-                crate::descriptor::host::view_copy(&view(start + 100 + 4 * k)).unwrap();
-            }
+            crate::descriptor::host::view_copy(&view(off_element + 4 * k)).unwrap();
         }
-        let found = crate::descriptor::host::view_copy(&view(start + 100)).unwrap().0;
+        let found = crate::descriptor::host::view_copy(&view(off_element)).unwrap().0;
         assert!(shown.upgrade().is_some_and(|s| std::sync::Arc::ptr_eq(&s, &found)), "the slot's copy");
         drop(found);
         let list = host.new_list().unwrap();

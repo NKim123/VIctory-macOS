@@ -147,6 +147,9 @@ fn key(
     if wide_scalar_loads {
         h.update(b"wide scalar loads");
     }
+    if victory_shader::emit::raw_structured_views() {
+        h.update(b"raw structured views");
+    }
     *h.finalize().as_bytes()
 }
 

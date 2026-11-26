@@ -426,6 +426,21 @@ pub fn raw_root_cbvs() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_PORT_CBV").as_deref() == Ok("1"))
 }
 
+/// The host publishes structured buffers of whole dwords as raw views.
+pub fn raw_structured_views() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_RAW_STRUCTURED_VIEWS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_RAW_STRUCTURED_VIEWS").as_deref() == Ok("1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_RAW_STRUCTURED_VIEWS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 #[cfg(test)]
 thread_local! {
     static TEST_WIDE_SCALAR_LOADS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
