@@ -280,20 +280,32 @@ fn tag(blob: &[u8]) -> String {
     h.finalize().to_hex().to_string()
 }
 
-/// The pre-build's list as saved: the tag it holds for, then its keys.
+/// The checksum, followed by the library tag and keys it covers.
 fn list(tag: &str, keys: &HashSet<String>) -> String {
     let keys = keys.iter().map(String::as_str);
-    std::iter::once(tag).chain(keys).collect::<Vec<_>>().join("\n")
+    let body = std::iter::once(tag)
+        .chain(keys)
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{}\n{body}", blake3::hash(body.as_bytes()).to_hex())
 }
 
-/// The keys of a saved list, if it holds for `tag` (else none).
+/// A missing or damaged checksum leaves the caller to check the host library.
 fn listed(list: &[u8], tag: &str) -> HashSet<String> {
-    let list = String::from_utf8_lossy(list);
-    let mut lines = list.lines();
-    match lines.next() == Some(tag) {
-        true => lines.filter(|key| super::known::valid_key(key)).map(str::to_owned).collect(),
-        false => HashSet::new(),
+    let Some((checksum, body)) = str::from_utf8(list)
+        .ok()
+        .and_then(|text| text.split_once('\n'))
+    else {
+        return HashSet::new();
+    };
+    let mut lines = body.lines();
+    if lines.next() != Some(tag) || checksum != blake3::hash(body.as_bytes()).to_hex().as_str() {
+        return HashSet::new();
     }
+    lines
+        .filter(|key| super::known::valid_key(key))
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Whether the pre-build has the title pipeline `key` in the library.
@@ -772,6 +784,17 @@ mod tests {
         assert_eq!(listed(saved.as_bytes(), &tag(b"library")), keys);
         assert!(listed(saved.as_bytes(), &tag(b"library2")).is_empty());
         assert!(listed(b"", &tag(b"library")).is_empty());
+    }
+
+    #[test]
+    fn a_prebuilt_index_cannot_claim_a_hit_after_its_keys_change() {
+        let tag = tag(b"library");
+        let saved = list(&tag, &HashSet::from(["a".repeat(32)]));
+        let corrupt = format!("{saved}\n{}", "b".repeat(32));
+        assert!(listed(corrupt.as_bytes(), &tag).is_empty());
+
+        let (_, legacy) = saved.split_once('\n').unwrap();
+        assert!(listed(legacy.as_bytes(), &tag).is_empty());
     }
 
     #[test]
