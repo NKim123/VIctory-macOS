@@ -556,6 +556,104 @@ fn reduction(op: u32, ident: u32, input: u32) -> Vec<u32> {
     w
 }
 
+/// The whole console wave chooses between a masked reduction and a
+/// scalar fallback. The scalar result survives the join and is stored
+/// after EXEC has been restored, including by lanes outside the mask.
+fn conditional_reduction(op: u32, ident: u32, mask: u64, branch_on_vcc: bool) -> Vec<u32> {
+    let reduction = reduction(op, ident, V_MOV_V3_V0);
+    let start = PROLOGUE.len() + 2;
+    let after = reduction.len() - 4;
+    let section = &reduction[start..after];
+    let mut words = reduction[..start].to_vec();
+    words.extend([
+        0xBE94_047E, // s_mov_b64 s[20:21], exec
+        0xBE88_03FF, // s_mov_b32 s8, literal
+        mask as u32,
+        0xBE89_03FF, // s_mov_b32 s9, literal
+        (mask >> 32) as u32,
+        0x7D88_00A0, // v_cmp_gt_u32 vcc, 32, v0
+        0xD501_0002,
+        0x01A8_1009, // v_cndmask_b32 v2, s9, s8, vcc
+        0x2C04_0500, // v_lshrrev_b32 v2, v0, v2
+        0x3604_0481, // v_and_b32 v2, 1, v2
+    ]);
+    if branch_on_vcc {
+        words.push(0x7D84_00BF); // v_cmp_eq_u32 vcc, 63, v0
+    }
+    words.push(0x7DAA_0480); // v_cmpx_ne_u32 exec, 0, v2
+    // s_cbranch_vccnz or s_cbranch_execz to fallback.
+    let branch = if branch_on_vcc {
+        0xBF87_0000
+    } else {
+        0xBF88_0000
+    };
+    words.push(branch | (section.len() as u32 + 1));
+    words.extend(section);
+    words.extend([
+        0xBF82_0001, // s_branch join
+        0xBE8F_03A5, // fallback: s_mov_b32 s15, 37
+        0xBEFE_0414, // join: s_mov_b64 exec, s[20:21]
+    ]);
+    words.extend(&reduction[after..]);
+    words
+}
+
+#[test]
+fn whole_group_selects_reductions_for_divergent_masks() {
+    use super::{Options, container, emit_with};
+    use crate::Container;
+
+    let bytes = container::build(&[]);
+    let c = Container::parse(&bytes).expect("empty container");
+    let mut failed = Vec::new();
+    for (mask, branch_on_vcc) in [
+        (0u64, false),
+        (1 << 4, false),
+        (1 << 45, false),
+        ((1 << 2) | (1 << 19) | (1 << 42) | (1 << 60), false),
+        // The VCC branch sees lane 63 even though EXEC has only lane 4.
+        (1 << 4, true),
+    ] {
+        for (op, ident, expected) in [
+            (V_MIN_U32, 0xC1, mask.trailing_zeros()),
+            (V_MAX_U32, 0x80, 63u32.saturating_sub(mask.leading_zeros())),
+        ] {
+            let words = conditional_reduction(op, ident, mask, branch_on_vcc);
+            let why = refusal(&words, 64, 0);
+            assert!(
+                why.contains("a wave reduction over both 32-lane halves"),
+                "{why}"
+            );
+            let n = native(&words, true, 64, 0);
+            let p = ir::build(&n.code, n.wave64, n.vgprs).expect("ir::build");
+            let st = structure::structure(&p).expect("structure");
+            let res = resource::track(&p, &n.layout, n.stage, Some(&st)).expect("track");
+            let io = io::raise(&p, &n).expect("io::raise");
+            let host = emit_with(
+                &c,
+                &n,
+                &p,
+                &st,
+                &io,
+                &res,
+                Options {
+                    host_wave32: true,
+                    ..Options::default()
+                },
+            )
+            .expect("group vote makes the reduction convergent");
+            let expected = if mask == 0 || branch_on_vcc {
+                37
+            } else {
+                expected
+            };
+            let want = [expected; 64];
+            failed.extend(check_differences(&[("group vote", host)], 64, 1, &want));
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
 /// What the console gives [`reduction`] of `f` (folding the inputs of a
 /// console wave's lanes) in lane `l` of a group of `threads`.
 fn console_reduction(
@@ -991,6 +1089,15 @@ fn differences_in(
             shader(lowered_with(&n, false, narrow_waves).expect("one wave32")),
         )]
     };
+    check_differences(&forms, threads, per_lane, want)
+}
+
+fn check_differences(
+    forms: &[(&str, super::HostShader)],
+    threads: u32,
+    per_lane: usize,
+    want: &[u32],
+) -> Vec<String> {
     let views = [
         View::Texture(1, 1, &[[0.0; 4]]),
         View::Buffer {
@@ -1009,7 +1116,7 @@ fn differences_in(
     let mut failed = Vec::new();
     for (adapter, host) in &hosts {
         let wave32 = host.wave32().unwrap_or(false);
-        for (form, shader) in &forms {
+        for (form, shader) in forms {
             let label = format!("{adapter} ({form})");
             // A host of 32-lane waves only ever runs the halves. NVIDIA
             // refuses the console's own form; D3DMetal makes its pipeline

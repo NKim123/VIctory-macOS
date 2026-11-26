@@ -407,6 +407,9 @@ struct Lower<'a> {
     cur_ir: usize,
     /// Whole-wave sections by block and start index.
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
+    /// Group-wide branch votes and the blocks that read them.
+    group_bits: Map<usize, (V, usize)>,
+    group_bit_uses: Vec<(usize, usize)>,
     /// Values written in a section that code outside it reads.
     section_out: Set<Value>,
     /// The program's constant table (the code from the first byte read
@@ -536,6 +539,8 @@ enum MaskData {
 pub(super) const LDS_ACROSS: Why =
     "LDS one console wave64 shares without barriers, on a host of 32-lane waves";
 pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
+pub(super) const REDUCTION_ACROSS: Why =
+    "a wave reduction over both 32-lane halves (wave64 on a 32-lane host)";
 const LANE_MASK: Why = "a lane mask read as data";
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
@@ -905,7 +910,11 @@ impl<'a> Lower<'a> {
             halves,
             halves_refused,
             relabelled: None,
-            step: if halves { in_step(p, x.st) } else { Vec::new() },
+            step: if halves {
+                in_step(p, x.st, &x.res.waterfall.reads)
+            } else {
+                Vec::new()
+            },
             half_words: None,
             level: 0,
             alike: if halves {
@@ -943,6 +952,8 @@ impl<'a> Lower<'a> {
             descriptor_load_uses: OnceCell::new(),
             cur_ir: 0,
             sections: HashMap::new(),
+            group_bits: Map::default(),
+            group_bit_uses: Vec::new(),
             section_out: Set::default(),
             code_table: None,
             memory_null: None,
@@ -1349,7 +1360,6 @@ impl<'a> Lower<'a> {
     /// expanded gives on that wave.
     fn shape(&mut self, shape: super::wave::Shape) -> Result<V, Why> {
         use super::wave::{Op, Shape};
-        const ACROSS: Why = "a wave reduction over both 32-lane halves (wave64 on a 32-lane host)";
         let (op, src, mask, ident, prefix) = match shape {
             Shape::K(k) => return Ok(self.s.m.i32(k)),
             Shape::Value(v) => return self.i32_of(v),
@@ -1370,7 +1380,7 @@ impl<'a> Lower<'a> {
             Shape::Prefix(op, src, mask, ident, inclusive) => {
                 (op, src, mask, ident, Some(inclusive))
             }
-            Shape::Half(..) if self.halves => return Err(ACROSS),
+            Shape::Half(..) if self.halves => return Err(REDUCTION_ACROSS),
             Shape::Half(_, src, mask, ident, hi) => {
                 // The high half is a console lane's: compute only.
                 if self.mask_data != MaskData::Console {
@@ -1442,7 +1452,7 @@ impl<'a> Lower<'a> {
         // order. Otherwise the halves pass each other their results.
         let across = self.halves && !self.one_host_wave();
         if across && !self.across_here() {
-            return Err(ACROSS);
+            return Err(REDUCTION_ACROSS);
         }
         let c = self.cur;
         let &m = self
@@ -1633,6 +1643,12 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        if !self.s.m.blocks_dominate_uses(&self.group_bit_uses) {
+            return Err(unsupported(
+                0,
+                "a group vote that does not dominate its use",
+            ));
+        }
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -3158,6 +3174,14 @@ impl<'a> Lower<'a> {
 
     fn atom(&mut self, atom: Atom, at: usize) -> Result<V, Why> {
         match atom {
+            Atom::GroupAny(b) => {
+                let &(bit, def) = self
+                    .group_bits
+                    .get(&b)
+                    .ok_or("a group vote written after its use")?;
+                self.group_bit_uses.push((def, at));
+                Ok(bit)
+            }
             Atom::Lane(v) => self.lane_bits.get(&v).copied().ok_or_else(|| {
                 self.lane_fail
                     .get(&v)
@@ -3558,11 +3582,44 @@ impl<'a> Lower<'a> {
         )
     }
 
-    /// `x` of lane `src` (in this lane's quad) through quad reads, whose
-    /// lane must be a constant.
-    fn quad_pick(&mut self, x: V, src: V) -> V {
+    /// `x` of lane `src` in this lane's quad. DXIL's quad operations
+    /// require constant selectors. Broadcasts and axis swaps need only one
+    /// quad operation. Other permutations select among four broadcasts.
+    fn quad_pick(&mut self, x: V, src: V, pattern: Option<u8>) -> V {
         self.s.flags |= flags::WAVE_OPS;
         let c = self.cur;
+        if let Some(pattern) = pattern {
+            let lane = u32::from(pattern & 3);
+            if u32::from(pattern) == lane * 0x55 {
+                let lane = self.s.m.i32(lane);
+                return self.s.op(
+                    c,
+                    "quadReadLaneAt.i32",
+                    Attr::NoUnwind,
+                    self.s.t.i32,
+                    122,
+                    &[x, lane],
+                );
+            }
+            let direction = match pattern {
+                0xE4 => return x, // [0, 1, 2, 3]
+                0xB1 => Some(0),  // [1, 0, 3, 2]
+                0x4E => Some(1),  // [2, 3, 0, 1]
+                0x1B => Some(2),  // [3, 2, 1, 0]
+                _ => None,
+            };
+            if let Some(direction) = direction {
+                let direction = self.s.m.i8(direction);
+                return self.s.op(
+                    c,
+                    "quadOp.i32",
+                    Attr::NoUnwind,
+                    self.s.t.i32,
+                    123,
+                    &[x, direction],
+                );
+            }
+        }
         let three = self.s.m.i32(3);
         let q = self.s.m.bin(c, Bin::And, src, three);
         let mut r = x;
@@ -3653,13 +3710,14 @@ impl<'a> Lower<'a> {
         src: V,
         guard: Option<V>,
         mesh_quad: bool,
+        pattern: Option<u8>,
     ) -> Option<V> {
         let c = self.cur;
         if self.s.pixel {
             let g = guard?;
             let (one, zero) = (self.s.m.i32(1), self.s.m.i32(0));
             let active_i32 = self.s.m.select(c, g, one, zero);
-            let picked = self.quad_pick(active_i32, src);
+            let picked = self.quad_pick(active_i32, src, pattern);
             return Some(self.s.m.cmp(c, pred::NE, picked, zero));
         }
         if !mesh_quad
@@ -3774,9 +3832,10 @@ impl<'a> Lower<'a> {
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
             let use_quad = mesh_quad || self.helpers_read(quad);
-            let src_ok = self.src_lane_active(inst, src, guard, mesh_quad);
+            let pattern = (offset & 0x8000 != 0).then_some(offset as u8);
+            let src_ok = self.src_lane_active(inst, src, guard, mesh_quad, pattern);
             let mut r = if use_quad {
-                self.quad_pick(x, src)
+                self.quad_pick(x, src, pattern)
             } else {
                 let safe_src = match src_ok {
                     Some(ok) => self.s.m.select(c, ok, src, lane),
@@ -6719,17 +6778,24 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl, fi)
             }
         };
+        let pattern = match dpp {
+            Dpp::Row {
+                ctrl: ctrl @ 0..=0xFF,
+                ..
+            } => Some(ctrl as u8),
+            _ => None,
+        };
         let src_active = if fi {
             None
         } else {
-            self.src_lane_active(inst, src, guard, mesh_quad)
+            self.src_lane_active(inst, src, guard, mesh_quad, pattern)
         };
         let valid = match (inside, src_active) {
             (Some(in_b), Some(act)) => Some(self.s.m.bin(c, Bin::And, in_b, act)),
             (a, b) => a.or(b),
         };
         let mut r = if use_quad {
-            self.quad_pick(x, src)
+            self.quad_pick(x, src, pattern)
         } else {
             let safe_src = match valid {
                 Some(ok) => self.s.m.select(c, ok, src, lane),
@@ -9197,12 +9263,21 @@ impl<'a> Lower<'a> {
     fn uniform_join(&self, b: usize) -> bool {
         let st = self.x.st;
         let preds = &self.x.p.blocks[b].preds;
-        preds.iter().filter(|&&q| self.block[q].is_some()).all(|&q| match st.exits[q] {
-            LaneExit::Branch { when, taken, not_taken } if taken != not_taken => {
-                st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_)))
-            }
-            _ => true,
-        })
+        preds
+            .iter()
+            .filter(|&&q| self.block[q].is_some())
+            .all(|&q| match st.exits[q] {
+                LaneExit::Branch {
+                    when,
+                    taken,
+                    not_taken,
+                } if taken != not_taken => st
+                    .bools
+                    .support(when)
+                    .iter()
+                    .all(|a| matches!(a, Atom::Uniform(_) | Atom::GroupAny(_))),
+                _ => true,
+            })
     }
 
     /// Whether no lane goes from IR block `q` to `b`.
@@ -11282,6 +11357,10 @@ impl<'a> Lower<'a> {
             .insts
             .last()
             .map_or(self.x.p.blocks[b].offset, |i| i.machine.offset);
+        if let Some(&any) = self.x.st.group_branches.get(&b) {
+            let bit = self.group_any(any).map_err(|w| unsupported(offset, w))?;
+            self.group_bits.insert(b, (bit, self.cur));
+        }
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
                 let ok = self.count_iteration(t, pred::IULT);
@@ -11559,6 +11638,7 @@ impl<'a> Lower<'a> {
                 | Atom::Phi(v)
                 | Atom::Quad(v)
                 | Atom::Opaque(v) => Some(v),
+                Atom::GroupAny(_) => return true,
                 Atom::Constant(_) => None,
             };
             if v.is_some_and(|v| tainted.contains(&v)) {

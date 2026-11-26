@@ -378,6 +378,16 @@ SRV buffer load into one DXIL call. The switch defaults to off and has
 separate shader cache entries for native warm-up and runtime. The lowering
 comes from avatarmanz/VIctory-7900XTX.
 
+`VICTORY_VIEW_MARKS=0` disables translated texture read and buffer write
+marks for profiling. View marks default to on. Turning them off can affect
+which resources are refreshed or written back. Native warm-up and runtime
+use separate shader and pipeline cache keys for this setting.
+
+`VICTORY_LINK_MESH_OUTPUTS=all` also prunes unused mesh outputs in
+pipelines below Metal's output limit. The default under Wine links
+pipelines that exceed the limit. Linking adds translation work at
+pipeline creation and uses a separate pipeline library identity.
+
 ## GPU write-back through physical sections
 
 `VICTORY_LAND=1` enables post-fence buffer write-back through xmem's writable section views. The title's read-only write monitors stay in place. Other copies of the same physical page are dirtied, and only GPU-changed bytes are stored, so unrelated CPU writes survive. While landing is enabled, DirectStorage section writes and GPU write-back wait for overlapping writes to finish. Each GPU submission checks that its physical destination still has the same mapping, including when fault tracking is disabled. Computed-address writes without fault tracking use a pre-submit snapshot of the GPU shadow to distinguish GPU changes from concurrent CPU writes. An overlapping declared range also gets a complete page snapshot when it fits. Before any post-fence merge, computed marks with a complete snapshot take ownership of the whole shadow page, including its declared GPU writes. These snapshots share a 64 MiB budget per submission. Snapshot copying can reach that budget even when the shaders leave no computed-write marks. The opt-in path accepts this preparation cost and may omit shader outputs when it cannot determine which bytes the GPU wrote. If an untracked or overlapping computed write lacks a complete snapshot, the computed write is withheld and the shadow refreshes from title memory again. View marks on a shadow that straddles tracked and untracked pages also need a complete baseline for each untracked page before they can land.

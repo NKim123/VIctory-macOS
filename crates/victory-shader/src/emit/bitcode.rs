@@ -766,6 +766,25 @@ impl Module {
         plan
     }
 
+    /// Check that no use can be reached from the entry without its
+    /// definition. Lowering may refer back to a branch vote from a guard.
+    pub fn blocks_dominate_uses(&self, uses: &[(usize, usize)]) -> bool {
+        let mut reachable_without = HashMap::new();
+        uses.iter().all(|&(def, use_block)| {
+            let bypass = reachable_without.entry(def).or_insert_with(|| {
+                let mut seen = vec![false; self.blocks.len()];
+                let mut pending = vec![0];
+                while let Some(b) = pending.pop() {
+                    if b != def && !std::mem::replace(&mut seen[b], true) {
+                        pending.extend(successors(self.term(b)).iter().copied());
+                    }
+                }
+                seen
+            });
+            !bypass[use_block]
+        })
+    }
+
     pub fn write(&self) -> Vec<u8> {
         let plan = self.plan();
         let (live, layout) = (&plan.live, &plan.layout);

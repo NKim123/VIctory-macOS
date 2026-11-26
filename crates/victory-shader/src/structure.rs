@@ -49,6 +49,9 @@ pub enum Atom {
     Lane(Value),
     /// An SCC value, the same in every lane.
     Uniform(Value),
+    /// Whether any lane set the mask tested at the end of this block,
+    /// with one console wave per thread group.
+    GroupAny(usize),
     /// A lane mask joined at a block entry, by its low dword's phi.
     Phi(Value),
     /// `s_wqm` result: some lane of the quad is in the source mask.
@@ -446,6 +449,8 @@ pub struct Structured {
     pub bools: Bools,
     /// Per block.
     pub exits: Vec<LaneExit>,
+    /// The per-lane input to each group-wide branch vote, by block.
+    pub(crate) group_branches: Map<usize, Bool>,
     /// Per block and instruction: the condition, beyond reaching it, under
     /// which a lane runs a vector instruction; `None` when reaching it is
     /// enough (lanes outside EXEC then never get there, so a VGPR write
@@ -487,7 +492,7 @@ impl Structured {
 
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
-    structure_as(program, true)
+    structure_as(program, true, false)
 }
 
 /// The per-lane form with a pixel's discarded lanes taken out of the live
@@ -495,11 +500,23 @@ pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
 /// what a program needs whose discarded lanes would read values no
 /// surviving lane does (see [`Structured::discards`]).
 pub fn killing(program: &Program) -> Result<Structured, ShaderError> {
-    structure_as(program, false)
+    structure_as(program, false, false)
 }
 
-fn structure_as(program: &Program, helpers: bool) -> Result<Structured, ShaderError> {
+/// Keep the original wave-wide mask branches for a compute group with one
+/// console wave. A lane reaching the body of an EXEC branch may still have
+/// its EXEC bit clear, so its vector writes keep their normal guards.
+pub(crate) fn with_group_branches(program: &Program) -> Result<Structured, ShaderError> {
+    structure_as(program, false, true)
+}
+
+fn structure_as(
+    program: &Program,
+    helpers: bool,
+    group_branches: bool,
+) -> Result<Structured, ShaderError> {
     let mut l = Lanes::new(program)?;
+    l.vote_across_group = group_branches;
     if !helpers {
         l.kills.clear();
     }
@@ -546,6 +563,8 @@ struct Lanes<'a> {
     first: Vec<Bool>,
     /// Per block ending in a branch: when a lane takes it.
     when: Vec<Option<Bool>>,
+    vote_across_group: bool,
+    group_branches: Map<usize, Bool>,
     /// See [`Structured::active`].
     active: Set<Value>,
     /// See [`Structured::restored`].
@@ -620,6 +639,8 @@ impl<'a> Lanes<'a> {
             joins: Vec::new(),
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
+            vote_across_group: false,
+            group_branches: Map::default(),
             active: Set::default(),
             restored: Map::default(),
             kills: HashSet::new(),
@@ -698,6 +719,7 @@ impl<'a> Lanes<'a> {
         self.joins.clear();
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
+        self.group_branches.clear();
         self.active.clear();
     }
 
@@ -780,6 +802,9 @@ impl<'a> Lanes<'a> {
                     } else if self.kill_exit(not_taken, live) {
                         w = Bool::TRUE;
                     }
+                }
+                if self.vote_across_group {
+                    w = self.group_branch(last, w, b, n);
                 }
                 self.when[b] = Some(w);
             }
@@ -900,6 +925,7 @@ impl<'a> Lanes<'a> {
                 .collect(),
             bools: self.b,
             exits,
+            group_branches: self.group_branches,
             guards,
             reach: cond.to_vec(),
         })
@@ -1364,7 +1390,13 @@ impl<'a> Lanes<'a> {
                     Some(k) => self.mask(k).0,
                     None => Bool::FALSE,
                 };
-                let any = self.b.and(vcc, exec);
+                // The scalar branch checks the whole VCC register. The
+                // per-lane form keeps only lanes that participate in EXEC.
+                let any = if self.vote_across_group {
+                    vcc
+                } else {
+                    self.b.and(vcc, exec)
+                };
                 if n.ends_with("nz") {
                     any
                 } else {
@@ -1389,6 +1421,35 @@ impl<'a> Lanes<'a> {
                 }
             }
         }
+    }
+
+    /// A mask branch tests the whole console wave. Keep its vote distinct
+    /// from the lane's own mask, which still guards the instructions.
+    fn group_branch(&mut self, inst: &Inst, when: Bool, block: usize, order: usize) -> Bool {
+        let zero = match inst.name() {
+            "s_cbranch_execz" | "s_cbranch_vccz" => true,
+            "s_cbranch_execnz" | "s_cbranch_vccnz" => false,
+            name @ ("s_cbranch_scc0" | "s_cbranch_scc1")
+                if inst
+                    .read(Reg::Scc)
+                    .is_some_and(|v| self.scc_lane.contains_key(&v)) =>
+            {
+                name == "s_cbranch_scc0"
+            }
+            _ => return when,
+        };
+        if self
+            .b
+            .support(when)
+            .iter()
+            .all(|a| matches!(a, Atom::Uniform(_) | Atom::GroupAny(_)))
+        {
+            return when;
+        }
+        let any = if zero { self.b.not(when) } else { when };
+        self.group_branches.insert(block, any);
+        let vote = self.b.atom(Atom::GroupAny(block), order);
+        if zero { self.b.not(vote) } else { vote }
     }
 
     /// What a lane knows on entering each block, to a fixpoint. A loop

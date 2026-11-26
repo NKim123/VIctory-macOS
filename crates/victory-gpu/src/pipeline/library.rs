@@ -498,12 +498,16 @@ fn tag(blob: &[u8]) -> String {
     tag_with_settings(blob, translation, super::link_mesh_outputs())
 }
 
-fn tag_with_settings(blob: &[u8], translation: &[u8; 32], link_mesh_outputs: bool) -> String {
+fn tag_with_settings(
+    blob: &[u8],
+    translation: &[u8; 32],
+    link_mesh_outputs: super::MeshLink,
+) -> String {
     let mut h = blake3::Hasher::new();
     for part in [
         blob,
         translation,
-        &[u8::from(link_mesh_outputs)],
+        &[link_mesh_outputs as u8],
         include_bytes!("../pipeline.rs"),
         include_bytes!("host.rs"),
         include_bytes!("library.rs"),
@@ -1270,6 +1274,7 @@ mod tests {
 
     #[test]
     fn changing_translation_settings_invalidates_the_prebuilt_list() {
+        use crate::pipeline::MeshLink;
         use crate::shader_cache::{runtime_options, translation_build};
 
         let options = runtime_options();
@@ -1283,14 +1288,15 @@ mod tests {
             tag_with_settings(b"library", translation_build(options), link)
         };
         let keys = HashSet::from(["a".repeat(32)]);
-        let original = current(false, false, false, false);
+        let original = current(false, false, false, MeshLink::Off);
         let saved = list(&original, &keys);
         assert_eq!(listed(saved.as_bytes(), &original), keys);
         for changed in [
-            current(true, false, false, false),
-            current(false, true, false, false),
-            current(false, false, true, false),
-            current(false, false, false, true),
+            current(true, false, false, MeshLink::Off),
+            current(false, true, false, MeshLink::Off),
+            current(false, false, true, MeshLink::Off),
+            current(false, false, false, MeshLink::OverLimit),
+            current(false, false, false, MeshLink::All),
         ] {
             assert!(listed(saved.as_bytes(), &changed).is_empty());
         }
