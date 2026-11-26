@@ -597,13 +597,11 @@ pub(crate) fn service_pending(
 fn with_current_record(handle: u64, record: [u32; 3], f: impl FnOnce()) -> bool {
     let views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
     let [_, i, generation] = record;
-    let mut bytes = [0; 12];
     if views
         .list
         .get(i as usize)
         .is_some_and(|(_, current)| *current == generation)
-        && crate::host::read_into(handle as *const u8, &mut bytes)
-        && bytes == record.map(u32::to_le_bytes).as_flattened()
+        && host::header_matches(handle, record)
     {
         f();
         true

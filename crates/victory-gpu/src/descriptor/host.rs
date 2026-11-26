@@ -32,20 +32,37 @@ fn record_key([_, view, generation]: [u32; 3]) -> u64 {
     u64::from(generation) << 32 | u64::from(view)
 }
 
-fn header_matches(address: u64, record: [u32; 3]) -> bool {
+pub(super) fn header_matches(address: u64, record: [u32; 3]) -> bool {
     #[cfg(target_arch = "x86_64")]
     if super::scan::on() {
         return super::scan::matches(address as *const u8, record);
     }
-    let mut bytes = [0u8; 12];
-    crate::host::read_into(address as *const u8, &mut bytes)
-        && bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .copied()
-            .map(u32::from_le_bytes)
-            .eq(record)
+    read_header(address) == Some(record)
+}
+
+fn read_header(address: u64) -> Option<[u32; 3]> {
+    let mut bytes = [[0u8; 4]; 3];
+    crate::host::read_into(address as *const u8, bytes.as_flattened_mut())
+        .then(|| bytes.map(u32::from_le_bytes))
+}
+
+fn read_table_header(address: u64, ready: u64) -> Option<[u32; 3]> {
+    // Most table slots are already mirrored. Validate those headers
+    // without a kernel call on hosts with guarded reads.
+    #[cfg(target_arch = "x86_64")]
+    if super::scan::on() {
+        let expected = if ready == 0 {
+            [0; 3]
+        } else {
+            [VIEW_TAG, ready as u32, (ready >> 32) as u32]
+        };
+        if super::scan::matches(address as *const u8, expected) {
+            return Some(expected);
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = ready;
+    read_header(address)
 }
 
 #[cfg(test)]
@@ -2459,16 +2476,11 @@ impl HostHeap {
         {
             for &index in tables.range(..self.count) {
                 let handle = start + u64::from(index) * step;
-                let mut bytes = [0; 12];
-                if !crate::host::read_into(handle as *const u8, &mut bytes) {
+                let ready = self.ready[index as usize].load(Ordering::Acquire);
+                let Some(record @ [tag, view, generation]) = read_table_header(handle, ready)
+                else {
                     continue;
-                }
-                let words: [[u8; 4]; 3] = bytes
-                    .as_chunks::<4>()
-                    .0
-                    .try_into()
-                    .expect("a title descriptor record has three words");
-                let record @ [tag, view, generation] = words.map(u32::from_le_bytes);
+                };
                 if tag == VIEW_TAG
                     && self.ready[index as usize].load(Ordering::Acquire) == record_key(record)
                     && let Some(pin) = view_at(view, generation)
@@ -2576,14 +2588,14 @@ impl HostHeap {
                 if key == 0 || self.ready[index as usize].load(Ordering::Acquire) != key {
                     continue;
                 }
+                let Some(resource) = self.viewed.texture_resource(index) else {
+                    continue;
+                };
                 let (view, generation) = (key as u32, (key >> 32) as u32);
                 let Some(pin) = view_at(view, generation) else {
                     continue;
                 };
                 pins.push(pin);
-                let Some(resource) = self.viewed.texture_resource(index) else {
-                    continue;
-                };
                 let Some(copy) = crate::resource::made_copy(resource as crate::object::This) else {
                     continue;
                 };
@@ -2608,7 +2620,9 @@ impl HostHeap {
                     continue;
                 };
                 let handle = start + u64::from(index) * step;
-                if super::with_current_record(handle, [VIEW_TAG, view, generation], || {}) {
+                // The pin above keeps this generation's resources live.
+                // No shared descriptor is changed on this path.
+                if header_matches(handle, [VIEW_TAG, view, generation]) {
                     copy.stamp();
                     upload(super::PendingUpload {
                         copy,
