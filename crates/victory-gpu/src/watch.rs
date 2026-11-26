@@ -40,7 +40,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// Whether title writes may fault into a tracker: the guards here and the
 /// write watch of the runtime's pools (`victory_hle`'s `XMemVirtualAlloc`,
@@ -115,6 +115,26 @@ const WHOLE: u16 = u16::MAX;
 fn page_parts() -> bool {
     static ON: LazyLock<bool> =
         LazyLock::new(|| std::env::var_os("VICTORY_PAGE_PARTS").is_none_or(|v| v != "0"));
+    *ON
+}
+
+/// Enable shared guard operations. The exclusive path remains the default.
+pub(crate) fn port_guard() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("VICTORY_PORT_GUARD").is_some_and(|v| v == "1"));
+    *ON
+}
+
+pub(crate) fn port_guard_plan() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("VICTORY_PORT_GUARD_PLAN").is_none_or(|v| v != "0"));
+    port_guard() && *ON
+}
+
+/// Enable sharded dirty journals and early descriptor-heap refresh asks.
+pub(crate) fn port_journal() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("VICTORY_PORT_JOURNAL").is_some_and(|v| v == "1"));
     *ON
 }
 
@@ -218,12 +238,7 @@ pub use write_sites::{observe_write_sites, write_site_guards};
 /// The pages a tracker has not taken since they changed, what it saves of
 /// pages it armed, its bit in [`DIRTY`] (none: always taken as dirty), and
 /// whether it is a host buffer copy's (the only trackers [`retake`] marks).
-struct Changed(
-    Mutex<BTreeMap<usize, DirtyPage>>,
-    Mutex<Saved>,
-    Option<u32>,
-    bool,
-);
+struct Changed(DirtyJournal, Mutex<Saved>, Option<u32>, bool);
 
 /// A bit per tracker, set while it holds changed pages: set and cleared
 /// under the tracker's lock, read without one ([`Tracked::clean`]). Dense,
@@ -231,6 +246,110 @@ struct Changed(
 /// reads a few KB instead of a cache line per copy.
 static DIRTY: [AtomicU64; DIRTY_WORDS] = [const { AtomicU64::new(0) }; DIRTY_WORDS];
 const DIRTY_WORDS: usize = 1 << 14;
+
+// Each bit names a journal shard that still holds dirty pages. Updating it
+// under that shard's lock makes concurrent publishes and clears independent.
+static DIRTY_SHARDS: [AtomicU64; DIRTY_WORDS * 64] =
+    [const { AtomicU64::new(0) }; DIRTY_WORDS * 64];
+
+const JOURNAL_SHARDS: usize = 64;
+const SHARD_PAGES: usize = 16;
+type DirtyMap = BTreeMap<usize, DirtyPage>;
+
+enum DirtyJournal {
+    Single(Mutex<DirtyMap>),
+    Sharded(Box<[Mutex<DirtyMap>; JOURNAL_SHARDS]>),
+}
+
+impl DirtyJournal {
+    fn new(pages: &[usize], bit: Option<u32>, sharded: bool) -> Self {
+        // Keep the inline map for small copies. A 64-lock directory there
+        // would cost more memory than their dirty entries.
+        let distributed = sharded && pages.len() >= JOURNAL_SHARDS;
+        let journal = if distributed {
+            Self::Sharded(Box::new(std::array::from_fn(|_| Mutex::default())))
+        } else {
+            Self::Single(Mutex::default())
+        };
+        for &page in pages {
+            journal.update(page, bit, |map| map.insert(page, DirtyPage::WHOLE));
+        }
+        journal
+    }
+
+    fn shard_of(page: usize) -> usize {
+        page / SHARD_PAGES % JOURNAL_SHARDS
+    }
+
+    fn shard(&self, page: usize) -> (usize, &Mutex<DirtyMap>) {
+        match self {
+            Self::Single(map) => (0, map),
+            Self::Sharded(shards) => {
+                let i = Self::shard_of(page);
+                (i, &shards[i])
+            }
+        }
+    }
+
+    fn get(&self, page: usize) -> Option<DirtyPage> {
+        self.shard(page)
+            .1
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&page)
+            .copied()
+    }
+
+    fn update<T>(
+        &self,
+        page: usize,
+        bit: Option<u32>,
+        update: impl FnOnce(&mut DirtyMap) -> T,
+    ) -> T {
+        let (index, map) = self.shard(page);
+        let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
+        let was_empty = map.is_empty();
+        let result = update(&mut map);
+        if let Some(bit) = bit
+            && was_empty != map.is_empty()
+        {
+            if port_journal() {
+                let entry = &DIRTY_SHARDS[bit as usize];
+                if map.is_empty() {
+                    entry.fetch_and(!(1 << index), Ordering::Release);
+                } else {
+                    entry.fetch_or(1 << index, Ordering::Release);
+                }
+            } else {
+                set_dirty(Some(bit), !map.is_empty());
+            }
+        }
+        result
+    }
+
+    fn range(&self, first: usize, last: usize) -> Vec<(usize, u16)> {
+        let mut out = Vec::new();
+        if first >= last {
+            return out;
+        }
+        let mut collect = |map: &Mutex<DirtyMap>| {
+            let map = map.lock().unwrap_or_else(|e| e.into_inner());
+            out.extend(map.range(first..last).map(|(&page, _)| (page, WHOLE)));
+        };
+        match self {
+            Self::Single(map) => collect(map),
+            Self::Sharded(shards) => {
+                let count = (last.div_ceil(SHARD_PAGES) - first / SHARD_PAGES).min(JOURNAL_SHARDS);
+                let start = Self::shard_of(first);
+                for i in 0..count {
+                    collect(&shards[(start + i) % JOURNAL_SHARDS]);
+                }
+                out.sort_unstable_by_key(|&(page, _)| page);
+            }
+        }
+        out
+    }
+}
 
 /// Bits of [`DIRTY`] given back, and the first never handed out.
 static FREE_BITS: Mutex<(Vec<u32>, u32)> = Mutex::new((Vec::new(), 0));
@@ -261,13 +380,23 @@ fn set_dirty(bit: Option<u32>, dirty: bool) {
 /// Whether the tracker with bit `bit` holds no changed page (see
 /// [`Tracked::clean`]).
 pub(crate) fn clean_bit(bit: Option<u32>) -> bool {
-    bit.is_some_and(|bit| DIRTY[bit as usize / 64].load(Ordering::Acquire) & 1 << (bit % 64) == 0)
+    bit.is_some_and(|bit| {
+        if port_journal() {
+            DIRTY_SHARDS[bit as usize].load(Ordering::Acquire) == 0
+        } else {
+            DIRTY[bit as usize / 64].load(Ordering::Acquire) & 1 << (bit % 64) == 0
+        }
+    })
 }
 
 impl Drop for Changed {
     fn drop(&mut self) {
         if let Some(bit) = self.2 {
-            set_dirty(Some(bit), false);
+            if port_journal() {
+                DIRTY_SHARDS[bit as usize].store(0, Ordering::Release);
+            } else {
+                set_dirty(Some(bit), false);
+            }
             FREE_BITS.lock().unwrap_or_else(|e| e.into_inner()).0.push(bit);
         }
     }
@@ -327,6 +456,11 @@ impl Saved {
 }
 
 impl Changed {
+    fn clear_page(&self, page: usize) {
+        self.0.update(page, self.2, |map| map.remove(&page));
+        self.taken(page);
+    }
+
     /// Page `page` was taken: what it saved of it is stale.
     fn taken(&self, page: usize) {
         self.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.remove(&page);
@@ -361,12 +495,63 @@ pub(crate) struct Tracked {
     untracked: Vec<(usize, usize)>,
 }
 
+/// The blocks we made read-only. The value records whether the block uses
+/// kernel write watch. Only the publishing thread holds this lock, and
+/// only for a lookup or update, never across a memory system call.
+#[derive(Default)]
+struct Protected(RwLock<BTreeMap<usize, bool>>);
+
+impl Protected {
+    fn contains(&self, page: &usize) -> bool {
+        self.0
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(page)
+    }
+
+    fn watched(&self, page: usize) -> bool {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).get(&page) == Some(&true)
+    }
+
+    fn remove(&self, page: usize) -> bool {
+        self.0
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&page)
+            .is_some()
+    }
+
+    fn any(&self, first: usize, last: usize) -> bool {
+        self.0
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .range(first..last)
+            .next()
+            .is_some()
+    }
+
+    fn range(&self, first: usize, last: usize) -> Vec<usize> {
+        self.0
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .range(first..last)
+            .map(|(&p, _)| p)
+            .collect()
+    }
+
+    fn insert(&self, pages: &[usize], ends: &[usize]) {
+        let mut protected = self.0.write().unwrap_or_else(|e| e.into_inner());
+        protected.extend(
+            pages
+                .iter()
+                .copied()
+                .zip(ends.iter().map(|&end| page_parts() && end == usize::MAX)),
+        );
+    }
+}
+
 struct Guards {
-    /// Blocks (pages) we made read-only.
-    protected: BTreeSet<usize>,
-    /// Guarded blocks that the existing runtime-memory check identified as
-    /// write-watched pools. Section views can be guarded without this.
-    watched_guards: BTreeSet<usize>,
+    protected: Protected,
     /// The trackers holding each page.
     holders: BTreeMap<usize, Vec<Arc<Changed>>>,
     /// Pages `[first, last)` of writes the guards do not see that are under
@@ -379,19 +564,18 @@ struct Guards {
     alias_of: BTreeMap<usize, Vec<usize>>,
     /// Tracked pages written this frame and the frame before (diagnostics).
     #[cfg(feature = "diagnostics")]
-    written: BTreeSet<usize>,
+    written: Mutex<BTreeSet<usize>>,
     #[cfg(feature = "diagnostics")]
     written_before: BTreeSet<usize>,
 }
 
-static GUARDS: Mutex<Guards> = Mutex::new(Guards {
-    protected: BTreeSet::new(),
-    watched_guards: BTreeSet::new(),
+static GUARDS: RwLock<Guards> = RwLock::new(Guards {
+    protected: Protected(RwLock::new(BTreeMap::new())),
     holders: BTreeMap::new(),
     busy: Vec::new(),
     alias_of: BTreeMap::new(),
     #[cfg(feature = "diagnostics")]
-    written: BTreeSet::new(),
+    written: Mutex::new(BTreeSet::new()),
     #[cfg(feature = "diagnostics")]
     written_before: BTreeSet::new(),
 });
@@ -438,7 +622,7 @@ fn open_under_lock(page: usize) {
 /// The guard lock, held while this lives. With diagnostics, timed for the
 /// line that took it ([`held_times`]).
 struct Held {
-    guard: Option<std::sync::MutexGuard<'static, Guards>>,
+    guard: Option<RwLockWriteGuard<'static, Guards>>,
     #[cfg(feature = "diagnostics")]
     since: std::time::Instant,
     #[cfg(feature = "diagnostics")]
@@ -448,9 +632,9 @@ struct Held {
 #[track_caller]
 fn guards() -> Held {
     use std::sync::atomic::Ordering::AcqRel;
-    let guard = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = GUARDS.write().unwrap_or_else(|e| e.into_inner());
     HOLDING.with(|h| h.set(true));
-    let mut held = Held {
+    let held = Held {
         guard: Some(guard),
         #[cfg(feature = "diagnostics")]
         since: std::time::Instant::now(),
@@ -461,11 +645,53 @@ fn guards() -> Held {
         for slot in &OPENED_UNDER_LOCK {
             let page = slot.swap(0, AcqRel);
             if page != 0 {
-                changed(&mut held, page, page + 1, false);
+                changed(&held, page, page + 1, false);
             }
         }
     }
     held
+}
+
+/// Shared holders leave mappings, external writers and tracker lifetimes
+/// fixed. Only page claims serialize protection changes and their dirty
+/// marks. A structural change takes the lock exclusively and needs no
+/// claims. Drain the exclusive path's emergency fault slots first.
+fn guards_shared() -> RwLockReadGuard<'static, Guards> {
+    loop {
+        let guard = GUARDS.read().unwrap_or_else(|e| e.into_inner());
+        if !OPENED.load(Ordering::Acquire) {
+            return guard;
+        }
+        drop(guard);
+        drop(guards());
+    }
+}
+
+/// Fixed-size striped claims, indexed by 64 KiB block. Collisions only
+/// serialize otherwise independent blocks. Always lock in stripe order
+/// and include the other views before clearing a tracker's dirty entry.
+const CLAIM_COUNT: usize = 4096;
+static CLAIMS: [Mutex<()>; CLAIM_COUNT] = [const { Mutex::new(()) }; CLAIM_COUNT];
+const CLAIM_BATCH: usize = 64;
+
+fn claim_blocks(g: &Guards, pages: &[usize]) -> Vec<std::sync::MutexGuard<'static, ()>> {
+    let mut stripes = [0u64; CLAIM_COUNT / 64];
+    for page in pages {
+        for block in std::iter::once(page).chain(g.alias_of.get(page).into_iter().flatten()) {
+            let index = block % CLAIM_COUNT;
+            stripes[index / 64] |= 1 << (index % 64);
+        }
+    }
+    let mut claims =
+        Vec::with_capacity(stripes.iter().map(|bits| bits.count_ones() as usize).sum());
+    for (word, mut bits) in stripes.into_iter().enumerate() {
+        while bits != 0 {
+            let index = word * 64 + bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            claims.push(CLAIMS[index].lock().unwrap_or_else(|e| e.into_inner()));
+        }
+    }
+    claims
 }
 
 impl std::ops::Deref for Held {
@@ -532,7 +758,7 @@ fn aliases(g: &Guards, pages: &[usize]) -> Vec<(usize, usize)> {
 
 /// Guards the other mappings of taken pages, returning those that still
 /// have an unguarded mapping (cannot be taken yet).
-fn guard_aliases(g: &mut Guards, pairs: &[(usize, usize)]) -> BTreeSet<usize> {
+fn guard_aliases(g: &Guards, pairs: &[(usize, usize)]) -> BTreeSet<usize> {
     if pairs.is_empty() {
         return BTreeSet::new();
     }
@@ -569,7 +795,16 @@ fn track_as(start: usize, len: usize, views: bool, copy: bool) -> Option<Tracked
         return None;
     }
     let end = start + len;
-    let pages = runtime_pages(start, end, views);
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let known_views = port_guard() && {
+        let g = guards_shared();
+        g.alias_of.range(first..last).count() == last - first
+    };
+    let pages = match (known_views, views) {
+        (true, true) => (first..last).collect(),
+        (true, false) => return None,
+        _ => runtime_pages(start, end, views),
+    };
     if pages.is_empty() {
         return None;
     }
@@ -586,9 +821,8 @@ fn track_as(start: usize, len: usize, views: bool, copy: bool) -> Option<Tracked
     }
     // A tracker with untracked parts is never clean: no bit.
     let bit = if untracked.is_empty() { dirty_bit() } else { None };
-    set_dirty(bit, true);
-    let dirty = pages.iter().map(|&page| (page, DirtyPage::WHOLE)).collect();
-    let changed = Arc::new(Changed(Mutex::new(dirty), Mutex::default(), bit, copy));
+    let dirty = DirtyJournal::new(&pages, bit, port_journal());
+    let changed = Arc::new(Changed(dirty, Mutex::default(), bit, copy));
     let mut g = guards();
     for &page in &pages {
         g.holders.entry(page).or_default().push(changed.clone());
@@ -718,21 +952,20 @@ impl Drop for Tracked {
         for page in free {
             let watched_elsewhere = g.alias_of.get(&page).is_some_and(|o| o.iter().any(|p| g.holders.contains_key(p)));
             if !watched_elsewhere {
-                open(&mut g, page);
+                open(&g, page);
             }
         }
     }
 }
 
 /// Gives write access back to page `page` if we guarded it.
-fn open(g: &mut Guards, page: usize) -> bool {
+fn open(g: &Guards, page: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    if !g.protected.remove(&page) {
+    if !g.protected.remove(page) {
         return false;
     }
     #[cfg(target_arch = "x86_64")]
     write_sites::forget(page..page + 1);
-    g.watched_guards.remove(&page);
     let mut old = 0;
     // SAFETY: a block we made read-only (failing harmlessly if it is gone).
     unsafe { VirtualProtect((page * PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old) };
@@ -742,7 +975,7 @@ fn open(g: &mut Guards, page: usize) -> bool {
 }
 
 /// [`open`] of the guarded pages `[first, last)`, all in `protected`.
-fn open_run(g: &mut Guards, first: usize, last: usize) {
+fn open_run(g: &Guards, first: usize, last: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     if last - first == 1 {
         open(g, first);
@@ -759,8 +992,7 @@ fn open_run(g: &mut Guards, first: usize, last: usize) {
         return;
     }
     for page in first..last {
-        g.protected.remove(&page);
-        g.watched_guards.remove(&page);
+        g.protected.remove(page);
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::OpenPages, (last - first) as u64);
@@ -797,77 +1029,49 @@ impl Tracked {
         let mut pages: Vec<(usize, u16)> = {
             #[cfg(feature = "diagnostics")]
             let waited = Timed(std::time::Instant::now(), crate::copystat::C::GuardWaitUs);
-            let changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
+            let pages = self.changed.0.range(from / PAGE, to.div_ceil(PAGE));
             #[cfg(feature = "diagnostics")]
             drop(waited);
-            changed
-                .range(from / PAGE..to.div_ceil(PAGE))
-                .map(|(&page, _)| (page, WHOLE))
-                .collect()
+            pages
         };
         if pages.is_empty() {
             return (Vec::new(), Vec::new());
         }
-        let mut whole: Vec<usize> = pages
+        let whole: Vec<usize> = pages
             .iter()
             .map(|&(page, _)| page)
             .filter(|&p| (p * PAGE).max(self.start) >= from && ((p + 1) * PAGE).min(self.end) <= to)
             .collect();
-        // Every address showing the same pages is guarded too. A write in
-        // between marks them changed again; the copy, made after, has it.
-        #[cfg(feature = "diagnostics")]
-        let waited = Timed(std::time::Instant::now(), crate::copystat::C::GuardWaitUs);
-        let mut g = guards();
-        let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
-        #[cfg(feature = "diagnostics")]
-        drop(waited);
-        #[cfg(feature = "diagnostics")]
-        let asked = Timed(std::time::Instant::now(), crate::copystat::C::AliasUs);
-        let others = aliases(&g, &whole);
-        let unguarded = guard_aliases(&mut g, &others);
-        #[cfg(feature = "diagnostics")]
-        drop(asked);
-        whole.retain(|p| !unguarded.contains(p));
         let mut unmapped = Vec::new();
-        let taken = protect_noting(&mut g, &whole, &mut unmapped);
-        for &page in &taken {
-            if let Some(dirty) = changed.get_mut(&page)
-                && dirty.pending
-            {
-                let parts = if g.watched_guards.contains(&page) && !g.alias_of.contains_key(&page) {
-                    watched_parts(page, WRITE_WATCH_RESET)
-                } else {
-                    WHOLE
-                };
-                dirty.resolve(parts);
-                // A reset consumes a shared answer. Even holders refreshing
-                // later must see these parts, along with their earlier dirties.
-                for holder in &g.holders[&page] {
-                    if !Arc::ptr_eq(holder, &self.changed)
-                        && let Some(dirty) = holder
-                            .0
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .get_mut(&page)
-                    {
-                        dirty.resolve(parts);
-                    }
-                }
+        if port_guard() {
+            for group in whole.chunks(CLAIM_BATCH) {
+                #[cfg(feature = "diagnostics")]
+                let waited = Timed(std::time::Instant::now(), crate::copystat::C::GuardWaitUs);
+                let g = guards_shared();
+                let _claims = claim_blocks(&g, group);
+                #[cfg(feature = "diagnostics")]
+                drop(waited);
+                self.take_claimed(&g, group, &mut pages, &mut unmapped);
+            }
+        } else {
+            #[cfg(feature = "diagnostics")]
+            let waited = Timed(std::time::Instant::now(), crate::copystat::C::GuardWaitUs);
+            let g = guards();
+            #[cfg(feature = "diagnostics")]
+            drop(waited);
+            self.take_claimed(&g, &whole, &mut pages, &mut unmapped);
+        }
+        // Partial pages were copied but not taken. Read their remaining
+        // dirty masks after the tracked pages in this range are rearmed.
+        for (page, mask) in &mut pages {
+            if whole.binary_search(page).is_err() {
+                *mask = self.changed.0.get(*page).map_or(WHOLE, DirtyPage::mask);
             }
         }
-        for (page, mask) in &mut pages {
-            *mask = changed.get(page).map_or(WHOLE, |dirty| dirty.mask());
-        }
-        for page in taken {
-            changed.remove(&page);
-            self.changed.taken(page);
-        }
-        set_dirty(self.changed.2, !changed.is_empty());
-        drop(changed);
-        drop(g);
         let (mut copy, mut zero): (Runs, Runs) = (Vec::new(), Vec::new());
+        let mut unmapped = unmapped.into_iter().peekable();
         for (page, mask) in pages {
-            if unmapped.contains(&page) {
+            if unmapped.next_if_eq(&page).is_some() {
                 append_parts(&mut zero, page, WHOLE, from, to);
             } else {
                 append_parts(&mut copy, page, mask, from, to);
@@ -876,32 +1080,88 @@ impl Tracked {
         (copy, zero)
     }
 
+    /// Rearm pages and consume their dirty parts with either the exclusive
+    /// guard lock or the pages' claims. A failed rearm leaves dirt behind.
+    fn take_claimed(
+        &self,
+        g: &Guards,
+        group: &[usize],
+        pages: &mut [(usize, u16)],
+        unmapped: &mut Vec<usize>,
+    ) {
+        #[cfg(feature = "diagnostics")]
+        let asked = Timed(std::time::Instant::now(), crate::copystat::C::AliasUs);
+        let others = aliases(g, group);
+        let unguarded = guard_aliases(g, &others);
+        #[cfg(feature = "diagnostics")]
+        drop(asked);
+        let whole: Vec<_> = group
+            .iter()
+            .copied()
+            .filter(|p| !unguarded.contains(p))
+            .collect();
+        let taken = protect_noting(g, &whole, unmapped);
+        for &page in &taken {
+            let pending = self.changed.0.get(page).is_some_and(|dirty| dirty.pending);
+            if !pending {
+                continue;
+            }
+            let parts = if g.protected.watched(page) && !g.alias_of.contains_key(&page) {
+                watched_parts(page, WRITE_WATCH_RESET)
+            } else {
+                WHOLE
+            };
+            // A reset consumes a shared answer. Every holder must see it.
+            for holder in &g.holders[&page] {
+                holder.0.update(page, holder.2, |map| {
+                    if let Some(dirty) = map.get_mut(&page) {
+                        dirty.resolve(parts);
+                    }
+                });
+            }
+        }
+        for &page in group {
+            let i = pages
+                .binary_search_by_key(&page, |&(p, _)| p)
+                .expect("requested page");
+            pages[i].1 = self.changed.0.get(page).map_or(WHOLE, DirtyPage::mask);
+        }
+        for page in taken {
+            self.changed.clear_page(page);
+        }
+    }
+
     /// Whether page `page` (a page number) changed since it was taken.
     pub(crate) fn changed(&self, page: usize) -> bool {
-        self.changed
-            .0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(&page)
+        self.changed.0.get(page).is_some()
     }
 
     /// The caller made pages (page numbers) of its copy equal to title
     /// memory itself (what shaders wrote went back): taken and guarded.
     pub(crate) fn taken(&self, pages: &[usize]) {
-        let mut g = guards();
-        let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
-        let others = aliases(&g, pages);
-        let unguarded = guard_aliases(&mut g, &others);
+        if port_guard() {
+            for group in pages.chunks(CLAIM_BATCH) {
+                let g = guards_shared();
+                let _claims = claim_blocks(&g, group);
+                self.taken_claimed(&g, group);
+            }
+        } else {
+            let g = guards();
+            self.taken_claimed(&g, pages);
+        }
+    }
+
+    fn taken_claimed(&self, g: &Guards, pages: &[usize]) {
+        let others = aliases(g, pages);
+        let unguarded = guard_aliases(g, &others);
         let pages: Vec<usize> = pages
             .iter()
             .copied()
             .filter(|p| !unguarded.contains(p))
             .collect();
-        for page in protect(&mut g, &pages) {
-            changed.remove(&page);
-            self.changed.taken(page);
+        for page in protect(g, &pages) {
+            self.changed.clear_page(page);
         }
-        set_dirty(self.changed.2, !changed.is_empty());
     }
 
     /// Whether no page changed since it was taken: then [`Tracked::take`]
@@ -1014,13 +1274,13 @@ fn append_parts(runs: &mut Runs, page: usize, mut mask: u16, from: usize, to: us
 /// Makes `pages` read-only where not already (in runs), and returns those
 /// now guarded or with nothing mapped (taken either way); a page that is
 /// mapped but cannot be guarded is left out (it stays changed).
-fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
+fn protect(g: &Guards, pages: &[usize]) -> Vec<usize> {
     protect_noting(g, pages, &mut Vec::new())
 }
 
 /// [`protect`], also listing in `unmapped` the pages taken because nothing
 /// is mapped there.
-fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usize>) -> Vec<usize> {
+fn protect_noting(g: &Guards, pages: &[usize], unmapped_pages: &mut Vec<usize>) -> Vec<usize> {
     #[cfg(feature = "diagnostics")]
     let counted = |calls: u64, pages: u64| {
         crate::copystat::add(crate::copystat::C::ProtectCalls, calls);
@@ -1067,6 +1327,11 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
             if g.protected.contains(&p) {
                 return Some((p, usize::MAX));
             }
+            // Only xmem's registered views bypass the OS query. Each
+            // view is one block, including where Wine refuses a run.
+            if port_guard() && g.alias_of.contains_key(&p) {
+                return Some((p, p + 1));
+            }
             allowed.region(p).map(|end| (p, end))
         })
         .unzip();
@@ -1093,26 +1358,15 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
             #[cfg(target_arch = "x86_64")]
             // An allocation under the lock can fault and open a page again.
             write_sites::publish(run, run_ends);
-            g.protected.extend(run);
-            if page_parts() {
-                g.watched_guards.extend(
-                    run.iter()
-                        .copied()
-                        .zip(run_ends)
-                        .filter_map(|(page, &end)| (end == usize::MAX).then_some(page)),
-                );
-            }
+            g.protected.insert(run, run_ends);
             taken.extend(run);
             continue;
         }
         for (&page, &end) in run.iter().zip(run_ends) {
-            if set(page, page + 1) {
+            if (!port_guard() || run.len() > 1) && set(page, page + 1) {
                 #[cfg(target_arch = "x86_64")]
                 write_sites::publish(&[page], std::slice::from_ref(&end));
-                g.protected.insert(page);
-                if page_parts() && end == usize::MAX {
-                    g.watched_guards.insert(page);
-                }
+                g.protected.insert(&[page], &[end]);
                 taken.push(page);
             } else if unmapped(page) {
                 taken.push(page);
@@ -1137,7 +1391,7 @@ impl RuntimeRegions {
     /// to end before (`usize::MAX` for a pool, whose end is not asked).
     fn region(&mut self, page: usize) -> Option<usize> {
         use windows_sys::Win32::System::Memory::{
-            MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+            MEM_COMMIT, MEM_IMAGE, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
         };
         if let Some((a, b, yes)) = self.last
             && (a..b).contains(&page)
@@ -1158,7 +1412,8 @@ impl RuntimeRegions {
             return None;
         }
         // Not watched: what `runtime_memory` asks of views, from this query.
-        let yes = !(info.State == MEM_COMMIT && info.Type == MEM_PRIVATE);
+        let yes = !(info.State == MEM_COMMIT && info.Type == MEM_PRIVATE)
+            && !(port_guard() && info.Type == MEM_IMAGE);
         let (base, size) = (info.BaseAddress as usize, info.RegionSize);
         // In our pages, rounded inward so the region never claims a page it
         // only shares.
@@ -1172,12 +1427,12 @@ impl RuntimeRegions {
 /// elsewhere: gives write access back where we guarded them and marks them
 /// in every tracker holding them. True if one of `[first, last)` was
 /// guarded.
-fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
+fn changed(g: &Guards, first: usize, last: usize, save: bool) -> bool {
     changed_with(g, first, last, save, DirtyPage::WHOLE)
 }
 
-fn changed_with(g: &mut Guards, first: usize, last: usize, save: bool, dirty: DirtyPage) -> bool {
-    let guarded = g.protected.range(first..last).next().is_some();
+fn changed_with(g: &Guards, first: usize, last: usize, save: bool, dirty: DirtyPage) -> bool {
+    let guarded = g.protected.any(first, last);
     let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
     #[cfg(feature = "diagnostics")]
     {
@@ -1200,8 +1455,12 @@ fn changed_with(g: &mut Guards, first: usize, last: usize, save: bool, dirty: Di
 }
 
 /// Gives write access back to the pages of `[first, last)` we guarded.
-fn open_guarded(g: &mut Guards, first: usize, last: usize) {
-    let guarded: Vec<usize> = g.protected.range(first..last).copied().collect();
+fn open_guarded(g: &Guards, first: usize, last: usize) {
+    if first.saturating_add(1) == last {
+        open(g, first);
+        return;
+    }
+    let guarded = g.protected.range(first, last);
     // In runs: one protection change for consecutive pages (a run across
     // two views fails, and goes page by page).
     let mut i = 0;
@@ -1218,33 +1477,32 @@ fn open_guarded(g: &mut Guards, first: usize, last: usize) {
 /// Marks pages `[first, last)` changed in every tracker holding them,
 /// leaving their protection as it is. With `save`, before the write lands:
 /// trackers armed for a page they had taken keep its bytes.
-fn mark_changed(g: &mut Guards, first: usize, last: usize, save: bool) {
+fn mark_changed(g: &Guards, first: usize, last: usize, save: bool) {
     mark_changed_with(g, first, last, save, DirtyPage::WHOLE);
 }
 
-fn mark_changed_with(g: &mut Guards, first: usize, last: usize, save: bool, dirty: DirtyPage) {
+fn mark_changed_with(g: &Guards, first: usize, last: usize, save: bool, dirty: DirtyPage) {
     for (&page, holders) in g.holders.range(first..last) {
         for c in holders {
-            let first_write = {
-                let mut set = c.0.lock().unwrap_or_else(|e| e.into_inner());
-                set_dirty(c.2, true);
-                match set.entry(page) {
-                    std::collections::btree_map::Entry::Occupied(mut entry) => {
-                        entry.get_mut().merge(dirty);
-                        false
-                    }
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert(dirty);
-                        true
-                    }
+            let first_write = c.0.update(page, c.2, |map| match map.entry(page) {
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    entry.get_mut().merge(dirty);
+                    false
                 }
-            };
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(dirty);
+                    true
+                }
+            });
             if first_write && save {
                 c.save(page);
             }
         }
         #[cfg(feature = "diagnostics")]
-        g.written.insert(page);
+        g.written
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(page);
     }
 }
 
@@ -1253,7 +1511,7 @@ fn mark_changed_with(g: &mut Guards, first: usize, last: usize, save: bool, dirt
 #[cfg(feature = "diagnostics")]
 pub(crate) fn frame_done() {
     let mut g = guards();
-    let written = std::mem::take(&mut g.written);
+    let written = std::mem::take(g.written.get_mut().unwrap_or_else(|e| e.into_inner()));
     let again = written.intersection(&g.written_before).count();
     crate::copystat::add(crate::copystat::C::WrittenPages, written.len() as u64);
     crate::copystat::add(crate::copystat::C::WrittenAgain, again as u64);
@@ -1272,7 +1530,7 @@ fn aliases_guarded(g: &Guards, page: usize) -> bool {
 
 /// A direct write opened the destination. Guard it again and take any
 /// CPU bytes written while it was open before clearing the origin's dirt.
-fn rearm_direct(g: &mut Guards, page: usize, at: usize, host: &mut [u8]) -> bool {
+fn rearm_direct(g: &Guards, page: usize, at: usize, host: &mut [u8]) -> bool {
     protect(g, &[page]);
     g.protected.contains(&page)
         && aliases_guarded(g, page)
@@ -1298,7 +1556,7 @@ pub(crate) fn land(
     let page = at / PAGE;
     let mut landed = None;
     crate::land::page(at, |destination| {
-        let mut g = guards();
+        let g = guards();
         let saved = if old.is_none()
             && let Some(t) = tracked
         {
@@ -1342,10 +1600,10 @@ pub(crate) fn land(
                 // the GPU bytes. Their next refresh must see the write.
                 let others = g.alias_of.get(&page).cloned().unwrap_or_default();
                 for p in std::iter::once(page).chain(others) {
-                    mark_changed(&mut g, p, p + 1, true);
+                    mark_changed(&g, p, p + 1, true);
                 }
             } else {
-                changed(&mut g, page, page + 1, true);
+                changed(&g, page, page + 1, true);
             }
         }
 
@@ -1386,14 +1644,11 @@ pub(crate) fn land(
             && let Some(t) = tracked
             && at == (page * PAGE).max(t.start)
             && at + host.len() == ((page + 1) * PAGE).min(t.end)
-            && (beside.is_some() || !writes || rearm_direct(&mut g, page, at, host))
+            && (beside.is_some() || !writes || rearm_direct(&g, page, at, host))
         {
             // The writing copy now has every byte it holds of this page.
             // Clear only its tracker, with the guards still held.
-            let mut dirty = t.changed.0.lock().unwrap_or_else(|e| e.into_inner());
-            dirty.remove(&page);
-            t.changed.taken(page);
-            set_dirty(t.changed.2, !dirty.is_empty());
+            t.changed.clear_page(page);
         }
         landed = Some(if writes { host.len() } else { 0 });
     });
@@ -1418,9 +1673,9 @@ impl Drop for Writing {
             g.busy.swap_remove(i);
         }
         if self.beside {
-            mark_changed(&mut g, self.first, self.last, false);
+            mark_changed(&g, self.first, self.last, false);
         } else {
-            changed(&mut g, self.first, self.last, false);
+            changed(&g, self.first, self.last, false);
         }
     }
 }
@@ -1436,7 +1691,7 @@ pub fn writing(at: usize, len: usize) -> Writing {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
     g.busy.push((first, last));
-    changed(&mut g, first, last, true);
+    changed(&g, first, last, true);
     Writing {
         first,
         last,
@@ -1450,7 +1705,7 @@ pub fn writing_beside(at: usize, len: usize) -> Writing {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
     g.busy.push((first, last));
-    mark_changed(&mut g, first, last, true);
+    mark_changed(&g, first, last, true);
     Writing {
         first,
         last,
@@ -1461,13 +1716,8 @@ pub fn writing_beside(at: usize, len: usize) -> Writing {
 /// The runtime is about to split a view. Keep the baseline for armed
 /// copies of the surviving pages, which return at the same addresses.
 pub fn title_memory_moving(at: usize, len: usize) {
-    let mut g = guards();
-    mark_changed(
-        &mut g,
-        at / PAGE,
-        at.saturating_add(len).div_ceil(PAGE),
-        true,
-    );
+    let g = guards();
+    mark_changed(&g, at / PAGE, at.saturating_add(len).div_ceil(PAGE), true);
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
@@ -1506,7 +1756,7 @@ pub fn title_memory_restored(at: usize, len: usize) {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
     // What it showed is gone already: nothing to keep.
-    changed(&mut g, first, last, false);
+    changed(&g, first, last, false);
     // What it showed is not what it shows now: its links go, both ways.
     let stale: Vec<usize> = g.alias_of.range(first..last).map(|(&p, _)| p).collect();
     for page in stale {
@@ -1530,13 +1780,13 @@ pub(crate) fn notify_written(at: usize, len: usize) {
         return;
     }
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
-    let mut g = guards();
+    let g = guards();
     if g.holders.range(first..last).next().is_none()
         && g.alias_of.range(first..last).next().is_none()
     {
         return;
     }
-    changed(&mut g, first, last, false);
+    changed(&g, first, last, false);
 }
 
 /// What shaders wrote into host copies of `[at, at + len)` is dropped:
@@ -1562,9 +1812,7 @@ pub(crate) fn retake(at: usize, len: usize) {
 fn mark_copies(g: &Guards, first: usize, last: usize) {
     for (&page, holders) in g.holders.range(first..last) {
         for c in holders.iter().filter(|c| c.3) {
-            let mut set = c.0.lock().unwrap_or_else(|e| e.into_inner());
-            set_dirty(c.2, true);
-            set.insert(page, DirtyPage::WHOLE);
+            c.0.update(page, c.2, |map| map.insert(page, DirtyPage::WHOLE));
         }
     }
 }
@@ -1587,10 +1835,9 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
     // If the new mapping cannot be guarded (a write the guards do not see is
     // under way through it), the page is changed; its bytes now may hold that
     // write already, so nothing is saved of them.
-    if others.iter().any(|&o| g.protected.contains(&(o / PAGE)))
-        && protect(&mut g, &[page]).is_empty()
+    if others.iter().any(|&o| g.protected.contains(&(o / PAGE))) && protect(&g, &[page]).is_empty()
     {
-        changed(&mut g, page, page + 1, false);
+        changed(&g, page, page + 1, false);
     }
 }
 
@@ -1635,29 +1882,47 @@ fn install() {
             }
             return EXCEPTION_CONTINUE_SEARCH;
         }
-        let mut g = guards();
-        #[cfg(target_arch = "x86_64")]
-        // SAFETY: the system is dispatching this exception; we hold the guard lock.
-        unsafe {
-            write_sites::observe(info, at)
-        };
         let page = at / PAGE;
-        let dirty = if g.watched_guards.contains(&page) && !g.alias_of.contains_key(&page) {
-            DirtyPage::WATCH
+        let opened = if port_guard() {
+            let g = guards_shared();
+            let _claims = claim_blocks(&g, &[page]);
+            // SAFETY: the system is dispatching this exception.
+            unsafe { open_faulted(&g, info, at) }
         } else {
-            DirtyPage::WHOLE
+            let g = guards();
+            // SAFETY: the system is dispatching this exception.
+            unsafe { open_faulted(&g, info, at) }
         };
-        if changed_with(&mut g, page, page + 1, true, dirty) {
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::GuardFaults, 1);
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
-        if writable(at) {
+        if opened {
             EXCEPTION_CONTINUE_EXECUTION
         } else {
             EXCEPTION_CONTINUE_SEARCH
         }
     }
+
+    unsafe fn open_faulted(g: &Guards, info: *mut EXCEPTION_POINTERS, at: usize) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: the system is dispatching this exception. The page's
+        // protection cannot change under the exclusive lock or claim.
+        unsafe {
+            write_sites::observe(info, at)
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = info;
+        let page = at / PAGE;
+        let dirty = if g.protected.watched(page) && !g.alias_of.contains_key(&page) {
+            DirtyPage::WATCH
+        } else {
+            DirtyPage::WHOLE
+        };
+        if changed_with(g, page, page + 1, true, dirty) {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+            return true;
+        }
+        writable(at)
+    }
+
     static ONCE: std::sync::Once = std::sync::Once::new();
     // SAFETY: the handler only touches our guard state and protections.
     ONCE.call_once(|| unsafe {
@@ -1821,11 +2086,11 @@ pub(crate) mod tests {
             let (slots, _) = write_site_guards();
             let first = &slots[page % slots.len()];
             let second = &slots[(page + 1) % slots.len()];
-            let mut g = guards();
-            assert_eq!(protect(&mut g, &[page, page + 1]), [page, page + 1]);
+            let g = guards();
+            assert_eq!(protect(&g, &[page, page + 1]), [page, page + 1]);
             assert_eq!(first.load(Ordering::Relaxed), base);
             assert_eq!(second.load(Ordering::Relaxed), base + PAGE);
-            open_run(&mut g, page, page + 2);
+            open_run(&g, page, page + 2);
             assert_eq!(first.load(Ordering::Relaxed), 0);
             assert_eq!(second.load(Ordering::Relaxed), 0);
         }
@@ -1850,8 +2115,7 @@ pub(crate) mod tests {
         }
         let (first, last) = (p / PAGE, (p + len).div_ceil(PAGE));
         let g = guards();
-        g.protected.range(first..last).next().is_some()
-            || g.holders.range(first..last).next().is_some()
+        g.protected.any(first, last) || g.holders.range(first..last).next().is_some()
     }
 
     /// Everything is changed at first; after taking, only what is written
@@ -2006,6 +2270,38 @@ pub(crate) mod tests {
         assert!(slow.clean());
         drop((a, b, slow));
         free(p);
+    }
+
+    #[test]
+    fn disjoint_faults_and_takes_keep_a_shared_trackers_dirty_pages() {
+        if !fault_tracking() {
+            return;
+        }
+        let base = pool(4 * SHARD_PAGES);
+        let end = base + 4 * SHARD_PAGES * PAGE;
+        let tracker = track(base, end - base, true).unwrap();
+        assert_eq!(tracker.take(base, end), [(base, end)]);
+        let start = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for (i, page) in (base..end).step_by(SHARD_PAGES * PAGE).enumerate() {
+                let tracker = &tracker;
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    for byte in 1..=32u8 {
+                        // SAFETY: each worker writes only its own page.
+                        unsafe { ((page + i) as *mut u8).write_volatile(byte) };
+                        assert!(tracker.changed(page / PAGE));
+                        let runs = tracker.take(page, page + PAGE);
+                        assert!(runs.iter().any(|&(a, b)| (a..b).contains(&(page + i))));
+                        assert!(!tracker.changed(page / PAGE));
+                    }
+                });
+            }
+        });
+        assert!(tracker.clean());
+        drop(tracker);
+        free(base);
     }
 
     #[test]

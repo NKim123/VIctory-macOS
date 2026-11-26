@@ -370,6 +370,27 @@ in title heaps and descriptor tables already use raw views in either mode.
 The switch is included in the translation cache key, and the host pipeline
 library hashes the resulting DXIL and root signature.
 
+## Experimental write tracking and descriptor sync
+
+`VICTORY_PORT_GUARD=1` lets write faults and refreshes share access to the
+guard metadata. Claims on 64 KiB blocks, including their known aliases,
+serialize protection changes and dirty marks. Registered XMem views skip
+write-watch and region queries where their mapping is already known. A
+refresh claims at most 64 requested blocks at a time, plus their aliases.
+On Rosetta this path still requires `VICTORY_FAULT_TRACKING=1` and the usual
+loader store workarounds. XMem mapping remains single-threaded.
+
+With the guard port enabled, `VICTORY_PORT_GUARD_PLAN=0` disables parallel
+clean checks for direct refreshes before the first title-memory write in
+large submissions. Planning reuses the texture workers and caps its input
+at 64 lists and 65,536 steps.
+
+`VICTORY_PORT_JOURNAL=1` divides the dirty pages of large copies across 64
+journal locks per copy and requests an early descriptor-heap scan at title
+submit. One worker can collect dirty ranges covering up to 64 MiB of heap
+addresses. Submission still checks for later writes and reads and publishes
+the descriptor records under the host submission lock.
+
 ## Optional switches for slow storage, low memory and speed
 
 None of these changes the default. Each is read from the environment when the game starts, and all of them are tools for testers, so please post what you see on #131 or #135 when you try one.
