@@ -445,6 +445,24 @@ those running on macOS under Wine.
   require the existing submission-time lifetime and visibility checks.
   With the wall-time profiler off, the frame report logs the number of
   fence waits saved by batching.
+- `VICTORY_INFLIGHT=1` enables four outstanding title submissions on the
+  host's direct queue. Set `2`–`8` to choose the depth. The ring takes
+  precedence over the submission worker and also caps its collective
+  list count at 128 and its accounted upload, readback and indirect scratch
+  at 128 MiB. A full ring waits for its oldest fence. Each submission
+  keeps its list, prelude, allocators, uploads, tile mappings and
+  descriptor backing through its own fence. The title can reset a closed
+  list immediately. Its previous allocator stays with the queued recording.
+  A title queue signal is
+  published to the title's fence and events after that native fence.
+  Copy-back, computed title-memory callbacks, bottom-of-pipe CPU writes,
+  first texture fills, timing, profiling and capture use the synchronous
+  path. CPU copies involving aliases, shared shadow refreshes, list
+  replay, heap initialization, presentation and memory mapping changes
+  drain preceding flights as needed. A missing completion mark drains
+  the old queue before the runtime probes it and replaces it if needed.
+  The frame report counts ring admissions, CPU preparations started with
+  a pending GPU fence and drains by reason.
 
 
 Pipelining adds a bounded pool of completion marks. The switches reuse the existing command list, staging and snapshot allocations.

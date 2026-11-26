@@ -479,3 +479,6 @@ impl Host {
 
 /// The completion worker is unique to the process host.
 pub(super) type Reaper = OnceLock<SyncSender<()>>;
+
+#[cfg(test)]
+mod tests;
