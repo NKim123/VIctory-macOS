@@ -1,8 +1,10 @@
 //! The host GPU: one D3D12 device and direct queue (decision 0007), and a
 //! window to present on.
 //!
-//! shortcut: every submission is waited for, so CPU and GPU never overlap;
-//! overlap them with per-submission fences once more than clears run.
+//! Title-memory submissions wait for the GPU before landing. The bounded
+//! submission worker can queue independent host-only parts before waiting.
+
+mod submission_profile;
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -25,6 +27,11 @@ use windows::core::{Interface, PCWSTR, w};
 pub(crate) fn texture_state(state: u32) -> u32 {
     const BUFFER_ONLY: u32 = 0x1 | 0x2 | 0x100 | 0x200;
     state & 0x01ff_ffff & !BUFFER_ONLY
+}
+
+pub(crate) fn pipeline_submissions() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_GPU_PIPELINE"))
 }
 
 /// Slots available to the regular render target binding ring.
@@ -72,6 +79,7 @@ pub(crate) struct Host {
     mark: OnceLock<Option<Mark>>,
     /// Extra marks for native calls before the final call of a split submission.
     split_marks: Mutex<Option<Vec<Mark>>>,
+    pipeline_marks: Mutex<Option<Vec<Mark>>>,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -400,6 +408,7 @@ fn create() -> windows::core::Result<Host> {
             submitted: Mutex::new(0),
             mark: OnceLock::new(),
             split_marks: Mutex::new(Some(Vec::new())),
+            pipeline_marks: Mutex::new(Some(Vec::new())),
             event,
             rtvs,
             rtv_size,
@@ -1374,6 +1383,7 @@ pub(crate) struct HostList {
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
+    profile_commands: Mutex<submission_profile::Commands>,
     /// Which list this is, for the name that tells it apart in device-removed
     /// data (see [`HostList::is_node`]).
     id: u64,
@@ -1647,6 +1657,34 @@ impl Deferred {
     }
 }
 
+/// Keep simultaneous parts off one another's resources. Even read-only
+/// reuse of a HostList could reset its submission-time prelude allocator.
+fn independent_parts(parts: &[&[&HostList]]) -> bool {
+    let mut lists = std::collections::HashSet::new();
+    let mut resources = std::collections::HashMap::new();
+    for (part, runs) in parts.iter().enumerate() {
+        for &list in *runs {
+            if !lists.insert(std::ptr::from_ref(list)) {
+                return false;
+            }
+            for (_, _, copy) in list
+                .states
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .values()
+            {
+                if resources
+                    .insert(copy.texture.as_raw(), part)
+                    .is_some_and(|prior| prior != part)
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 /// Wait for a queued signal when no completion event was registered.
 fn poll_fence(fence: &ID3D12Fence, value: u64) -> bool {
     loop {
@@ -1812,6 +1850,7 @@ impl Host {
                 memory_writer: false.into(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
+                profile_commands: Mutex::default(),
                 id,
                 budget: OnceLock::new(),
                 arguments: Mutex::new(None),
@@ -1949,15 +1988,27 @@ impl Host {
         lists: &[Option<ID3D12CommandList>],
         value: u64,
     ) -> bool {
-        // SAFETY: the closed lists, queue, fence and event are live under the submission lock.
+        // SAFETY: the closed lists and queue stay live through this wait.
+        unsafe { queue.ExecuteCommandLists(lists) };
+        self.signal_submission(queue, value) && self.wait_for_submission(value)
+    }
+
+    fn signal_submission(&self, queue: &ID3D12CommandQueue, value: u64) -> bool {
+        // SAFETY: the queue and fence are live under the submission lock.
         unsafe {
-            queue.ExecuteCommandLists(lists);
             if let Err(e) = queue.Signal(&self.fence, value) {
                 if self.device.GetDeviceRemovedReason().is_err() {
                     return false;
                 }
                 fail(format_args!("could not signal host submission fence ({e})"));
             }
+        }
+        true
+    }
+
+    fn wait_for_submission(&self, value: u64) -> bool {
+        // SAFETY: a live fence and event under the submission lock.
+        unsafe {
             if let Err(e) = self.fence.SetEventOnCompletion(value, self.event) {
                 tracing::warn!(error = %e, "host fence event unavailable; polling the fence");
                 return poll_fence(&self.fence, value);
@@ -2019,9 +2070,126 @@ impl Host {
         let mut pending_pins = Vec::new();
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let _holding = Holding::enter();
+        if pipeline_submissions()
+            && !submission_profile::enabled()
+            && !split_uav_srv_prelude()
+            && self.execute_host_pipeline(parts, &mut submitted)
+        {
+            return;
+        }
         for runs in parts {
             self.execute_part(runs, &mut submitted, true, &mut pending_pins);
         }
+    }
+
+    /// Submit independent host-only parts on one queue, then check each
+    /// part's mark after the final fence. The worker keeps every HostList
+    /// alive until return, including its prelude, allocator and host targets.
+    fn execute_host_pipeline(&self, parts: &[&[&HostList]], submitted: &mut u64) -> bool {
+        if parts.len() < 2 || !independent_parts(parts) {
+            return false;
+        }
+        let mut pool = self
+            .pipeline_marks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(marks) = pool.as_mut() else {
+            return false;
+        };
+        for _ in marks.len()..parts.len() {
+            let mark = Mark::new(self).and_then(|mark| {
+                mark.list().ok_or_else(windows::core::Error::empty)?;
+                Ok(mark)
+            });
+            match mark {
+                Ok(mark) => marks.push(mark),
+                Err(error) => {
+                    tracing::warn!(%error, "could not make pipeline submission marks");
+                    *pool = None;
+                    return false;
+                }
+            }
+        }
+
+        let queue = self.queue();
+        let first = *submitted + 1;
+        let mut flights = Vec::with_capacity(parts.len());
+        let mut prep = Duration::ZERO;
+        let mut gpu = Duration::ZERO;
+        *WAITING_ON.lock().unwrap_or_else(|e| e.into_inner()) =
+            format!("{} independent host submission parts", parts.len());
+        for (offset, runs) in parts.iter().enumerate() {
+            let started = Instant::now();
+            let mut lists = Vec::with_capacity(runs.len() * 2 + 1);
+            for list in *runs {
+                if let Some((prelude, _)) = list.prelude(false) {
+                    lists.push(Some(prelude));
+                }
+                lists.push(list.list.cast().ok());
+            }
+            let value = first + offset as u64;
+            *submitted = value;
+            let mark = &marks[offset];
+            mark.arm(value);
+            lists.push(mark.list());
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::Submissions, 1);
+                crate::copystat::add(crate::copystat::C::ExecuteLists, runs.len() as u64);
+                crate::resource::life::note(0, crate::resource::life::SUBMITTED, value, 0);
+            }
+            #[cfg(test)]
+            tests::native_call(lists.len());
+            let prepared = Instant::now();
+            prep += prepared - started;
+            // SAFETY: the worker keeps the closed lists, their allocators
+            // and referenced objects alive through the final fence.
+            unsafe { queue.ExecuteCommandLists(&lists) };
+            if !self.signal_submission(&queue, value) {
+                fail(format_args!(
+                    "host GPU device removed during pipelined submission of {} lists{}{}",
+                    runs.len(),
+                    self.removal_data(runs),
+                    last_notes(runs)
+                ));
+            }
+            gpu += prepared.elapsed();
+            flights.push(lists);
+        }
+        let waiting = Instant::now();
+        let waited = self.wait_for_submission(*submitted);
+        gpu += waiting.elapsed();
+        #[cfg(test)]
+        tests::native_call_group(waited);
+        // SAFETY: a plain query on the live device.
+        if !waited || unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+            let runs: Vec<_> = parts.iter().flat_map(|part| part.iter().copied()).collect();
+            fail(format_args!(
+                "host GPU device removed after pipelined submissions{}{}",
+                self.removal_data(&runs),
+                last_notes(&runs)
+            ));
+        }
+        SUBMISSION_US[0].fetch_add(prep.as_micros() as u64, Ordering::Relaxed);
+        SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+        let mut lost = 0;
+        for (offset, mark) in marks[..parts.len()].iter().enumerate() {
+            let value = first + offset as u64;
+            if submission_ran(mark, value) {
+                #[cfg(feature = "diagnostics")]
+                crate::resource::life::note(0, crate::resource::life::RAN, value, 0);
+            } else {
+                lost += 1;
+            }
+        }
+        if lost > 0 {
+            tracing::warn!(lost, "pipelined host submissions missing completion marks");
+            // Only after all fences and mark reads may recovery arm a
+            // mark, clear atomic locks, or replace the queue.
+            self.lost(submitted, &marks[0]);
+        }
+        self.log_messages();
+        true
     }
 
     fn execute_part(
@@ -2305,6 +2473,8 @@ impl Host {
             // All native calls share the existing completion fence. Mark
             // every call since the final mark alone cannot vouch for an
             // earlier call that D3DMetal dropped.
+            let profile = submission_profile::enabled();
+            let mut encode = Duration::ZERO;
             let mut first = 0;
             for (&end, mark) in native_boundaries.iter().zip(split_marks) {
                 mark.arm(*submitted);
@@ -2312,13 +2482,41 @@ impl Host {
                 marked.push(mark.list());
                 #[cfg(test)]
                 tests::native_call(marked.len());
+                let timed = profile.then(Instant::now);
                 // SAFETY: closed lists, kept alive until the shared fence.
                 unsafe { queue.ExecuteCommandLists(&marked) };
+                if let Some(timed) = timed {
+                    encode += timed.elapsed();
+                }
                 first = end;
             }
             #[cfg(test)]
             tests::native_call(group.len() - first);
-            let waited = self.submit_and_wait(&queue, &group[first..], *submitted);
+            let waited = if profile {
+                let start = Instant::now();
+                // SAFETY: closed lists, kept alive until the fence.
+                unsafe { queue.ExecuteCommandLists(&group[first..]) };
+                encode += start.elapsed();
+                let signalled = self.signal_submission(&queue, *submitted);
+                let start = Instant::now();
+                let waited = signalled && self.wait_for_submission(*submitted);
+                let wait = start.elapsed();
+                let profiled_runs = if groups.len() > 1 {
+                    &runs[i..i + 1]
+                } else {
+                    runs
+                };
+                submission_profile::record(
+                    *submitted,
+                    group.len() + native_boundaries.len(),
+                    encode,
+                    wait,
+                    profiled_runs,
+                );
+                waited
+            } else {
+                self.submit_and_wait(&queue, &group[first..], *submitted)
+            };
             drop(frozen);
             #[cfg(test)]
             tests::native_call_group(waited);
@@ -3043,6 +3241,12 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        if submission_profile::enabled() {
+            *self
+                .profile_commands
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Default::default();
+        }
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -3472,6 +3676,21 @@ impl HostList {
         let mut targets = self.targets.lock().unwrap_or_else(|e| e.into_inner());
         if !targets.iter().any(|t| t.0 == resource) {
             targets.push((resource, by.to_owned()));
+        }
+    }
+
+    /// Records an executed draw or dispatch for the opt-in wall-time report.
+    pub(crate) fn profile_command(
+        &self,
+        pipeline: usize,
+        compute: bool,
+        label: impl FnOnce() -> String,
+    ) {
+        if submission_profile::enabled() {
+            self.profile_commands
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .add(pipeline, compute, label);
         }
     }
 
@@ -5037,6 +5256,7 @@ impl Meter {
             let [back_ms, back_mb] = [0, 1].map(|i| {
                 COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / report_frames
             });
+            submission_profile::log(report_frames);
             let dropped = crate::draw::take_dropped() as f64 / report_frames;
             let indirect = crate::list::take_indirect() as f64 / report_frames;
             let root_views = crate::draw::take_root_view_slots() as f64 / report_frames;
@@ -6391,6 +6611,39 @@ mod marks {
             "the mark shows submission {}",
             *submitted
         );
+    }
+
+    #[test]
+    fn independent_host_parts_wait_once_and_recover_missing_marks() {
+        let Some(host) = super::host() else { return };
+        let lists = [host.new_list().unwrap(), host.new_list().unwrap()];
+        for list in &lists {
+            list.close();
+        }
+        let (a, b) = ([&lists[0]], [&lists[1]]);
+        let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let _holding = super::Holding::enter();
+        assert!(!host.execute_host_pipeline(&[&a, &a], &mut submitted));
+
+        super::tests::start_native_call_trace();
+        let first = *submitted + 1;
+        assert!(host.execute_host_pipeline(&[&a, &b], &mut submitted));
+        assert_eq!(*submitted, first + 1);
+        assert_eq!(super::tests::take_native_call_trace(), [(vec![2, 2], true)]);
+
+        let lost = LOST[0].load(Ordering::Relaxed);
+        super::MISS_NEXT_SUBMISSION_MARK.set(true);
+        let first = *submitted + 1;
+        assert!(host.execute_host_pipeline(&[&a, &b], &mut submitted));
+        assert_eq!(*submitted, first + 2, "recover after both parts' fences");
+        assert_eq!(LOST[0].load(Ordering::Relaxed), lost + 1);
+        let pool = host
+            .pipeline_marks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let marks = pool.as_ref().unwrap();
+        assert!(marks[0].saw(*submitted), "recovery mark");
+        assert!(marks[1].saw(first + 1), "second part retained its own mark");
     }
 
     #[test]
