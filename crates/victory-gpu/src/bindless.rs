@@ -30,7 +30,8 @@ enum Seen {
     /// A view left without a host view (textures the title placed itself),
     /// by kind (diagnostics: `KINDS`), with a placed texture's address and
     /// console bytes.
-    Left(#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))] (usize, u64, u64)),
+    #[cfg(feature = "diagnostics")]
+    Left((usize, u64, u64)),
 }
 
 impl Seen {
@@ -42,6 +43,7 @@ impl Seen {
             #[cfg(feature = "diagnostics")]
             (Self::DirectBuffer, Self::DirectBuffer) => true,
             (Self::Texture(a), Self::Texture(b)) => a == b,
+            #[cfg(feature = "diagnostics")]
             (Self::Left(a), Self::Left(b)) => a == b,
             _ => false,
         }
@@ -202,6 +204,7 @@ impl Inner {
             }
             #[cfg(feature = "diagnostics")]
             Seen::DirectBuffer => {}
+            #[cfg(feature = "diagnostics")]
             Seen::Left(_) => {}
         }
     }
@@ -248,11 +251,11 @@ impl Viewed {
         widened: bool,
     ) {
         let seen = view.and_then(|v| {
-            if made {
-                seen(v, backing, widened)
-            } else {
-                Some(Seen::Left(left_kind(v)))
+            #[cfg(feature = "diagnostics")]
+            if !made {
+                return Some(Seen::Left(left_kind(v)));
             }
+            made.then(|| seen(v, backing, widened)).flatten()
         });
         self.updates().set(index, seen);
     }
@@ -389,6 +392,7 @@ fn seen_buffer((shadow, address, len): BufferView, uav: bool, widened: bool) -> 
     (len != 0).then_some(Seen::Buffer(shadow, address, len, uav))
 }
 
+#[cfg(feature = "diagnostics")]
 fn left_kind(view: &View) -> (usize, u64, u64) {
     match view {
         View::Placed(_, resource, desc) if resource[0] != 1 => {

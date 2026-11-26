@@ -1106,6 +1106,7 @@ fn view_at(i: u32, generation: u32) -> Option<ViewPin> {
 /// Snapshot records that differ from the host slot, and the key observed
 /// there. An obsolete generation is equivalent to a null descriptor.
 #[cfg(windows)]
+#[derive(Clone, Copy)]
 struct ChangedRecord {
     index: u32,
     record: [u32; 3],
