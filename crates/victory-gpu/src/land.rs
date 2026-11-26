@@ -252,9 +252,8 @@ mod tests {
         if !crate::watch::fault_tracking() {
             return;
         }
-        let require_marks = enabled()
-            || crate::descriptor::host::show_after()
-            || crate::texback::enabled();
+        let require_marks =
+            enabled() || crate::descriptor::host::show_after() || crate::texback::enabled();
         let host = crate::host::host().expect("the landing fixture needs a GPU");
         let at = crate::watch::tests::pool(1);
         crate::shadow::register(at, at as u64, PAGE as u64);

@@ -1673,7 +1673,11 @@ impl Host {
         host_only: bool,
         pending_pins: &mut Vec<crate::descriptor::ViewPin>,
     ) -> Option<(u64, Vec<(usize, String)>)> {
-        let landing = if host_only { None } else { crate::land::begin() };
+        let landing = if host_only {
+            None
+        } else {
+            crate::land::begin()
+        };
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
@@ -1745,7 +1749,8 @@ impl Host {
             }
             crate::descriptor::service_pending(&demand, &heaps, pending_pins, Some(&mut textures));
             #[cfg(test)]
-            if let Some(resource) = crate::descriptor::RELEASE_AFTER_PENDING_COLLECTION.replace(None)
+            if let Some(resource) =
+                crate::descriptor::RELEASE_AFTER_PENDING_COLLECTION.replace(None)
             {
                 assert_eq!(
                     crate::object::release_ref(resource as crate::object::This),
