@@ -302,6 +302,9 @@ pub(crate) struct Tracked {
 struct Guards {
     /// Blocks (pages) we made read-only.
     protected: BTreeSet<usize>,
+    /// Guarded blocks that the existing runtime-memory check identified as
+    /// write-watched pools. Section views can be guarded without this.
+    watched_guards: BTreeSet<usize>,
     /// The trackers holding each page.
     holders: BTreeMap<usize, Vec<Arc<Changed>>>,
     /// Pages `[first, last)` of writes the guards do not see that are under
@@ -321,6 +324,7 @@ struct Guards {
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
+    watched_guards: BTreeSet::new(),
     holders: BTreeMap::new(),
     busy: Vec::new(),
     alias_of: BTreeMap::new(),
@@ -549,6 +553,10 @@ const WRITE_WATCH_RESET: u32 = 1;
 /// The guard lock serializes resets and publication to the block's holders.
 /// Old kernel bits from before the first take may add parts to the answer.
 fn watched_parts(page: usize, flags: u32) -> u16 {
+    #[cfg(test)]
+    if flags == WRITE_WATCH_RESET {
+        tests::PART_WATCH_QUERIES.with(|n| n.set(n.get() + 1));
+    }
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     let start = page * PAGE;
     let mut addresses = [std::ptr::null_mut(); PAGE / PART];
@@ -658,6 +666,7 @@ fn open(g: &mut Guards, page: usize) -> bool {
     if !g.protected.remove(&page) {
         return false;
     }
+    g.watched_guards.remove(&page);
     let mut old = 0;
     // SAFETY: a block we made read-only (failing harmlessly if it is gone).
     unsafe { VirtualProtect((page * PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old) };
@@ -683,6 +692,7 @@ fn open_run(g: &mut Guards, first: usize, last: usize) {
     }
     for page in first..last {
         g.protected.remove(&page);
+        g.watched_guards.remove(&page);
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::OpenPages, (last - first) as u64);
@@ -756,7 +766,7 @@ impl Tracked {
             if let Some(dirty) = changed.get_mut(&page)
                 && dirty.pending
             {
-                let parts = if g.protected.contains(&page) && !g.alias_of.contains_key(&page) {
+                let parts = if g.watched_guards.contains(&page) && !g.alias_of.contains_key(&page) {
                     watched_parts(page, WRITE_WATCH_RESET)
                 } else {
                     WHOLE
@@ -999,15 +1009,27 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
             i += 1;
         }
         let run = &pages[first..=i];
+        let run_ends = &ends[first..=i];
         i += 1;
         if set(run[0], run[run.len() - 1] + 1) {
             g.protected.extend(run);
+            if page_parts() {
+                g.watched_guards.extend(
+                    run.iter()
+                        .copied()
+                        .zip(run_ends)
+                        .filter_map(|(page, &end)| (end == usize::MAX).then_some(page)),
+                );
+            }
             taken.extend(run);
             continue;
         }
-        for &page in run {
+        for (&page, &end) in run.iter().zip(run_ends) {
             if set(page, page + 1) {
                 g.protected.insert(page);
+                if page_parts() && end == usize::MAX {
+                    g.watched_guards.insert(page);
+                }
                 taken.push(page);
             } else if unmapped(page) {
                 taken.push(page);
@@ -1309,12 +1331,11 @@ fn install() {
         }
         let mut g = guards();
         let page = at / PAGE;
-        let dirty =
-            if page_parts() && g.protected.contains(&page) && !g.alias_of.contains_key(&page) {
-                DirtyPage::WATCH
-            } else {
-                DirtyPage::WHOLE
-            };
+        let dirty = if g.watched_guards.contains(&page) && !g.alias_of.contains_key(&page) {
+            DirtyPage::WATCH
+        } else {
+            DirtyPage::WHOLE
+        };
         if changed_with(&mut g, page, page + 1, true, dirty) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
@@ -1531,6 +1552,33 @@ pub(crate) mod tests {
         title_memory_remapped(p, PAGE);
         assert!(a.changed(p / PAGE) && !a.changed(p / PAGE + 1));
         drop((a, b));
+        free(p);
+    }
+
+    #[test]
+    fn first_dirty_refresh_can_include_initialization_writes() {
+        if !fault_tracking() {
+            return;
+        }
+        let p = pool(1);
+        // SAFETY: the whole fresh pool, before tracking or guard setup.
+        unsafe { (p as *mut u8).write_bytes(1, PAGE) };
+        let t = track(p, PAGE, true).expect("write-watched pool");
+        assert_eq!(t.take(p, p + PAGE), [(p, p + PAGE)]);
+        let refresh = |value| {
+            // SAFETY: this byte belongs to the fixture. The handler opens
+            // the guard before the store completes.
+            unsafe { ((p + 8) as *mut u8).write_volatile(value) };
+            let expected = expected_write_watch(p);
+            let ranges = t.take(p, p + PAGE);
+            assert_eq!(ranges, expected);
+            assert!(ranges.iter().any(|&(a, b)| (a..b).contains(&(p + 8))));
+            ranges.iter().map(|(a, b)| b - a).sum::<usize>()
+        };
+        let first = refresh(2);
+        let second = refresh(3);
+        eprintln!("initialized pool: first dirty refresh {first} bytes, second {second} bytes");
+        drop(t);
         free(p);
     }
 
@@ -1886,6 +1934,7 @@ pub(crate) mod tests {
     thread_local! {
         /// `VirtualProtect` calls this thread made in `protect`.
         pub(super) static PROTECTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        pub(super) static PART_WATCH_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
     /// `single` views of one page each side by side, as the runtime's page
@@ -1941,6 +1990,44 @@ pub(crate) mod tests {
             let long = base + single * PAGE;
             map(long, single * PAGE, single);
             (base, long)
+        }
+    }
+
+    #[test]
+    fn section_views_refresh_whole_without_collecting_write_watch() {
+        if !fault_tracking() {
+            return;
+        }
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+        let (a, b) = twin_views(1);
+        title_memory_remapped(b, PAGE);
+        let t = track(a, PAGE, true).expect("section view is tracked");
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        let queries = || PART_WATCH_QUERIES.with(std::cell::Cell::get);
+        let initial = queries();
+        // SAFETY: a byte of our first view; the guard handler opens it.
+        unsafe { ((a + 8) as *mut u8).write_volatile(1) };
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        assert_eq!(queries(), initial, "the unaliased view has no write watch");
+        title_memory_aliased(b, &[a]);
+        // SAFETY: a byte of our second, now guarded view.
+        unsafe { ((b + 16) as *mut u8).write_volatile(2) };
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        assert_eq!(queries(), initial, "aliases use whole-page refreshes");
+        eprintln!(
+            "section refresh: {PAGE} bytes with {} write-watch collections",
+            queries() - initial
+        );
+        drop(t);
+        for view in [a, b] {
+            title_memory_remapped(view, PAGE);
+            // SAFETY: mapped by twin_views and no remaining tracker owns it.
+            let unmapped = unsafe {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: view as *mut _,
+                })
+            };
+            assert_ne!(unmapped, 0);
         }
     }
 
