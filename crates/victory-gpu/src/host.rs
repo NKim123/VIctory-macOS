@@ -1188,6 +1188,14 @@ struct Deferred {
     missed: Vec<MissedCheck>,
 }
 
+/// Wait for a queued signal when no completion event was registered.
+fn poll_fence(fence: &ID3D12Fence, value: u64) {
+    // SAFETY: a live fence; the queue's signal was submitted successfully.
+    while unsafe { fence.GetCompletedValue() } < value {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 impl Host {
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
@@ -1637,7 +1645,7 @@ impl Host {
                     }
                     Err(e) if landing.is_some() => {
                         tracing::warn!(error = %e, "host submission fence event unavailable; polling the fence");
-                        self.wait_for(*submitted);
+                        poll_fence(&self.fence, *submitted);
                         true
                     }
                     Err(e) => {
@@ -4678,6 +4686,20 @@ mod marks {
             "the mark shows submission {}",
             *submitted
         );
+    }
+
+    #[test]
+    fn a_queued_signal_completes_without_a_fence_event() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        // SAFETY: a new fence and a live queue; no event is registered.
+        unsafe {
+            let fence: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            host.queue().Signal(&fence, 1).unwrap();
+            super::poll_fence(&fence, 1);
+            assert_eq!(fence.GetCompletedValue(), 1);
+        }
     }
 
     /// Work goes on, on the same fence, once a new queue replaces the
