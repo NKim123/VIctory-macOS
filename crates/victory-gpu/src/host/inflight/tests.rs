@@ -12,6 +12,25 @@ fn depth_defaults_and_caps_at_eight() {
     assert_eq!(parse_limit("broken"), 0);
 }
 
+#[test]
+fn clearing_forgotten_reads_preserves_uncollected_feedback() {
+    let Some(host) = host_for_ring() else { return };
+    host.present_boundary();
+    let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+    let forgotten = victory_shader::emit::HEAP_VIEWS - 7;
+    let unread = forgotten + 1;
+    crate::shadow::tests::mark_read(false, forgotten);
+    assert!(crate::shadow::take_reads().contains(&forgotten));
+    crate::shadow::forget_read(forgotten);
+    crate::shadow::tests::mark_read(true, unread);
+    crate::shadow::clear_forgotten_reads();
+    let next = crate::shadow::take_reads();
+    assert!(!next.contains(&forgotten));
+    assert!(next.contains(&unread));
+    crate::shadow::tests::mark_read(false, forgotten);
+    assert!(crate::shadow::take_reads().contains(&forgotten));
+}
+
 /// A native queue wait holds the GPU while CPU submission proceeds.
 /// A watchdog opens it on a regression so the test fails without a hang.
 struct Gate {

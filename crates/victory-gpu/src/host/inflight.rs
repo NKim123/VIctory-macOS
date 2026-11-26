@@ -494,6 +494,7 @@ impl Host {
         }
         let mut recovery_mark = None;
         let mut completions = Vec::new();
+        let mut finished_feedback = false;
         while s.flights.front().is_some_and(|f| f.value <= completed) {
             let mut f = s.flights.pop_front().expect("completed flight");
             let mut feedback_ran = true;
@@ -556,6 +557,7 @@ impl Host {
                     },
                     &mut f._pins,
                 );
+                finished_feedback = true;
             } else {
                 let missed = f.computed.as_ref().is_some_and(|baselines| {
                     f.lists.iter().any(|list| list.deferred().missed(baselines))
@@ -599,14 +601,19 @@ impl Host {
             s.marks.push(marks);
         }
         if !s.busy() {
-            // Flights cannot produce copy-back through this shared bitmap.
-            // Consume read feedback and clear the alias marks only while
-            // there is no writer, independently of which flight produced it.
-            crate::shadow::copy_back_aliased_marks();
-            log_gave_up();
-            let read = crate::shadow::take_reads();
-            if !read.is_empty() {
-                crate::descriptor::make_read(&read);
+            if finished_feedback {
+                // The ordered completion consumed all GPU feedback. A
+                // descriptor published during it can still reset a slot.
+                crate::shadow::clear_forgotten_reads();
+            } else {
+                // Ordinary flights leave shared read feedback and alias
+                // marks for this idle boundary.
+                crate::shadow::copy_back_aliased_marks();
+                log_gave_up();
+                let read = crate::shadow::take_reads();
+                if !read.is_empty() {
+                    crate::descriptor::make_read(&read);
+                }
             }
             release_retired();
             self.log_messages();
