@@ -1184,6 +1184,12 @@ fn map_physical(physical: &mut Physical, base: usize, len: usize, pages: Option<
     }) {
         return true;
     }
+    // Validate the complete request before demoting a tiled chunk or
+    // removing any of the existing CPU/GPU mappings.
+    if let Some(page) = pages.iter().find(|page| !physical.pages.contains_key(page)) {
+        tracing::warn!(page, "XMemMapPhysicalPages: unknown page");
+        return false;
+    }
     if !physical.reservations.is_empty() {
         for (i, page) in pages.iter().enumerate() {
             if let Some(slice) = physical.pages.get(page)
@@ -1203,10 +1209,7 @@ fn map_physical(physical: &mut Physical, base: usize, len: usize, pages: Option<
     }
     let mut i = 0;
     while i < pages.len() {
-        let Some(first) = physical.pages.get(&pages[i]).cloned() else {
-            tracing::warn!(page = pages[i], "XMemMapPhysicalPages: unknown page");
-            return false;
-        };
+        let first = physical.pages[&pages[i]].clone();
         let run = 1 + pages[i + 1..]
             .iter()
             .zip(1..)
@@ -2011,6 +2014,26 @@ mod tests {
         assert!(!reservation.chunks.contains_key(&0));
     }
 
+    #[test]
+    fn unknown_physical_page_preserves_previous_mapping() {
+        let pages = allocate(2);
+        let base = reserve_pages(2);
+        assert_eq!(XMemMapPhysicalPages(base, 2, pages.as_ptr()), base);
+
+        let invalid = [pages[1], 0];
+        assert!(XMemMapPhysicalPages(base, 2, invalid.as_ptr()).is_null());
+        let physical = physical();
+        let first = slice_at(&physical, base as usize).map(|slice| slice.key(0));
+        let second = slice_at(&physical, base as usize + PAGE).map(|slice| slice.key(0));
+        assert_eq!(first, Some(physical.pages[&pages[0]].key(0)));
+        assert_eq!(second, Some(physical.pages[&pages[1]].key(0)));
+        drop(physical);
+
+        assert_eq!(XMemMapPhysicalPages(base, 2, std::ptr::null()), base);
+        release_placeholders(base, 2);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
     #[cfg(feature = "diagnostics")]
     fn allocate_file_page() -> usize {
         let (mut count, mut file) = (1, 0);
@@ -2113,6 +2136,45 @@ mod tests {
         assert!(!physical().reservations.contains_key(&(base as usize)));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, other.as_ptr()), 1);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    #[ignore = "requires Rosetta, D3DMetal and VICTORY_PHYSICAL_TILES=1"]
+    fn tiled_chunk_boundary_and_last_physical_reference() {
+        assert!(victory_gpu::physical_tiles_enabled());
+        let chunk_pages = victory_gpu::MAX_TILED_BUFFER / PAGE;
+        let base = reserve_pages(chunk_pages + 1);
+        let left = base.wrapping_byte_add((chunk_pages - 1) * PAGE);
+        let right = left.wrapping_byte_add(PAGE);
+        let pages = allocate(2);
+        let backing = Arc::downgrade(physical().pages[&pages[0]].section.shared.as_ref().unwrap());
+        assert_eq!(XMemMapPhysicalPages(left, 2, pages.as_ptr()), left);
+        // SAFETY: both pages of the mapped run belong to the test.
+        unsafe {
+            left.cast::<u32>().write(71);
+            right.cast::<u32>().write(92);
+        }
+        let probe =
+            |at: *mut c_void, replace| victory_gpu::probe_tiled_alias(at as usize, replace, false);
+        let (left_gpu, left_words) = probe(left, false);
+        let (right_gpu, right_words) = probe(right, true);
+        assert_eq!(left_words, [71; 2]);
+        assert_eq!(right_words, [92; 2]);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+        assert_eq!(probe(right, false), (right_gpu, [92; 2]));
+        assert_eq!(XMemMapPhysicalPages(left, 2, std::ptr::null()), left);
+        assert!(
+            backing.upgrade().is_some(),
+            "GPU mappings still need the heap"
+        );
+        assert_eq!(probe(left, false), (left_gpu, [0; 2]));
+        assert!(
+            backing.upgrade().is_none(),
+            "the fence retired both mappings"
+        );
+        assert_eq!(probe(right, false), (right_gpu, [0; 2]));
+        release_placeholders(base, chunk_pages + 1);
     }
 
     #[test]
