@@ -112,6 +112,7 @@ struct IndirectBatch {
     jobs: crate::indirect::Batch,
     epoch: u64,
     compute: bool,
+    aliased: bool,
     // For window mode, the last record and the distance between records.
     last: u64,
     step: Option<u64>,
@@ -1308,7 +1309,7 @@ impl State {
         if self
             .indirect
             .as_ref()
-            .is_some_and(|b| !b.compute || crate::indirect::batch_mode() != 2)
+            .is_some_and(|b| !b.compute || b.aliased || crate::indirect::batch_mode() != 2)
         {
             self.indirect = None;
         }
@@ -2107,12 +2108,14 @@ impl State {
         (kind, stride): (u32, u32),
         (source, offset): (u64, u64),
         window: bool,
+        aliased: bool,
     ) -> Option<(ID3D12Resource, u64)> {
         let epoch = list.indirect_epoch();
         let compute = kind == 2;
         if let Some(batch) = &mut self.indirect
             && batch.epoch == epoch
             && batch.compute == compute
+            && batch.aliased == aliased
         {
             let step = offset.saturating_sub(batch.last);
             let fits_window = batch.signature == (kind, stride)
@@ -2135,6 +2138,7 @@ impl State {
             jobs,
             epoch,
             compute,
+            aliased,
             last: offset,
             step: None,
             signature: (kind, stride),
@@ -2236,12 +2240,14 @@ impl State {
         }
         // Bounded first: the clamp binds a compute pipeline of its own. It
         // reads the count, so that it stops where the execution does.
-        let counted = counter.as_ref().map(|(s, at)| s.gpu(*at));
+        let clamp = crate::indirect::clamp_enabled();
         let mode = crate::indirect::batch_mode();
         let window = mode == 0 && crate::indirect::windows();
-        let keep_readable = mode != 0 || window;
+        let keep_readable = clamp && (mode != 0 || window);
+        let aliased = args.is_aliased() || args.is_tiled();
+        let batch_aliased = aliased && mode != 0 && crate::indirect::batch_aliased();
         let may_write = keep_readable
-            && kind != DISPATCH
+            && (kind != DISPATCH || batch_aliased)
             && p.stages.iter().any(|stage| {
                 let t = stage.translated();
                 t.host.memory_writes
@@ -2250,42 +2256,45 @@ impl State {
                     || t.used.iter().any(|u| u.kind == ResourceType::Uav)
             });
         let offset = args.offset(arguments);
-        // Aliased arguments must be clamped immediately, after all their
-        // producers (see the reference fork's PORT_CONSTANTS_ORDER fix).
-        let eligible = max == 1
-            && count.is_none()
-            && (mode != 0 || (window && kind != DISPATCH && !may_write))
-            && crate::indirect::Batch::accepts(kind, stride, offset);
-        let aliased = eligible && args.is_aliased();
-        if aliased {
-            crate::indirect::note_aliased_record();
-        }
-        let batched = if eligible && !aliased {
-            self.batched_indirect(
-                list,
-                (kind, stride),
-                (args.gpu(arguments) - offset, offset),
-                window,
-            )
+        let gpu = args.gpu(arguments);
+        let source_window = if batch_aliased {
+            crate::indirect::source_window(gpu, offset)
         } else {
-            None
+            (gpu - offset, offset)
         };
-        let (clamped, at) = if let Some(record) = batched {
+        // The batch starts at its first consumer, after prior writes. A
+        // potentially writing draw or aliased dispatch can use its last slot.
+        let eligible = clamp
+            && max == 1
+            && count.is_none()
+            && (!aliased || batch_aliased)
+            && (mode != 0 || (window && kind != DISPATCH && !may_write))
+            && crate::indirect::Batch::accepts(kind, stride, source_window.1);
+        let batched = eligible
+            .then(|| self.batched_indirect(list, (kind, stride), source_window, window, aliased))
+            .flatten();
+        let (argument_buffer, at) = if !clamp {
+            // The diagnostic timing path bypasses the work limits and budget.
+            (args.buffer.clone(), offset)
+        } else if let Some(record) = batched {
+            if aliased {
+                crate::indirect::note_batched_alias();
+            }
             record
         } else {
             self.indirect = None;
-            let Some(clamped) = crate::indirect::bound(
-                list,
-                args.gpu(arguments),
-                (kind, stride, max),
-                counted,
-                keep_readable,
-            ) else {
+            let counted = counter.as_ref().map(|(s, at)| s.gpu(*at));
+            let Some(clamped) =
+                crate::indirect::bound(list, gpu, (kind, stride, max), counted, keep_readable)
+            else {
                 why("not bounded (no clamp, or arguments not 4-byte aligned)");
                 return false;
             };
             self.host_pipeline = 0;
             self.host_roots[1] = 0;
+            if aliased && max == 1 && count.is_none() {
+                crate::indirect::note_aliased_record();
+            }
             (clamped, 0)
         };
         // The GPU controls the effective count and dimensions. Even a
@@ -2302,8 +2311,8 @@ impl State {
             _ => unreachable!("the signature check above admits only these kinds"),
         };
         if !ran {
-            if !keep_readable {
-                crate::indirect::done(list, &clamped);
+            if clamp && !keep_readable {
+                crate::indirect::done(list, &argument_buffer);
             }
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
@@ -2333,12 +2342,13 @@ impl State {
             list.list.ExecuteIndirect(
                 &signature,
                 max,
-                &clamped,
+                &argument_buffer,
                 at,
                 counter.as_ref().map(|(s, _)| &s.buffer),
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
+        crate::indirect::note_execution(max, count.is_some());
         // Tag the aligned COM pointer so an indirect call gets its own
         // count even when the same pipeline also runs direct commands.
         list.profile_command(self.host_pipeline | 1, kind == DISPATCH, || {
@@ -2355,7 +2365,7 @@ impl State {
                 let name = crate::pipeline::shaders_of(pipeline);
                 crate::capture::read_indirect(
                     list,
-                    (&clamped, at),
+                    (&argument_buffer, at),
                     count,
                     (kind, stride, max),
                     name,
@@ -2363,10 +2373,10 @@ impl State {
                 );
             }
         }
-        if !keep_readable {
-            crate::indirect::done(list, &clamped);
+        if clamp && !keep_readable {
+            crate::indirect::done(list, &argument_buffer);
         }
-        if (kind == DISPATCH && mode != 2) || (kind != DISPATCH && may_write) {
+        if (kind == DISPATCH && mode != 2) || may_write {
             self.indirect = None;
         }
         if kind == DISPATCH {
@@ -2620,6 +2630,105 @@ mod tests {
     use crate::object::{HRESULT, S_OK};
     use crate::compute::{Param, srv, uav};
     use windows::core::s;
+
+    #[test]
+    #[ignore = "requires VICTORY_PHYSICAL_TILES=1 VICTORY_INDIRECT_BATCH=2"]
+    fn aliased_indirect_batches_fill_a_window_and_stop_at_a_writer() {
+        use crate::host::{transition, uav_barrier};
+        use crate::watch::PAGE;
+        use windows_sys::Win32::System::Memory::{
+            MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc, VirtualFree,
+        };
+
+        const RESERVATION: usize = (512 << 20) + PAGE;
+        const SLOTS: u64 = 256;
+        assert!(crate::alias::physical_tiles_enabled());
+        assert!(crate::indirect::batching());
+        let host = crate::host::host().expect("D3D12 device");
+        // SAFETY: reserve a private, inaccessible range for the title alias.
+        let base =
+            unsafe { VirtualAlloc(std::ptr::null(), RESERVATION, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!base.is_null());
+        let title =
+            crate::tiled::TiledAlias::new(base as usize, RESERVATION).expect("sparse title buffer");
+        let heap =
+            std::sync::Arc::new(crate::alias::PhysicalHeap::new(&host.device, PAGE).unwrap());
+        let address = base as usize + RESERVATION - PAGE;
+        title.map(address, PAGE, Some((&heap, 0)));
+        let args = crate::shadow::find(address as u64, 12).unwrap();
+        assert!(args.is_tiled());
+        let gpu = args.gpu(address as u64);
+        let window = crate::indirect::source_window(gpu, args.offset(address as u64));
+        assert!(window.0 > gpu - args.offset(address as u64));
+        let list = host.new_list().unwrap();
+        args.refresh(&list, address as u64, 12);
+        let (readback, read) = list.readback(host, 36).unwrap();
+        let (root, writer) = crate::compute::pipeline(
+            r"
+RWByteAddressBuffer record : register(u0);
+[numthreads(1, 1, 1)]
+void main() { record.Store(0, 17); }
+",
+            s!("write indirect record"),
+            0,
+            &[Param::Uav { register: 0 }],
+        )
+        .unwrap();
+        let mut state = State::default();
+        let place = |state: &mut State| {
+            state
+                .batched_indirect(&list, (10, 12), window, false, true)
+                .unwrap()
+        };
+        let l = &list.list;
+        let copy = |out: &ID3D12Resource, at, to| {
+            let indirect = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+            let source = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            // SAFETY: read one initialized slot of the list's clamp output.
+            unsafe {
+                l.ResourceBarrier(&[transition(out, indirect, source)]);
+                l.CopyBufferRegion(&readback, to, out, at, 12);
+                l.ResourceBarrier(&[transition(out, source, indirect)]);
+            }
+        };
+        // SAFETY: the CPU mapping is live. The rest of the test accesses
+        // the same page through the reserved GPU buffer.
+        unsafe { (heap.cpu_address() as *mut [u32; 3]).write([7, 1, 1]) };
+        for slot in 0..SLOTS {
+            state.set_pipeline(std::ptr::null());
+            state.set_constants(false, 0, &[slot as u32], 0);
+            let (out, offset) = place(&mut state);
+            assert_eq!(offset, 32 * slot);
+            if slot == SLOTS - 1 {
+                copy(&out, offset, 0);
+            }
+        }
+        let (out, offset) = place(&mut state);
+        assert_eq!(offset, 0, "full job table starts a second pass");
+        copy(&out, offset, 12);
+        // SAFETY: an open list, a mapped tile and a live pipeline. Match
+        // the write and the barrier separating it from the next consumer.
+        unsafe {
+            l.SetComputeRootSignature(&root);
+            l.SetPipelineState(&writer);
+            l.SetComputeRootUnorderedAccessView(0, gpu);
+            l.Dispatch(1, 1, 1);
+            l.ResourceBarrier(&[uav_barrier()]);
+        }
+        list.indirect_boundary();
+        let (out, offset) = place(&mut state);
+        assert_eq!(offset, 0, "the boundary starts a new pass after the writer");
+        copy(&out, offset, 24);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: the readback is mapped and execution has finished.
+        let actual = unsafe { read.cast::<[[u32; 3]; 3]>().read() };
+        assert_eq!(actual, [[7, 1, 1], [7, 1, 1], [17, 1, 1]]);
+        drop(title);
+        // SAFETY: release the reservation made by this test.
+        let released = unsafe { VirtualFree(base, 0, MEM_RELEASE) };
+        assert_ne!(released, 0);
+    }
 
     /// A root constant's dword 4 is a value: only a root descriptor's dword
     /// 4 names its view's offset.

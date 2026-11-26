@@ -2,7 +2,7 @@
 //! title's own compute passes write most of them; a pass we drop or
 //! translate wrongly leaves whatever the memory held, and a draw of four
 //! billion vertices or a dispatch past the host's limits runs until the
-//! host resets the display driver. So every record is clamped on the GPU,
+//! host resets the display driver. By default every record is clamped on the GPU,
 //! just before its execution, by a compute shader of ours (HLSL compiled by
 //! the system's compiler; a 5.1 shader with its root signature inside).
 //!
@@ -50,15 +50,34 @@ pub(crate) fn windows() -> bool {
     *ENABLED.get_or_init(|| crate::switch::on("VICTORY_INDIRECT_WINDOW"))
 }
 
-pub(crate) fn batching() -> bool {
-    batch_mode() != 0 || windows()
+pub(crate) fn batch_aliased() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| crate::switch::on("VICTORY_INDIRECT_BATCH_ALIASED"))
 }
 
-const JOBS: u32 = 64;
+pub(crate) fn clamp_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("VICTORY_INDIRECT_CLAMP").as_deref() != Ok("0"))
+}
+
+pub(crate) fn batching() -> bool {
+    clamp_enabled() && (batch_mode() != 0 || windows())
+}
+
+const JOBS: u32 = 256;
 const JOB_BYTES: u64 = 16;
 const SLOT_BYTES: u64 = 32;
 
-static BATCH_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static BATCH_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static EXECUTIONS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Keep the root SRV inside the backing buffer, with small shader offsets
+/// even when a tiled allocation crosses the 4 GiB mark.
+pub(crate) fn source_window(gpu: u64, offset: u64) -> (u64, u64) {
+    const MASK: u64 = (256 << 20) - 1;
+    let base = (gpu & !MASK).max(gpu - offset);
+    (base, gpu - base)
+}
 
 /// A clamp shared by executions reading one host backing buffer. Its
 /// mapped job table is finalized by recording, before the list can run.
@@ -192,14 +211,34 @@ pub(crate) fn note_aliased_record() {
     BATCH_STATS[2].fetch_add(1, Ordering::Relaxed);
 }
 
+pub(crate) fn note_batched_alias() {
+    BATCH_STATS[3].fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn note_execution(max: u32, counted: bool) {
+    let shape = if counted { 2 } else { usize::from(max != 1) };
+    EXECUTIONS[shape].fetch_add(1, Ordering::Relaxed);
+}
+
 pub(crate) fn report_batches(frames: f64) {
-    let [passes, records, aliased] = BATCH_STATS.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
+    let [passes, records, aliased, batched_aliases] =
+        BATCH_STATS.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
     if passes > 0 || aliased > 0 {
         tracing::info!(
-            "indirect batch per frame: {:.0} records in {:.0} passes, {:.0} aliased single records clamped immediately",
+            "indirect batch per frame: {:.0} records in {:.0} passes, {:.0} aliased single records clamped immediately, {:.0} batched aliased records",
             records as f64 / frames,
             passes as f64 / frames,
-            aliased as f64 / frames
+            aliased as f64 / frames,
+            batched_aliases as f64 / frames
+        );
+    }
+    let [single, other, counted] = EXECUTIONS.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
+    if single + other + counted > 0 {
+        tracing::info!(
+            "indirect executions per frame: {:.0} single, {:.0} other uncounted, {:.0} counted",
+            single as f64 / frames,
+            other as f64 / frames,
+            counted as f64 / frames
         );
     }
 }
@@ -533,6 +572,23 @@ pub(crate) fn done(list: &HostList, arguments: &ID3D12Resource) {
 #[cfg(test)]
 mod tests {
     use windows::Win32::Graphics::Direct3D12::*;
+
+    #[test]
+    fn aliased_source_window_handles_offsets_past_four_gib() {
+        use super::{Batch, source_window};
+
+        let backing = 0x1_0123_0000;
+        assert_eq!(source_window(backing + 12, 12), (backing, 12));
+        let gpu = 0x2_1000_0040;
+        let offset = gpu - backing;
+        assert!(offset > u64::from(u32::MAX));
+        assert!(!Batch::accepts(10, 12, offset));
+        let (base, relative) = source_window(gpu, offset);
+        assert_eq!(base, 0x2_1000_0000);
+        assert_eq!(relative, 64);
+        assert!(Batch::accepts(10, 12, relative));
+        assert!(!Batch::accepts(10, 12, relative + 1));
+    }
 
     #[test]
     fn batched_clamp_preserves_record_order_and_budget_across_passes() {
