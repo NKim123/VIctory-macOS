@@ -117,6 +117,11 @@ enum Binding {
 
 const TEMPLATE_SHARDS: usize = 4;
 const STAGING_WORKERS: usize = TEMPLATE_SHARDS;
+#[cfg(test)]
+thread_local! {
+    static STAGED_BATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 const STAGING_SLOTS: usize = 4096;
 const MIN_STAGED_RECORDS: usize = 128;
 
@@ -1671,8 +1676,9 @@ impl HostHeap {
         (word >> (index % 64)) & 1 != 0
     }
 
-    /// Capture disjoint dirty spans and stage buffer descriptors in workers.
-    /// Only the submission thread publishes them into the shared heap.
+    /// Capture disjoint dirty spans, using workers for large reads.
+    /// Large miss batches can use workers regardless of the capture path.
+    /// Only the submission thread publishes into the shared heap.
     pub(super) fn sync_ranges(&self, ranges: &[(u32, u32)], start: u64, step: u64) {
         const SLOTS_PER_SPAN: u32 = 2048;
         let spans: Vec<_> = ranges
@@ -1694,43 +1700,46 @@ impl HostHeap {
         crate::copystat::add(crate::copystat::C::SyncSlots, slots);
         static PARALLEL: OnceLock<bool> = OnceLock::new();
         let mut bytes = Vec::new();
-        if spans.len() <= 1
-            || slots < 4096
-            || !*PARALLEL
-                .get_or_init(|| std::env::var_os("VICTORY_SYNC_FINE").is_none_or(|v| v != "0"))
-        {
-            for (lo, hi) in spans {
-                self.sync_slots_serial(lo, hi, start, step, &mut bytes);
-            }
-            return;
-        }
-
-        let spans_per_job = spans.len().div_ceil(8);
-        let scans: Vec<OnceLock<Vec<Option<SlotScan>>>> = spans
-            .chunks(spans_per_job)
-            .map(|_| OnceLock::new())
-            .collect();
-        crate::texture::in_parallel(scans.len(), |i| {
-            let first = i * spans_per_job;
-            let job = &spans[first..(first + spans_per_job).min(spans.len())];
-            let mut bytes = Vec::new();
-            let captured = job
+        let parallel = spans.len() > 1
+            && slots >= 4096
+            && *PARALLEL
+                .get_or_init(|| std::env::var_os("VICTORY_SYNC_FINE").is_none_or(|v| v != "0"));
+        let scans = if parallel {
+            let spans_per_job = spans.len().div_ceil(8);
+            let scans: Vec<OnceLock<Vec<Option<SlotScan>>>> = spans
+                .chunks(spans_per_job)
+                .map(|_| OnceLock::new())
+                .collect();
+            crate::texture::in_parallel(scans.len(), |i| {
+                let first = i * spans_per_job;
+                let job = &spans[first..(first + spans_per_job).min(spans.len())];
+                let mut bytes = Vec::new();
+                let captured = job
+                    .iter()
+                    .map(|&(lo, hi)| self.capture_slots(lo, hi, start, step, &mut bytes))
+                    .collect();
+                let _ = scans[i].set(captured);
+            });
+            scans
+                .into_iter()
+                .flat_map(|job| job.into_inner().unwrap())
+                .collect()
+        } else {
+            spans
                 .iter()
                 .map(|&(lo, hi)| self.capture_slots(lo, hi, start, step, &mut bytes))
-                .collect();
-            let _ = scans[i].set(captured);
-        });
-        let scans = scans.into_iter().flat_map(|job| job.into_inner().unwrap());
+                .collect::<Vec<_>>()
+        };
         let mut pending = Vec::new();
         for ((lo, hi), scan) in spans.into_iter().zip(scans) {
             if let Some(scan) = scan {
                 pending.push((lo, hi, scan));
             } else {
-                self.publish_scans(start, step, std::mem::take(&mut pending), true);
+                self.publish_scans(start, step, std::mem::take(&mut pending));
                 self.sync_slots_serial(lo, hi, start, step, &mut bytes);
             }
         }
-        self.publish_scans(start, step, pending, true);
+        self.publish_scans(start, step, pending);
     }
 
     #[cfg(test)]
@@ -1743,7 +1752,7 @@ impl HostHeap {
 
     fn sync_slots_serial(&self, first: u32, last: u32, start: u64, step: u64, bytes: &mut Vec<u8>) {
         if let Some(scan) = self.capture_slots(first, last, start, step, bytes) {
-            self.publish_scans(start, step, vec![(first, last, scan)], false);
+            self.publish_scans(start, step, vec![(first, last, scan)]);
         } else {
             // A failed read can cover multiple Windows pages. Retry
             // smaller ranges so a hole does not hide readable neighbors.
@@ -1816,13 +1825,7 @@ impl HostHeap {
         Some(SlotScan { candidates, forgot })
     }
 
-    fn publish_scans(
-        &self,
-        start: u64,
-        step: u64,
-        mut scans: Vec<(u32, u32, SlotScan)>,
-        parallel: bool,
-    ) {
+    fn publish_scans(&self, start: u64, step: u64, mut scans: Vec<(u32, u32, SlotScan)>) {
         if scans.is_empty() {
             return;
         }
@@ -1843,7 +1846,7 @@ impl HostHeap {
             };
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::SyncChanged, records.len() as u64);
-            self.publish_records(&records, start, step, parallel);
+            self.publish_records(&records, start, step);
         }
 
         for (first, last, scan) in scans {
@@ -1857,16 +1860,23 @@ impl HostHeap {
         }
     }
 
-    fn publish_records(&self, records: &[ChangedRecord], start: u64, step: u64, parallel: bool) {
+    fn publish_records(&self, records: &[ChangedRecord], start: u64, step: u64) {
         let mut misses = Vec::new();
         let cache = templates::enabled();
         if cache {
             let mut batch = PublishBatch::default();
             self.publish_templates(records, start, step, None, &mut batch, &mut misses);
-            if parallel && !self.sampler && misses.len() >= MIN_STAGED_RECORDS {
+            if !self.sampler && misses.len() >= MIN_STAGED_RECORDS {
                 let staging = VIEW_STAGING.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(workers) = staging.get_or_init(view_staging) {
+                    #[cfg(test)]
+                    STAGED_BATCHES.with(|batches| batches.set(batches.get() + 1));
+                    // A worker temporarily owns this heap's template shard.
+                    // Later frames can hit the cache without another worker
+                    // round, while scratch sources stay live through the copy.
+                    self.swap_buffer_templates(workers);
                     let staged = stage_views(workers, &misses);
+                    self.swap_buffer_templates(workers);
                     let mut remaining = Vec::new();
                     self.publish_templates(
                         &misses,
@@ -1890,6 +1900,17 @@ impl HostHeap {
         {
             let address = start + u64::from(index) * step;
             let _ = self.mirror_record(index, false, Some((previous, address)), || record);
+        }
+    }
+
+    fn swap_buffer_templates(&self, workers: &StagingWorkers) {
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        for (templates, worker) in made.templates.iter_mut().zip(workers) {
+            templates.get_or_init(|| Templates::new(false));
+            if let Some(templates) = templates.get_mut().and_then(Option::as_mut) {
+                let mut worker = worker.lock().unwrap_or_else(|e| e.into_inner());
+                std::mem::swap(templates, &mut worker.templates);
+            }
         }
     }
 
@@ -5090,12 +5111,43 @@ mod tests {
             &mut misses,
         );
         assert_eq!(misses.len(), 1);
-        heap.publish_records(&records[2..], start, 32, false);
+        heap.publish_records(&records[2..], start, 32);
         assert!(Arc::ptr_eq(&heap.table_backing(2).unwrap(), &replacement));
 
         crate::shadow::unregister(allocation + 1, address);
         crate::shadow::unregister(allocation, base);
         drop((staged, heap, original, replacement));
+        crate::watch::tests::free(allocation);
+    }
+
+    #[test]
+    fn serial_scans_stage_a_large_miss_batch_during_a_stable_epoch() {
+        if !templates::enabled() {
+            return;
+        }
+        let count = MIN_STAGED_RECORDS as u32;
+        let Some(heap) = HostHeap::new(false, count) else {
+            return;
+        };
+        let allocation = crate::watch::tests::pool(1);
+        crate::shadow::register(allocation, allocation as u64, crate::watch::PAGE as u64);
+        let mut slots = vec![[0u64; 4]; count as usize];
+        let start = slots.as_mut_ptr() as u64;
+        let mut bytes = Vec::new();
+        let before = STAGED_BATCHES.with(std::cell::Cell::get);
+        for offset in [256, 512] {
+            let address = allocation as u64 + offset;
+            super::super::record(start, View::Constant(address, 256));
+            let record = slots[0];
+            slots.fill(record);
+            std::hint::black_box(&slots);
+            heap.sync_slots(0, count, start, 32, &mut bytes);
+            assert!((0..count).all(|index| heap.kept(index)));
+        }
+        assert_eq!(STAGED_BATCHES.with(std::cell::Cell::get) - before, 2);
+        crate::shadow::unregister(allocation, allocation as u64);
+        drop(heap);
+        crate::host::release_retired();
         crate::watch::tests::free(allocation);
     }
 
