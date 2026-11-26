@@ -1504,3 +1504,60 @@ fn the_permlanex16_model_follows_the_instruction() {
     assert_eq!(permlanex16_console(32)[0], 63);
     assert_eq!(permlanex16_console(48)[0], 47);
 }
+
+/// A divergent branch writes one flag, then reads it before joining. Its
+/// final value is read after the join. An optional store after the internal
+/// read checks that the branch cannot write a different value.
+fn idempotent_lds_flag(second: Option<u32>) -> Vec<u32> {
+    let mut words = PROLOGUE.to_vec();
+    words.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x7E12_0280, // v_mov_b32 v9, 0
+        0xD834_0000,
+        0x0000_0909, // ds_write_b32 v9, v9
+        0x7D88_00FF,
+        33, // v_cmp_gt_u32 vcc, 33, v0
+    ]);
+    let mut branch = vec![
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0xD834_0000,
+        0x0000_0209, // ds_write_b32 v9, v2
+        0xD8D8_0000,
+        0x0300_0009, // ds_read_b32 v3, v9
+    ];
+    if let Some(value) = second {
+        branch.extend([
+            0x7E04_02FF,
+            value, // v_mov_b32 v2, literal
+            0xD834_0000,
+            0x0000_0209, // ds_write_b32 v9, v2
+        ]);
+    }
+    words.extend([
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0000 | branch.len() as u32,
+    ]);
+    words.extend(branch);
+    words.extend([
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0xD8D8_0000,
+        0x0500_0009, // ds_read_b32 v5, v9
+    ]);
+    words.extend(store(5, 0));
+    words.push(S_ENDPGM);
+    words
+}
+
+#[test]
+fn divergent_lds_flag_is_visible_to_both_halves_after_rejoining() {
+    let words = idempotent_lds_flag(Some(1));
+    let n = native(&words, true, 64, 512);
+    let result = lowered_with(&n, true, true).expect("a branch that only writes one flag");
+    assert!(result.split_barriers >= 2);
+    let failures = differences_with(&words, 64, 1, &[1; 64], 512, true);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+
+    let different_words = idempotent_lds_flag(Some(2));
+    let different = native(&different_words, true, 64, 512);
+    assert!(lowered_with(&different, true, true).is_err());
+}
