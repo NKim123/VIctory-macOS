@@ -829,8 +829,9 @@ pub fn emit_with(
             }
         }
         // A full console wave can vote on its mask branches as a group,
-        // with a host thread for each bit of EXEC and VCC.
-        if *what == lower::REDUCTION_ACROSS
+        // with a host thread for each bit of EXEC and VCC. Both halves then
+        // reach the exchange for the reduction or first active lane.
+        if matches!(*what, lower::REDUCTION_ACROSS | lower::FIRST_ACROSS)
             && matches!(native.io, crate::native::StageIo::Cs(cs)
                 if cs.lds_bytes() == 0 && cs.threads.iter().product::<u32>() == 64)
             && let Ok(st) = structure::with_group_branches(p)

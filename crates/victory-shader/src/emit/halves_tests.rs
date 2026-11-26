@@ -565,6 +565,13 @@ fn conditional_reduction(op: u32, ident: u32, mask: u64, branch_on_vcc: bool) ->
     let after = reduction.len() - 4;
     let section = &reduction[start..after];
     let mut words = reduction[..start].to_vec();
+    words.extend(conditional_scalar(section, mask, branch_on_vcc));
+    words.extend(&reduction[after..]);
+    words
+}
+
+fn conditional_scalar(section: &[u32], mask: u64, branch_on_vcc: bool) -> Vec<u32> {
+    let mut words = Vec::new();
     words.extend([
         0xBE94_047E, // s_mov_b64 s[20:21], exec
         0xBE88_03FF, // s_mov_b32 s8, literal
@@ -594,7 +601,6 @@ fn conditional_reduction(op: u32, ident: u32, mask: u64, branch_on_vcc: bool) ->
         0xBE8F_03A5, // fallback: s_mov_b32 s15, 37
         0xBEFE_0414, // join: s_mov_b64 exec, s[20:21]
     ]);
-    words.extend(&reduction[after..]);
     words
 }
 
@@ -650,6 +656,68 @@ fn whole_group_selects_reductions_for_divergent_masks() {
             let want = [expected; 64];
             failed.extend(check_differences(&[("group vote", host)], 64, 1, &want));
         }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+#[test]
+fn whole_group_reads_first_active_lane_under_divergent_masks() {
+    use super::{Options, container, emit_with};
+    use crate::Container;
+
+    let bytes = container::build(&[]);
+    let c = Container::parse(&bytes).expect("empty container");
+    let mut failed = Vec::new();
+    for (mask, branch_on_vcc) in [
+        (0u64, false),
+        (1 << 4, false),
+        (1 << 45, false),
+        ((1 << 2) | (1 << 42), false),
+        (1 << 4, true),
+    ] {
+        let mut words = PROLOGUE.to_vec();
+        words.push(0x3420_0085); // v_lshlrev_b32 v16, 5, v0
+        let read = [
+            0xD765_0003,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v3, -1, 0
+            0xD766_0003,
+            0x0002_06C1, // v_mbcnt_hi_u32_b32 v3, -1, v3
+            0x7E1E_0503, // v_readfirstlane_b32 s15, v3
+        ];
+        words.extend(conditional_scalar(&read, mask, branch_on_vcc));
+        words.push(0x7E02_020F); // v_mov_b32 v1, s15
+        words.extend(store(1, 0));
+        words.push(S_ENDPGM);
+
+        let n = native(&words, true, 64, 0);
+        let p = ir::build(&n.code, n.wave64, n.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &n.layout, n.stage, Some(&st)).expect("track");
+        let io = io::raise(&p, &n).expect("io::raise");
+        let host = emit_with(
+            &c,
+            &n,
+            &p,
+            &st,
+            &io,
+            &res,
+            Options {
+                host_wave32: true,
+                ..Options::default()
+            },
+        )
+        .expect("group vote lets both halves reach the first-lane read");
+        let expected = if mask == 0 || branch_on_vcc {
+            37
+        } else {
+            mask.trailing_zeros()
+        };
+        failed.extend(check_differences(
+            &[("group vote", host)],
+            64,
+            1,
+            &[expected; 64],
+        ));
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
