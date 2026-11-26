@@ -2845,7 +2845,7 @@ void main(uint3 id : SV_DispatchThreadID) {{
         let view = descriptor::recorded_view(record).unwrap();
         let heap = HostHeap::new(false, 8).unwrap();
         let mut templates = ListViews::new().unwrap();
-        let first = heap.dynamic(3).unwrap();
+        let first = heap.dynamic(4).unwrap();
         assert!(ListViews::can_cache(&view));
         let (backing, _, _) = descriptor::host::view_copy(&view).unwrap();
         assert!(templates.make(&heap, first, record, &view, &backing));
@@ -2853,37 +2853,45 @@ void main(uint3 id : SV_DispatchThreadID) {{
         let out = [39, 1, 0, 0, 1024, 0, 0, 0, 1, 0];
         let out_view = View::Unordered(dst as usize, 0, Some(out));
         heap.make_at(first + 2, &out_view);
+        heap.raw_view_at(first + 3, None, 0, 0, false);
         drop(templates); // destination slots own their backing
 
         let (root, pso) = compile();
         let list = host.new_list().unwrap();
         readable(&list, &used(ResourceType::Srv), &view, true);
-        // SAFETY: the list and its heaps are live; every access is within the
-        // respective title buffer or descriptor table.
+        // SAFETY: the source is a live writable title buffer.
         unsafe {
             for i in 0..16 {
                 (src_bytes as *mut u32)
                     .add(i * 16)
                     .write(0x1234_0000 + i as u32);
             }
-            list.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
-            list.list.SetComputeRootSignature(&root);
-            list.list
-                .SetComputeRootDescriptorTable(0, heap.gpu(first + 1));
-            list.list
-                .SetComputeRootDescriptorTable(1, heap.gpu(first + 2));
-            list.list
-                .SetComputeRoot32BitConstants(2, 2, [0u32; 2].as_ptr().cast(), 0);
-            list.list.SetPipelineState(&pso);
-            list.list.Dispatch(1, 1, 1);
         }
-        list.close();
-        host.execute(&[&list]);
+        let dispatch = |source| {
+            // SAFETY: an open list, live heaps and valid slots.
+            unsafe {
+                list.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetComputeRootDescriptorTable(0, heap.gpu(source));
+                list.list
+                    .SetComputeRootDescriptorTable(1, heap.gpu(first + 2));
+                list.list
+                    .SetComputeRoot32BitConstants(2, 2, [0u32; 2].as_ptr().cast(), 0);
+                list.list.SetPipelineState(&pso);
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.close();
+            host.execute(&[&list]);
+        };
+        dispatch(first + 1);
         let out = crate::shadow::find(dst_bytes as u64, 4096).unwrap();
         assert_eq!(
             out.read_host(dst_bytes as u64, 16),
             (0..16).map(|i| 0x1234_0000 + i).collect::<Vec<_>>()
         );
+        list.reset();
+        dispatch(first + 3);
+        assert_eq!(out.read_host(dst_bytes as u64, 16), [0; 16]);
     }
 
     #[test]
@@ -2983,12 +2991,15 @@ void main(uint3 id : SV_DispatchThreadID) {{
         drop(state);
         drop(list);
         assert!(
-            released.upgrade().is_none(),
-            "released table slots cannot retain the inner shadow"
+            released.upgrade().is_some(),
+            "a reachable slot keeps its backing"
         );
+        assert!(slots.kept(second));
+        slots.make_null(second);
+        slots.make_null(third);
         assert!(
-            !slots.kept(second),
-            "the live heap no longer owns the slot's resource"
+            released.upgrade().is_none(),
+            "replacing the vacant slots releases the old shadow"
         );
         drop(view);
         crate::object::release_ref(heap);

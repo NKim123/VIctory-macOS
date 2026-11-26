@@ -556,19 +556,24 @@ impl HostHeap {
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = (at + n).min(self.dynamic) as usize;
         if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            // Detach before exposing the slots to another recorder. Retire
-            // the COM references through the submission boundary, and drop
-            // the shadows outside both locks: destruction can return memory
-            // to the allocator.
-            let released: Vec<_> = {
+            // A computed title index may still reach the vacant descriptor
+            // below the shader's clamp. Keep its entire backing, including
+            // any mark owner, until the next recorder replaces it. Avoid
+            // descriptor/metadata writes while another list can use the heap.
+            let unreachable = first.max(victory_shader::emit::HEAP_VIEWS) as usize;
+            let limit = self.count as usize + end;
+            let retired: Vec<_> = if unreachable < limit {
                 let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-                (first as usize..self.count as usize + end)
+                (unreachable..limit)
                     .filter_map(|index| kept.slot(index, false)?.take())
                     .collect()
+            } else {
+                Vec::new()
             };
             slots.fill(false);
             drop(guard);
-            for (resource, _) in released {
+            // Drop shadows and enqueue COM retirement outside both locks.
+            for (resource, _) in retired {
                 crate::host::retire(resource);
             }
         }
@@ -3174,27 +3179,41 @@ mod tests {
             };
             let list = host.new_list().unwrap();
             list.close();
-            for release in [false, true] {
-                heap.raw_view_at(a, Some(&buffer), 0, 256, false);
-                assert_eq!(references(&buffer), 2, "ours and the slot's");
-                if release {
-                    heap.release(a, 50);
-                } else {
-                    heap.make_null(a);
-                }
-                assert!(!heap.kept(a), "the slot no longer owns the resource");
-                // Complete a real submission rather than draining the global
-                // retirement queue while another test might have work in flight.
+            let wait_for_retirement = || {
                 host.execute(&[&list]);
-                // Released on a thread of its own.
                 let since = std::time::Instant::now();
                 while references(&buffer) > 1 && since.elapsed() < std::time::Duration::from_secs(5) {
                     std::thread::yield_now();
                 }
                 assert_eq!(references(&buffer), 1, "ours");
+            };
+
+            // A low vacancy remains reachable by computed heap indices.
+            heap.raw_view_at(a, Some(&buffer), 0, 256, false);
+            assert_eq!(references(&buffer), 2, "ours and the slot's");
+            heap.release(a, 50);
+            assert!(heap.kept(a));
+            assert_eq!(heap.dynamic(50), Some(a));
+            heap.make_null(a);
+            assert!(!heap.kept(a));
+            wait_for_retirement();
+
+            // This path requires a host capable of allocating a full heap
+            // plus spill slots. A capped device exercises the case above.
+            let bound = victory_shader::emit::HEAP_VIEWS;
+            if let Some(high) = HostHeap::new(false, bound)
+                && high.count() >= bound
+            {
+                let slot = high.dynamic(1).unwrap();
+                assert!(slot >= bound);
+                eprintln!("checking retirement above the computed resource heap limit at slot {slot}");
+                high.raw_view_at(slot, Some(&buffer), 0, 256, false);
+                assert_eq!(references(&buffer), 2, "ours and the slot's");
+                high.release(slot, 1);
+                assert!(!high.kept(slot));
+                wait_for_retirement();
             }
         }
-        assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
     }
 
