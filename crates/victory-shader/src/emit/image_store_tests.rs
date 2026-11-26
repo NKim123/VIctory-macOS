@@ -150,6 +150,7 @@ fn lower(native: &NativeProgram) -> Result<HostShader, ShaderError> {
         atomic_locks: false,
         atomic_lock_rounds: false,
         atomic_umax: false,
+        atomic_early_exit: false,
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,

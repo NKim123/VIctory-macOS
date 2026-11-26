@@ -1276,6 +1276,13 @@ impl State {
         }
     }
 
+    fn profile_command(&self, list: &HostList, compute: bool) {
+        list.profile_command(self.host_pipeline, compute, || {
+            crate::pipeline::host_pipeline(self.pipeline as This)
+                .map_or_else(String::new, |p| p.name.clone())
+        });
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         #[cfg(feature = "diagnostics")]
@@ -1311,6 +1318,7 @@ impl State {
         self.probe_small(list, true);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        self.profile_command(list, true);
         if x != 0
             && y != 0
             && z != 0
@@ -1464,6 +1472,7 @@ impl State {
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
+                    self.profile_command(list, false);
                     if x != 0
                         && let Some(writes) = texture_writes
                     {
@@ -1932,6 +1941,7 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            self.profile_command(list, false);
             if count != 0
                 && instances != 0
                 && let Some(writes) = texture_writes
@@ -2033,6 +2043,7 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            self.profile_command(list, false);
             if indices != 0
                 && instances != 0
                 && let Some(writes) = texture_writes
@@ -2183,6 +2194,7 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
+        self.profile_command(list, kind == DISPATCH);
         // A listed frame, or any frame for a traced shader: what the records
         // held (after the clamp).
         #[cfg(feature = "diagnostics")]
@@ -5749,6 +5761,7 @@ void main(uint3 id : SV_DispatchThreadID) {
                 atomic_locks: false,
                 atomic_lock_rounds: false,
                 atomic_umax: false,
+                atomic_early_exit: false,
                 bias_as_gradients: false,
                 host_wave32: false,
                 narrow_waves: false,

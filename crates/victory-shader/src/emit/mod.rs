@@ -463,6 +463,8 @@ pub struct Options {
     /// representative a group locking (module notes, "Atomic locks"). The
     /// translation differs, so the shader cache keys on it.
     pub atomic_umax: bool,
+    /// Let glc-clear unsigned max skip locking if the current high word is larger.
+    pub atomic_early_exit: bool,
     /// Compute-stage biased samples run as gradient samples with the quad
     /// gradients scaled by `2^bias`, for hosts that ignore the bias of a
     /// compute shader's sample (D3DMetal, #30).
@@ -855,6 +857,7 @@ fn emit_pruned(
         atomic_locks: options.atomic_locks,
         atomic_lock_rounds: options.atomic_lock_rounds,
         atomic_umax: options.atomic_umax,
+        atomic_early_exit: options.atomic_early_exit,
         bias_as_gradients: options.bias_as_gradients,
         host_wave32: options.host_wave32,
         narrow_waves: options.narrow_waves,

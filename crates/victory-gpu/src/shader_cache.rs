@@ -155,17 +155,21 @@ fn options_for(wine: bool, wave32: bool) -> Options {
     let atomic_locks = flag("VICTORY_ATOMIC_LOCKS", wine);
     let rounds = std::env::var("VICTORY_ATOMIC_LOCK_ROUNDS").ok();
     let atomic_lock_rounds = rounds_on(atomic_locks, rounds.as_deref());
+    let atomic_umax = atomic_lock_rounds && flag("VICTORY_ATOMIC_UMAX", false);
     Options {
         view_marks: true,
         atomic_locks,
         atomic_lock_rounds,
-        atomic_umax: atomic_lock_rounds && flag("VICTORY_ATOMIC_UMAX", false),
+        atomic_umax,
+        atomic_early_exit: atomic_umax && flag("VICTORY_ATOMIC_EARLY_EXIT", true),
         bias_as_gradients: flag("VICTORY_BIAS_AS_GRADIENTS", wine),
         host_wave32: wave32,
         narrow_waves: flag("VICTORY_NARROW_WAVES", wine),
     }
 }
 
+/// The rounds, given whether the locks are on and
+/// `VICTORY_ATOMIC_LOCK_ROUNDS`: on with the locks unless it is `0`.
 fn rounds_on(locks: bool, var: Option<&str>) -> bool {
     locks && var != Some("0")
 }
@@ -198,16 +202,18 @@ pub(crate) fn translation_build(options: Options) -> &'static [u8; 32] {
     let narrow = options.narrow_waves;
     let rounds = locks && options.atomic_lock_rounds;
     let umax = rounds && options.atomic_umax;
+    let early_exit = umax && options.atomic_early_exit;
     if !locks && !bias && !narrow {
         return build(options.host_wave32);
     }
-    static BUILDS: [OnceLock<[u8; 32]>; 64] = [const { OnceLock::new() }; 64];
+    static BUILDS: [OnceLock<[u8; 32]>; 128] = [const { OnceLock::new() }; 128];
     let n = usize::from(locks)
         | usize::from(bias) << 1
         | usize::from(narrow) << 2
         | usize::from(rounds) << 3
         | usize::from(umax) << 4
-        | usize::from(options.host_wave32) << 5;
+        | usize::from(early_exit) << 5
+        | usize::from(options.host_wave32) << 6;
     BUILDS[n].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build(options.host_wave32));
@@ -219,6 +225,9 @@ pub(crate) fn translation_build(options: Options) -> &'static [u8; 32] {
         }
         if umax {
             h.update(b"atomic umax");
+        }
+        if early_exit {
+            h.update(b"atomic early exit");
         }
         if bias {
             h.update(b"bias as gradients");

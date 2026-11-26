@@ -40,9 +40,16 @@ impl Lane {
             let join = std::env::var("VICTORY_JOIN_PARTS")
                 .ok()
                 .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(1)
+                .unwrap_or(if crate::host::pipeline_submissions() {
+                    2
+                } else {
+                    1
+                })
                 .clamp(1, LIST_LIMIT);
-            if join == 1 && !crate::switch::on("VICTORY_ASYNC_SUBMIT") {
+            if join == 1
+                && !crate::host::pipeline_submissions()
+                && !crate::switch::on("VICTORY_ASYNC_SUBMIT")
+            {
                 return None;
             }
             let host = crate::host::host()?;

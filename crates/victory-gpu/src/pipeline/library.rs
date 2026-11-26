@@ -1304,15 +1304,18 @@ mod tests {
         };
         assert_ne!(rounds(true), rounds(false));
         // And a reduced umax changes it again.
-        let umax = |on| {
+        let umax = |on, early_exit| {
             translation_build(victory_shader::emit::Options {
                 atomic_locks: true,
                 atomic_lock_rounds: true,
                 atomic_umax: on,
+                atomic_early_exit: early_exit,
                 ..options
             })
         };
-        assert_ne!(umax(true), umax(false));
+        assert_ne!(umax(true, false), umax(false, false));
+        assert_ne!(umax(true, true), umax(true, false));
+        assert_eq!(umax(false, true), umax(false, false));
         assert_eq!(
             tag(b"library"),
             current(

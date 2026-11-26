@@ -146,6 +146,8 @@ pub(crate) struct Parts<'a> {
     /// each texel's lanes of a wave to their maximum key
     /// ([`Options::atomic_umax`](super::Options)).
     pub atomic_umax: bool,
+    /// Let glc-clear unsigned max skip locking if the current high word is larger.
+    pub atomic_early_exit: bool,
     /// Compute-stage biased samples run as gradient samples scaled by
     /// `2^bias` ([`Options::bias_as_gradients`](super::Options)).
     pub bias_as_gradients: bool,
@@ -9371,11 +9373,9 @@ impl<'a> Lower<'a> {
                 // taken where the guard is live — inside, a ballot of the
                 // branch's own condition is not exact under D3DMetal. A
                 // glc-set umax reads its old value, so it cannot reduce.
-                let (value, not_rep) = if self.x.atomic_umax
-                    && self.x.atomic_lock_rounds
-                    && op == "umax"
-                    && !cache.glc
-                {
+                let reduce =
+                    self.x.atomic_umax && self.x.atomic_lock_rounds && op == "umax" && !cache.glc;
+                let (value, not_rep) = if reduce {
                     let bit = guard.unwrap_or_else(|| self.s.m.bool(true));
                     let four = self.s.m.named_struct("dx.types.fouri32", vec![self.s.t.i32; 4]);
                     let present = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
@@ -9386,7 +9386,16 @@ impl<'a> Lower<'a> {
                     (value, self.s.m.bool(false))
                 };
                 let at = self.begin_guarded(guard);
-                let (lo, hi) = self.locked_atomic64(h, &cs, coords, op, value, compare, not_rep);
+                let (lo, hi) = self.locked_atomic64(
+                    h,
+                    &cs,
+                    coords,
+                    op,
+                    value,
+                    compare,
+                    not_rep,
+                    reduce && self.x.atomic_early_exit,
+                );
                 let r = self.end_guarded(at, &[(lo, old[0]), (hi, old[1])]);
                 if cache.glc {
                     for (k, x) in (0..).zip(r) {
