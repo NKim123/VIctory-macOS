@@ -303,7 +303,13 @@ On an M5 Max with D3DMetal 4.0 beta 3 the world-entry hang of #172 still happens
 Two counts of a mesh shader's outputs disagree. `MeshOutputs::bytes` counts four bytes per declared component; the layout Metal allocates puts clip and cull distances first, then the position, then each other output aligned to its own size, the same for primitives, times the declared maxima (the count #172 used, from the older `metal_mesh_bytes`). For 1.0.2.1 the packed count puts every world mesh shader at or under 32,768 bytes, while the aligned layout puts about 20 of them at 34,816 to 38,400, and those are the pipelines in the submission that hangs.
 
 Under Wine, linking is now on by default, and a mesh pipeline that is still over 32 KiB after it, by either count, is refused: its draws are dropped and the queue keeps running. With that, the same run goes past the title card and into the world; 20 to 25 pipelines are refused per run. `VICTORY_LINK_MESH_OUTPUTS=0` turns linking off and `VICTORY_MESH_OVER_LIMIT=1` makes over-limit pipelines anyway.
-The diagnostics switch `VICTORY_PHYSICAL_TILES=1` lets XMem use CPU-visible D3D12 heaps for physical page allocations on Rosetta. Wine supplies its usual placeholder views, and the mapped view and DirectStorage share the heap's bytes. The XMem test checks page aliases, remapping, unmapping, and DirectStorage writes. The GPU probe also checks both directions of a copy through an aliased Windows view, including after that view is unmapped.
+The opt-in `VICTORY_PHYSICAL_TILES=1` works in release and diagnostics builds with Rosetta, the CPU alias probe, and tier 2 tiled resources. XMem allocates CPU-visible D3D12 heaps for physical pages. Wine supplies its usual placeholder views, and the title view and DirectStorage share the heap's bytes.
+
+An eligible XMem placeholder, including the low 32-bit graphics heap, gets a reserved buffer on its first physical mapping. Reservations larger than 2 GiB are split into chunks to fit the 32-bit byte offsets used for computed buffer addresses. The host batches edits by destination resource and backing heap before executing command lists. Each chunk retains its GPU address through remaps and NULL mappings, and the replacement queue replays the mappings. A view crossing two chunks and a view that needs an alignment or format conversion use the ordinary copy paths. Texture uploads continue to track and detile title memory.
+
+A file-backed page can keep a chunk on ordinary shadows before a native binding uses it. After a binding retains the tiled GPU address, replacing it with a file-backed page fails the mapping call without changing the existing views. This preserves the recorded address. A chunk with an existing ordinary GPU copy also stays on that copy path.
+
+The diagnostics integration test `low_placeholder_is_a_coherent_tiled_buffer` checks CPU writes through root CBV and SRV reads, GPU UAV writes directly into the title page, remaps, NULL reads and queue replacement. Run it serially with the D3DMetal Wine runner and `VICTORY_PHYSICAL_TILES=1`.
 
 A separate 6.10 GiB heap and reserved buffer worked on the same M1 Max. Readback matched data from four sampled tiles, including the last two in the heap. A GPU write reached the final tile's CPU mapping.
 
@@ -436,10 +442,8 @@ Pipelining adds a bounded pool of completion marks. The switches reuse the exist
 Under Rosetta with D3DMetal, memory the title commits read-write with `XMemVirtualAlloc`, in whole 64 KiB pages, is pointed at the pages of a D3DMetal buffer with `mach_vm_remap` (#204). The GPU then reads and writes the title's own memory, so those buffers need no host copy, no copy-back after a submission that wrote them, and no refresh before one. A probe at start-up falls back to the copies if the remap does not work, and `VICTORY_ALIAS_BUFFERS=0` keeps the copies.
 
 The title's low 32-bit graphics heap uses placeholder reservations and
-physical page mappings, so those pages do not pass through this committed
-virtual allocation path. The diagnostic `VICTORY_PHYSICAL_TILES=1` can
-back XMem physical pages with a D3DMetal heap, but this does not register
-contiguous title-buffer aliases for arbitrary physical mappings.
+physical page mappings. Set `VICTORY_PHYSICAL_TILES=1` to use the reserved
+buffer path described in “CPU-visible tiles in reserved buffers”.
 
 `VICTORY_PORT_CBV=1` translates eligible root constant-buffer loads through
 bounded raw SRVs. They can read the existing buffer at a 16-byte-aligned

@@ -22,7 +22,6 @@ use windows_sys::Win32::System::Memory::{
 use crate::host::host;
 use crate::watch::PAGE;
 
-#[cfg(any(test, feature = "diagnostics"))]
 use windows::Win32::Graphics::Direct3D12::*;
 
 #[cfg(target_arch = "x86_64")]
@@ -315,16 +314,14 @@ fn supported() -> Option<bool> {
 
 /// CPU-visible backing for XMem physical pages. The placed buffer keeps a
 /// CPU mapping of the heap from which reserved resources can take tiles.
-#[cfg(any(test, feature = "diagnostics"))]
 pub struct PhysicalHeap {
     backing: ID3D12Resource,
     // A placed buffer must keep its heap alive.
-    pub(crate) _heap: ID3D12Heap,
+    pub(crate) heap: ID3D12Heap,
     address: usize,
-    len: usize,
+    pub(crate) len: usize,
 }
 
-#[cfg(any(test, feature = "diagnostics"))]
 impl PhysicalHeap {
     pub(crate) fn new(device: &ID3D12Device, len: usize) -> windows::core::Result<Self> {
         let desc = D3D12_HEAP_DESC {
@@ -376,7 +373,7 @@ impl PhysicalHeap {
         }
         Ok(Self {
             backing,
-            _heap: heap,
+            heap,
             address: address as usize,
             len,
         })
@@ -414,7 +411,6 @@ impl PhysicalHeap {
     }
 }
 
-#[cfg(any(test, feature = "diagnostics"))]
 impl Drop for PhysicalHeap {
     fn drop(&mut self) {
         // SAFETY: unmapped once, while the placed buffer still owns the view.
@@ -422,14 +418,30 @@ impl Drop for PhysicalHeap {
     }
 }
 
-/// Allocates CPU-visible physical tiles for the Rosetta diagnostics trial.
-#[cfg(feature = "diagnostics")]
-pub fn physical_heap(len: usize) -> Option<PhysicalHeap> {
+/// Whether the opt-in physical-page path has a usable CPU-visible host.
+pub fn physical_tiles_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    if !*ENABLED.get_or_init(|| crate::switch::on("VICTORY_PHYSICAL_TILES") && supported().is_some())
-        || len == 0
-        || !len.is_multiple_of(PAGE)
-    {
+    *ENABLED.get_or_init(|| {
+        if !crate::switch::on("VICTORY_PHYSICAL_TILES") || supported().is_none() {
+            return false;
+        }
+        let Some(host) = host() else { return false };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        // SAFETY: the feature enum, structure and size match.
+        let queried = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        };
+        queried.is_ok() && options.TiledResourcesTier.0 >= D3D12_TILED_RESOURCES_TIER_2.0
+    })
+}
+
+/// Allocates CPU-visible physical tiles on Rosetta.
+pub fn physical_heap(len: usize) -> Option<PhysicalHeap> {
+    if !physical_tiles_enabled() || len == 0 || !len.is_multiple_of(PAGE) {
         return None;
     }
     let host = host()?;

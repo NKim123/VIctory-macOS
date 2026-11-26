@@ -454,7 +454,20 @@ impl Shared {
             named.push(c);
             slots.push(slot);
         }
-        let ranges: Vec<(u64, u64)> = named.iter().map(|c| c.range()).collect();
+        let mut aliases = Vec::new();
+        let ranges: Vec<_> = named
+            .iter()
+            .enumerate()
+            .map(|(k, copy)| {
+                let (start, len) = copy.range();
+                if let Some(valid) = copy.tiled_ranges() {
+                    aliases.extend(valid.into_iter().map(|(at, bytes)| (k, at, bytes)));
+                    (start, 0)
+                } else {
+                    (start, len)
+                }
+            })
+            .collect();
         // The last table's blocks and owners, built back into if no list
         // still reads them (a reader clones the layout, under the lock
         // this holds); their buffers are kept between rewrites.
@@ -463,7 +476,9 @@ impl Shared {
             Ok(Layout { blocks, owner, .. }) => pagetable::Outputs { blocks, owners: owner },
             Err(_) => pagetable::Outputs::default(),
         };
-        let built = self.scratch.build(&ranges, &slots, self.null, &mut out);
+        let built = self
+            .scratch
+            .build_with_aliases(&ranges, &slots, self.null, &mut out, &aliases);
         // SAFETY: the mapping has room for `CAPACITY` blocks, which the
         // builder keeps to; no submission runs.
         unsafe { std::ptr::copy_nonoverlapping(built.dwords.as_ptr(), self.data as *mut u32, built.dwords.len()) };
@@ -523,6 +538,9 @@ impl ComputedBaselines {
             return;
         }
         for copy in &layout.copies {
+            if copy.is_tiled() {
+                continue;
+            }
             let key = Arc::as_ptr(copy) as usize;
             if copy.dirty_bit().is_some() {
                 self.tracked_copies.insert(key);
@@ -781,6 +799,17 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         } else {
             0
         };
+        // The tiled buffer already wrote the shared physical page. It
+        // only needs the texture and other view trackers notified.
+        writes.retain(|&(k, at)| {
+            let copy = &copies[k];
+            if copy.is_tiled() {
+                copy.copy_back_page(at as usize, None);
+                false
+            } else {
+                true
+            }
+        });
         if withheld > 0 {
             for &(_, at) in &writes {
                 if accept_landing {

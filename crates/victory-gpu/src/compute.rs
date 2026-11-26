@@ -22,6 +22,8 @@ pub(crate) enum Param<'a> {
     Constants { register: u32, count: u32 },
     /// A root shader resource view in `t{register}, space{space}`.
     Srv { register: u32, space: u32 },
+    #[cfg(feature = "diagnostics")]
+    Cbv { register: u32 },
     /// A root unordered access view in `u{register}`.
     Uav { register: u32 },
 }
@@ -176,6 +178,8 @@ pub(crate) fn root_signature(device: &ID3D12Device, params: &[Param]) -> Result<
             Param::Srv { register, space } => {
                 descriptor(D3D12_ROOT_PARAMETER_TYPE_SRV, register, space)
             }
+            #[cfg(feature = "diagnostics")]
+            Param::Cbv { register } => descriptor(D3D12_ROOT_PARAMETER_TYPE_CBV, register, 0),
             Param::Uav { register } => descriptor(D3D12_ROOT_PARAMETER_TYPE_UAV, register, 0),
         })
         .collect();

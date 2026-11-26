@@ -1977,6 +1977,7 @@ impl Host {
         *submitted += 1;
         mark.arm(*submitted);
         let queue = self.queue();
+        let _tiles = crate::tiled::flush(&queue);
         let ran = self.submit_and_wait(&queue, &[mark.list()], *submitted) && mark.saw(*submitted);
         #[cfg(test)]
         let ran = !MISS_NEXT_QUEUE_PROBE.replace(false) && ran;
@@ -2021,6 +2022,12 @@ impl Host {
         self.wait_for(value)
     }
 
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn replace_queue_for_probe(&self) {
+        let _quiet = self.quiet();
+        self.replace_queue().expect("replacement queue");
+    }
+
     /// A new direct queue in place of the current one. Under the submission
     /// lock, so no submission is on the old queue.
     fn replace_queue(&self) -> windows::core::Result<()> {
@@ -2032,6 +2039,7 @@ impl Host {
             })
         }?;
         *self.queue.lock().unwrap_or_else(|e| e.into_inner()) = queue;
+        crate::tiled::replay();
         Ok(())
     }
 
@@ -2116,6 +2124,7 @@ impl Host {
         }
 
         let queue = self.queue();
+        let _tile_guard = crate::tiled::flush(&queue);
         let first = *submitted + 1;
         let mut flights = Vec::with_capacity(parts.len());
         let mut prep = Duration::ZERO;
@@ -2474,6 +2483,7 @@ impl Host {
             };
             let frozen = crate::ambient::arm(&pairings);
             let queue = self.queue();
+            let _tiles = crate::tiled::flush(&queue);
             // All native calls share the existing completion fence. Mark
             // every call since the final mark alone cannot vouch for an
             // earlier call that D3DMetal dropped.
