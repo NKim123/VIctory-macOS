@@ -18,12 +18,52 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
+
+fn under_fused() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_UNDER_FUSED").is_some_and(|v| v == "1"))
+}
+
+fn put_under(offset: usize, title: &[u8], host: &mut [u8], before: &mut Snapshot) {
+    let end = offset + title.len();
+    // Skip stores of equal cache lines to the mapped host buffer.
+    for (src, dst) in title.chunks(64).zip(host.chunks_mut(64)) {
+        if src != dst {
+            dst.copy_from_slice(src);
+        }
+    }
+    // Even when a GPU write left the same bytes in the host copy, the
+    // baseline must take the bytes the refresh observed in title memory.
+    for (at, bytes) in &mut before.0 {
+        let (lo, hi) = (offset.max(*at), end.min(*at + bytes.len()));
+        if lo < hi {
+            bytes[lo - *at..hi - *at].copy_from_slice(&title[lo - offset..hi - offset]);
+        }
+    }
+}
+
+#[test]
+fn fused_refresh_updates_overlapping_baselines_even_if_host_already_matches() {
+    let title: Vec<u8> = (0..135).collect();
+    let mut host = title.clone();
+    host[70] ^= 0x80;
+    let mut before = (
+        vec![(0, vec![0; 5]), (70, vec![0xff; 90]), (160, vec![7; 3])],
+        Default::default(),
+    );
+    put_under(3, &title, &mut host, &mut before);
+    assert_eq!(host, title);
+    assert_eq!(&before.0[0].1[..], &[0, 0, 0, 0, 1]);
+    assert_eq!(&before.0[1].1[..68], &title[67..]);
+    assert_eq!(&before.0[1].1[68..], &[0xff; 22]);
+    assert_eq!(&before.0[2].1[..], &[7; 3]);
+}
 
 fn merge_writeback(title: &mut [u8], host: &mut [u8], old: &[u8]) -> bool {
     let mut changed = 0;
@@ -1121,21 +1161,21 @@ impl Shadow {
             for (a, e) in busy {
                 let (a, e) = (a.max(from), e.min(to));
                 if a > at {
-                    bytes += self.update_untracked(at, a);
+                    bytes += self.update_untracked(at, a, None);
                 }
                 if e > a.max(at) {
                     let (a, e) = (a.max(at), e);
-                    bytes += self.update_untracked(a, e);
-                    self.sync_snapshot(a, e);
+                    let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+                    bytes += self.update_untracked(a, e, Some(&mut before));
                 }
                 at = at.max(e);
             }
             if at < to {
-                bytes += self.update_untracked(at, to);
+                bytes += self.update_untracked(at, to, None);
             }
             return bytes;
         }
-        self.update_untracked(from, to)
+        self.update_untracked(from, to, None)
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where the
@@ -1167,15 +1207,9 @@ impl Shadow {
         );
         let start = self.start as usize;
         let mut before = busy.then(|| self.before.lock().unwrap_or_else(|e| e.into_inner()));
-        let mut sync_before = |a: usize, b: usize| {
-            if let Some(before) = &mut before {
-                self.sync_snapshot_in(before, a, b);
-            }
-        };
         let mut copied = 0;
         for (a, b) in runs {
-            copied += self.copy(a, b);
-            sync_before(a, b);
+            copied += self.refresh_under(a, b, before.as_deref_mut());
         }
         for (a, b) in unmapped {
             // SAFETY: inside the mapping (`take_split` cuts to the buffer).
@@ -1183,7 +1217,9 @@ impl Shadow {
             if self.has_widened.load(Ordering::Acquire) {
                 self.refresh_widened(a, b);
             }
-            sync_before(a, b);
+            if let Some(before) = &mut before {
+                self.sync_snapshot_in(before, a, b);
+            }
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::Unmapped, (b - a) as u64);
         }
@@ -1191,8 +1227,7 @@ impl Shadow {
         for (a, b) in t.untracked(from, to) {
             #[cfg(feature = "diagnostics")]
             let started = std::time::Instant::now();
-            copied += self.copy(a, b);
-            sync_before(a, b);
+            copied += self.refresh_under(a, b, before.as_deref_mut());
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
@@ -1212,11 +1247,6 @@ impl Shadow {
 
     /// Puts the copy's bytes of `[a, b)` (title addresses), just updated,
     /// into the snapshot a submission that is writing took.
-    fn sync_snapshot(&self, a: usize, b: usize) {
-        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        self.sync_snapshot_in(&mut before, a, b);
-    }
-
     fn sync_snapshot_in(&self, before: &mut Snapshot, a: usize, b: usize) {
         let start = self.start as usize;
         let (a, b) = (a - start, b - start);
@@ -1231,17 +1261,75 @@ impl Shadow {
     }
 
     /// [`Shadow::update`] of untracked `[from, to)` (inside the buffer).
-    fn update_untracked(&self, from: usize, to: usize) -> usize {
+    fn update_untracked(&self, from: usize, to: usize, before: Option<&mut Snapshot>) -> usize {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        self.copy(from, to);
+        let copied = self.refresh_under(from, to, before);
         #[cfg(feature = "diagnostics")]
         {
             use crate::copystat::{C, add};
             add(C::WholeBytes, (to - from) as u64);
             add(C::WholeUs, started.elapsed().as_micros() as u64);
         }
-        to - from
+        copied
+    }
+
+    fn refresh_under(&self, from: usize, to: usize, before: Option<&mut Snapshot>) -> usize {
+        let Some(before) = before else {
+            return self.copy(from, to);
+        };
+        if under_fused() {
+            self.copy_under(from, to, before)
+        } else {
+            let copied = self.copy(from, to);
+            self.sync_snapshot_in(before, from, to);
+            copied
+        }
+    }
+
+    /// Refresh the shadow and any busy-range baselines together from a
+    /// bounded scratch read. The existing mapped reader zeroes holes.
+    fn copy_under(&self, from: usize, to: usize, before: &mut Snapshot) -> usize {
+        let offset = from - self.start as usize;
+        let len = to - from;
+        let overlaps = before
+            .0
+            .iter()
+            .any(|(at, bytes)| *at < offset + len && offset < *at + bytes.len());
+        #[cfg(feature = "diagnostics")]
+        let overlaps = overlaps && crate::copystat::mode() == 0;
+        if !overlaps {
+            let copied = self.copy(from, to);
+            self.sync_snapshot_in(before, from, to);
+            return copied;
+        }
+        thread_local! {
+            static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        // SAFETY: inside the persistent host mapping, with GPU work held
+        // off and widened_source excluding other CPU writers.
+        let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(offset), len) };
+        TITLE.with_borrow_mut(|scratch| {
+            scratch.resize(PAGE.min(len), 0);
+            for (i, dst) in host.chunks_mut(PAGE).enumerate() {
+                let at = i * PAGE;
+                let title = &mut scratch[..dst.len()];
+                crate::host::copy_mapped(
+                    title.as_mut_ptr(),
+                    (from + at) as *const u8,
+                    title.len(),
+                    false,
+                );
+                put_under(offset + at, title, dst, before);
+            }
+        });
+        if self.has_widened.load(Ordering::Acquire) {
+            self.refresh_widened(from, to);
+        }
+        if let Some(t) = &self.tracked {
+            t.refreshed(from, host);
+        }
+        len
     }
 
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
@@ -3534,8 +3622,8 @@ pub(crate) mod tests {
         // SAFETY: bytes of our pool.
         let read = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
         assert_eq!((read(10), read(PAGE + 10)), (0xaa, 0), "page 1 held back");
-        // SAFETY: a dword of the mapped bitmap.
         assert_eq!(
+            // SAFETY: a dword of the mapped bitmap.
             unsafe { *(memory.data as *const u32).add((base + 1) / 32) } & 1 << ((base + 1) % 32),
             0,
             "cleared"
@@ -3590,8 +3678,8 @@ pub(crate) mod tests {
             (0x11, 0x11),
             "frame N+1: title memory's bytes"
         );
-        // SAFETY: as above.
         assert_eq!(
+            // SAFETY: as above.
             unsafe { ((p + 16) as *const u8).read_volatile() },
             0x11,
             "title memory untouched"
