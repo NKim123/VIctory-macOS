@@ -351,6 +351,45 @@ fn a_deferred_upload_reads_the_earlier_label() {
 }
 
 #[test]
+fn draining_a_newer_flight_publishes_the_earlier_label() {
+    let Some(host) = host_for_ring() else { return };
+    host.present_boundary();
+    let (out, _) = host.mapped_buffer(8, true).unwrap();
+    let label = AtomicU32::new(0);
+    let mut first_gate = Gate::new(host);
+    let first = record_copy(host, &out, 4, 1);
+    first.defer_write(label.as_ptr().cast(), crate::queue::Written::Value(17), 4);
+    assert!(host.execute_title(&[first]));
+    let mut second_gate = Gate::new(host);
+    assert!(host.execute_title(&[record_copy(host, &out, 4, 2)]));
+
+    let counter = &DRAINS[Boundary::Present as usize];
+    let before = counter.load(Ordering::Relaxed);
+    std::thread::scope(|scope| {
+        let drain = scope.spawn(|| host.present_boundary());
+        let until = Instant::now() + Duration::from_secs(3);
+        while counter.load(Ordering::Relaxed) == before {
+            assert!(
+                Instant::now() < until,
+                "the concurrent drain must enter its fence wait"
+            );
+            std::hint::spin_loop();
+        }
+        first_gate.open();
+        while label.load(Ordering::Acquire) == 0 {
+            assert!(
+                Instant::now() < until,
+                "the first label must land before the second fence"
+            );
+            std::hint::spin_loop();
+        }
+        assert_eq!(label.load(Ordering::Acquire), 17);
+        second_gate.open();
+        drain.join().unwrap();
+    });
+}
+
+#[test]
 fn a_native_copy_sees_an_earlier_label_through_a_zero_copy_buffer() {
     let Some(host) = host_for_ring() else { return };
     host.present_boundary();

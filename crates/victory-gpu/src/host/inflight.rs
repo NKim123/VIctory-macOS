@@ -250,20 +250,29 @@ impl Host {
     }
 
     fn wait_inflight(&self, s: &mut Submission, value: u64, why: Boundary) {
-        // SAFETY: the queue has signalled this fence value.
-        let completed = unsafe { self.fence.GetCompletedValue() };
-        if completed == u64::MAX {
-            self.flight_device_removed(s);
-        }
-        if completed < value {
-            DRAINS[why as usize].fetch_add(1, Ordering::Relaxed);
-            let started = Instant::now();
-            if !self.wait_for_submission(value) {
+        let mut waited = false;
+        while let Some(first) = s.flights.front().filter(|first| first.value <= value) {
+            // SAFETY: the queue has signalled this fence value.
+            let completed = unsafe { self.fence.GetCompletedValue() };
+            if completed == u64::MAX {
                 self.flight_device_removed(s);
             }
-            SUBMISSION_US[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            if completed < first.value {
+                if !waited {
+                    DRAINS[why as usize].fetch_add(1, Ordering::Relaxed);
+                    waited = true;
+                }
+                let started = Instant::now();
+                // This caller holds the submission lock. Publish older labels
+                // and signals before waiting for later flights that may rely
+                // on the title reacting to those earlier completions.
+                if !self.wait_for_submission(first.value) {
+                    self.flight_device_removed(s);
+                }
+                SUBMISSION_US[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
+            self.retire_inflight(s);
         }
-        self.retire_inflight(s);
     }
 
     fn flight_device_removed(&self, s: &Submission) -> ! {
