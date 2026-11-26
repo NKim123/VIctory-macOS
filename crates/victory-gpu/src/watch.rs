@@ -856,6 +856,8 @@ pub(crate) fn track_copy(start: usize, len: usize, views: bool) -> Option<Tracke
     track_as(start, len, views, TrackerUse::Copy)
 }
 
+/// Tracks a single upload footprint, allowing a fault to open adjacent
+/// blocks that feed the same subresource.
 pub(crate) fn track_texture(start: usize, len: usize) -> Option<Tracked> {
     track_as(start, len, true, TrackerUse::Texture)
 }
@@ -2063,15 +2065,18 @@ pub(crate) fn aliased(at: usize, len: usize) -> bool {
 const TEXTURE_FAULT_BLOCKS: usize = 4;
 
 fn texture_fault_end(g: &Guards, page: usize, limit: usize) -> usize {
-    let texture_only = |page| {
-        !g.alias_of.contains_key(&page)
-            && g.holders.get(&page).is_some_and(|holders| {
-                !holders.is_empty() && holders.iter().all(|holder| holder.3 == TrackerUse::Texture)
-            })
+    let tracker_at = |page| {
+        if g.alias_of.contains_key(&page) {
+            return None;
+        }
+        let [tracker] = g.holders.get(&page)?.as_slice() else {
+            return None;
+        };
+        (tracker.3 == TrackerUse::Texture).then_some(tracker)
     };
-    if !texture_only(page) {
+    let Some(tracker) = tracker_at(page) else {
         return page + 1;
-    }
+    };
     let protected = g.protected.0.read().unwrap_or_else(|e| e.into_inner());
     let Some(guard) = protected.get(&page).filter(|guard| guard.watched) else {
         return page + 1;
@@ -2082,7 +2087,8 @@ fn texture_fault_end(g: &Guards, page: usize, limit: usize) -> usize {
         .min(limit);
     (page + 1..end)
         .find(|next| {
-            !texture_only(*next) || !protected.get(next).is_some_and(|guard| guard.watched)
+            !tracker_at(*next).is_some_and(|next| Arc::ptr_eq(next, tracker))
+                || !protected.get(next).is_some_and(|guard| guard.watched)
         })
         .unwrap_or(end)
 }

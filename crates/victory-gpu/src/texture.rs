@@ -1521,7 +1521,11 @@ pub(crate) fn staging_for(
         layout,
         mips: u32::from(d.MipLevels),
         memory: memory as *const u8,
-        tracked: crate::watch::track_texture(memory, layout_size),
+        tracked: if count == 1 {
+            crate::watch::track_texture(memory, layout_size)
+        } else {
+            crate::watch::track(memory, layout_size, true)
+        },
         uploaded_once: std::sync::atomic::AtomicBool::new(false),
         retry: std::sync::atomic::AtomicBool::new(false),
         checked_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
