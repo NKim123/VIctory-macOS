@@ -4447,7 +4447,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         drop(copy);
         // A slot made from the view holds its copy: after more than a
         // thousand other views' copies, draws still find (and refresh) the
-        // copy the slot shows; rewritten, the slot lets it go.
+        // copy the slot shows. After an overwrite, retirement keeps the
+        // copy through the submission boundary.
         let null = std::ptr::null();
         let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
         let mut heap = null;
@@ -4464,8 +4465,19 @@ void main(uint3 id : SV_DispatchThreadID) {
         let found = crate::descriptor::host::view_copy(&view(start + 100)).unwrap().0;
         assert!(shown.upgrade().is_some_and(|s| std::sync::Arc::ptr_eq(&s, &found)), "the slot's copy");
         drop(found);
-        slots.make_null(0);
-        assert!(shown.upgrade().is_none(), "released with the slot");
+        let list = host.new_list().unwrap();
+        let retired = shown.clone();
+        list.defer_host(move || {
+            slots.make_null(0);
+            assert!(retired.upgrade().is_some(), "retirement still owns the copy");
+        });
+        list.close();
+        host.execute(&[&list]);
+        let since = std::time::Instant::now();
+        while shown.upgrade().is_some() && since.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::yield_now();
+        }
+        assert!(shown.upgrade().is_none(), "released after submission");
     }
 
     #[test]
