@@ -1561,3 +1561,22 @@ fn divergent_lds_flag_is_visible_to_both_halves_after_rejoining() {
     let different = native(&different_words, true, 64, 512);
     assert!(lowered_with(&different, true, true).is_err());
 }
+
+#[test]
+fn first_lane_can_be_in_the_upper_half_after_an_exec_filter() {
+    let mut words = PROLOGUE.to_vec();
+    words.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0xD765_0001,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0 (console lanes)
+        0x7D82_00A7, // v_cmp_lt_u32 vcc, 39, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0x7E1C_0500, // v_readfirstlane_b32 s14, v0
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x7E02_020E, // v_mov_b32 v1, s14
+    ]);
+    words.extend(store(1, 0));
+    words.push(S_ENDPGM);
+    let failures = differences(&words, 64, 1, &[40; 64]);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

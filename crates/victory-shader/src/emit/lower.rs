@@ -6502,7 +6502,11 @@ impl<'a> Lower<'a> {
         // A scalar result (`v_readlane`, `v_readfirstlane`) is written
         // whatever EXEC holds.
         let mut guard = match v.dst {
-            Some(Operand::Scalar { .. }) => None,
+            Some(Operand::Scalar { .. })
+                if name != "v_readfirstlane_b32" || !self.across_here() =>
+            {
+                None
+            }
             _ => self.guard(b, i)?,
         };
         if let Some(d) = v.dpp {
@@ -7444,7 +7448,7 @@ impl<'a> Lower<'a> {
                         return Err(halves::FIRST_ACROSS);
                     }
                     let a = s(self, 0)?;
-                    let r = self.first_lane_across(a)?;
+                    let r = self.first_lane_across(a, guard)?;
                     return int(self, r);
                 }
                 let a = s(self, 0)?;
