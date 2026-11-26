@@ -216,6 +216,11 @@ mod tests {
         // SAFETY: the fixture owns the still-current destination.
         assert_eq!(unsafe { (p as *const u8).read_volatile() }, 1);
 
+        let copied = copy.update(p, PAGE);
+        let echoes = !crate::watch::fault_tracking() || !echo();
+        assert_eq!(copied, if echoes { PAGE } else { 0 });
+        eprintln!("Direct pool write-back: origin refreshed {copied} bytes");
+
         let baseline = copy
             .dirty_bit()
             .is_none()
@@ -373,6 +378,8 @@ mod tests {
                 PAGE_READWRITE,
                 "only the CPU store opened this alias"
             );
+        }
+        if on {
             let copied = exact.update(a, PAGE);
             assert_eq!(copied, if echo() { 0 } else { PAGE });
             echo_bytes = Some(copied);

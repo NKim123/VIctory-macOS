@@ -1876,8 +1876,14 @@ mod tests {
         // show their original section slices and take the in-flight writes.
         let middle = a.wrapping_byte_add(PAGE);
         assert_eq!(XMemMapPhysicalPages(middle, 1, pages[3..].as_ptr()), middle);
-        landing_page(at + PAGE, epoch, true, &mut |p| {
-            assert!(matches!(p, LandingPage::Replaced))
+        for beside in [true, false] {
+            landing_page(at + PAGE, epoch, beside, &mut |p| {
+                assert!(matches!(p, LandingPage::Replaced))
+            });
+        }
+        let after_replacement = victory_gpu::next_mapping_epoch();
+        landing_page(at + PAGE, after_replacement, false, &mut |p| {
+            assert!(matches!(p, LandingPage::Direct))
         });
         landing_page(at + 2 * PAGE, epoch, true, &mut |p| {
             assert!(matches!(p, LandingPage::Beside(_)))

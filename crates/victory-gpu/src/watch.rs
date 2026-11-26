@@ -1025,6 +1025,15 @@ fn aliases_guarded(g: &Guards, page: usize) -> bool {
             .is_none_or(|others| others.iter().all(|p| g.protected.contains(p) && !busy(*p)))
 }
 
+/// A direct write opened the destination. Guard it again and take any
+/// CPU bytes written while it was open before clearing the origin's dirt.
+fn rearm_direct(g: &mut Guards, page: usize, at: usize, host: &mut [u8]) -> bool {
+    protect(g, &[page]);
+    g.protected.contains(&page)
+        && aliases_guarded(g, page)
+        && crate::host::read_into(at as *const u8, host)
+}
+
 /// Merge within one 64 KiB block, after its GPU fence. The mapping callback
 /// holds the physical map stable until we have written and notified every
 /// tracker. Guard faults cannot mark or reopen an alias during the merge.
@@ -1128,11 +1137,11 @@ pub(crate) fn land(
         }
 
         if guarded
-            && (beside.is_some() || !writes)
             && crate::land::echo()
             && let Some(t) = tracked
             && at == (page * PAGE).max(t.start)
             && at + host.len() == ((page + 1) * PAGE).min(t.end)
+            && (beside.is_some() || !writes || rearm_direct(&mut g, page, at, host))
         {
             // The writing copy now has every byte it holds of this page.
             // Clear only its tracker, with the guards still held.
