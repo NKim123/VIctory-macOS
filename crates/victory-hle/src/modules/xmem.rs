@@ -1550,13 +1550,13 @@ mod tests {
         assert_eq!(query(last).host.State, MEM_RESERVE);
         assert!(map_alias(source as u64, 0, 3 * PAGE as u64));
         assert!(map_alias(target as u64, 0, PAGE as u64));
-        // SAFETY: return the independently owned test view to its placeholder.
         assert_ne!(
+            // SAFETY: return the independently owned test view to its placeholder.
             unsafe { UnmapViewOfFile2(GetCurrentProcess(), middle_view, MEM_PRESERVE_PLACEHOLDER) },
             0
         );
-        // SAFETY: these four separate reservations belong to this test.
         for region in [source, target, middle, last] {
+            // SAFETY: these four separate reservations belong to this test.
             assert_ne!(unsafe { VirtualFree(region, 0, MEM_RELEASE) }, 0);
         }
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
