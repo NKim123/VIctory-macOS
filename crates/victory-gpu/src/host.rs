@@ -2719,7 +2719,7 @@ impl Host {
                 );
             }
         }
-        let (back, withheld, mut computed) = crate::land::relay(landing, move || {
+        let relay = crate::land::start(landing, move || {
             let _holding = Holding::enter();
             crate::shadow::copy_back_marks(
                 &withheld,
@@ -2781,15 +2781,46 @@ impl Host {
             }
             (back, withheld, computed)
         });
+        let can_land_texture = |i, list: &HostList, missed| {
+            ran(i)
+                && !unconfirmed_lists.contains(&std::ptr::from_ref(list))
+                && !(missed || withholding && !list.deferred().missed.is_empty())
+        };
+        // Retiling reads only this list's fence-completed readback. Prepare
+        // at most one texture while the worker merges buffer shadows, and
+        // publish it at the same point in submission order as before.
+        let first_texture = if landing.is_some() && crate::land::async_enabled() {
+            runs.iter()
+                .zip(&missed)
+                .enumerate()
+                .find_map(|(i, (&list, &missed))| {
+                    if !can_land_texture(i, list, missed) {
+                        return None;
+                    }
+                    let deferred = list.deferred();
+                    deferred
+                        .texture_backs
+                        .first()
+                        .map(|back| (i, back.prepare_land()))
+                })
+        } else {
+            None
+        };
+        let (back, withheld, mut computed) = relay.finish();
+        let mut first_texture = first_texture;
         crate::land::during(landing, || {
-            for (i, (list, &missed)) in runs.iter().zip(&missed).enumerate() {
+            for (i, (&list, &missed)) in runs.iter().zip(&missed).enumerate() {
+                let can_land = can_land_texture(i, list, missed);
                 let deferred = list.deferred();
-                if ran(i)
-                    && !unconfirmed_lists.contains(&std::ptr::from_ref(*list))
-                    && !(missed || withholding && !deferred.missed.is_empty())
-                {
-                    for back in &deferred.texture_backs {
-                        back.land();
+                if can_land {
+                    for (j, back) in deferred.texture_backs.iter().enumerate() {
+                        if j == 0 && first_texture.as_ref().is_some_and(|(index, _)| *index == i) {
+                            if let Some((_, Some(prepared))) = first_texture.take() {
+                                back.finish_land(prepared);
+                            }
+                        } else {
+                            back.land();
+                        }
                     }
                 }
                 for work in &deferred.after {

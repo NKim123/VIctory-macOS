@@ -610,33 +610,47 @@ impl WrittenTexels {
     }
 }
 
+/// CPU-only preparation of already completed readback bytes. Publication
+/// must still run in order with the buffer merges and computed writes.
+pub(crate) struct PreparedBack {
+    tiled: Vec<u8>,
+    texels: WrittenTexels,
+}
+
 impl Back {
     pub(crate) fn land(&self) {
+        if let Some(prepared) = self.prepare_land() {
+            self.publish_land(prepared);
+        }
+    }
+
+    pub(crate) fn prepare_land(&self) -> Option<PreparedBack> {
         if !self.ticket.valid.load(Ordering::Relaxed)
             || self
                 .copies
                 .iter()
                 .all(|copy| !bindings_live(&copy.bindings))
         {
-            return;
+            return None;
         }
         let mut data = std::ptr::null_mut();
         // SAFETY: the host fence completed the copy, and the buffer is live.
         if unsafe { self.buffer.Map(0, None, Some(&mut data)) }.is_err() {
             tracing::warn!("texture write-back buffer could not be mapped");
-            return;
+            return None;
         }
-        if !data.is_null() {
-            self.land_mapped(data.cast());
-        }
+        let prepared = (!data.is_null())
+            .then(|| self.retile(data.cast()))
+            .flatten();
         // SAFETY: the map succeeded, and the CPU only read the buffer.
         unsafe {
             self.buffer
                 .Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }))
         };
+        prepared
     }
 
-    fn land_mapped(&self, data: *const u8) {
+    fn retile(&self, data: *const u8) -> Option<PreparedBack> {
         let mut tiled = vec![0; self.layout.size as usize];
         let mut texels = WrittenTexels::new(tiled.len(), self.layout.desc.element_bytes as usize);
         for copy in &self.copies {
@@ -668,9 +682,27 @@ impl Back {
                     slice = copy.slice,
                     "texture write-back could not be tiled"
                 );
-                return;
+                return None;
             }
         }
+        Some(PreparedBack { tiled, texels })
+    }
+
+    pub(crate) fn finish_land(&self, prepared: PreparedBack) {
+        if self
+            .copies
+            .iter()
+            .any(|copy| !bindings_live(&copy.bindings))
+        {
+            // A descriptor can be rebound while the relay runs. Retile
+            // again with the surviving copies before publishing any bytes.
+            self.land();
+        } else {
+            self.publish_land(prepared);
+        }
+    }
+
+    fn publish_land(&self, PreparedBack { tiled, texels }: PreparedBack) {
         // Allocation invalidation and landing share this lock. Release and unmap
         // invalidate before giving up the allocation.
         let _tickets = tickets();

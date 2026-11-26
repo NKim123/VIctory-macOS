@@ -4,7 +4,7 @@
 use std::cell::Cell;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
 /// The runtime holds its mapping lock for the duration of the callback.
 pub enum LandingPage {
@@ -86,12 +86,56 @@ pub(crate) fn echo() -> bool {
 
 type Job = Box<dyn FnOnce() + Send>;
 
-/// Land on a single worker after the GPU fence. A rendezvous keeps the
-/// queue empty and the submitting thread holds its lock until landing ends.
-pub(crate) fn relay<R: Send + 'static>(
+pub(crate) fn async_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_RELAY").is_none_or(|v| v != "0")
+            && (crate::switch::on("VICTORY_RELAY_ASYNC")
+                || std::env::var_os("VICTORY_RELAY").is_some_and(|v| v == "2"))
+    })
+}
+
+type ResultReceiver<R> = Receiver<std::thread::Result<R>>;
+
+pub(crate) struct Landing<R> {
+    ready: Option<R>,
+    result: Option<ResultReceiver<R>>,
+}
+
+impl<R> Landing<R> {
+    pub(crate) fn finish(mut self) -> R {
+        if let Some(value) = self.ready.take() {
+            return value;
+        }
+        match self
+            .result
+            .take()
+            .expect("pending landing")
+            .recv()
+            .expect("landing completed")
+        {
+            Ok(value) => value,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+}
+
+impl<R> Drop for Landing<R> {
+    fn drop(&mut self) {
+        // Even on unwind the submission cannot give up its lock while the
+        // worker can change the shared shadows or publish title bytes.
+        if let Some(result) = self.result.take() {
+            let _ = result.recv();
+        }
+    }
+}
+
+/// Start one post-fence merge. The ticket must be joined under the
+/// submission lock before any conflicting refresh or completion write.
+pub(crate) fn start<R: Send + 'static>(
     epoch: Option<u64>,
     work: impl FnOnce() -> R + Send + 'static,
-) -> R {
+) -> Landing<R> {
     static WORKER: OnceLock<Option<SyncSender<Job>>> = OnceLock::new();
     let worker = epoch.and_then(|_| {
         WORKER
@@ -99,7 +143,7 @@ pub(crate) fn relay<R: Send + 'static>(
                 if std::env::var_os("VICTORY_RELAY").is_some_and(|v| v == "0") {
                     return None;
                 }
-                let (send, recv) = sync_channel::<Job>(0);
+                let (send, recv) = sync_channel::<Job>(1);
                 std::thread::Builder::new()
                     .name("victory-land".into())
                     .spawn(move || {
@@ -113,7 +157,10 @@ pub(crate) fn relay<R: Send + 'static>(
             .as_ref()
     });
     let Some(worker) = worker else {
-        return during(epoch, work);
+        return Landing {
+            ready: Some(during(epoch, work)),
+            result: None,
+        };
     };
     let (done, result) = sync_channel(1);
     let job = Box::new(move || {
@@ -124,9 +171,9 @@ pub(crate) fn relay<R: Send + 'static>(
         // The worker is gone, so execute the work here.
         disconnected.0();
     }
-    match result.recv().expect("landing completed") {
-        Ok(value) => value,
-        Err(panic) => std::panic::resume_unwind(panic),
+    Landing {
+        ready: None,
+        result: Some(result),
     }
 }
 
@@ -141,6 +188,25 @@ mod tests {
         CreateFileMappingW, FILE_MAP_WRITE, MEMORY_BASIC_INFORMATION, MapViewOfFile, PAGE_READONLY,
         PAGE_READWRITE, UnmapViewOfFile, VirtualQuery,
     };
+
+    #[test]
+    fn landing_ticket_allows_work_before_join_and_preserves_epoch() {
+        if std::env::var_os("VICTORY_RELAY").is_some_and(|v| v == "0") {
+            return;
+        }
+        let (resume, blocked) = sync_channel(1);
+        let ticket = start(Some(37), move || {
+            assert_eq!(SUBMISSION.get(), Some(37));
+            matches!(
+                blocked.recv_timeout(std::time::Duration::from_secs(2)),
+                Ok(42)
+            )
+        });
+        // The worker cannot finish until after start returns.
+        resume.send(42).unwrap();
+        assert!(ticket.finish());
+        assert!(!active());
+    }
 
     static VIEWS: std::sync::Mutex<Option<[usize; 3]>> = std::sync::Mutex::new(None);
     static REPLACEMENT: std::sync::Mutex<Option<(usize, u64)>> = std::sync::Mutex::new(None);

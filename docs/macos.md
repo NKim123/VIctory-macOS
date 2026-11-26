@@ -306,6 +306,28 @@ The title's tile passes are indirect dispatches of one group per 8x4 tile of the
 
 The title has eight loops that write cache lines back with `clwb`, which faults under Rosetta and costs an exception each time (#135). Under Rosetta, the same check that decides fault tracking, `victory` turns the `clwb` of each loop into a NOP when it loads the image. It patches only when it finds exactly eight loops and logs the number it found otherwise. `VICTORY_NOP_CLWB=0` leaves the loops alone and `VICTORY_NOP_CLWB=1` patches them where Rosetta is not detected.
 
+## 64-bit image atomics
+
+`VICTORY_ATOMIC_UMAX=1` enables the per-wave reduction for unsigned
+64-bit image max with a discarded return value, when the emulated locks
+and rounds are active. Its representative lanes also check the high word
+before locking. A strictly larger unsigned high word makes a lower key
+redundant during monotonic max updates. Equal high words still use the
+locked comparison. Set `VICTORY_ATOMIC_EARLY_EXIT=0` to disable just the
+unlocked check for A/B testing. The reduction and the check are both
+included in the translation cache key.
+
+## GPU submission profiling
+
+`VICTORY_SUBMISSION_PROFILE=1` reports CPU wall time spent in
+`ExecuteCommandLists` and waiting for the fence in the five-second frame
+report. The five slowest submissions include native list count, recorded
+draw and dispatch calls, and the three busiest shader hash sets. Mesh
+dispatches count as draws and indirect calls count once each. The wait
+includes any GPU work still outstanding, so the report works when the
+adapter's D3D12 timestamps do not advance. Profiling uses the synchronous
+fence path for per-submission attribution.
+
 ## GPU write-back through physical sections
 
 `VICTORY_LAND=1` enables post-fence buffer write-back through xmem's writable section views. The title's read-only write monitors stay in place. Other copies of the same physical page are dirtied, and only GPU-changed bytes are stored, so unrelated CPU writes survive. While landing is enabled, DirectStorage section writes and GPU write-back wait for overlapping writes to finish. Each GPU submission checks that its physical destination still has the same mapping, including when fault tracking is disabled. Computed-address writes without fault tracking use a pre-submit snapshot of the GPU shadow to distinguish GPU changes from concurrent CPU writes. An overlapping declared range also gets a complete page snapshot when it fits. Before any post-fence merge, computed marks with a complete snapshot take ownership of the whole shadow page, including its declared GPU writes. These snapshots share a 64 MiB budget per submission. Snapshot copying can reach that budget even when the shaders leave no computed-write marks. The opt-in path accepts this preparation cost and may omit shader outputs when it cannot determine which bytes the GPU wrote. If an untracked or overlapping computed write lacks a complete snapshot, the computed write is withheld and the shadow refreshes from title memory again. View marks on a shadow that straddles tracked and untracked pages also need a complete baseline for each untracked page before they can land.
@@ -315,6 +337,15 @@ The title has eight loops that write cache lines back with `clwb`, which faults 
 With `VICTORY_LAND`, `VICTORY_TEXTURE_BACK` or `VICTORY_SHOW_AFTER` enabled, a submission that lacks completion evidence for any group withholds its shared shadow and computed results. Groups can write the same host copy, and their page marks do not identify which group wrote a byte. The runtime clears those marks, refreshes affected host copies from title memory on their next use, and still delivers title completion writes in order. Turning all three options off preserves the default buffer path.
 
 Declared and view-marked buffer merges can run on the relay. Computed-address merges run on the submitting thread and can use the writable section view. Texture retiling runs on the submitting thread through the normal watched title-memory writer. A closed list replay uses the same texture read-back buffer, so a missed mark for any group that names the list withholds its texture results.
+
+`VICTORY_RELAY_ASYNC=1` (also `VICTORY_RELAY=2`) lets the submitting
+thread retile one completed texture readback while the relay merges
+buffer writes. The submitting thread joins before publishing the
+texture, running computed-address merges, releasing retired resources,
+or delivering bottom-of-pipe writes. A later submission's refresh may
+consume the newly landed bytes, so the submission lock still covers the
+join. The relay keeps the physical mapping epoch checks on its worker.
+
 
 ## Experimental command recording and submission
 
@@ -348,8 +379,20 @@ those running on macOS under Wine.
   runs adjacent eligible submissions on the same queue under one hold
   of the host submission lock. Each keeps its own host submission and
   fence. Larger limits are clamped to four.
+- `VICTORY_GPU_PIPELINE=1` enables the submission worker with a default
+  join limit of two. An admitted batch can issue up to four adjacent
+  independent parts on one queue before waiting on the last fence. Parts
+  sharing a texture or reusing a command list take the serial path. Each
+  in-flight part has its own completion mark and fence value. The worker
+  retains every list and its allocators, state prelude and resources
+  through the final fence. It checks all marks before probing or replacing
+  the queue. Synchronous submissions and queue boundaries still drain the
+  worker. Split-prelude diagnostics and the wall-time profiler use serial
+  waits. Lists that refer to title memory, even through an alias, still
+  require the existing submission-time lifetime and visibility checks.
 
-The switches add no allocator, staging, or snapshot pools.
+
+Pipelining adds a bounded pool of completion marks. The switches reuse the existing command list, staging and snapshot allocations.
 
 ## Title buffers on D3DMetal's pages
 
