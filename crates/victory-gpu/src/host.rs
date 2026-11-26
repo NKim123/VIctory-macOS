@@ -183,6 +183,7 @@ impl Mark {
 
 #[cfg(test)]
 thread_local! {
+    static MISS_NEXT_QUEUE_PROBE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(crate) static OMIT_NEXT_SUBMISSION_MARK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(crate) static MISS_NEXT_SUBMISSION_MARK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(crate) static SUBMISSION_MARKS_BEFORE_MISS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -1976,7 +1977,10 @@ impl Host {
         *submitted += 1;
         mark.arm(*submitted);
         let queue = self.queue();
-        self.submit_and_wait(&queue, &[mark.list()], *submitted) && mark.saw(*submitted)
+        let ran = self.submit_and_wait(&queue, &[mark.list()], *submitted) && mark.saw(*submitted);
+        #[cfg(test)]
+        let ran = !MISS_NEXT_QUEUE_PROBE.replace(false) && ran;
+        ran
     }
 
     /// A signal must be queued before any submission resources can be
@@ -6662,19 +6666,32 @@ mod marks {
         assert_eq!(*submitted, first + 1);
         assert_eq!(super::tests::take_native_call_trace(), [(vec![2, 2], true)]);
 
-        let lost = LOST[0].load(Ordering::Relaxed);
-        super::MISS_NEXT_SUBMISSION_MARK.set(true);
-        let first = *submitted + 1;
-        assert!(host.execute_host_pipeline(&[&a, &b], &mut submitted));
-        assert_eq!(*submitted, first + 2, "recover after both parts' fences");
-        assert_eq!(LOST[0].load(Ordering::Relaxed), lost + 1);
-        let pool = host
-            .pipeline_marks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let marks = pool.as_ref().unwrap();
-        assert!(marks[0].saw(*submitted), "recovery mark");
-        assert!(marks[1].saw(first + 1), "second part retained its own mark");
+        for replace in [false, true] {
+            let old_queue = host.queue();
+            let [lost, replaced] = LOST.each_ref().map(|n| n.load(Ordering::Relaxed));
+            super::MISS_NEXT_SUBMISSION_MARK.set(true);
+            super::MISS_NEXT_QUEUE_PROBE.set(replace);
+            let first = *submitted + 1;
+            assert!(host.execute_host_pipeline(&[&a, &b], &mut submitted));
+            assert_eq!(
+                *submitted,
+                first + 2 + u64::from(replace),
+                "recover after both parts' fences"
+            );
+            assert_eq!(LOST[0].load(Ordering::Relaxed), lost + 1);
+            assert_eq!(
+                LOST[1].load(Ordering::Relaxed),
+                replaced + u64::from(replace)
+            );
+            assert_eq!(host.queue() != old_queue, replace);
+            let pool = host
+                .pipeline_marks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let marks = pool.as_ref().unwrap();
+            assert!(marks[0].saw(*submitted), "recovery mark");
+            assert!(marks[1].saw(first + 1), "second part retained its own mark");
+        }
     }
 
     #[test]
