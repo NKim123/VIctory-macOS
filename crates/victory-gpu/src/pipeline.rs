@@ -232,14 +232,12 @@ impl Shader {
                     let done = translate(&container);
                     // After the translation, not before: if it panics, the
                     // bytes are still there for the next try.
-                    let keep = link_mesh_outputs() && done.0.as_ref().is_ok_and(|t| {
-                        self.stage == "pixel"
-                            || (self.stage == "mesh"
-                                && victory_shader::emit::mesh_outputs(&t.host.dxil)
-                                    .is_some_and(|o| {
-                                        o.bytes() > victory_shader::emit::METAL_MESH_OUTPUT_BYTES
-                                    }))
-                    });
+                    let link = link_mesh_outputs();
+                    let keep = self.spilled.get().is_none()
+                        && done.0.as_ref().is_ok_and(|t| {
+                            (self.stage == "pixel" && link != MeshLink::Off)
+                                || (self.stage == "mesh" && link.applies_to(&t.host.dxil))
+                        });
                     if !keep {
                         *container = Vec::new();
                     }
@@ -350,13 +348,35 @@ fn with_resources(
 }
 
 #[cfg(windows)]
-fn link_mesh_outputs() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MeshLink {
+    Off,
+    OverLimit,
+    All,
+}
+
+#[cfg(windows)]
+impl MeshLink {
+    fn applies_to(self, dxil: &[u8]) -> bool {
+        match self {
+            Self::Off => false,
+            Self::All => true,
+            Self::OverLimit => victory_shader::emit::mesh_outputs(dxil)
+                .is_some_and(|o| o.bytes() > victory_shader::emit::METAL_MESH_OUTPUT_BYTES),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn link_mesh_outputs() -> MeshLink {
+    static MODE: OnceLock<MeshLink> = OnceLock::new();
     // On by default under Wine (D3DMetal): an over-limit mesh pipeline there
     // is made, draws nothing and its submission never completes (#172).
-    *ON.get_or_init(|| match std::env::var_os("VICTORY_LINK_MESH_OUTPUTS") {
-        Some(v) => crate::switch::value_is_on(Some(&v)),
-        None => crate::shader_cache::under_wine(),
+    *MODE.get_or_init(|| match std::env::var_os("VICTORY_LINK_MESH_OUTPUTS") {
+        Some(v) if v == "all" => MeshLink::All,
+        Some(v) if crate::switch::value_is_on(Some(&v)) => MeshLink::OverLimit,
+        None if crate::shader_cache::under_wine() => MeshLink::OverLimit,
+        _ => MeshLink::Off,
     })
 }
 
@@ -385,6 +405,16 @@ type LinkedKey = ([u8; 32], Option<[u8; 32]>);
 
 #[cfg(windows)]
 impl Shader {
+    fn container_for_link(&self) -> Vec<u8> {
+        let container = self.container.lock().unwrap_or_else(|e| e.into_inner());
+        if container.is_empty()
+            && let (Some(full), Some(dir)) = (self.spilled.get(), SPILL_DIR.get())
+        {
+            return crate::read_file(&spill_path(dir, full)).unwrap_or_default();
+        }
+        container.clone()
+    }
+
     fn with_translation(&self, translated: Translated) -> Arc<Shader> {
         let cell = OnceLock::new();
         let _ = cell.set(Some(translated));
@@ -422,17 +452,8 @@ pub(crate) fn translate_linked(
             .as_ref()
             .map(|pair| (pair.mesh.clone(), pair.pixel.clone()));
     }
-    let mesh_bytes = ms
-        .container
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    let pixel_bytes = ps.map(|p| {
-        p.container
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-    });
+    let mesh_bytes = ms.container_for_link();
+    let pixel_bytes = ps.map(Shader::container_for_link);
     let options = crate::shader_cache::runtime_options();
     let result = match victory_shader::emit::translate_linked(
         &mesh_bytes,

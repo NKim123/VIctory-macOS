@@ -162,7 +162,7 @@ fn options_for(wine: bool, wave32: bool) -> Options {
     let atomic_lock_rounds = rounds_on(atomic_locks, rounds.as_deref());
     let atomic_umax = atomic_lock_rounds && flag("VICTORY_ATOMIC_UMAX", false);
     Options {
-        view_marks: true,
+        view_marks: flag("VICTORY_VIEW_MARKS", true),
         atomic_locks,
         atomic_lock_rounds,
         atomic_umax,
@@ -199,26 +199,29 @@ pub(crate) fn under_wine() -> bool {
 }
 
 /// [`build`] for translations with host workarounds (atomic locks, their
-/// rounds and umax reduction, bias as gradients, narrow waves): their own
+/// rounds and umax reduction, bias as gradients, narrow waves, and view
+/// instrumentation): their own
 /// cache entries, one per combination.
 pub(crate) fn translation_build(options: Options) -> &'static [u8; 32] {
     let locks = options.atomic_locks;
     let bias = options.bias_as_gradients;
     let narrow = options.narrow_waves;
+    let no_marks = !options.view_marks;
     let rounds = locks && options.atomic_lock_rounds;
     let umax = rounds && options.atomic_umax;
     let early_exit = umax && options.atomic_early_exit;
-    if !locks && !bias && !narrow {
+    if !locks && !bias && !narrow && !no_marks {
         return build(options.host_wave32);
     }
-    static BUILDS: [OnceLock<[u8; 32]>; 128] = [const { OnceLock::new() }; 128];
+    static BUILDS: [OnceLock<[u8; 32]>; 256] = [const { OnceLock::new() }; 256];
     let n = usize::from(locks)
         | usize::from(bias) << 1
         | usize::from(narrow) << 2
         | usize::from(rounds) << 3
         | usize::from(umax) << 4
         | usize::from(early_exit) << 5
-        | usize::from(options.host_wave32) << 6;
+        | usize::from(options.host_wave32) << 6
+        | usize::from(no_marks) << 7;
     BUILDS[n].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build(options.host_wave32));
@@ -239,6 +242,9 @@ pub(crate) fn translation_build(options: Options) -> &'static [u8; 32] {
         }
         if narrow {
             h.update(b"narrow waves");
+        }
+        if no_marks {
+            h.update(b"no view marks");
         }
         *h.finalize().as_bytes()
     })
@@ -704,6 +710,20 @@ mod tests {
                 .unwrap()
                 .contains("fn encode(translation: &Result<HostShader, String>)")
         );
+    }
+
+    #[test]
+    fn view_marks_have_separate_translation_keys() {
+        for wine in [false, true] {
+            let options = options_for(wine, wine);
+            let key = |view_marks| {
+                translation_build(Options {
+                    view_marks,
+                    ..options
+                })
+            };
+            assert_ne!(key(true), key(false));
+        }
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
