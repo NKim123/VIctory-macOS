@@ -2245,7 +2245,7 @@ fn prepare_readable(
                 crate::texture::alias_copy(list, a, *resource as This);
             }
             if let Some(copy) = crate::resource::host_copy(*resource as This)
-                && crate::texture::title_written(&copy.texture)
+                && copy.title_written()
                 && !(live_upload && crate::texture::eligible_for_gating(*resource as This, &copy))
             {
                 crate::texture::upload(list, *resource as This, &copy.texture);
@@ -2442,7 +2442,7 @@ void main() {
     fn marked_writes_build() -> bool {
         match crate::compute::pipeline(MARKED_WRITE_SOURCE, s!("root"), 0, MARKED_WRITES) {
             Ok(_) => true,
-            Err(e) if crate::shader_cache::under_wine() => {
+            Err(e) if crate::under_wine() => {
                 eprintln!("skipped: Wine's HLSL compiler cannot build the marked write shader ({e})");
                 false
             }
@@ -2978,7 +2978,7 @@ uint ps() : SV_Target { return 1; }
     /// format-correct w through the host descriptor.
     #[test]
     fn three_channel_typed_srvs_reach_shaders_with_their_own_stride() {
-        if !crate::shader_cache::under_wine() {
+        if !crate::under_wine() {
             return;
         }
         let Some(host) = crate::host::host() else { return };
@@ -3375,7 +3375,7 @@ void main(uint3 id : SV_DispatchThreadID) {{
     /// submission when the title issues a buffer barrier between them.
     #[test]
     fn a_widened_srv_sees_an_earlier_uav_write_in_the_same_submission() {
-        if !crate::shader_cache::under_wine() {
+        if !crate::under_wine() {
             return;
         }
         let Some(host) = crate::host::host() else { return };
@@ -3512,7 +3512,7 @@ void main() { dst.Store4(0, asuint(src[1])); }
     /// after that barrier must see the heap's then-current UAV range.
     #[test]
     fn a_late_widened_view_follows_a_bindless_write() {
-        if !crate::shader_cache::under_wine() {
+        if !crate::under_wine() {
             return;
         }
         let Some(host) = crate::host::host() else { return };
@@ -3606,7 +3606,7 @@ void main() { dst.Store4(0, asuint(src[1])); }
     /// widened SRV after a barrier just like table UAVs do.
     #[test]
     fn a_root_uav_write_reaches_a_widened_srv_in_the_same_submission() {
-        if !crate::shader_cache::under_wine() {
+        if !crate::under_wine() {
             return;
         }
         let Some(host) = crate::host::host() else { return };

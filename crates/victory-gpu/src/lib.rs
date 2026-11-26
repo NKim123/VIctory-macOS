@@ -113,6 +113,16 @@ pub use watch::{
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub use watch::{observe_write_sites, write_site_guards};
 
+/// [`shader_cache::under_wine`], asked once: it looks `wine_get_version` up
+/// in ntdll, which takes Wine's loader lock, and draws ask it per descriptor,
+/// barrier and heap write. Not in `shader_cache`, whose bytes key the
+/// translation caches.
+#[cfg(windows)]
+pub(crate) fn under_wine() -> bool {
+    static WINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WINE.get_or_init(shader_cache::under_wine)
+}
+
 /// A whole file, read without asking for its size or other metadata.
 /// `std::fs::read` and `read_to_end` call `File::metadata()`, which Wine
 /// answers with `NtQueryVolumeInformationFile`: an ioctl to its mount
