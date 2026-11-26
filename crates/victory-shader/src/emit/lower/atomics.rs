@@ -26,6 +26,7 @@ impl<'a> Lower<'a> {
         value: V,
         compare: Option<V>,
         not_rep: V,
+        early_exit: bool,
     ) -> (V, V) {
         let i32t = self.s.t.i32;
         let i64t = self.s.m.int(64);
@@ -71,22 +72,23 @@ impl<'a> Lower<'a> {
             2
         };
         let fence = k(self, fence_mode);
-        // Under the lock, in block `b`: fence, read, write, fence, free (only
-        // if `won`: past the bounded spin a lane goes on without it). The
-        // old value's low and high dwords.
-        let step = |l: &mut Self, b: usize, won: V| -> (V, V) {
-            l.s.op(b, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
+        let load = |l: &mut Self, b| {
             let mut args = vec![h, iu];
             args.extend(cs);
             args.extend([iu, iu, iu]);
-            let r = l.s.op(
+            l.s.op(
                 b,
                 "textureLoad.i32",
                 Attr::ReadOnly,
                 l.s.t.res_ret_i32,
                 66,
                 &args,
-            );
+            )
+        };
+        // Return the old words and the block that releases the lock.
+        let step = |l: &mut Self, b: usize, won: V| -> (V, V, usize) {
+            l.s.op(b, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
+            let r = load(l, b);
             let lo = l.s.m.extract(b, r, 0);
             let hi = l.s.m.extract(b, r, 1);
             let l64 = l.s.m.cast(b, Cast::ZExt, lo, i64t);
@@ -114,15 +116,28 @@ impl<'a> Lower<'a> {
                     m.select(b, same, value, old)
                 }
             };
-            let nlo = l.s.m.cast(b, Cast::Trunc, new, i32t);
-            let nhi = l.s.m.bin(b, Bin::LShr, new, k32);
-            let nhi = l.s.m.cast(b, Cast::Trunc, nhi, i32t);
+            let (store, release) = if op == "swap" {
+                (b, b)
+            } else {
+                let changed = l.s.m.cmp(b, pred::NE, new, old);
+                let store = l.s.m.new_block();
+                let release = l.s.m.new_block();
+                l.s.m.terminate(b, Term::CondBr(changed, store, release));
+                (store, release)
+            };
+            let nlo = l.s.m.cast(store, Cast::Trunc, new, i32t);
+            let nhi = l.s.m.bin(store, Bin::LShr, new, k32);
+            let nhi = l.s.m.cast(store, Cast::Trunc, nhi, i32t);
             let mut args = vec![h];
             args.extend(cs);
             // DXIL stores all four channels; an R32G32 view keeps two.
             args.extend([nlo, nhi, nlo, nhi, l.s.m.i8(0xF)]);
-            l.s.op(b, "textureStore.i32", Attr::NoUnwind, void, 67, &args);
-            l.s.op(b, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
+            l.s.op(store, "textureStore.i32", Attr::NoUnwind, void, 67, &args);
+            l.s.op(store, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
+            if store != release {
+                l.s.m.terminate(store, Term::Br(release));
+            }
+            let b = release;
             // One add either way: a lane that took the lock frees it (it
             // holds 1, so all ones brings it to 0), and a lane that gave up
             // counts itself at `ATOMIC_LOCKS_GAVE_UP_AT` instead.
@@ -132,7 +147,7 @@ impl<'a> Lower<'a> {
             let all = l.s.m.i32(u32::MAX);
             let by = l.s.m.select(b, won, all, one);
             l.atomic_bin_op(b, &[locks, add, at, iu, iu, by]);
-            (lo, hi)
+            (lo, hi, release)
         };
 
         // Rounds ([`Parts::atomic_lock_rounds`]), before the turns: in each
@@ -163,7 +178,24 @@ impl<'a> Lower<'a> {
                 *b = self.s.m.new_block();
             }
             let [head, attempt, held, latch, done] = blocks;
-            self.s.m.terminate(c, Term::Br(head));
+            let entry = if early_exit {
+                let probe = self.s.m.new_block();
+                self.s.m.terminate(c, Term::CondBr(start, done, probe));
+                let r = load(self, probe);
+                let cur_hi = self.s.m.extract(probe, r, 1);
+                let shift = self.s.m.int_const(i64t, 32);
+                let new_hi = self.s.m.bin(probe, Bin::LShr, value, shift);
+                let new_hi = self.s.m.cast(probe, Cast::Trunc, new_hi, i32t);
+                // A stale high word can only be smaller during monotonic
+                // max updates. Equal high words need the locked low word
+                // comparison, since the two channels can be read torn.
+                let beats = self.s.m.cmp(probe, pred::IUGT, cur_hi, new_hi);
+                self.s.m.terminate(probe, Term::CondBr(beats, done, head));
+                probe
+            } else {
+                self.s.m.terminate(c, Term::Br(head));
+                c
+            };
             let round = self.s.m.phi(head, i32t);
             let was = self.s.m.phi(head, i1);
             let plo = self.s.m.phi(head, i32t);
@@ -180,29 +212,43 @@ impl<'a> Lower<'a> {
             );
             let won = self.s.m.cmp(attempt, pred::EQ, got, zero);
             self.s.m.terminate(attempt, Term::CondBr(won, held, latch));
-            let (lo, hi) = step(self, held, won);
-            self.s.m.terminate(held, Term::Br(latch));
+            let (lo, hi, release) = step(self, held, won);
+            self.s.m.terminate(release, Term::Br(latch));
             let is = self.s.m.phi(latch, i1);
             self.s
                 .m
-                .set_phi(is, vec![(yes, held), (was, head), (was, attempt)]);
+                .set_phi(is, vec![(yes, release), (was, head), (was, attempt)]);
             let olo = self.s.m.phi(latch, i32t);
             self.s
                 .m
-                .set_phi(olo, vec![(lo, held), (plo, head), (plo, attempt)]);
+                .set_phi(olo, vec![(lo, release), (plo, head), (plo, attempt)]);
             let ohi = self.s.m.phi(latch, i32t);
             self.s
                 .m
-                .set_phi(ohi, vec![(hi, held), (phi_, head), (phi_, attempt)]);
+                .set_phi(ohi, vec![(hi, release), (phi_, head), (phi_, attempt)]);
             let next = self.s.m.bin(latch, Bin::Add, round, one);
             let rounds = k(self, crate::emit::ATOMIC_LOCK_ROUNDS);
             let more = self.s.m.cmp(latch, pred::IULT, next, rounds);
-            self.s.m.set_phi(round, vec![(zero, c), (next, latch)]);
-            self.s.m.set_phi(was, vec![(start, c), (is, latch)]);
-            self.s.m.set_phi(plo, vec![(iu, c), (olo, latch)]);
-            self.s.m.set_phi(phi_, vec![(iu, c), (ohi, latch)]);
+            self.s.m.set_phi(round, vec![(zero, entry), (next, latch)]);
+            let initial = if early_exit {
+                self.s.m.bool(false)
+            } else {
+                start
+            };
+            self.s.m.set_phi(was, vec![(initial, entry), (is, latch)]);
+            self.s.m.set_phi(plo, vec![(iu, entry), (olo, latch)]);
+            self.s.m.set_phi(phi_, vec![(iu, entry), (ohi, latch)]);
             self.s.m.terminate(latch, Term::CondBr(more, head, done));
-            (done, Some((is, yes)), olo, ohi)
+            if early_exit {
+                // The caller discards old values in this form.
+                let finished = self.s.m.phi(done, i1);
+                self.s
+                    .m
+                    .set_phi(finished, vec![(is, latch), (yes, c), (yes, entry)]);
+                (done, Some((finished, yes)), iu, iu)
+            } else {
+                (done, Some((is, yes)), olo, ohi)
+            }
         } else {
             (c, None, iu, iu)
         };
@@ -251,14 +297,14 @@ impl<'a> Lower<'a> {
         self.s.m.terminate(spin, Term::CondBr(leave, held, spin));
 
         // Held: fence, read, write, fence, free.
-        let (lo, hi) = step(self, held, won);
-        self.s.m.terminate(held, Term::Br(latch));
+        let (lo, hi, release) = step(self, held, won);
+        self.s.m.terminate(release, Term::Br(latch));
 
         // Latch: the next lane.
         let olo = self.s.m.phi(latch, i32t);
-        self.s.m.set_phi(olo, vec![(lo, held), (plo, head)]);
+        self.s.m.set_phi(olo, vec![(lo, release), (plo, head)]);
         let ohi = self.s.m.phi(latch, i32t);
-        self.s.m.set_phi(ohi, vec![(hi, held), (phi_, head)]);
+        self.s.m.set_phi(ohi, vec![(hi, release), (phi_, head)]);
         let next = self.s.m.bin(latch, Bin::Add, i, one);
         let more = self.s.m.cmp(latch, pred::IULT, next, lanes);
         self.s.m.set_phi(i, vec![(zero, c), (next, latch)]);

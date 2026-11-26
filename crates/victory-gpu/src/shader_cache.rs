@@ -137,6 +137,12 @@ fn atomic_umax() -> bool {
     })
 }
 
+/// A/B override for the unlocked high-word check on reduced umax.
+fn atomic_early_exit() -> bool {
+    static EARLY: OnceLock<bool> = OnceLock::new();
+    *EARLY.get_or_init(|| std::env::var_os("VICTORY_ATOMIC_EARLY_EXIT").is_none_or(|v| v != "0"))
+}
+
 /// The rounds, given whether the locks are on and
 /// `VICTORY_ATOMIC_LOCK_ROUNDS`: on with the locks unless it is `0`.
 fn rounds_on(locks: bool, var: Option<&str>) -> bool {
@@ -195,15 +201,17 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
     let narrow = options.narrow_waves;
     let rounds = locks && options.atomic_lock_rounds;
     let umax = rounds && options.atomic_umax;
+    let early_exit = umax && options.atomic_early_exit;
     if !locks && !bias && !narrow {
         return build();
     }
-    static BUILDS: [OnceLock<[u8; 32]>; 32] = [const { OnceLock::new() }; 32];
+    static BUILDS: [OnceLock<[u8; 32]>; 64] = [const { OnceLock::new() }; 64];
     let n = usize::from(locks)
         | usize::from(bias) << 1
         | usize::from(narrow) << 2
         | usize::from(rounds) << 3
-        | usize::from(umax) << 4;
+        | usize::from(umax) << 4
+        | usize::from(early_exit) << 5;
     BUILDS[n].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build());
@@ -215,6 +223,9 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         }
         if umax {
             h.update(b"atomic umax");
+        }
+        if early_exit {
+            h.update(b"atomic early exit");
         }
         if bias {
             h.update(b"bias as gradients");
@@ -237,6 +248,7 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         atomic_locks: atomic_locks(),
         atomic_lock_rounds: atomic_lock_rounds(),
         atomic_umax: atomic_umax(),
+        atomic_early_exit: atomic_umax() && atomic_early_exit(),
         bias_as_gradients: bias_as_gradients(),
         host_wave32: host_wave32(),
         narrow_waves: narrow_waves(),
