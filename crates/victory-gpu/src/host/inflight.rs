@@ -30,6 +30,7 @@ fn parse_limit(value: &str) -> usize {
 #[derive(Default)]
 pub(super) struct Submission {
     pub(super) value: u64,
+    pub(super) completion_us: u64,
     flights: VecDeque<InFlight>,
     marks: Vec<Vec<Mark>>,
     feedback: Vec<MarkFeedback>,
@@ -52,10 +53,41 @@ pub(super) struct InFlight {
     _pins: Vec<crate::descriptor::ViewPin>,
     _retired: Vec<crate::descriptor::host::Held>,
     computed: Option<crate::memory::ComputedBaselines>,
+    ordered: Option<OrderedCompletion>,
     bytes: u64,
-    writes: Vec<BottomWrite>,
+    writes: Vec<(BottomWrite, bool)>,
     shared_writes: bool,
     signals: Vec<TitleSignal>,
+}
+
+/// Work that can outlive ExecuteCommandLists but must land before the
+/// next submission reuses its mapped shadows, marks or shared views.
+#[derive(Default)]
+pub(super) struct OrderedCompletion {
+    pub(super) landing: Option<u64>,
+    pub(super) show_after: bool,
+    pub(super) title_memory: bool,
+    pub(super) descriptors: bool,
+    pub(super) computed: bool,
+    pub(super) marked: bool,
+    pub(super) shadow: bool,
+}
+
+impl OrderedCompletion {
+    pub(super) fn reason(&self) -> Option<Boundary> {
+        self.reasons().next()
+    }
+
+    fn reasons(&self) -> impl Iterator<Item = Boundary> {
+        [
+            (self.descriptors, Boundary::Descriptors),
+            (self.computed, Boundary::ComputedBack),
+            (self.marked, Boundary::MarkedBack),
+            (self.shadow, Boundary::ShadowBack),
+        ]
+        .into_iter()
+        .filter_map(|(needed, why)| needed.then_some(why))
+    }
 }
 
 /// A slot's readback of the page bits. Read marks and atomic lock words stay
@@ -149,11 +181,11 @@ impl BottomWrite {
             && start < self.address.saturating_add(self.bytes)
     }
 
-    fn may_alias(&self) -> bool {
+    fn directly_mapped(&self) -> bool {
         crate::shadow::has_aliased_overlap(
             self.address as u64,
             self.address.saturating_add(self.bytes) as u64,
-        ) || crate::watch::aliased(self.address, self.bytes)
+        )
     }
 }
 
@@ -178,6 +210,8 @@ pub(super) enum Boundary {
     MarkedBack,
     ShadowBack,
     BottomOfPipe,
+    NativeBottomOfPipe,
+    BottomOfPipeRead,
     CpuAccess,
     Descriptors,
     Quiet,
@@ -195,6 +229,8 @@ static OVERLAPPED: AtomicU64 = AtomicU64::new(0);
 static QUEUED_OVERLAPPED: AtomicU64 = AtomicU64::new(0);
 static FALLBACKS: [AtomicU64; Boundary::Fence as usize + 1] =
     [const { AtomicU64::new(0) }; Boundary::Fence as usize + 1];
+static ORDERED: [AtomicU64; Boundary::Fence as usize + 1] =
+    [const { AtomicU64::new(0) }; Boundary::Fence as usize + 1];
 static DRAINS: [AtomicU64; Boundary::Fence as usize + 1] =
     [const { AtomicU64::new(0) }; Boundary::Fence as usize + 1];
 
@@ -204,6 +240,7 @@ pub(super) fn log(frames: f64) {
     }
     let count = |why: Boundary| DRAINS[why as usize].swap(0, Ordering::Relaxed);
     let sync = |why: Boundary| FALLBACKS[why as usize].swap(0, Ordering::Relaxed);
+    let ordered = |why: Boundary| ORDERED[why as usize].swap(0, Ordering::Relaxed);
     let back = [
         Boundary::TextureBack,
         Boundary::ComputedBack,
@@ -212,10 +249,17 @@ pub(super) fn log(frames: f64) {
     ];
     let [texture_back, computed_back, marked_back, shadow_back] = back.map(sync);
     let (mark_copies, mark_widened) = crate::shadow::mark_landing_owners();
+    let bottom_cpu = count(Boundary::BottomOfPipe);
+    let bottom_native = count(Boundary::NativeBottomOfPipe);
+    let bottom_read = count(Boundary::BottomOfPipeRead);
     tracing::info!(
         frames,
         queued = QUEUED.swap(0, Ordering::Relaxed),
         queued_computed = QUEUED_COMPUTED.swap(0, Ordering::Relaxed),
+        queued_ordered_computed = ordered(Boundary::ComputedBack),
+        queued_ordered_marked = ordered(Boundary::MarkedBack),
+        queued_ordered_shadow = ordered(Boundary::ShadowBack),
+        queued_ordered_descriptors = ordered(Boundary::Descriptors),
         overlapped = OVERLAPPED.swap(0, Ordering::Relaxed),
         queued_overlapped = QUEUED_OVERLAPPED.swap(0, Ordering::Relaxed),
         synchronous_copy_back = texture_back + computed_back + marked_back + shadow_back,
@@ -234,7 +278,10 @@ pub(super) fn log(frames: f64) {
         capacity = count(Boundary::Capacity),
         reused_list = count(Boundary::ReusedList),
         copy_back = back.into_iter().map(count).sum::<u64>(),
-        bottom_of_pipe = count(Boundary::BottomOfPipe),
+        bottom_of_pipe = bottom_cpu + bottom_native + bottom_read,
+        bottom_cpu,
+        bottom_native,
+        bottom_read,
         diagnostics = count(Boundary::Diagnostics),
         cpu_access = count(Boundary::CpuAccess),
         descriptors = count(Boundary::Descriptors),
@@ -290,20 +337,39 @@ impl Host {
         }
     }
 
+    pub(super) fn wait_ordered_completion(
+        &self,
+        s: &mut Submission,
+        touches: impl FnOnce(&OrderedCompletion) -> bool,
+    ) {
+        // An ordered completion is always the youngest flight. Ordinary
+        // flights before it have isolated feedback or no CPU write-back.
+        if let Some(flight) = s.flights.back()
+            && let Some(work) = &flight.ordered
+            && touches(work)
+        {
+            self.wait_inflight(
+                s,
+                flight.value,
+                work.reason().expect("ordered completion reason"),
+            );
+        }
+    }
+
     /// A CPU touch may need the old label value to have landed first.
     /// Unknown ranges include indirect reads such as computed addresses.
     pub(super) fn wait_bottom_writes(
         &self,
         s: &mut Submission,
+        why: Boundary,
         touches: impl Fn(&BottomWrite, bool) -> bool,
     ) -> bool {
-        if let Some(flight) = s
-            .flights
-            .iter()
-            .rev()
-            .find(|f| f.writes.iter().any(|write| touches(write, f.shared_writes)))
-        {
-            self.wait_inflight(s, flight.value, Boundary::BottomOfPipe);
+        if let Some(flight) = s.flights.iter().rev().find(|f| {
+            f.writes
+                .iter()
+                .any(|(write, may_alias)| touches(write, *may_alias))
+        }) {
+            self.wait_inflight(s, flight.value, why);
             return true;
         }
         false
@@ -315,7 +381,7 @@ impl Host {
     /// here would prevent synchronous callers from retiring the ring.
     pub(super) fn order_shared_bottom_writes(&self, s: &mut Submission) {
         if let Some(flight) = s.flights.iter().rev().find(|f| f.shared_writes) {
-            self.wait_inflight(s, flight.value, Boundary::BottomOfPipe);
+            self.wait_inflight(s, flight.value, Boundary::NativeBottomOfPipe);
         }
     }
 
@@ -327,7 +393,7 @@ impl Host {
         }
         let mut s = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let _holding = Holding::enter();
-        self.wait_bottom_writes(&mut s, |write, may_alias| {
+        self.wait_bottom_writes(&mut s, Boundary::BottomOfPipeRead, |write, may_alias| {
             may_alias || write.overlaps(address, bytes)
         });
     }
@@ -352,7 +418,9 @@ impl Host {
                 if !self.wait_for_submission(first.value) {
                     self.flight_device_removed(s);
                 }
-                SUBMISSION_US[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                let waited_us = started.elapsed().as_micros() as u64;
+                s.completion_us += waited_us;
+                SUBMISSION_US[1].fetch_add(waited_us, Ordering::Relaxed);
             }
             self.retire_inflight(s);
         }
@@ -386,7 +454,7 @@ impl Host {
         let mut recovery_mark = None;
         let mut completions = Vec::new();
         while s.flights.front().is_some_and(|f| f.value <= completed) {
-            let f = s.flights.pop_front().expect("completed flight");
+            let mut f = s.flights.pop_front().expect("completed flight");
             let mut feedback_ran = true;
             if let Some(feedback) = f.feedback {
                 feedback_ran = feedback.mark.saw(f.value);
@@ -408,8 +476,9 @@ impl Host {
                     if !self.wait_for_submission(last.value) {
                         self.flight_device_removed(s);
                     }
-                    SUBMISSION_US[1]
-                        .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    let waited_us = started.elapsed().as_micros() as u64;
+                    s.completion_us += waited_us;
+                    SUBMISSION_US[1].fetch_add(waited_us, Ordering::Relaxed);
                     completed = last.value;
                 }
                 recovery_mark = Some(f.marks);
@@ -423,6 +492,47 @@ impl Host {
                 crate::resource::life::note(0, crate::resource::life::RAN, f.value, 0);
             }
             drop(f.native_lists);
+            if let Some(work) = f.ordered {
+                assert!(
+                    !s.busy(),
+                    "a younger flight must wait for ordered completion"
+                );
+                let runs: Vec<_> = f
+                    .upload
+                    .iter()
+                    .map(|upload| &*upload.list)
+                    .chain(f.lists.iter().map(AsRef::as_ref))
+                    .collect();
+                s.completion_us += self.finish_title_submission(
+                    &runs,
+                    f.computed.take().expect("ordered baselines"),
+                    CompletionStatus {
+                        landing: work.landing,
+                        show_after: work.show_after,
+                        verified: true,
+                        incomplete: if ran { &[] } else { &[0] },
+                        individual: false,
+                    },
+                    &mut f._pins,
+                );
+            } else {
+                let missed = f.computed.as_ref().is_some_and(|baselines| {
+                    f.lists.iter().any(|list| list.deferred().missed(baselines))
+                });
+                crate::memory::note_submission(missed);
+                if let Some(mut baselines) = f.computed {
+                    for list in &f.lists {
+                        for work in &list.deferred().after {
+                            if let AfterWork::Computed(feedback) = work {
+                                feedback.finish(&mut baselines, ran, true);
+                            }
+                        }
+                    }
+                }
+                for list in &f.lists {
+                    list.notify_aliased_writes();
+                }
+            }
             if let Some(upload) = f.upload {
                 if !ran {
                     for staging in upload.sources {
@@ -431,21 +541,7 @@ impl Host {
                 }
                 s.recycle_upload(upload.list);
             }
-            let missed = f.computed.as_ref().is_some_and(|baselines| {
-                f.lists.iter().any(|list| list.deferred().missed(baselines))
-            });
-            crate::memory::note_submission(missed);
-            if let Some(mut baselines) = f.computed {
-                for list in &f.lists {
-                    for work in &list.deferred().after {
-                        if let AfterWork::Computed(feedback) = work {
-                            feedback.finish(&mut baselines, ran, true);
-                        }
-                    }
-                }
-            }
             for list in f.lists {
-                list.notify_aliased_writes();
                 crate::list::recycle(list);
             }
             // Last releases of title resources can acquire other runtime
@@ -476,7 +572,7 @@ impl Host {
         }
         let published = !completions.is_empty();
         for (writes, signals) in completions {
-            writes.into_iter().for_each(BottomWrite::publish);
+            writes.into_iter().for_each(|(write, _)| write.publish());
             signals.into_iter().for_each(TitleSignal::publish);
         }
         published
@@ -538,17 +634,34 @@ impl Host {
         bytes: u64,
         feedback: Option<MarkFeedback>,
         computed: Option<crate::memory::ComputedBaselines>,
+        ordered: Option<OrderedCompletion>,
         overlapped: bool,
     ) {
         let started = Instant::now();
-        if computed.is_some() {
+        if computed.is_some()
+            && lists
+                .iter()
+                .any(|list| list.deferred().has_computed_feedback())
+        {
             QUEUED_COMPUTED.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(work) = &ordered {
+            for why in work.reasons() {
+                ORDERED[why as usize].fetch_add(1, Ordering::Relaxed);
+            }
         }
         let mut writes = Vec::new();
         for list in lists {
-            writes.extend_from_slice(&list.deferred().writes);
+            writes.extend(
+                list.deferred()
+                    .writes
+                    .iter()
+                    .map(|&write| (write, crate::watch::aliased(write.address, write.bytes))),
+            );
         }
-        let shared_writes = writes.iter().any(BottomWrite::may_alias);
+        let shared_writes = writes
+            .iter()
+            .any(|(write, may_alias)| *may_alias || write.directly_mapped());
         s.value += 1;
         let value = s.value;
         let queue = self.queue();
@@ -608,6 +721,7 @@ impl Host {
             _pins: pins,
             _retired: take_retired(),
             computed,
+            ordered,
             bytes,
             writes,
             shared_writes,

@@ -127,6 +127,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     }
     #[cfg(windows)]
     if crate::host::host().is_some() {
+        let setup = CpuTimer::new(CpuPhase::QueueSetup);
         crate::descriptor::request_heap_records();
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
@@ -172,6 +173,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
                 .for_each(&mut push),
         }
         account().submissions += 1;
+        drop(setup);
         pump(&mut held, Why::Submission);
         return;
     }
@@ -319,6 +321,66 @@ fn synchronous_boundary() -> Option<std::sync::MutexGuard<'static, ()>> {
     let ordered = lane.order();
     lane.drain();
     Some(ordered)
+}
+
+/// Optional aggregate call durations for CPU work outside host submission.
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+pub(crate) enum CpuPhase {
+    State,
+    Barriers,
+    ListLifecycle,
+    QueueSetup,
+    PresentSetup,
+}
+
+#[cfg(windows)]
+static CPU_PHASE_NS: [AtomicU64; CpuPhase::PresentSetup as usize + 1] =
+    [const { AtomicU64::new(0) }; CpuPhase::PresentSetup as usize + 1];
+
+#[cfg(windows)]
+pub(crate) struct CpuTimer(Option<(CpuPhase, std::time::Instant)>);
+
+#[cfg(windows)]
+impl CpuTimer {
+    pub(crate) fn new(phase: CpuPhase) -> Self {
+        Self(cpu_phases_enabled().then(|| (phase, std::time::Instant::now())))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for CpuTimer {
+    fn drop(&mut self) {
+        if let Some((phase, start)) = self.0 {
+            CPU_PHASE_NS[phase as usize]
+                .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn cpu_phases_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_CPU_PHASES"))
+}
+
+#[cfg(windows)]
+pub(crate) fn log_cpu_phases(frames: f64) {
+    if !cpu_phases_enabled() {
+        return;
+    }
+    let ms = |phase: CpuPhase| {
+        CPU_PHASE_NS[phase as usize].swap(0, Ordering::Relaxed) as f64 / (1_000_000.0 * frames)
+    };
+    tracing::info!(
+        frames,
+        state_ms = ms(CpuPhase::State),
+        barriers_ms = ms(CpuPhase::Barriers),
+        lifecycle_ms = ms(CpuPhase::ListLifecycle),
+        queue_setup_ms = ms(CpuPhase::QueueSetup),
+        present_setup_ms = ms(CpuPhase::PresentSetup),
+        "title CPU calls per frame"
+    );
 }
 
 /// What queues did with held work since the last presented frame.
@@ -712,6 +774,8 @@ extern "system" fn present(
     {
         host.present_boundary();
     }
+    #[cfg(windows)]
+    let setup = CpuTimer::new(CpuPhase::PresentSetup);
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     #[cfg(windows)]
     account_frame(frame);
@@ -760,6 +824,8 @@ extern "system" fn present(
     let shown = shown_plane(&found);
     #[cfg(windows)]
     log_planes(frame, planes, &found, shown);
+    #[cfg(windows)]
+    drop(setup);
     #[cfg(windows)]
     if let Some(&resource) = found.get(shown).and_then(|p| p.first())
         && let Some(texture) = crate::resource::host_resource(resource)

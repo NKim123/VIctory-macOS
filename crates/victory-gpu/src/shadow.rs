@@ -1553,10 +1553,6 @@ pub(crate) fn mark_landing_owners() -> (usize, usize) {
     )
 }
 
-pub(crate) fn has_copy_back_marks() -> bool {
-    mark_landing_owners() != (0, 0)
-}
-
 static MARKS: Mutex<Marks> = Mutex::new(Marks {
     free: BTreeMap::new(),
     end: 0,

@@ -655,13 +655,22 @@ impl ComputedBaselines {
 /// bound: the heap's page table names every host copy there is, each
 /// brought up to date (`add` takes a copy's range, once per submission
 /// until a step writes title memory).
-pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
+pub(crate) fn prepare(
+    key: usize,
+    allow_rewrite: bool,
+    mut add: impl FnMut(&Arc<Shadow>, usize, usize),
+) -> bool {
+    let mut blocked = false;
     let layout = with_heap(key, |heap| {
         let mut shared = shared();
         let host = std::ptr::from_ref(heap) as usize;
         let (_, s) = shared.iter_mut().find(|(k, s)| *k == key && s.host == host)?;
         let now = crate::shadow::generation();
         if s.generation != now {
+            if !allow_rewrite {
+                blocked = true;
+                return None;
+            }
             s.rewrite(heap, now);
         }
         Some(s.layout.clone())
@@ -677,6 +686,7 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
             }
         }
     }
+    !blocked
 }
 
 /// Whether any marked page in `marks` fell outside a valid copy in `l`.
@@ -712,6 +722,14 @@ impl Feedback {
             .copies
             .iter()
             .all(|copy| copy.is_tiled() && copy.clean())
+    }
+
+    pub(crate) fn has_copies(&self, baselines: &ComputedBaselines) -> bool {
+        baselines
+            .layout(self.key)
+            .copies
+            .iter()
+            .any(|copy| !copy.is_aliased())
     }
 
     pub(crate) fn missed(&self, baselines: &ComputedBaselines) -> bool {
