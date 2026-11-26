@@ -76,15 +76,16 @@ struct Mirrored {
     keys: Vec<u64>,
     /// Unpublished texture SRVs, guarded by the same lock as the records.
     pending: BTreeMap<u32, PendingTexture>,
-    templates: OnceLock<Option<Templates>>,
+    templates: [OnceLock<Option<Templates>>; TEMPLATE_SHARDS],
     textures: OnceLock<Option<TextureTemplates>>,
 }
 
 impl Mirrored {
     fn null_template(&self) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
         self.templates
-            .get()
-            .and_then(Option::as_ref)
+            .iter()
+            .filter_map(OnceLock::get)
+            .find_map(Option::as_ref)
             .map(Templates::null)
             .or_else(|| self.textures.get()?.as_ref().map(TextureTemplates::null))
     }
@@ -115,7 +116,8 @@ enum Binding {
 }
 
 const PUBLISH_BATCH: usize = 256;
-const STAGING_WORKERS: usize = 4;
+const TEMPLATE_SHARDS: usize = 4;
+const STAGING_WORKERS: usize = TEMPLATE_SHARDS;
 const STAGING_SLOTS: usize = 2048;
 const MIN_STAGED_RECORDS: usize = 512;
 
@@ -215,6 +217,10 @@ fn is_widened(held: &Kept) -> bool {
     matches!(held, Some((_, Some(HeldSource::Widened(..)))))
 }
 
+fn template_shard(key: u64) -> usize {
+    ((key as u32) ^ ((key >> 32) as u32)) as usize % TEMPLATE_SHARDS
+}
+
 /// One process-wide set of scratch heaps, kept locked through publication
 /// so another heap sync cannot overwrite descriptors still being copied.
 type StagingWorkers = [Mutex<BufferStaging>; STAGING_WORKERS];
@@ -234,7 +240,7 @@ fn stage_buffers(workers: &StagingWorkers, records: &[ChangedRecord]) -> StagedB
     let mut jobs: [_; STAGING_WORKERS] = std::array::from_fn(|_| Vec::new());
     for record in records.iter().filter(|record| !record.clear) {
         let key = record_key(record.record);
-        let worker = (record.record[1] ^ record.record[2]) as usize % STAGING_WORKERS;
+        let worker = template_shard(key);
         let job = &mut jobs[worker];
         if job.len() < STAGING_SLOTS && seen.insert(key) {
             job.push(record.record);
@@ -792,7 +798,7 @@ impl HostHeap {
             made: Mutex::new(Mirrored {
                 keys: vec![0; count as usize],
                 pending: BTreeMap::new(),
-                templates: OnceLock::new(),
+                templates: std::array::from_fn(|_| OnceLock::new()),
                 textures: OnceLock::new(),
             }),
             staging_epoch: AtomicU64::new(0),
@@ -1826,7 +1832,6 @@ impl HostHeap {
             clear,
         } in records.iter().take(PUBLISH_BATCH)
         {
-            let buffer_templates = made.templates.get().and_then(Option::as_ref);
             let address = start + u64::from(index) * step;
             if made.keys[index as usize] != previous {
                 taken += 1;
@@ -1858,7 +1863,9 @@ impl HostHeap {
                 }
                 continue;
             }
-            let buffer = buffer_templates
+            let buffer = made.templates[self.template_shard(key)]
+                .get()
+                .and_then(Option::as_ref)
                 .and_then(|templates| templates.get(key, crate::shadow::lookup_epoch()));
             let texture = if buffer.is_none() {
                 made.textures
@@ -1976,6 +1983,10 @@ impl HostHeap {
             hit.binding,
             hit.held,
         ));
+    }
+
+    fn template_shard(&self, key: u64) -> usize {
+        if self.sampler { 0 } else { template_shard(key) }
     }
 
     fn begin_record(&self, made: &mut Mirrored, index: u32, key: u64, view: &View) {
@@ -2213,8 +2224,9 @@ impl HostHeap {
             } else {
                 let dst = self.cpu(index);
                 if cache && (backing.is_some() || self.sampler) {
-                    made.templates.get_or_init(|| Templates::new(self.sampler));
-                    if let Some(templates) = made.templates.get_mut().and_then(Option::as_mut) {
+                    let templates = &mut made.templates[self.template_shard(key)];
+                    templates.get_or_init(|| Templates::new(self.sampler));
+                    if let Some(templates) = templates.get_mut().and_then(Option::as_mut) {
                         templates.make(dst, key, epoch, &view, backing.as_ref())
                     } else {
                         make_marked_with_backing(&view, dst, backing.as_ref().map(|b| &b.0))
@@ -4889,7 +4901,11 @@ mod tests {
         assert!(Arc::ptr_eq(&heap.table_backing(1).unwrap(), &original));
         {
             let made = heap.made.lock().unwrap();
-            let template = made.templates.get().unwrap().as_ref().unwrap();
+            let template = made.templates[heap.template_shard(key)]
+                .get()
+                .unwrap()
+                .as_ref()
+                .unwrap();
             assert!(template.get(key, crate::shadow::lookup_epoch()).is_some());
         }
 
@@ -4900,7 +4916,11 @@ mod tests {
         assert!(!Arc::ptr_eq(&original, &replacement));
         {
             let made = heap.made.lock().unwrap();
-            let template = made.templates.get().unwrap().as_ref().unwrap();
+            let template = made.templates[heap.template_shard(key)]
+                .get()
+                .unwrap()
+                .as_ref()
+                .unwrap();
             assert!(template.get(key, crate::shadow::lookup_epoch()).is_none());
         }
         slots[2] = slots[0];
