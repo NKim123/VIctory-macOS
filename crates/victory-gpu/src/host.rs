@@ -1140,6 +1140,8 @@ enum Step {
     /// Brings the current buffer view of a table slot up to date: the title
     /// may have rewritten the slot since the draw was recorded.
     Slot(std::sync::Arc<crate::bindless::Viewed>, u32),
+    /// Upload demand for the SRV actually in a shared table slot at submit.
+    TextureSlot(std::sync::Arc<crate::bindless::Viewed>, u32),
     /// Work that may write title memory.
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
@@ -1178,6 +1180,7 @@ struct Deferred {
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
     /// Table slots asked for since the last title write (heap, index).
     slots: std::collections::HashSet<(usize, u32)>,
+    texture_slots: std::collections::HashSet<(usize, u32)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -1552,15 +1555,18 @@ impl Host {
             .collect();
         let show_after = crate::descriptor::host::show_after();
         if show_after {
-            let mut demand = std::collections::HashSet::new();
+            let mut demand = crate::descriptor::TableTextureSlots::new();
             for list in runs {
                 for step in &list.deferred().copies {
-                    if let Step::Slot(viewed, index) = step {
-                        demand.insert((std::sync::Arc::as_ptr(viewed) as usize, *index));
+                    if let Step::TextureSlot(viewed, index) = step {
+                        demand
+                            .entry(std::sync::Arc::as_ptr(viewed) as usize)
+                            .or_default()
+                            .insert(*index);
                     }
                 }
             }
-            crate::descriptor::service_pending(&demand, &mut pending_pins, Some(&mut textures));
+            crate::descriptor::service_pending(&demand, &heaps, &mut pending_pins, Some(&mut textures));
         }
         #[cfg(test)]
         if let Some(resource) = crate::descriptor::RELEASE_AFTER_PENDING_COLLECTION.replace(None) {
@@ -1840,7 +1846,7 @@ impl Host {
                     }
                 }
             }
-            crate::descriptor::service_pending(&Default::default(), &mut pending_pins, None);
+            crate::descriptor::service_pending(&Default::default(), &[], &mut pending_pins, None);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
@@ -2555,6 +2561,22 @@ impl HostList {
         }
     }
 
+    /// Unlike a list-owned view, a shared table may name a different
+    /// resource by submission time. Keep the slot, not its recorded SRV.
+    pub(crate) fn defer_texture_slot(
+        &self,
+        viewed: &std::sync::Arc<crate::bindless::Viewed>,
+        index: u32,
+    ) {
+        let mut deferred = self.deferred();
+        let key = (std::sync::Arc::as_ptr(viewed) as usize, index);
+        if deferred.texture_slots.insert(key) {
+            deferred
+                .copies
+                .push(Step::TextureSlot(viewed.clone(), index));
+        }
+    }
+
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run
     /// (`marked`: the pages they mark).
@@ -2788,7 +2810,7 @@ impl HostList {
                     Step::Copy(..) | Step::Fill(..) => C::StepCopyUs,
                     Step::Run(_) | Step::Host(_) => C::StepWorkUs,
                     Step::GpuWrite(..) => C::StepGpuWriteUs,
-                    Step::Texture(..) => C::StepTextureUs,
+                    Step::Texture(..) | Step::TextureSlot(..) => C::StepTextureUs,
                     Step::Heap(_) => C::StepHeapUs,
                     Step::Memory(_) => C::StepMemoryUs,
                 },
@@ -2848,7 +2870,7 @@ impl HostList {
                     continue;
                 }
                 // Brought up to date before the submission's lists were made.
-                Step::Texture(..) => continue,
+                Step::Texture(..) | Step::TextureSlot(..) => continue,
                 Step::Heap(viewed) => {
                     crate::bindless::refresh(viewed, |s, a, l| batch.add(s, a, l));
                     continue;

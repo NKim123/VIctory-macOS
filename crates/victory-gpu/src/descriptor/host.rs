@@ -1043,13 +1043,41 @@ impl HostHeap {
         &self,
         start: u64,
         step: u64,
-        demand: &std::collections::HashSet<(usize, u32)>,
+        tables: Option<&std::collections::BTreeSet<u32>>,
+        heap_read: bool,
         pins: &mut Vec<ViewPin>,
         mut upload: Option<&mut dyn FnMut(super::PendingUpload)>,
     ) {
+        // Normal descriptor writes and tracked raw writes have already
+        // mirrored this heap. A demanded slot can still be lazy (placed or
+        // evicted) or contain a newly copied record in untracked memory.
+        if upload.is_some()
+            && let Some(tables) = tables
+        {
+            for &index in tables.range(..self.count) {
+                let handle = start + u64::from(index) * step;
+                let mut bytes = [0; 12];
+                if !crate::host::read_into(handle as *const u8, &mut bytes) {
+                    continue;
+                }
+                let words: [[u8; 4]; 3] = bytes
+                    .as_chunks::<4>()
+                    .0
+                    .try_into()
+                    .expect("a title descriptor record has three words");
+                let record = words.map(u32::from_le_bytes);
+                if self.ready[index as usize].load(Ordering::Acquire) == record_key(record)
+                    && record[0] == VIEW_TAG
+                {
+                    continue;
+                }
+                if let Some(pin) = self.mirror(index, handle, true) {
+                    pins.push(pin);
+                }
+            }
+        }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let Mirrored { keys, pending } = &mut *made;
-        let viewed = Arc::as_ptr(&self.viewed) as usize;
         pending.retain(|&index, texture| {
             let Some(copy) = texture.copy.upgrade() else {
                 keys[index as usize] = 0;
@@ -1059,8 +1087,12 @@ impl HostHeap {
             };
             let handle = start + u64::from(index) * step;
             let ready = copy.initialized.load(Ordering::Acquire);
-            let demanded = texture.demanded || demand.contains(&(viewed, index));
-            if !ready && (!demanded || upload.is_none()) && !copy.evicted.load(Ordering::Acquire) {
+            let demanded = (heap_read && texture.demanded)
+                || tables.is_some_and(|slots| slots.contains(&index));
+            if !ready
+                && (!demanded || upload.is_none())
+                && !copy.evicted.load(Ordering::Acquire)
+            {
                 return true;
             }
             let Some(pin) = view_at(texture.record[1], texture.record[2]) else {
@@ -1079,22 +1111,8 @@ impl HostHeap {
                 assert!(crate::object::release_ref(texture.resource as crate::object::This) > 0);
             }
             let current = texture.current(&copy);
-            let bytes = copy.gated_upload_bytes();
             let same_record = super::with_current_record(handle, texture.record, || {
-                if !current {
-                    return;
-                }
-                if !ready {
-                    if texture.demanded
-                        && bytes.is_some_and(|bytes| bytes > super::PENDING_STAGING_BYTES)
-                    {
-                        // Tables request large textures through their upload step.
-                        // For heap reads, register ordinary upload demand without
-                        // publishing the descriptor.
-                        self.viewed
-                            .set(index, Some(&View::Shader(texture.resource, None)), true);
-                        copy.stamp();
-                    }
+                if !current || !ready {
                     return;
                 }
                 write_texture_srv(&copy, texture.desc.as_ref(), self.cpu(index));
@@ -1119,17 +1137,74 @@ impl HostHeap {
             }
             if !ready
                 && let Some(upload) = upload.as_mut()
-                && let Some(bytes) = bytes.filter(|&bytes| bytes <= super::PENDING_STAGING_BYTES)
+                && let Some(bytes) = copy.gated_upload_bytes()
             {
+                copy.stamp();
                 upload(super::PendingUpload {
                     copy,
                     memory: texture.memory,
                     layout: texture.layout,
                     bytes,
+                    initial: true,
                 });
             }
             !ready
         });
+        // Ready shared views still need their ordinary refreshes. Match the
+        // current record and the exact resource held by the GPU slot before
+        // reading its title backing, just as for a pending first fill.
+        if let (Some(tables), Some(upload)) = (tables, upload) {
+            for &index in tables {
+                let Some(&key) = keys.get(index as usize) else {
+                    continue;
+                };
+                if key == 0 || self.ready[index as usize].load(Ordering::Acquire) != key {
+                    continue;
+                }
+                let (view, generation) = (key as u32, (key >> 32) as u32);
+                let Some(pin) = view_at(view, generation) else {
+                    continue;
+                };
+                pins.push(pin);
+                let Some(resource) = self.viewed.texture_resource(index) else {
+                    continue;
+                };
+                let Some(copy) = crate::resource::made_copy(resource as crate::object::This) else {
+                    continue;
+                };
+                let Some(bytes) = copy.gated_upload_bytes() else {
+                    continue;
+                };
+                if !copy.initialized.load(Ordering::Acquire)
+                    || copy.evicted.load(Ordering::Acquire)
+                    || copy.host_written.load(Ordering::Relaxed)
+                    || !self
+                        .kept
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(index as usize)
+                        .is_some_and(|(held, _)| *held == copy.texture)
+                {
+                    continue;
+                }
+                let Some((memory, layout)) =
+                    crate::resource::texture_memory(resource as crate::object::This)
+                else {
+                    continue;
+                };
+                let handle = start + u64::from(index) * step;
+                if super::with_current_record(handle, [VIEW_TAG, view, generation], || {}) {
+                    copy.stamp();
+                    upload(super::PendingUpload {
+                        copy,
+                        memory: memory as usize,
+                        layout,
+                        bytes,
+                        initial: false,
+                    });
+                }
+            }
+        }
     }
 
     /// The view host slot `index` was made from, in a few words, with the

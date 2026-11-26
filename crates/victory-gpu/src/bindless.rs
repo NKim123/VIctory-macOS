@@ -141,6 +141,19 @@ impl Viewed {
         }
     }
 
+    pub(crate) fn texture_resource(&self, index: u32) -> Option<usize> {
+        match self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .slots
+            .get(&index)
+        {
+            Some(Seen::Texture(resource)) => Some(*resource),
+            _ => None,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn tracks_texture(&self, resource: This) -> bool {
         self.inner
@@ -241,7 +254,14 @@ pub(crate) fn uploads(
         }
     }
     let mut done = std::collections::HashSet::new();
-    let mut large_first_fill = false;
+    let is_large_first_fill = |copy: &crate::resource::HostTexture| {
+        !copy.initialized.load(Relaxed)
+            && copy
+                .gated_upload_bytes()
+                .is_some_and(|bytes| bytes > crate::descriptor::PENDING_STAGING_BYTES)
+    };
+    let mut large_first_fill = crate::descriptor::host::show_after()
+        && work.iter().any(|(_, copy)| is_large_first_fill(copy));
     for viewed in heaps {
         let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
         for &r in inner.textures.keys() {
@@ -269,10 +289,7 @@ pub(crate) fn uploads(
             if texture.host_written.load(Relaxed) {
                 continue;
             }
-            let large = !texture.initialized.load(Relaxed)
-                && texture
-                    .gated_upload_bytes()
-                    .is_some_and(|bytes| bytes > crate::descriptor::PENDING_STAGING_BYTES);
+            let large = is_large_first_fill(&texture);
             // At most one new large heap-backed texture per submission.
             // An explicit transfer may already have selected this texture.
             if large

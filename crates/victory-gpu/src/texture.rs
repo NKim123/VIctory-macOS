@@ -255,14 +255,24 @@ struct Bounds {
 }
 
 impl Bounds {
+    fn intersection(self, other: Self) -> Option<Self> {
+        let lo = std::array::from_fn(|i| self.lo[i].max(other.lo[i]));
+        let hi = std::array::from_fn(|i| self.hi[i].min(other.hi[i]));
+        (0..3).all(|i| lo[i] < hi[i]).then_some(Self { lo, hi })
+    }
+
+    fn align_blocks(&mut self, block: u32) {
+        for axis in 0..2 {
+            self.lo[axis] = self.lo[axis] / block * block;
+            self.hi[axis] = self.hi[axis].next_multiple_of(block);
+        }
+    }
+
     fn subtract(mut self, written: Self, remaining: &mut Vec<Self>) {
-        let lo = std::array::from_fn(|i| self.lo[i].max(written.lo[i]));
-        let hi = std::array::from_fn(|i| self.hi[i].min(written.hi[i]));
-        let intersection = Self { lo, hi };
-        if (0..3).any(|i| lo[i] >= hi[i]) {
+        let Some(intersection) = self.intersection(written) else {
             remaining.push(self);
             return;
-        }
+        };
         // Cut off the two outer slabs in each axis. The slabs are disjoint
         // and the piece left at the end is exactly the written intersection.
         for axis in 0..3 {
@@ -311,6 +321,35 @@ impl CopyCoverage {
             _ => None,
         }
     }
+}
+
+/// The complement of verified writes in this subresource. None preserves
+/// the ordinary whole-copy command, including compressed mip tails.
+fn upload_regions(
+    full: Bounds,
+    block: u32,
+    index: u32,
+    preserved: &[CopyCoverage],
+) -> Option<Vec<Bounds>> {
+    let mut written = preserved.iter().filter_map(|write| {
+        let mut area = write.area(index, full)?.intersection(full)?;
+        area.align_blocks(block);
+        Some(area)
+    });
+    let first = written.next()?;
+    // BC copies cover physical blocks, including the padded rows and
+    // columns of the last block of a non-multiple-of-four mip.
+    let mut physical = full;
+    physical.align_blocks(block);
+    let mut unfilled = vec![physical];
+    let mut next = Vec::new();
+    for area in std::iter::once(first).chain(written) {
+        for piece in unfilled.drain(..) {
+            piece.subtract(area, &mut next);
+        }
+        std::mem::swap(&mut unfilled, &mut next);
+    }
+    Some(unfilled)
 }
 
 /// Logical texel extents of a texture subresource, without footprint padding.
@@ -622,7 +661,6 @@ fn copies(
         let i = i as usize;
         let mut footprint = staging.footprints[i];
         footprint.Offset += at;
-        let footprint = &footprint;
         #[cfg(feature = "diagnostics")]
         {
             let f = footprint.Footprint;
@@ -658,40 +696,43 @@ fn copies(
                 SubresourceIndex: i as u32,
             },
         };
+        let regions = if preserved.is_empty() {
+            None
+        } else {
+            // SAFETY: the destination is a live texture.
+            let desc = unsafe { texture.GetDesc() };
+            let full = Bounds {
+                lo: [0; 3],
+                hi: subresource_extent(&desc, i as u32),
+            };
+            let block = crate::resource::element(footprint.Footprint.Format.0 as u32)
+                .map_or(1, |(_, block)| block as u32);
+            let regions = upload_regions(full, block, i as u32, preserved);
+            if regions.is_some() && block > 1 {
+                // This placed footprint has room for whole blocks in its
+                // existing row pitch and allocation, even at a mip edge.
+                footprint.Footprint.Width = full.hi[0].next_multiple_of(block);
+                footprint.Footprint.Height = full.hi[1].next_multiple_of(block);
+            }
+            regions
+        };
         let from = D3D12_TEXTURE_COPY_LOCATION {
-            // SAFETY: as above.
+            // SAFETY: a borrowed pointer the location never releases.
             pResource: unsafe { std::mem::transmute_copy(buffer) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                PlacedFootprint: *footprint,
+                PlacedFootprint: footprint,
             },
         };
-        if preserved.is_empty() {
+        let Some(regions) = regions else {
             // SAFETY: an open list; both locations name live resources.
             unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
             continue;
-        }
-        // SAFETY: the destination is a live texture.
-        let desc = unsafe { texture.GetDesc() };
-        let full = Bounds {
-            lo: [0; 3],
-            hi: subresource_extent(&desc, i as u32),
         };
-        let mut unfilled = vec![full];
-        let mut next = Vec::new();
-        for written in preserved
-            .iter()
-            .filter_map(|write| write.area(i as u32, full))
-        {
-            for area in unfilled.drain(..) {
-                area.subtract(written, &mut next);
-            }
-            std::mem::swap(&mut unfilled, &mut next);
-        }
-        for region in unfilled {
+        for region in regions {
             let [x, y, z] = region.lo;
-            // SAFETY: the bounds are a subset of this subresource, and
-            // both locations have the full subresource's layout.
+            // SAFETY: both locations have the full subresource's layout.
+            // The box covers only the remaining texels or physical blocks.
             unsafe {
                 list.list
                     .CopyTextureRegion(&to, x, y, z, &from, Some(&region.d3d()))
@@ -1262,6 +1303,36 @@ pub(crate) fn staging_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bc_upload_regions_use_whole_copies_or_complete_blocks() {
+        let writes = [CopyCoverage::Region {
+            subresource: 1,
+            origin: [0; 3],
+            extent: [4, 4, 1],
+        }];
+        let tail = Bounds {
+            lo: [0; 3],
+            hi: [2, 2, 1],
+        };
+        assert!(upload_regions(tail, 4, 2, &writes).is_none());
+        let mip = Bounds {
+            lo: [0; 3],
+            hi: [7, 5, 1],
+        };
+        let regions = upload_regions(mip, 4, 1, &writes).unwrap();
+        assert_eq!(regions.len(), 2);
+        assert!(
+            regions
+                .iter()
+                .any(|r| r.lo == [4, 0, 0] && r.hi == [8, 8, 1])
+        );
+        assert!(
+            regions
+                .iter()
+                .any(|r| r.lo == [0, 4, 0] && r.hi == [4, 8, 1])
+        );
+    }
 
     #[test]
     fn subresource_len_stays_inside_staging_total() {

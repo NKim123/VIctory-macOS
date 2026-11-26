@@ -292,18 +292,24 @@ thread_local! {
 }
 
 #[cfg(windows)]
+pub(crate) type TableTextureSlots =
+    std::collections::HashMap<usize, std::collections::BTreeSet<u32>>;
+
+#[cfg(windows)]
 struct PendingUpload {
     copy: std::sync::Arc<crate::resource::HostTexture>,
     memory: usize,
     layout: crate::resource::ResourceDesc,
     bytes: u64,
+    initial: bool,
 }
 
 /// Collects uploads for pending SRVs, or publishes those whose copy has
 /// finished. Only Host::execute calls this, with submissions held off.
 #[cfg(windows)]
 pub(crate) fn service_pending(
-    demand: &std::collections::HashSet<(usize, u32)>,
+    tables: &TableTextureSlots,
+    heaps_read: &[std::sync::Arc<crate::bindless::Viewed>],
     pins: &mut Vec<ViewPin>,
     uploads: Option<&mut Vec<crate::texture::UploadSource>>,
 ) {
@@ -317,12 +323,37 @@ pub(crate) fn service_pending(
     }
     let collecting = uploads.is_some();
     let mut planned = Vec::new();
+    let mut oversized = uploads.as_ref().is_some_and(|uploads| {
+        uploads.iter().any(|(_, copy)| {
+            use std::sync::atomic::Ordering::Acquire;
+            !copy.initialized.load(Acquire)
+                && !copy.host_written.load(Acquire)
+                && copy
+                    .gated_upload_bytes()
+                    .is_some_and(|bytes| bytes > PENDING_STAGING_BYTES)
+        })
+    });
     let mut upload = |source: PendingUpload| {
         let key = std::sync::Arc::as_ptr(&source.copy);
-        if source.bytes <= budget && seen.insert(key) {
-            budget -= source.bytes;
-            planned.push(source);
+        if seen.contains(&key) {
+            return;
         }
+        if source.initial {
+            if source.bytes > PENDING_STAGING_BYTES {
+                // All optional first fills use one admission limit, whether
+                // they came from a table or a marked heap index.
+                if oversized {
+                    return;
+                }
+                oversized = true;
+            } else if let Some(left) = budget.checked_sub(source.bytes) {
+                budget = left;
+            } else {
+                return;
+            }
+        }
+        seen.insert(key);
+        planned.push(source);
     };
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(start, _, at) in heaps.iter() {
@@ -334,7 +365,8 @@ pub(crate) fn service_pending(
             host.service_pending(
                 start,
                 u64::from(increment(VIEWS_KIND).unwrap()),
-                demand,
+                tables.get(&(std::sync::Arc::as_ptr(&host.viewed) as usize)),
+                heaps_read.iter().any(|read| std::sync::Arc::ptr_eq(read, &host.viewed)),
                 pins,
                 collecting.then_some(&mut upload as &mut dyn FnMut(_)),
             );
