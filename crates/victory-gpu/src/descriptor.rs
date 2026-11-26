@@ -87,6 +87,7 @@ thread_local! {
 
 impl Heap {
     /// Whether this is a sampler heap.
+    #[cfg(windows)]
     pub(crate) fn samplers(&self) -> bool {
         self.desc.kind == SAMPLERS
     }
@@ -139,6 +140,7 @@ impl Heap {
     }
 
     /// The descriptor index of `handle` in this heap, if it lies in it.
+    #[cfg(windows)]
     pub(crate) fn index(&self, handle: u64) -> Option<u32> {
         let step = u64::from(increment(self.desc.kind)?);
         let at = handle.checked_sub(self.start)?;
@@ -837,14 +839,16 @@ fn record(handle: u64, view: View) {
 }
 
 /// Bumped whenever [`forget`] invalidates a recorded view while holding `VIEWS`.
+#[cfg(any(windows, test))]
 static VIEWS_FORGOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 pub(crate) fn views_forgot() -> u64 {
     VIEWS_FORGOT.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// The title released `resource`: the views naming it go stale.
+#[cfg(any(windows, test))]
 pub(crate) fn forget(resource: usize) {
     let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
     let Some(entries) = views.by_resource.remove(&resource) else {
@@ -1161,15 +1165,18 @@ pub(crate) extern "system" fn copy(
 }
 
 /// The view recorded at `handle`, if one is.
+#[cfg(windows)]
 pub(crate) fn rtv_record(handle: u64) -> Option<RtvRecord> {
     tagged_record(handle, RTV_TAG)
 }
 
 /// The depth view recorded at `handle`, if one is.
+#[cfg(windows)]
 pub(crate) fn dsv_record(handle: u64) -> Option<RtvRecord> {
     tagged_record(handle, DSV_TAG)
 }
 
+#[cfg(windows)]
 fn tagged_record(handle: u64, tag: u32) -> Option<RtvRecord> {
     if handle == 0 {
         return None;
@@ -1287,12 +1294,15 @@ static FUNCTIONS: Table<24> = {
 pub(crate) mod tests {
     /// Work to run while `make_read` makes the textures of a read slot (the
     /// slot), outside the heaps' lock.
+    #[cfg(windows)]
     pub(crate) static WHILE_MAKING: std::sync::Mutex<Option<(u32, Work)>> =
         std::sync::Mutex::new(None);
 
     /// The work [`WHILE_MAKING`] runs.
+    #[cfg(windows)]
     pub(crate) type Work = Box<dyn FnOnce() + Send>;
 
+    #[cfg(windows)]
     pub(crate) fn while_making(slots: &[u32]) {
         let mut hook = WHILE_MAKING.lock().unwrap_or_else(|e| e.into_inner());
         if hook.as_ref().is_some_and(|(slot, _)| slots.contains(slot))
