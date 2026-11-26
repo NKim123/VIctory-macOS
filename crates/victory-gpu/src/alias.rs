@@ -525,6 +525,9 @@ pub fn alias_region(base: usize, len: usize, preserve_contents: bool) -> bool {
 
 /// Removes an aliased region registered at `base`.
 pub fn unalias_region(base: usize) -> bool {
+    let _quiet = crate::host::inflight_enabled()
+        .then(|| host()?.quiet_mapping())
+        .flatten();
     crate::shadow::unregister_aliased(base as u64)
 }
 

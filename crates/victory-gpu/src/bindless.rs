@@ -278,24 +278,37 @@ fn left_kind(view: &View) -> (usize, u64, u64) {
 ///
 /// shortcut: a title copy into texture memory recorded in the same
 /// submission shows from the next one on.
+#[cfg(test)]
 pub(crate) fn uploads(
     heaps: &[Arc<Viewed>],
     textures: &[crate::texture::UploadSource],
 ) -> Option<Uploads> {
-    static LIST: Mutex<Holder> = Mutex::new(Holder(None));
-    let mut guard = LIST.lock().unwrap_or_else(|e| e.into_inner());
-    crate::texture::recycle();
-    match &guard.0 {
-        // Closed by the last submission, which has run.
-        Some(list) => list.reset(),
-        // Made open.
-        None => {
-            let list = crate::host::host()?.new_list().ok()?;
-            list.set_ours();
-            guard.0 = Some(list);
+    uploads_for(heaps, textures, None, |_| {}).filter(Uploads::recorded)
+}
+
+pub(crate) fn uploads_for(
+    heaps: &[Arc<Viewed>],
+    textures: &[crate::texture::UploadSource],
+    private: Option<Box<HostList>>,
+    before_refresh: impl FnOnce(&[crate::texture::UploadSource]),
+) -> Option<Uploads> {
+    static LIST: Mutex<Option<HostList>> = Mutex::new(None);
+    let storage = if let Some(list) = private {
+        UploadList::Owned(list)
+    } else {
+        let mut guard = LIST.lock().unwrap_or_else(|e| e.into_inner());
+        crate::texture::recycle();
+        match &guard.as_ref() {
+            Some(list) => list.reset(),
+            None => {
+                let list = crate::host::host()?.new_list().ok()?;
+                list.set_ours();
+                *guard = Some(list);
+            }
         }
-    }
-    let list = guard.0.as_ref()?;
+        UploadList::Shared(guard)
+    };
+    let list = storage.list();
     // What to bring up: the textures lists read through tables, and those
     // the heaps view that shaders read lately. Collected under the heaps'
     // locks and brought up without them, several at a time: reading title
@@ -367,12 +380,18 @@ pub(crate) fn uploads(
         }
     }
     let mut recorded = false;
+    let mut staged_uploads = Vec::new();
     // The textures copied into stay alive in `work` until recorded.
     let mut readable = Vec::new();
-    for ((staging, copy), upload) in work.iter().zip(crate::texture::refresh_all(&work)) {
+    before_refresh(&work);
+    let local = matches!(storage, UploadList::Owned(_)).then_some(list);
+    for ((staging, copy), upload) in work.iter().zip(crate::texture::refresh_all(&work, local)) {
         if let Some(upload) = upload {
             readable.extend(crate::texture::record_upload(list, copy, staging, &upload));
             recorded = true;
+            if local.is_some() {
+                staged_uploads.push(staging.clone());
+            }
             #[cfg(feature = "diagnostics")]
             UPLOADED.fetch_add(1, Relaxed);
         }
@@ -382,22 +401,60 @@ pub(crate) fn uploads(
         unsafe { list.list.ResourceBarrier(&readable) };
     }
     list.close();
-    // A list recording nothing is not run (its reset next time is fine).
-    recorded.then_some(Uploads(guard))
+    Some(Uploads {
+        storage,
+        recorded,
+        staged_uploads,
+    })
 }
 
-/// The upload list, used under its lock only.
-pub(crate) struct Holder(Option<HostList>);
-// SAFETY: D3D12 objects are free-threaded; the list is used by one
-// submission at a time, under the lock.
-unsafe impl Send for Holder {}
+enum UploadList {
+    Owned(Box<HostList>),
+    Shared(std::sync::MutexGuard<'static, Option<HostList>>),
+}
 
-/// The upload list of a submission, ours until it has run.
-pub(crate) struct Uploads(std::sync::MutexGuard<'static, Holder>);
+impl UploadList {
+    fn list(&self) -> &HostList {
+        match self {
+            Self::Owned(list) => list,
+            Self::Shared(guard) => guard.as_ref().expect("upload list was created"),
+        }
+    }
+}
+
+/// The upload recording and its staging memory, kept through its fence.
+pub(crate) struct Uploads {
+    storage: UploadList,
+    recorded: bool,
+    staged_uploads: Vec<Arc<crate::texture::Staging>>,
+}
+
+pub(crate) struct OwnedUpload {
+    pub(crate) list: Box<HostList>,
+    pub(crate) sources: Vec<Arc<crate::texture::Staging>>,
+}
 
 impl Uploads {
     pub(crate) fn list(&self) -> &HostList {
-        self.0.0.as_ref().expect("made before it is handed out")
+        self.storage.list()
+    }
+
+    pub(crate) fn recorded(&self) -> bool {
+        self.recorded
+    }
+
+    pub(crate) fn is_owned(&self) -> bool {
+        matches!(self.storage, UploadList::Owned(_))
+    }
+
+    pub(crate) fn into_owned(self) -> Option<OwnedUpload> {
+        match self.storage {
+            UploadList::Owned(list) => Some(OwnedUpload {
+                list,
+                sources: self.staged_uploads,
+            }),
+            UploadList::Shared(_) => None,
+        }
     }
 }
 
@@ -496,6 +553,10 @@ pub(crate) fn heap_written() -> bool {
 }
 
 /// Whether the null unordered views are to be made again now (once).
+pub(crate) fn remake_pending() -> bool {
+    REMAKE.load(Relaxed)
+}
+
 pub(crate) fn take_remake() -> bool {
     REMAKE.swap(false, Relaxed)
 }

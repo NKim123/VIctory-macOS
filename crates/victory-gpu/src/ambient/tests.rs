@@ -202,8 +202,8 @@ fn a_shared_slot_is_frozen_once_and_a_rewrite_disarms_every_pair() {
     ];
     let frozen = arm(&pairs);
     assert_eq!((first, second, frozen.len()), (1, 1, 2));
-    assert!(image.0.try_write().is_err());
-    assert!(depth.0.try_write().is_err());
+    assert!(image.0.try_lock().is_err());
+    assert!(depth.0.try_lock().is_err());
     drop(frozen);
 
     depth.invalidate();

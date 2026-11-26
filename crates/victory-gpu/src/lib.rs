@@ -111,7 +111,7 @@ pub use land::{LandingPage, enabled as landing_enabled, next_mapping_epoch, use_
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use tiled::probe_tiled_alias;
 #[cfg(windows)]
-pub use tiled::{MAX_TILED_BUFFER, TiledAlias, with_physical_mapping};
+pub use tiled::{MAX_TILED_BUFFER, TiledAlias, with_inflight_mapping, with_physical_mapping};
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, fault_tracking, rosetta, stores_need_patching, title_memory_aliased,

@@ -249,17 +249,15 @@ fn pump(held: &mut Holding, why: Why) {
     let started = std::time::Instant::now();
     let mut ran = std::time::Duration::ZERO;
     let mut run = |_: usize, segments: Vec<std::sync::Arc<crate::host::HostList>>| {
-        let lists: Vec<&crate::host::HostList> = segments.iter().map(|s| &**s).collect();
         let at = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::PumpExecutes, 1);
-        host.execute(&lists);
+        host.execute_title(&segments);
         ran += at.elapsed();
-        drop(lists);
         segments.into_iter().for_each(crate::list::recycle);
     };
     let mut signal = |f: usize, value: u64| {
-        crate::fence::set(f as This, value);
+        signal_host(f as This, value);
         crate::fence::let_go(f as This);
     };
     let pumped = held.pump(&mut crate::hold::World {
@@ -432,6 +430,17 @@ extern "system" fn signal2_x(
 }
 /// Markers and events only matter to profilers.
 extern "system" fn marker(_: This) {}
+#[cfg(windows)]
+fn signal_host(fence: This, value: u64) {
+    if crate::host::inflight_enabled()
+        && let Some(host) = crate::host::host()
+    {
+        host.signal_title(fence, value);
+    } else {
+        crate::fence::set(fence, value);
+    }
+}
+
 /// At once, or behind the work the queue holds (its fence, and the memory
 /// the title reads it at, move only once that work has run).
 extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
@@ -447,7 +456,7 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
             crate::fence::keep(fence);
             held.push(key, Item::Signal(fence as usize, value));
         } else {
-            crate::fence::set(fence, value);
+            signal_host(fence, value);
         }
         // Another queue may wait for this fence.
         pump(&mut held, Why::Signal);
@@ -687,6 +696,12 @@ extern "system" fn present(
     // shortcut: PresentX does not wait behind work the queue still holds (it
     // shows the frame as far as it ran); the frame line names such work.
     pump_held(Why::Present);
+    #[cfg(windows)]
+    if crate::host::inflight_enabled()
+        && let Some(host) = crate::host::host()
+    {
+        host.present_boundary();
+    }
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     #[cfg(windows)]
     account_frame(frame);

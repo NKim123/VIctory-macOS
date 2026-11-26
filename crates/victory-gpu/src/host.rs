@@ -1,13 +1,16 @@
 //! The host GPU: one D3D12 device and direct queue (decision 0007), and a
 //! window to present on.
 //!
-//! Title-memory submissions wait for the GPU before landing. The bounded
-//! submission worker can queue independent host-only parts before waiting.
+//! Title-memory submissions wait for the GPU before landing. The optional
+//! ring keeps zero-copy submissions and their resources on the direct queue.
 
+mod inflight;
 mod submission_profile;
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use inflight::{Boundary, Submission};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -27,6 +30,10 @@ use windows::core::{Interface, PCWSTR, w};
 pub(crate) fn texture_state(state: u32) -> u32 {
     const BUFFER_ONLY: u32 = 0x1 | 0x2 | 0x100 | 0x200;
     state & 0x01ff_ffff & !BUFFER_ONLY
+}
+
+pub(crate) fn inflight_enabled() -> bool {
+    inflight::limit() != 0
 }
 
 pub(crate) fn pipeline_submissions() -> bool {
@@ -63,7 +70,7 @@ impl Drop for Holding {
 pub(crate) struct Quiet<'a> {
     // Dropped in this order: the mark, then the lock.
     _holding: Holding,
-    _held: std::sync::MutexGuard<'a, u64>,
+    _held: std::sync::MutexGuard<'a, Submission>,
 }
 
 pub(crate) struct Host {
@@ -74,7 +81,8 @@ pub(crate) struct Host {
     pub(crate) depth_bounds_supported: bool,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
-    submitted: Mutex<u64>,
+    submitted: Mutex<Submission>,
+    reaper: inflight::Reaper,
     /// The list every submission ends with, made on first use ([`Mark`]).
     mark: OnceLock<Option<Mark>>,
     /// Extra marks for native calls before the final call of a split submission.
@@ -407,7 +415,8 @@ fn create() -> windows::core::Result<Host> {
             queue: Mutex::new(queue),
             depth_bounds_supported,
             fence,
-            submitted: Mutex::new(0),
+            submitted: Mutex::default(),
+            reaper: OnceLock::new(),
             mark: OnceLock::new(),
             split_marks: Mutex::new(Some(Vec::new())),
             pipeline_marks: Mutex::new(Some(Vec::new())),
@@ -649,9 +658,9 @@ pub(crate) mod tests {
 
         let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let _holding = Holding::enter();
-        assert!(!host.execute_host_pipeline(&[&[&first], &[&conflict]], &mut submitted));
+        assert!(!host.execute_host_pipeline(&[&[&first], &[&conflict]], &mut submitted.value));
         start_native_call_trace();
-        assert!(host.execute_host_pipeline(&[&[&first], &[&second]], &mut submitted));
+        assert!(host.execute_host_pipeline(&[&[&first], &[&second]], &mut submitted.value));
         assert_eq!(take_native_call_trace(), [(vec![2, 2], true)]);
     }
 
@@ -1609,6 +1618,8 @@ enum Step {
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
+    /// Work on list-private storage or CPU-only metadata.
+    Private(Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy;
     /// whether they mark the pages they write (no snapshot then), and
     /// whether their program uses title memory (then the range is withheld
@@ -1624,6 +1635,32 @@ enum Step {
     /// heap's key, `crate::memory`): the table names every copy, each
     /// brought up to date.
     Memory(usize),
+}
+
+impl Step {
+    fn flushes_refreshes(&self) -> bool {
+        matches!(
+            self,
+            Self::Copy(..) | Self::Move(..) | Self::GpuWrite(_, _, _, false, _)
+        )
+    }
+
+    fn touches_shared_memory(&self) -> bool {
+        let alias = |at: usize, len: usize| {
+            crate::shadow::has_aliased_overlap(at as u64, at.saturating_add(len) as u64)
+                || crate::watch::aliased(at, len)
+        };
+        match *self {
+            Self::Copy(dst, src, len) | Self::Move(dst, src, len) => {
+                alias(dst, len) || alias(src, len)
+            }
+            Self::Fill(_, src, len) => alias(src, len),
+            Self::Host(_) | Self::Memory(_) => true,
+            #[cfg(test)]
+            Self::Run(_) => true,
+            _ => false,
+        }
+    }
 }
 
 type ComputedOwnership = Box<dyn Fn(&mut crate::memory::ComputedBaselines) + Send>;
@@ -1675,6 +1712,10 @@ struct Deferred {
     /// Work done once the list has run, before the bottom-of-pipe writes
     /// (title memory shaders wrote at addresses they computed goes back).
     after: Vec<AfterWork>,
+    /// This recording can write through the shared views' write bitmap.
+    view_writes: bool,
+    /// Shader-visible heaps and the objects behind their descriptors.
+    title_heaps: std::collections::HashMap<usize, Arc<crate::descriptor::host::HostHeap>>,
     /// Computed pages with full baselines own those pages before any
     /// post-fence merge can write CPU bytes into their shadows.
     computed_ownership: Vec<ComputedOwnership>,
@@ -1736,7 +1777,7 @@ fn independent_parts(parts: &[&[&HostList]]) -> bool {
 }
 
 /// Wait for a queued signal when no completion event was registered.
-fn poll_fence(fence: &ID3D12Fence, value: u64) -> bool {
+pub(crate) fn poll_fence(fence: &ID3D12Fence, value: u64) -> bool {
     loop {
         // SAFETY: a live fence; the queue's signal was submitted successfully.
         let completed = unsafe { fence.GetCompletedValue() };
@@ -1918,23 +1959,26 @@ impl Host {
     /// wake-up: the fence's completed value decides. Under D3DMetal a
     /// submission's work can finish without its event ever being set
     /// (#50: the title's main thread slept for good in this wait while the
-    /// queue was idle), so the wait wakes every second to check the fence
-    /// itself. A late event left set by an earlier wait cannot end a later
+    /// queue was idle), so the wait periodically checks the fence itself. A late event left set by an earlier wait cannot end a later
     /// wait early, as the fence is checked after every wake-up too.
     fn wait_for(&self, value: u64) -> bool {
         use std::sync::atomic::AtomicU64;
         static MISSED: AtomicU64 = AtomicU64::new(0);
-        let mut seconds = 0u32;
+        let started = Instant::now();
+        let interval = if inflight_enabled() { 2 } else { 1000 };
+        let mut seconds = 0;
         loop {
             // SAFETY: our event and fence.
-            let woke = unsafe { WaitForSingleObject(self.event, 1000) };
+            let woke = unsafe { WaitForSingleObject(self.event, interval) };
             // SAFETY: as above.
             let completed = unsafe { self.fence.GetCompletedValue() };
             if completed == u64::MAX {
                 return false;
             }
             if completed >= value {
-                if woke != windows::Win32::Foundation::WAIT_OBJECT_0 {
+                if woke != windows::Win32::Foundation::WAIT_OBJECT_0
+                    && started.elapsed().as_secs() != 0
+                {
                     let n = MISSED.fetch_add(1, Ordering::Relaxed) + 1;
                     if n.is_power_of_two() {
                         tracing::warn!(n, value, completed, "a host submission finished without setting its event; went on after checking the fence");
@@ -1942,8 +1986,9 @@ impl Host {
                 }
                 return true;
             }
-            if woke != windows::Win32::Foundation::WAIT_OBJECT_0 {
-                seconds += 1;
+            let elapsed = started.elapsed().as_secs();
+            if elapsed > seconds {
+                seconds = elapsed;
                 if seconds.is_power_of_two() {
                     tracing::warn!(seconds, value, completed, "still waiting for the host GPU");
                 }
@@ -2061,6 +2106,11 @@ impl Host {
     }
 
     fn wait_for_submission(&self, value: u64) -> bool {
+        // SAFETY: a plain query on our fence.
+        let completed = unsafe { self.fence.GetCompletedValue() };
+        if completed >= value {
+            return completed != u64::MAX;
+        }
         // SAFETY: a live fence and event under the submission lock.
         unsafe {
             if let Err(e) = self.fence.SetEventOnCompletion(value, self.event) {
@@ -2100,28 +2150,64 @@ impl Host {
     /// heap the lists bound (VIctory-macOS issue #31). Nothing on a thread
     /// that holds the submission lock already, nor off Wine.
     pub(crate) fn quiet(&self) -> Option<Quiet<'_>> {
-        if !crate::under_wine() || HOLDS_SUBMISSIONS.with(std::cell::Cell::get) {
+        if !crate::under_wine() && !inflight_enabled() {
             return None;
         }
-        let held = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        Some(Quiet { _holding: Holding::enter(), _held: held })
+        self.quiet_for(Boundary::Quiet)
     }
 
-    /// Runs closed lists and waits for them.
+    pub(crate) fn quiet_mapping(&self) -> Option<Quiet<'_>> {
+        self.quiet_for(Boundary::Mapping)
+    }
+
+    fn quiet_for(&self, why: Boundary) -> Option<Quiet<'_>> {
+        if HOLDS_SUBMISSIONS.with(std::cell::Cell::get) {
+            return None;
+        }
+        let mut held = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let holding = Holding::enter();
+        self.drain_inflight(&mut held, why);
+        Some(Quiet {
+            _holding: holding,
+            _held: held,
+        })
+    }
+
+    pub(crate) fn present_boundary(&self) {
+        if inflight_enabled() {
+            let _quiet = self.quiet_for(Boundary::Present);
+        }
+    }
+
+    /// Runs borrowed closed lists synchronously (including internal lists
+    /// whose caller consumes their readback immediately after this call).
     pub(crate) fn execute(&self, runs: &[&HostList]) {
-        // Pending uploads use title backing through staging and publication.
-        // A last pin may destroy a title resource, outside the submission lock.
+        self.execute_lists(runs, None);
+    }
+
+    pub(crate) fn execute_title(&'static self, owned: &[Arc<HostList>]) -> bool {
+        let runs: Vec<_> = owned.iter().map(AsRef::as_ref).collect();
+        let queued = self.execute_lists(&runs, inflight_enabled().then_some(owned));
+        if queued {
+            self.wake_reaper();
+        }
+        queued
+    }
+
+    fn execute_lists(&self, runs: &[&HostList], owned: Option<&[Arc<HostList>]>) -> bool {
+        // A last title pin can destroy a resource. Drop it outside the lock.
         let mut pending_pins = Vec::new();
-        // Preparation, execution and copy-back share the same lock.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let holding = Holding::enter();
-        let capture = self.execute_part(runs, &mut submitted, false, &mut pending_pins);
+        let capture = self.execute_part(runs, &mut submitted, false, &mut pending_pins, owned);
+        let busy = submitted.busy();
         drop((holding, submitted));
         #[cfg(feature = "diagnostics")]
         if let Some((sub, targets)) = capture {
             crate::capture::dump_submission(sub, &targets);
         }
         let _ = capture;
+        busy
     }
 
     /// Runs consecutive self-contained parts under one submission lock.
@@ -2131,15 +2217,16 @@ impl Host {
         let mut pending_pins = Vec::new();
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let _holding = Holding::enter();
+        self.drain_inflight(&mut submitted, Boundary::Synchronous);
         if pipeline_submissions()
             && !submission_profile::enabled()
             && !split_uav_srv_prelude()
-            && self.execute_host_pipeline(parts, &mut submitted)
+            && self.execute_host_pipeline(parts, &mut submitted.value)
         {
             return;
         }
         for runs in parts {
-            self.execute_part(runs, &mut submitted, true, &mut pending_pins);
+            self.execute_part(runs, &mut submitted, true, &mut pending_pins, None);
         }
     }
 
@@ -2258,14 +2345,55 @@ impl Host {
     fn execute_part(
         &self,
         runs: &[&HostList],
-        submitted: &mut u64,
+        submission: &mut Submission,
         host_only: bool,
         pending_pins: &mut Vec<crate::descriptor::ViewPin>,
+        owned: Option<&[Arc<HostList>]>,
     ) -> Option<(u64, Vec<(usize, String)>)> {
         let landing = if host_only {
             None
         } else {
             crate::land::begin()
+        };
+        #[cfg(feature = "diagnostics")]
+        let traced = !host_only && crate::capture::listed(crate::queue::presented() + 1);
+        #[cfg(not(feature = "diagnostics"))]
+        let traced = false;
+        #[cfg(feature = "diagnostics")]
+        let gpu_timing = timing();
+        #[cfg(not(feature = "diagnostics"))]
+        let gpu_timing = false;
+        let show_after = !host_only && crate::descriptor::host::show_after();
+        let fallback = if gpu_timing || traced || submission_profile::enabled() {
+            Some(Boundary::Diagnostics)
+        } else if owned.is_none() {
+            Some(Boundary::Synchronous)
+        } else if crate::bindless::remake_pending() {
+            Some(Boundary::Descriptors)
+        } else {
+            runs.iter().find_map(|list| list.inflight_barrier())
+        };
+        let owned = if let Some(why) = fallback {
+            self.note_sync(submission, why);
+            None
+        } else {
+            self.retire_inflight(submission);
+            if runs.iter().any(|list| submission.uses(list)) {
+                self.drain_inflight(submission, Boundary::ReusedList);
+            }
+            // A repeated occurrence in one call would use the same
+            // closed native list and submission-time prelude.
+            let mut unique = std::collections::HashSet::new();
+            if runs
+                .iter()
+                .all(|&list| unique.insert(std::ptr::from_ref(list)))
+            {
+                self.note_overlap(submission);
+                owned
+            } else {
+                self.note_sync(submission, Boundary::ReusedList);
+                None
+            }
         };
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -2277,10 +2405,13 @@ impl Host {
         if !host_only {
             // Host textures the title has not used for a while (or past the
             // card's budget) are given up first: the last submission has run.
-            crate::resource::evict_unused();
+            if !submission.busy() {
+                crate::resource::evict_unused();
+            }
             // The first shader writing through a heap may run in this
             // submission: unordered views left null are made again first.
             if crate::bindless::take_remake() {
+                self.drain_inflight(submission, Boundary::Descriptors);
                 crate::descriptor::remake_unordered();
             }
             // Descriptors the title copied into its heaps itself, before the
@@ -2325,7 +2456,6 @@ impl Host {
             .collect();
         // Pending shared SRVs can upload unrelated title memory. The
         // submit-ahead worker only runs lists that have no such dependencies.
-        let show_after = !host_only && crate::descriptor::host::show_after();
         if show_after {
             let mut demand = crate::descriptor::TableTextureSlots::new();
             for list in runs {
@@ -2350,10 +2480,25 @@ impl Host {
             }
         }
         #[cfg(feature = "diagnostics")]
-        let uploading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
-        let uploads = (!heaps.is_empty() || !textures.is_empty())
-            .then(|| crate::bindless::uploads(&heaps, &textures))
+        let uploading =
+            crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
+        let mut uploads = (!heaps.is_empty() || !textures.is_empty())
+            .then(|| {
+                let private = owned.and_then(|_| submission.upload_list(self));
+                crate::bindless::uploads_for(&heaps, &textures, private, |sources| {
+                    if submission.busy()
+                        && sources.iter().any(|(staging, _)| staging.may_read_alias())
+                    {
+                        self.drain_inflight(submission, Boundary::CpuAccess);
+                    }
+                })
+            })
             .flatten();
+        if let Some(unused) = uploads.take_if(|upload| !upload.recorded())
+            && let Some(upload) = unused.into_owned()
+        {
+            submission.recycle_upload(upload.list);
+        }
         #[cfg(feature = "diagnostics")]
         drop(uploading);
         let runs: Vec<&HostList> = uploads
@@ -2367,8 +2512,6 @@ impl Host {
         // the order the GPU runs them (with `VICTORY_D3D12_DRED`, which
         // notes them).
         #[cfg(feature = "diagnostics")]
-        let traced = !host_only && crate::capture::listed(crate::queue::presented() + 1);
-        #[cfg(feature = "diagnostics")]
         if traced {
             for (i, r) in runs.iter().enumerate() {
                 let notes = r.notes.lock().unwrap_or_else(|e| e.into_inner());
@@ -2376,16 +2519,12 @@ impl Host {
                     tracing::info!(
                         target: "victory_gpu::trace",
                         "s{} l{i}/{} #{k}: {note}",
-                        *submitted + 1,
+                        submission.value + 1,
                         runs.len()
                     );
                 }
             }
         }
-        #[cfg(feature = "diagnostics")]
-        let gpu_timing = timing();
-        #[cfg(not(feature = "diagnostics"))]
-        let gpu_timing = false;
         let split_preludes = !gpu_timing && split_uav_srv_prelude();
         let mut native_boundaries = Vec::new();
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
@@ -2400,7 +2539,14 @@ impl Host {
         for (i, list) in runs.iter().enumerate() {
             if !host_only {
                 let planned = plans.get(i).map_or(&[][..], |plan| &plan.skip);
-                list.run_deferred_planned(&mut batch, planned);
+                list.run_deferred_planned(&mut batch, planned, |batch, step| {
+                    if submission.busy()
+                        && (!batch.refreshes.is_empty() && step.flushes_refreshes()
+                            || step.touches_shared_memory())
+                    {
+                        self.drain_inflight(submission, Boundary::CpuAccess);
+                    }
+                });
             }
             firsts.push(lists.len());
             #[cfg(feature = "diagnostics")]
@@ -2412,6 +2558,9 @@ impl Host {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
+        }
+        if !batch.refreshes.is_empty() {
+            self.drain_inflight(submission, Boundary::CpuAccess);
         }
         batch.flush();
         let mut computed = crate::memory::ComputedBaselines::default();
@@ -2432,10 +2581,47 @@ impl Host {
             }
         }
         #[cfg(feature = "diagnostics")]
-        batch.log_refreshes(*submitted + 1, runs.len());
+        batch.log_refreshes(submission.value + 1, runs.len());
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
+        crate::copystat::add(
+            crate::copystat::C::FaultsPrep,
+            crate::copystat::page_faults().saturating_sub(faults),
+        );
+        let late_fallback =
+            owned.and_then(|_| runs.iter().find_map(|list| list.inflight_barrier()));
+        if let Some(owned) = owned
+            && late_fallback.is_none()
+            && uploads
+                .as_ref()
+                .is_none_or(crate::bindless::Uploads::is_owned)
+        {
+            let bytes = runs
+                .iter()
+                .map(|list| list.inflight_bytes())
+                .fold(0, u64::saturating_add);
+            if self.make_flight_room(submission, owned.len(), bytes)
+                && let Some(marks) = self.flight_marks(submission, native_boundaries.len() + 1)
+            {
+                SUBMISSION_US[0]
+                    .fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
+                self.enqueue_flight(
+                    submission,
+                    marks,
+                    lists,
+                    &native_boundaries,
+                    owned,
+                    uploads.and_then(crate::bindless::Uploads::into_owned),
+                    batch,
+                    std::mem::take(pending_pins),
+                    bytes,
+                );
+                return None;
+            }
+        }
+        if owned.is_some() {
+            self.note_sync(submission, late_fallback.unwrap_or(Boundary::Synchronous));
+        }
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
         let groups: Vec<&[Option<ID3D12CommandList>]> = if gpu_timing {
@@ -2506,14 +2692,14 @@ impl Host {
             format!("{} lists, pipelines {pipelines:?}", runs.len())
         };
         for (i, group) in groups.iter().enumerate() {
-            *submitted += 1;
+            submission.value += 1;
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
-            crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
+            crate::resource::life::note(0, crate::resource::life::SUBMITTED, submission.value, 0);
             // Last, the list that shows the submission ran.
             let mut group = group.to_vec();
             if let Some(mark) = mark {
-                mark.arm(*submitted);
+                mark.arm(submission.value);
                 group.push(mark.list());
             }
             // Capture slot versions only after sync, refreshes and deferred
@@ -2541,7 +2727,7 @@ impl Host {
             let mut encode = Duration::ZERO;
             let mut first = 0;
             for (&end, mark) in native_boundaries.iter().zip(split_marks) {
-                mark.arm(*submitted);
+                mark.arm(submission.value);
                 let mut marked = group[first..end].to_vec();
                 marked.push(mark.list());
                 #[cfg(test)]
@@ -2561,9 +2747,9 @@ impl Host {
                 // SAFETY: closed lists, kept alive until the fence.
                 unsafe { queue.ExecuteCommandLists(&group[first..]) };
                 encode += start.elapsed();
-                let signalled = self.signal_submission(&queue, *submitted);
+                let signalled = self.signal_submission(&queue, submission.value);
                 let start = Instant::now();
-                let waited = signalled && self.wait_for_submission(*submitted);
+                let waited = signalled && self.wait_for_submission(submission.value);
                 let wait = start.elapsed();
                 let profiled_runs = if groups.len() > 1 {
                     &runs[i..i + 1]
@@ -2571,7 +2757,7 @@ impl Host {
                     runs
                 };
                 submission_profile::record(
-                    *submitted,
+                    submission.value,
                     group.len() + native_boundaries.len(),
                     encode,
                     wait,
@@ -2579,7 +2765,7 @@ impl Host {
                 );
                 waited
             } else {
-                self.submit_and_wait(&queue, &group[first..], *submitted)
+                self.submit_and_wait(&queue, &group[first..], submission.value)
             };
             drop(frozen);
             #[cfg(test)]
@@ -2592,16 +2778,16 @@ impl Host {
                 && !(split_marks
                     .iter()
                     .take(native_boundaries.len())
-                    .all(|mark| submission_ran(mark, *submitted))
-                    && submission_ran(mark, *submitted))
+                    .all(|mark| submission_ran(mark, submission.value))
+                    && submission_ran(mark, submission.value))
                 // SAFETY: a plain query.
                 && unsafe { self.device.GetDeviceRemovedReason() }.is_ok()
             {
                 incomplete.push(i);
-                self.lost(submitted, mark);
+                self.lost(&mut submission.value, mark);
             }
             #[cfg(feature = "diagnostics")]
-            crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
+            crate::resource::life::note(0, crate::resource::life::RAN, submission.value, 0);
             #[cfg(feature = "diagnostics")]
             if groups.len() > 1 {
                 // SAFETY: a plain query.
@@ -2769,20 +2955,7 @@ impl Host {
                 }
             }
         }
-        // Lanes that gave up waiting for a 64-bit atomic's lock: their
-        // updates may be lost (`victory_shader::emit`, "Atomic locks").
-        let gave_up = crate::shadow::take_gave_up();
-        if gave_up > 0 {
-            let before = GAVE_UP.fetch_add(gave_up, Ordering::Relaxed);
-            let total = before + gave_up;
-            if before == 0 || before.ilog2() != total.ilog2() {
-                tracing::warn!(
-                    gave_up,
-                    total,
-                    "lanes gave up waiting for a 64-bit atomic's lock and went on without it, so their updates may be lost (#240)"
-                );
-            }
-        }
+        log_gave_up();
         let relay = crate::land::start(landing, move || {
             let _holding = Holding::enter();
             crate::shadow::copy_back_marks(
@@ -2919,7 +3092,7 @@ impl Host {
         // (the dumps submit lists of their own).
         #[cfg(feature = "diagnostics")]
         if traced {
-            let sub = *submitted;
+            let sub = submission.value;
             let mut targets: Vec<(usize, String)> = Vec::new();
             for r in runs {
                 for t in r.targets.lock().unwrap_or_else(|e| e.into_inner()).iter() {
@@ -3333,8 +3506,7 @@ impl HostList {
         }
     }
 
-    /// Only after the list's last submission finished (every one is waited
-    /// for).
+    /// Only after the list's last submission finished.
     pub(crate) fn reset(&self) {
         if submission_profile::enabled() {
             *self
@@ -3683,8 +3855,8 @@ impl HostList {
             return None;
         }
         let (allocator, list) = &self.prelude;
-        // SAFETY: the prelude is not executing (every submission is waited
-        // for); the textures are live.
+        // SAFETY: earlier uses of this recording have completed; the
+        // textures are live.
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
@@ -4045,6 +4217,75 @@ impl HostList {
         self.deferred().synchronous = true;
     }
 
+    fn inflight_barrier(&self) -> Option<Boundary> {
+        let d = self.deferred();
+        if !d.writes.is_empty() {
+            Some(Boundary::BottomOfPipe)
+        } else if d.synchronous {
+            Some(Boundary::Synchronous)
+        } else if !d.texture_fills.is_empty() {
+            Some(Boundary::Descriptors)
+        } else if !d.texture_backs.is_empty()
+            || !d.after.is_empty()
+            || !d.missed.is_empty()
+            || !d.computed_ownership.is_empty()
+            || d.view_writes && crate::shadow::has_copy_back_marks()
+            || d.copies.iter().any(|step| matches!(step, Step::GpuWrite(copy, ..) if !copy.is_aliased() || !copy.clean()))
+        {
+            Some(Boundary::CopyBack)
+        } else {
+            None
+        }
+    }
+
+    fn notify_aliased_writes(&self) {
+        for step in &self.deferred().copies {
+            if let Step::GpuWrite(copy, address, len, ..) = step {
+                debug_assert!(copy.is_aliased());
+                crate::watch::notify_written(*address, *len);
+            }
+        }
+    }
+
+    pub(crate) fn inflight_bytes(&self) -> u64 {
+        let bytes = self
+            .scratch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .chunks
+            .iter()
+            .map(|chunk| chunk.capacity)
+            .sum::<u64>();
+        let arguments = self.arguments.lock().unwrap_or_else(|e| e.into_inner());
+        let deferred = self.deferred();
+        deferred
+            .uploads
+            .iter()
+            .chain(arguments.as_ref())
+            .fold(bytes, |total, buffer| {
+                // SAFETY: a live resource retained by this list.
+                total.saturating_add(unsafe { buffer.GetDesc() }.Width)
+            })
+    }
+
+    pub(crate) fn note_view_writes(&self) {
+        if inflight_enabled() {
+            self.deferred().view_writes = true;
+        }
+    }
+
+    pub(crate) fn keep_title_heap(&self, heap: &crate::descriptor::Heap) {
+        if inflight_enabled()
+            && let Some(host) = heap.host_owner()
+        {
+            let key = Arc::as_ptr(host) as usize;
+            self.deferred()
+                .title_heaps
+                .entry(key)
+                .or_insert_with(|| host.clone());
+        }
+    }
+
     /// Only self-contained host commands may finish after the submit call.
     /// In particular, submission-time reads, readbacks and bottom-of-pipe
     /// writes still happen before a ready submission returns to the title.
@@ -4242,7 +4483,7 @@ impl HostList {
             deferred.budget_zeroed = true;
             let at = *data;
             // SAFETY: the list's own mapped word, written before it runs.
-            deferred.copies.push(Step::Host(Box::new(move || unsafe {
+            deferred.copies.push(Step::Private(Box::new(move || unsafe {
                 (at as *mut u32).write_volatile(0)
             })));
         }
@@ -4350,6 +4591,10 @@ impl HostList {
     }
 
     /// Runs `work` on host memory at submission, in order with the copies.
+    pub(crate) fn defer_private(&self, work: impl Fn() + Send + 'static) {
+        self.deferred().copies.push(Step::Private(Box::new(work)));
+    }
+
     pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
         self.deferred().copies.push(Step::Host(Box::new(work)));
     }
@@ -4370,13 +4615,19 @@ impl HostList {
     /// lists of a submission, through many ranges).
     #[cfg(test)]
     fn run_deferred(&self, batch: &mut Batch) {
-        self.run_deferred_planned(batch, &[]);
+        self.run_deferred_planned(batch, &[], |_, _| {});
     }
 
-    fn run_deferred_planned(&self, batch: &mut Batch, skip: &[bool]) {
+    fn run_deferred_planned(
+        &self,
+        batch: &mut Batch,
+        skip: &[bool],
+        mut before: impl FnMut(&Batch, &Step),
+    ) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for (i, step) in self.deferred().copies.iter().enumerate() {
+            before(batch, step);
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(
@@ -4386,7 +4637,7 @@ impl HostList {
                     Step::Copy(..) | Step::Move(..) | Step::Fill(..) => C::StepCopyUs,
                     #[cfg(test)]
                     Step::Run(_) => C::StepWorkUs,
-                    Step::Host(_) => C::StepWorkUs,
+                    Step::Host(_) | Step::Private(_) => C::StepWorkUs,
                     Step::GpuWrite(..) => C::StepGpuWriteUs,
                     Step::Texture(..) | Step::TextureSlot(..) => C::StepTextureUs,
                     Step::Heap(_) => C::StepHeapUs,
@@ -4438,7 +4689,7 @@ impl HostList {
                     work();
                     continue;
                 }
-                Step::Host(work) => {
+                Step::Host(work) | Step::Private(work) => {
                     work();
                     #[cfg(feature = "diagnostics")]
                     {
@@ -5359,6 +5610,7 @@ impl Meter {
                 COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / report_frames
             });
             submission_profile::log(report_frames);
+            inflight::log(report_frames);
             if pipeline_submissions() {
                 let waits = PIPELINE_WAITS_SAVED.swap(0, Ordering::Relaxed);
                 tracing::info!(
@@ -5510,6 +5762,7 @@ impl Host {
         overlay: Option<(&ID3D12Resource, u32)>,
         frame: u64,
     ) -> Option<bool> {
+        self.present_boundary();
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(picture_format) = swap_format(desc.Format) else {
@@ -5927,9 +6180,28 @@ pub(crate) fn retires_pending() -> bool {
 
 /// After a submission has run, with none running: the retired resources go.
 pub(crate) fn release_retired() {
-    let retired = std::mem::take(&mut *RETIRED.lock().unwrap_or_else(|e| e.into_inner()));
+    let retired = take_retired();
     if !retired.is_empty() {
         release_later(Box::new(retired));
+    }
+}
+
+fn take_retired() -> Vec<crate::descriptor::host::Held> {
+    std::mem::take(&mut *RETIRED.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+fn log_gave_up() {
+    let gave_up = crate::shadow::take_gave_up();
+    if gave_up > 0 {
+        let before = GAVE_UP.fetch_add(gave_up, Ordering::Relaxed);
+        let total = before + gave_up;
+        if before == 0 || before.ilog2() != total.ilog2() {
+            tracing::warn!(
+                gave_up,
+                total,
+                "lanes gave up waiting for a 64-bit atomic's lock and went on without it, so their updates may be lost (#240)"
+            );
+        }
     }
 }
 
@@ -6309,8 +6581,8 @@ mod batch {
         assert!(plan[0].skip.iter().all(|&skip| skip));
         assert!(plan[1].skip.is_empty());
         let mut batch = Batch::default();
-        before.run_deferred_planned(&mut batch, &plan[0].skip);
-        writes.run_deferred_planned(&mut batch, &plan[1].skip);
+        before.run_deferred_planned(&mut batch, &plan[0].skip, |_, _| {});
+        writes.run_deferred_planned(&mut batch, &plan[1].skip, |_, _| {});
         after.run_deferred(&mut batch);
         assert!(batch.flush() > 0);
         assert_eq!(copy.read_host(base as u64, 1), [12]);
@@ -6717,9 +6989,9 @@ mod marks {
         // whatever other tests submitted meanwhile.
         let submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
         assert!(
-            mark.saw(*submitted),
+            mark.saw(submitted.value),
             "the mark shows submission {}",
-            *submitted
+            submitted.value
         );
     }
 
@@ -6733,12 +7005,12 @@ mod marks {
         let (a, b) = ([&lists[0]], [&lists[1]]);
         let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let _holding = super::Holding::enter();
-        assert!(!host.execute_host_pipeline(&[&a, &a], &mut submitted));
+        assert!(!host.execute_host_pipeline(&[&a, &a], &mut submitted.value));
 
         super::tests::start_native_call_trace();
-        let first = *submitted + 1;
-        assert!(host.execute_host_pipeline(&[&a, &b], &mut submitted));
-        assert_eq!(*submitted, first + 1);
+        let first = submitted.value + 1;
+        assert!(host.execute_host_pipeline(&[&a, &b], &mut submitted.value));
+        assert_eq!(submitted.value, first + 1);
         assert_eq!(super::tests::take_native_call_trace(), [(vec![2, 2], true)]);
 
         for replace in [false, true] {
@@ -6746,10 +7018,10 @@ mod marks {
             let [lost, replaced] = LOST.each_ref().map(|n| n.load(Ordering::Relaxed));
             super::MISS_NEXT_SUBMISSION_MARK.set(true);
             super::MISS_NEXT_QUEUE_PROBE.set(replace);
-            let first = *submitted + 1;
-            assert!(host.execute_host_pipeline(&[&a, &b], &mut submitted));
+            let first = submitted.value + 1;
+            assert!(host.execute_host_pipeline(&[&a, &b], &mut submitted.value));
             assert_eq!(
-                *submitted,
+                submitted.value,
                 first + 2 + u64::from(replace),
                 "recover after both parts' fences"
             );
@@ -6764,7 +7036,7 @@ mod marks {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let marks = pool.as_ref().unwrap();
-            assert!(marks[0].saw(*submitted), "recovery mark");
+            assert!(marks[0].saw(submitted.value), "recovery mark");
             assert!(marks[1].saw(first + 1), "second part retained its own mark");
         }
     }
@@ -6794,16 +7066,22 @@ mod marks {
         let old = host.queue();
         {
             let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
-            assert!(host.runs(&mut submitted, mark), "the queue runs work");
+            assert!(host.runs(&mut submitted.value, mark), "the queue runs work");
             host.replace_queue().unwrap();
-            assert!(host.runs(&mut submitted, mark), "the new queue runs work");
+            assert!(
+                host.runs(&mut submitted.value, mark),
+                "the new queue runs work"
+            );
         }
         assert!(host.queue() != old, "a new queue");
         let list = host.new_list().unwrap();
         list.close();
         host.execute(&[&list]);
         let submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(mark.saw(*submitted), "a submission after the change ran");
+        assert!(
+            mark.saw(submitted.value),
+            "a submission after the change ran"
+        );
     }
 
     /// A draw over a `width` x `height` target whose pixels each loop `n`

@@ -470,7 +470,9 @@ impl Shadow {
         }
         ranges.push((address, len, Arc::downgrade(&widened)));
         WIDENED_ANY.store(true, Ordering::Release);
-        self.has_widened.store(true, Ordering::Release);
+        if !self.has_widened.swap(true, Ordering::AcqRel) && self.aliased && self.marked() {
+            COPY_BACK_MARKS.fetch_add(1, Ordering::Release);
+        }
         Some(widened)
     }
 
@@ -603,6 +605,7 @@ impl Shadow {
             tiled: None,
         });
         if let Some(base) = marks {
+            COPY_BACK_MARKS.fetch_add(1, Ordering::Release);
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
         }
         shadow
@@ -1459,6 +1462,9 @@ impl Drop for Shadow {
             let mut m = marks();
             m.owners.remove(&base);
             m.give_back(base, pages(self.start, self.len));
+            if !self.aliased || self.has_widened.load(Ordering::Acquire) {
+                COPY_BACK_MARKS.fetch_sub(1, Ordering::Release);
+            }
         }
     }
 }
@@ -1479,6 +1485,12 @@ struct Marks {
     end: u32,
     /// The copy holding each run, by its first bit.
     owners: BTreeMap<u32, std::sync::Weak<Shadow>>,
+}
+
+static COPY_BACK_MARKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn has_copy_back_marks() -> bool {
+    COPY_BACK_MARKS.load(Ordering::Acquire) != 0
 }
 
 static MARKS: Mutex<Marks> = Mutex::new(Marks {
@@ -1768,8 +1780,24 @@ thread_local! {
 pub(crate) fn copy_back_marks(
     withheld: &[(Arc<Shadow>, usize, usize)],
     memory_withheld: bool,
+    computed: Option<&mut crate::memory::ComputedBaselines>,
+    accept_landing: bool,
+) {
+    copy_back_marks_inner(withheld, memory_withheld, computed, accept_landing, false);
+}
+
+/// Zero-copy work still invalidates other CPU/GPU views of the written pages.
+/// Consume only alias marks when their shared bitmap is idle.
+pub(crate) fn copy_back_aliased_marks() {
+    copy_back_marks_inner(&[], false, None, true, true);
+}
+
+fn copy_back_marks_inner(
+    withheld: &[(Arc<Shadow>, usize, usize)],
+    memory_withheld: bool,
     mut computed: Option<&mut crate::memory::ComputedBaselines>,
     accept_landing: bool,
+    aliases_only: bool,
 ) {
     let (mut marked, mut held) = (Vec::new(), Vec::new());
     for memory in [false, true] {
@@ -1804,7 +1832,7 @@ pub(crate) fn copy_back_marks(
         let (&base, copy) = m.owners.range(..=n).next_back()?;
         let copy = copy.upgrade()?;
         let k = n - base;
-        (k < pages(copy.start, copy.len)).then(|| {
+        (k < pages(copy.start, copy.len) && (!aliases_only || copy.aliased)).then(|| {
             let page = (((copy.start >> 16) + u64::from(k)) << 16) as usize;
             (copy, page)
         })

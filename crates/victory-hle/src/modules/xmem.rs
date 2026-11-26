@@ -356,8 +356,10 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
-            victory_gpu::unalias_region(address as usize);
-            VirtualFree(address, 0, MEM_RELEASE);
+            victory_gpu::with_inflight_mapping(|| {
+                victory_gpu::unalias_region(address as usize);
+                VirtualFree(address, 0, MEM_RELEASE);
+            });
             return;
         }
         let user = address.cast::<u8>();
@@ -603,7 +605,7 @@ impl Physical {
 pub(crate) fn release_virtual(address: *mut c_void, size: usize, kind: u32) -> BOOL {
     if kind != MEM_RELEASE || !victory_gpu::physical_tiles_enabled() {
         // SAFETY: forwards the title's arguments to the host API.
-        return unsafe { VirtualFree(address, size, kind) };
+        return victory_gpu::with_inflight_mapping(|| unsafe { VirtualFree(address, size, kind) });
     }
     victory_gpu::with_physical_mapping(|| {
         let mut physical = physical();
@@ -955,12 +957,14 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     if pages.is_null() {
         return 0;
     }
-    let mut physical = physical();
-    for i in 0..n {
-        // SAFETY: the title passes `n` page numbers.
-        physical.pages.remove(&unsafe { *pages.add(i) });
-    }
-    1
+    victory_gpu::with_inflight_mapping(|| {
+        let mut physical = physical();
+        for i in 0..n {
+            // SAFETY: the title passes `n` page numbers.
+            physical.pages.remove(&unsafe { *pages.add(i) });
+        }
+        1
+    })
 }
 
 /// Consecutive slices of one section, committed and writable: through our

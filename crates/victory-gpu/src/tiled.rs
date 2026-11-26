@@ -27,11 +27,19 @@ static BUFFERS: Mutex<Vec<Weak<TiledBuffer>>> = Mutex::new(Vec::new());
 /// execution and copy-back. A caller must acquire its XMem lock inside this
 /// boundary. The disabled path takes no GPU lock.
 pub fn with_physical_mapping<T>(edit: impl FnOnce() -> T) -> T {
-    let _quiet = if physical_tiles_enabled() {
-        host().and_then(|h| h.quiet())
-    } else {
-        None
-    };
+    if !crate::host::inflight_enabled() && physical_tiles_enabled() {
+        let _quiet = host().and_then(|h| h.quiet());
+        return edit();
+    }
+    with_inflight_mapping(edit)
+}
+
+/// Allows CPU memory release paths to synchronize with the opt-in ring
+/// even when physical tiles are disabled.
+pub fn with_inflight_mapping<T>(edit: impl FnOnce() -> T) -> T {
+    let _quiet = crate::host::inflight_enabled()
+        .then(|| host()?.quiet_mapping())
+        .flatten();
     edit()
 }
 
@@ -548,7 +556,32 @@ void main() {
         list.list.Dispatch(1, 1, 1);
     }
     list.close();
-    host.execute(&[&list]);
+    if crate::host::inflight_enabled() {
+        use crate::object::S_OK;
+        let mut fence = std::ptr::null();
+        assert_eq!(
+            crate::fence::create(
+                std::ptr::null(),
+                0,
+                0,
+                &crate::fence::FENCE_IIDS[0],
+                &mut fence
+            ),
+            S_OK
+        );
+        assert!(
+            host.execute_title(&[Arc::new(list)]),
+            "tiled probe entered the ring"
+        );
+        host.signal_title(fence, 1);
+        assert_eq!(
+            crate::fence::set_event_on_completion(fence, 1, std::ptr::null_mut()),
+            S_OK
+        );
+        crate::fence::let_go(fence);
+    } else {
+        host.execute(&[&list]);
+    }
     if let Some(track) = &tracker {
         assert!(
             track.changed(base / PAGE),

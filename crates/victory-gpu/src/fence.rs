@@ -84,12 +84,32 @@ extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Fence>(this)
 }
 extern "system" fn completed(this: This) -> u64 {
-    // A title polling for a value: held work that may run now does first.
+    // A title polling for a value: publish completed native work, then
+    // let any emulated queue that depended on it go on.
+    #[cfg(windows)]
+    if crate::host::inflight_enabled()
+        && let Some(host) = crate::host::host()
+    {
+        host.reap_title_fences();
+    }
     crate::queue::pump_held_if_free(crate::queue::Why::Fence);
     fence(this).value.load(Ordering::Acquire)
 }
-extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
+pub(crate) extern "system" fn set_event_on_completion(
+    this: This,
+    value: u64,
+    event: *mut c_void,
+) -> HRESULT {
     crate::queue::pump_held_if_free(crate::queue::Why::Fence);
+    #[cfg(windows)]
+    if event.is_null()
+        && crate::host::inflight_enabled()
+        && fence(this).value.load(Ordering::Acquire) < value
+        && let Some(host) = crate::host::host()
+        && host.wait_title(this, value)
+    {
+        return S_OK;
+    }
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     if fence.value.load(Ordering::Acquire) >= value {
