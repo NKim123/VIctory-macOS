@@ -2261,8 +2261,7 @@ impl State {
         let keep_readable = clamp && (mode != 0 || window);
         let aliased = args.is_aliased() || args.is_tiled();
         let batch_aliased = aliased && mode != 0 && crate::indirect::batch_aliased();
-        let may_write =
-            keep_readable && (kind != DISPATCH || batch_aliased) && may_write_buffers(p);
+        let graphics_may_write = keep_readable && kind != DISPATCH && may_write_buffers(p);
         let offset = args.offset(arguments);
         let gpu = args.gpu(arguments);
         let source_window = if batch_aliased {
@@ -2270,13 +2269,13 @@ impl State {
         } else {
             (gpu - offset, offset)
         };
-        // The batch starts at its first consumer, after prior writes. A
-        // potentially writing draw or aliased dispatch can use its last slot.
+        // The batch starts at its first consumer, after prior writes. Mode 2
+        // relies on the title to synchronize dependent compute dispatches.
         let eligible = clamp
             && max == 1
             && count.is_none()
             && (!aliased || batch_aliased)
-            && (mode != 0 || (window && kind != DISPATCH && !may_write))
+            && (mode != 0 || (window && kind != DISPATCH && !graphics_may_write))
             && crate::indirect::Batch::accepts(kind, stride, source_window.1);
         let batched = eligible
             .then(|| self.batched_indirect(list, (kind, stride), source_window, window, aliased))
@@ -2384,7 +2383,7 @@ impl State {
         if clamp && !keep_readable {
             crate::indirect::done(list, &argument_buffer);
         }
-        if (kind == DISPATCH && mode != 2) || may_write {
+        if (kind == DISPATCH && mode != 2) || graphics_may_write {
             self.indirect = None;
         }
         if kind == DISPATCH {

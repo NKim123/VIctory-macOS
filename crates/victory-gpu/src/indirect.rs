@@ -574,6 +574,126 @@ mod tests {
     use windows::Win32::Graphics::Direct3D12::*;
 
     #[test]
+    #[ignore = "requires VICTORY_PHYSICAL_TILES=1 VICTORY_INDIRECT_BATCH=2 VICTORY_INDIRECT_BATCH_ALIASED=1"]
+    fn aliased_compute_dispatches_share_a_clamp_until_a_boundary() {
+        use super::*;
+        use crate::draw::State;
+        use crate::pipeline::{Shader, Translated};
+        use crate::watch::PAGE;
+        use victory_shader::emit::HostShader;
+        use victory_shader::native::HwStage;
+        use windows_sys::Win32::System::Memory::{
+            MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc, VirtualFree,
+        };
+
+        assert!(crate::alias::physical_tiles_enabled());
+        assert!(batch_aliased());
+        assert_eq!(batch_mode(), 2);
+        let host = host().expect("D3D12 device");
+        // SAFETY: reserve a private page for the title alias.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!base.is_null());
+        let title = crate::tiled::TiledAlias::new(base as usize, PAGE).unwrap();
+        let heap =
+            std::sync::Arc::new(crate::alias::PhysicalHeap::new(&host.device, PAGE).unwrap());
+        title.map(base as usize, PAGE, Some((&heap, 0)));
+        let gpu_data = heap.cpu_address() as *mut u32;
+        // The first two dispatches have independent arguments and outputs.
+        // The first writes the third record, which starts with zero groups.
+        // SAFETY: the first 192 bytes are in our mapped page.
+        unsafe {
+            gpu_data.cast::<[[u32; 8]; 3]>().write([
+                [1, 1, 1, 0, 0, 0, 0, 0],
+                [1, 1, 1, 0, 0, 0, 0, 0],
+                [0, 1, 1, 0, 0, 0, 0, 0],
+            ]);
+            std::ptr::write_bytes(gpu_data.add(24), 0, 24);
+        }
+        let source = b"
+RWByteAddressBuffer dst : register(u0, space1);
+[numthreads(1, 1, 1)]
+void main(uint3 group : SV_GroupID) { dst.Store(group.x * 4, 7); }
+";
+        let mut code = None;
+        // SAFETY: the source and result pointer remain live through the call.
+        unsafe {
+            D3DCompile(
+                source.as_ptr().cast(),
+                source.len(),
+                s!("clamp consumer"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+        }
+        .unwrap();
+        let code = code.unwrap();
+        // SAFETY: the compiler returned a live blob with this byte length.
+        let dxil = unsafe {
+            std::slice::from_raw_parts(code.GetBufferPointer().cast(), code.GetBufferSize())
+        }
+        .to_vec();
+        let pipeline = crate::pipeline::test_compute(Shader::for_test(
+            "compute",
+            Translated {
+                host: HostShader {
+                    stage: HwStage::Cs,
+                    dxil,
+                    user_data: vec![],
+                    samplers: vec![],
+                    static_samplers: vec![],
+                    root_cbvs: vec![],
+                    root_srvs: vec![],
+                    root_uavs: vec![0],
+                    root_srv_bytes: vec![],
+                    memory: false,
+                    memory_writes: false,
+                    view_addresses: false,
+                    heap: false,
+                    heap_writes: false,
+                    view_marks: false,
+                },
+                used: vec![],
+            },
+        ));
+        let passes = || BATCH_STATS[0].load(Ordering::Relaxed);
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_pipeline(pipeline);
+        let address = base as u64;
+        let before = passes();
+        state.set_view(true, 0, address + 64);
+        assert!(state.execute_indirect(&list, (2, 12, 1), address, None));
+        state.set_view(true, 0, address + 96);
+        assert!(state.execute_indirect(&list, (2, 12, 1), address + 32, None));
+        assert_eq!(
+            passes() - before,
+            1,
+            "independent consumers share the clamp"
+        );
+        list.indirect_boundary();
+        // SAFETY: order UAV writes before the next clamp reads its record.
+        unsafe { list.list.ResourceBarrier(&[uav_barrier()]) };
+        state.set_view(true, 0, address + 128);
+        assert!(state.execute_indirect(&list, (2, 12, 1), address + 64, None));
+        assert_eq!(passes() - before, 2, "a dependency starts a fresh clamp");
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: the test initialized this live page and the GPU finished.
+        assert_eq!(unsafe { gpu_data.add(38).read_volatile() }, 7);
+        assert_eq!(crate::object::release(pipeline), 0);
+        drop(list);
+        drop(title);
+        // SAFETY: release this test's reservation after the list finishes.
+        assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
+    }
+
+    #[test]
     fn aliased_source_window_handles_offsets_past_four_gib() {
         use super::{Batch, source_window};
 
