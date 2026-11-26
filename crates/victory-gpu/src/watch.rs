@@ -1536,6 +1536,9 @@ pub(crate) mod tests {
 
     #[test]
     fn racing_takes_keep_each_watch_answer_for_slower_trackers() {
+        if !fault_tracking() {
+            return;
+        }
         let p = pool(1);
         let [a, b, slow] =
             std::array::from_fn(|_| track(p, PAGE, true).expect("pool memory is tracked"));
