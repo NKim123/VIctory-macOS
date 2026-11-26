@@ -2995,12 +2995,27 @@ void main(uint3 id : SV_DispatchThreadID) {{
             "a reachable slot keeps its backing"
         );
         assert!(slots.kept(second));
-        slots.make_null(second);
-        slots.make_null(third);
+        let list = host.new_list().unwrap();
+        let still_in_flight = released.clone();
+        list.defer_host(move || {
+            // The submission lock is held here. The GPU and copy-back
+            // boundary has not been reached, so retirement cannot drain.
+            slots.make_null(second);
+            slots.make_null(third);
+            assert!(!slots.kept(second) && !slots.kept(third));
+            assert!(still_in_flight.upgrade().is_some());
+        });
+        list.close();
+        host.execute(&[&list]);
+        let since = std::time::Instant::now();
+        while released.upgrade().is_some() && since.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::yield_now();
+        }
         assert!(
             released.upgrade().is_none(),
-            "replacing the vacant slots releases the old shadow"
+            "the old shadow was retired after submission"
         );
+        drop(list);
         drop(view);
         crate::object::release_ref(heap);
         crate::object::release_ref(src);

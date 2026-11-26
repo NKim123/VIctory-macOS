@@ -572,9 +572,9 @@ impl HostHeap {
             };
             slots.fill(false);
             drop(guard);
-            // Drop shadows and enqueue COM retirement outside both locks.
-            for (resource, _) in retired {
-                crate::host::retire(resource);
+            // Enqueue complete backing ownership outside both locks.
+            for held in retired {
+                crate::host::retire(held);
             }
         }
     }
@@ -751,11 +751,11 @@ impl HostHeap {
                 let left = crate::resource::life::holders(old);
                 crate::resource::life::note(old.as_raw() as usize, crate::resource::life::SLOT, u64::from(index), left);
             }
-            // Title threads rewrite slots while the GPU runs a submission;
-            // one of its shaders may hold the old descriptor (or read the
-            // slot at an index from wrong data): what it views is freed
-            // only once that work has run.
-            if let Some((old, _)) = old {
+            drop(kept);
+            // A shader may still use the old descriptor. Its mark owner
+            // must also survive copy-back, and its arena space must stay
+            // reserved until the submission completes.
+            if let Some(old) = old {
                 crate::host::retire(old);
             }
         }
@@ -1580,13 +1580,13 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
 /// The host resource a slot made by [`make`] views, and the view's own copy
 /// of title memory ([`crate::shadow::for_view`]): the slot holds it, so that
 /// draws reading the view find and refresh that copy.
-type Held = (ID3D12Resource, Option<HeldSource>);
+pub(crate) type Held = (ID3D12Resource, Option<HeldSource>);
 
 /// The fields keep the normal and widened copies alive for as long as the
 /// slot shows them.
 #[allow(dead_code)]
 #[derive(Clone)]
-enum HeldSource {
+pub(crate) enum HeldSource {
     Shadow(std::sync::Arc<crate::shadow::Shadow>),
     /// A widened three-channel view and the normal shadow it reads.
     Widened(

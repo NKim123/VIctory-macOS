@@ -4068,16 +4068,13 @@ impl Host {
     }
 }
 
-/// Host resources that view heap slots stopped viewing while a submission
-/// may have been running ([`retire`]).
-static RETIRED: Mutex<Vec<ID3D12Resource>> = Mutex::new(Vec::new());
+/// Descriptor backing detached from heap slots while a submission may
+/// be running. Both the resource and any mark/arena owner must survive
+/// until the submission and its copy-back have finished.
+static RETIRED: Mutex<Vec<crate::descriptor::host::Held>> = Mutex::new(Vec::new());
 
-/// Keeps `resource` alive until the GPU work running now (or the next
-/// submission's) has run: title threads rewrite view heap slots while the
-/// GPU runs, and a shader that took the old descriptor still reads what it
-/// views.
-pub(crate) fn retire(resource: ID3D12Resource) {
-    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push(resource);
+pub(crate) fn retire(held: crate::descriptor::host::Held) {
+    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push(held);
 }
 
 /// After a submission has run, with none running: the retired resources go.
