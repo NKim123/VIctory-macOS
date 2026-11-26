@@ -830,10 +830,12 @@ pub fn emit_with(
         }
         // A full console wave can vote on its mask branches as a group,
         // with a host thread for each bit of EXEC and VCC. Both halves then
-        // reach the exchange for the reduction or first active lane. With
+        // reach the exchange for a reduction, first active lane or ballot. With
         // narrow waves, lowering must also be able to synchronize guest LDS.
-        if matches!(*what, lower::REDUCTION_ACROSS | lower::FIRST_ACROSS)
-            && matches!(native.io, crate::native::StageIo::Cs(cs)
+        if matches!(
+            *what,
+            lower::REDUCTION_ACROSS | lower::FIRST_ACROSS | lower::MASK_ACROSS
+        ) && matches!(native.io, crate::native::StageIo::Cs(cs)
                 if cs.threads.iter().product::<u32>() == 64
                     && (cs.lds_bytes() == 0 || options.narrow_waves))
             && let Ok(st) = structure::with_group_branches(p)
@@ -1211,6 +1213,123 @@ mod tests {
         assert!(error.to_string().contains(lower::LDS_ACROSS));
         translate_group_with_lds(true)
             .expect("the group can synchronize LDS and read the first active lane");
+    }
+
+    fn translate_group_with_uav(body: &[u32]) -> Result<HostShader, ShaderError> {
+        use crate::native::{ResourceType, RootParam, UsedResource};
+
+        let prologue = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        ];
+        let write = [
+            0x7E02_020F, // v_mov_b32 v1, s15
+            0xE070_1000,
+            0x800A_0110, // buffer_store_dword v1, v16, s[40:43], 0 offen
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 32,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 16,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 1,
+                threads: [64, 1, 1],
+            }),
+            code: prologue
+                .into_iter()
+                .chain(body.iter().copied())
+                .chain(write)
+                .flat_map(u32::to_le_bytes)
+                .collect(),
+        };
+        let bytes = container::build(&[]);
+        let container = Container::parse(&bytes).unwrap();
+        let program = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let structured = structure::structure(&program).unwrap();
+        let resources =
+            resource::track(&program, &native.layout, native.stage, Some(&structured)).unwrap();
+        let io = io::raise(&program, &native).unwrap();
+        emit_with(
+            &container,
+            &native,
+            &program,
+            &structured,
+            &io,
+            &resources,
+            Options {
+                host_wave32: true,
+                narrow_waves: true,
+                ..Options::default()
+            },
+        )
+    }
+
+    pub(super) fn translate_group_with_ballot(lane: u8) -> Result<HostShader, ShaderError> {
+        // The outer scalar branch must see the upper ballot word in both waves.
+        translate_group_with_uav(&[
+            0xBE8F_03BB, // s_mov_b32 s15, 59
+            0xD4C2_001A,
+            0x0002_0080 + u32::from(lane), // v_cmp_eq_u32 s[26:27], lane, v0
+            0xBE8C_031B,                   // s_mov_b32 s12, s27
+            0xBE8A_130C,                   // s_ff1_i32_b32 s10, s12
+            0xBF06_8D0A,                   // s_cmp_eq_u32 s10, 13
+            0xBF84_0007,                   // s_cbranch_scc0 write
+            0xBE94_047E,                   // s_mov_b64 s[20:21], exec
+            0x7DA4_00AD,                   // v_cmpx_eq_u32 exec, 45, v0
+            0xBF88_0002,                   // s_cbranch_execz fallback
+            0x7E1E_0500,                   // v_readfirstlane_b32 s15, v0
+            0xBF82_0001,                   // s_branch restore
+            0xBE8F_03A5,                   // fallback: s_mov_b32 s15, 37
+            0xBEFE_0414,                   // restore: s_mov_b64 exec, s[20:21]
+        ])
+    }
+
+    pub(super) fn translate_group_with_mask_as_data(lane: u8) -> Result<HostShader, ShaderError> {
+        // An EXEC branch encloses the definition of the mask used as data.
+        translate_group_with_uav(&[
+            0xBE94_047E,                   // s_mov_b64 s[20:21], exec
+            0x7DA4_0080 + u32::from(lane), // v_cmpx_eq_u32 exec, lane, v0
+            0xBF88_0004,                   // s_cbranch_execz fallback
+            0xD4C2_001A,
+            0x0002_0080 + u32::from(lane), // v_cmp_eq_u32 s[26:27], lane, v0
+            0xBE8F_141A,                   // s_ff1_i32_b64 s15, s[26:27]
+            0xBF82_0001,                   // s_branch restore
+            0xBE8F_03A5,                   // fallback: s_mov_b32 s15, 37
+            0xBEFE_0414,                   // restore: s_mov_b64 exec, s[20:21]
+        ])
+    }
+
+    #[test]
+    fn group_first_lane_retry_accepts_a_ballot_branch() {
+        translate_group_with_ballot(45).expect("the scalar branch sees a group-wide ballot");
+    }
+
+    #[test]
+    fn group_retry_materializes_the_mask_as_data() {
+        translate_group_with_mask_as_data(45).expect("both halves reach the mask's definition");
     }
 
     #[test]

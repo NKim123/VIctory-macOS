@@ -381,11 +381,6 @@ impl Lower<'_> {
     }
 }
 
-/// Why a lane mask read as data stops in halves: it is written where the
-/// lanes of the group may not all be, as often, so no group barrier can pass
-/// it between the halves.
-pub(super) const MASK_ACROSS: Why = "a lane mask read as data (wave64 on a 32-lane host)";
-
 /// The group-shared dwords a D3D12 compute program may declare, at most
 /// (32 KiB).
 const GROUP_SHARED_DWORDS: u32 = 8192;

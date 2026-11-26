@@ -733,6 +733,38 @@ fn whole_group_reads_first_lane_after_lds() {
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
+#[test]
+fn whole_group_branches_on_the_upper_ballot_word() {
+    let mut failed = Vec::new();
+    for (lane, expected) in [(45, 45), (46, 59), (13, 59)] {
+        let host = super::tests::translate_group_with_ballot(lane)
+            .expect("both halves see the same ballot");
+        failed.extend(check_differences(
+            &[("ballot branch", host)],
+            64,
+            1,
+            &[expected; 64],
+        ));
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+#[test]
+fn whole_group_materializes_a_mask_inside_an_exec_branch() {
+    let mut failed = Vec::new();
+    for (lane, expected) in [(45, 45), (5, 5), (64, 37)] {
+        let host = super::tests::translate_group_with_mask_as_data(lane)
+            .expect("both halves reach the mask's definition");
+        failed.extend(check_differences(
+            &[("mask as data", host)],
+            64,
+            1,
+            &[expected; 64],
+        ));
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
 /// What the console gives [`reduction`] of `f` (folding the inputs of a
 /// console wave's lanes) in lane `l` of a group of `threads`.
 fn console_reduction(
