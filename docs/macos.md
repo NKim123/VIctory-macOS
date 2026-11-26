@@ -355,6 +355,21 @@ The switches add no allocator, staging, or snapshot pools.
 
 Under Rosetta with D3DMetal, memory the title commits read-write with `XMemVirtualAlloc`, in whole 64 KiB pages, is pointed at the pages of a D3DMetal buffer with `mach_vm_remap` (#204). The GPU then reads and writes the title's own memory, so those buffers need no host copy, no copy-back after a submission that wrote them, and no refresh before one. A probe at start-up falls back to the copies if the remap does not work, and `VICTORY_ALIAS_BUFFERS=0` keeps the copies.
 
+## Experimental write tracking
+
+`VICTORY_PORT_GUARD=1` lets write faults and refreshes share access to the
+guard metadata. Claims on 64 KiB blocks, including their known aliases,
+serialize protection changes and dirty marks. Registered XMem views skip
+write-watch and region queries where their mapping is already known. A
+refresh claims at most 64 requested blocks at a time, plus their aliases.
+On Rosetta this path still requires `VICTORY_FAULT_TRACKING=1` and the usual
+loader store workarounds. XMem mapping remains single-threaded.
+
+With the guard port enabled, `VICTORY_PORT_GUARD_PLAN=0` disables parallel
+clean checks for direct refreshes before the first title-memory write in
+large submissions. Planning reuses the texture workers and caps its input
+at 64 lists and 65,536 steps.
+
 ## Optional switches for slow storage, low memory and speed
 
 None of these changes the default. Each is read from the environment when the game starts, and all of them are tools for testers, so please post what you see on #131 or #135 when you try one.

@@ -2161,9 +2161,15 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
-        for list in runs {
+        let plans = if !host_only && crate::watch::port_guard_plan() {
+            plan_refreshes(runs)
+        } else {
+            Vec::new()
+        };
+        for (i, list) in runs.iter().enumerate() {
             if !host_only {
-                list.run_deferred(&mut batch);
+                let planned = plans.get(i).map_or(&[][..], |plan| &plan.skip);
+                list.run_deferred_planned(&mut batch, planned);
             }
             firsts.push(lists.len());
             #[cfg(feature = "diagnostics")]
@@ -4041,10 +4047,15 @@ impl HostList {
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
+    #[cfg(test)]
     fn run_deferred(&self, batch: &mut Batch) {
+        self.run_deferred_planned(batch, &[]);
+    }
+
+    fn run_deferred_planned(&self, batch: &mut Batch, skip: &[bool]) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
-        for step in &self.deferred().copies {
+        for (i, step) in self.deferred().copies.iter().enumerate() {
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(
@@ -4091,7 +4102,9 @@ impl HostList {
                         add(C::Refreshes, 1);
                         add(C::RefreshBytes, *len as u64);
                     }
-                    batch.add(shadow, *address, *len);
+                    if !skip.get(i).copied().unwrap_or(false) {
+                        batch.add(shadow, *address, *len);
+                    }
                     continue;
                 }
                 Step::Slot(viewed, index) => {
@@ -4137,6 +4150,59 @@ impl HostList {
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
     }
+}
+
+#[derive(Default)]
+struct ListRefreshPlan {
+    skip: Vec<bool>,
+    title_write: bool,
+}
+
+/// Precheck only the direct refreshes that precede the submission's first
+/// title write. Live descriptor and page-table lookups still run in
+/// submission order. Bound the worker results and reuse the texture pool.
+fn plan_refreshes(runs: &[&HostList]) -> Vec<ListRefreshPlan> {
+    const MIN_STEPS: usize = 4096;
+    const MAX_STEPS: usize = 65536;
+    const MAX_LISTS: usize = 64;
+    if !(2..=MAX_LISTS).contains(&runs.len()) {
+        return Vec::new();
+    }
+    let steps: usize = runs.iter().map(|list| list.deferred().copies.len()).sum();
+    if !(MIN_STEPS..=MAX_STEPS).contains(&steps) {
+        return Vec::new();
+    }
+    let plans: Vec<Mutex<ListRefreshPlan>> = (0..runs.len()).map(|_| Mutex::default()).collect();
+    crate::texture::in_parallel(runs.len(), |i| {
+        let list = runs[i].deferred();
+        let mut plan = plans[i].lock().unwrap_or_else(|e| e.into_inner());
+        for step in &list.copies {
+            let skip = match step {
+                Step::Refresh(shadow, ..) => shadow.clean(),
+                Step::Copy(..) | Step::Move(..) => {
+                    plan.title_write = true;
+                    break;
+                }
+                #[cfg(test)]
+                Step::Run(_) => {
+                    plan.title_write = true;
+                    break;
+                }
+                _ => false,
+            };
+            plan.skip.push(skip);
+        }
+    });
+    let mut result = Vec::with_capacity(plans.len());
+    for plan in plans {
+        let plan = plan.into_inner().unwrap_or_else(|e| e.into_inner());
+        let title_write = plan.title_write;
+        result.push(plan);
+        if title_write {
+            break;
+        }
+    }
+    result
 }
 
 /// A submission's refreshes not done yet, as the ranges of each buffer copy
@@ -5797,7 +5863,7 @@ fn pump() {
 #[cfg(test)]
 mod batch {
     // `mod tests` is already taken at the top of this file
-    use super::{Batch, Step};
+    use super::{Batch, Step, plan_refreshes};
     use crate::shadow::Shadow;
     use crate::watch::PAGE;
     use std::sync::Arc;
@@ -5879,6 +5945,48 @@ mod batch {
         assert_eq!(list.fill_scratch(src, 16), Some(first));
         assert_eq!(list.deferred().copies.len(), 1, "a fresh fill after reset");
         list.close();
+    }
+
+    #[test]
+    fn refresh_planning_stops_at_the_first_title_write() {
+        if !crate::watch::fault_tracking() {
+            return;
+        }
+        let base = crate::watch::tests::pool(1);
+        crate::shadow::register(base, base as u64, PAGE as u64);
+        let copy = crate::shadow::find(base as u64, PAGE as u64).unwrap();
+        let host = super::host().unwrap();
+        let before = host.new_list().unwrap();
+        let writes = host.new_list().unwrap();
+        let after = host.new_list().unwrap();
+        copy.update(base, PAGE);
+        assert!(copy.clean());
+        before
+            .deferred()
+            .copies
+            .extend((0..4096).map(|_| Step::Refresh(copy.clone(), base, PAGE)));
+        writes.defer(move || {
+            // SAFETY: the test owns this pool and keeps it live.
+            unsafe { (base as *mut u8).write_volatile(12) };
+        });
+        after
+            .deferred()
+            .copies
+            .push(Step::Refresh(copy.clone(), base, PAGE));
+        let runs = [&before, &writes, &after];
+        let plan = plan_refreshes(&runs);
+        assert_eq!(plan.len(), 2);
+        assert!(plan[0].skip.iter().all(|&skip| skip));
+        assert!(plan[1].skip.is_empty());
+        let mut batch = Batch::default();
+        before.run_deferred_planned(&mut batch, &plan[0].skip);
+        writes.run_deferred_planned(&mut batch, &plan[1].skip);
+        after.run_deferred(&mut batch);
+        assert!(batch.flush() > 0);
+        assert_eq!(copy.read_host(base as u64, 1), [12]);
+        drop((batch, before, writes, after, copy));
+        crate::shadow::unregister(base, base as u64);
+        crate::watch::tests::free(base);
     }
 
     /// A host copy of tracked title memory: a submission whose lists all ask
