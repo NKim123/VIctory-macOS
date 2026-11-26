@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crate::descriptor::{View, host::Paged};
 use crate::host::HostList;
@@ -74,10 +74,16 @@ type Hull = (Arc<Shadow>, u64, u64, bool, Option<u32>);
 struct Inner {
     slots: Paged<Seen>,
     ranges: HashMap<Range, (u32, Arc<Shadow>)>,
-    textures: BTreeMap<usize, u32>,
+    textures: BTreeMap<usize, TextureUse>,
     /// A running hull of the refresh ranges per copy and access kind.
     /// A heap-indexing list asks for these on every submission.
     spans: HashMap<(usize, bool), Span>,
+}
+
+#[derive(Default)]
+struct TextureUse {
+    slots: u32,
+    copy: Weak<crate::resource::HostTexture>,
 }
 
 struct Span {
@@ -188,9 +194,9 @@ impl Inner {
                 }
             }
             Seen::Texture(r) => {
-                let n = self.textures.entry(*r).or_insert(0);
-                step(n);
-                if *n == 0 {
+                let tracked = self.textures.entry(*r).or_default();
+                step(&mut tracked.slots);
+                if tracked.slots == 0 {
                     self.textures.remove(r);
                 }
             }
@@ -464,18 +470,32 @@ pub(crate) fn uploads_for(
                 .gated_upload_bytes()
                 .is_some_and(|bytes| bytes > crate::descriptor::PENDING_STAGING_BYTES)
     };
-    let mut large_first_fill = crate::descriptor::host::show_after()
-        && work.iter().any(|(_, copy)| is_large_first_fill(copy));
+    let show_after = crate::descriptor::host::show_after();
+    let mut large_first_fill = show_after && work.iter().any(|(_, copy)| is_large_first_fill(copy));
     for viewed in heaps {
-        let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
-        for &r in inner.textures.keys() {
-            if !done.insert(r) {
+        let mut inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+        for (&r, tracked) in &mut inner.textures {
+            if heaps.len() > 1 && !done.insert(r) {
                 continue;
             }
             // Not made (given up, or never read): nothing to bring up.
-            let Some(texture) = crate::resource::made_copy(r as This)
-                .filter(|copy| !copy.evicted.load(std::sync::atomic::Ordering::Acquire))
-            else {
+            let live = |copy: &Arc<crate::resource::HostTexture>| {
+                !copy.evicted.load(std::sync::atomic::Ordering::Acquire)
+            };
+            // With show-after, eviction marks the old host copy before
+            // the resource can replace it. A weak cache avoids locking
+            // thousands of cold resource objects every submission.
+            let cached = show_after
+                .then(|| tracked.copy.upgrade())
+                .flatten()
+                .filter(live);
+            let Some(texture) = cached.or_else(|| {
+                let copy = crate::resource::made_copy(r as This).filter(live)?;
+                if show_after {
+                    tracked.copy = Arc::downgrade(&copy);
+                }
+                Some(copy)
+            }) else {
                 continue;
             };
             // Only what shaders read lately (the eviction pass's stamps):
