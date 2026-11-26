@@ -27,6 +27,7 @@ pub mod amd_patch;
 mod crash;
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub mod descriptor_sites;
+pub mod frame_rate;
 pub mod masked;
 #[cfg(windows)]
 mod patch;

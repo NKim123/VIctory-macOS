@@ -183,6 +183,21 @@ pub fn run(
         // SAFETY: the image stays mapped and nothing of it has run yet.
         unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
     }
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    if execute && let Some(ms) = victory_gpu::frame::interval_override_ms() {
+        use victory_loader::frame_rate::{apply, title_rate};
+        let title_fps = std::env::var("VICTORY_TITLE_FPS").ok();
+        if let Some(rate) = title_rate(ms, title_fps.as_deref()) {
+            if hash.as_str() == SERIES_1021_HASH {
+                let size = image.info().size_of_image as usize;
+                // SAFETY: the main image stays mapped and its code has yet to run.
+                let patched = unsafe { apply(image.base(), size, rate) };
+                println!("frame interval {ms} ms, title rate {rate}: {patched:?}");
+            } else {
+                println!("frame interval {ms} ms, unknown title build for the rate patch");
+            }
+        }
+    }
     // Masked stores redone as plain stores Rosetta can resume, so fault
     // tracking (`VICTORY_FAULT_TRACKING=1`) can run under Rosetta (#50).
     if let (Some(which), Some(original)) = (patching, original) {
