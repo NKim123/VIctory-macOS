@@ -32,9 +32,9 @@ pub(crate) fn texture_state(state: u32) -> u32 {
     pc_state(state) & !BUFFER_ONLY
 }
 
-/// Render target views live only until their command is recorded, so a
-/// ring of host descriptors is enough.
+/// Slots available to the regular render target binding ring.
 const RTV_RING: u32 = 1024;
+const CLEAR_RTV_SLOT: u32 = RTV_RING;
 
 thread_local! {
     /// The thread holds the submission lock ([`Host::execute`] or
@@ -78,6 +78,8 @@ pub(crate) struct Host {
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
+    /// Protects the reserved CPU descriptor through clear recording.
+    clear_rtv: Mutex<()>,
     /// A ring of depth views, used as `rtvs`.
     dsvs: ID3D12DescriptorHeap,
     dsv_size: u32,
@@ -333,7 +335,7 @@ fn create() -> windows::core::Result<Host> {
         let rtvs: ID3D12DescriptorHeap =
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-                NumDescriptors: RTV_RING,
+                NumDescriptors: RTV_RING + 1,
                 ..Default::default()
             })?;
         let rtv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
@@ -374,6 +376,7 @@ fn create() -> windows::core::Result<Host> {
             event,
             rtvs,
             rtv_size,
+            clear_rtv: Mutex::new(()),
             dsvs,
             dsv_size,
             next_dsv: AtomicU32::new(0),
@@ -499,6 +502,75 @@ pub(crate) fn video_memory() -> Option<[(f64, f64); 2]> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn clear_rtv_stays_reserved_through_a_ring_of_target_bindings() {
+        use super::*;
+        let Some(host) = host() else { return };
+        let target = || {
+            let mut resource = None;
+            // SAFETY: a plain, 4x4 color target with no mapped memory.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                            Width: 4,
+                            Height: 4,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                            SampleDesc: DXGI_SAMPLE_DESC {
+                                Count: 1,
+                                Quality: 0,
+                            },
+                            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                            ..Default::default()
+                        },
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        None,
+                        &mut resource,
+                    )
+                    .unwrap();
+            }
+            resource.unwrap()
+        };
+        let cleared = target();
+        let bound = target();
+        let clear = host.new_list().unwrap();
+        let binds = host.new_list().unwrap();
+
+        host.with_clear_rtv(&cleared, None, |clear_view| {
+            assert!(host.clear_rtv.try_lock().is_err());
+            // Record ordinary bindings through a full turn of the ring
+            // before the other list consumes its clear descriptor.
+            for _ in 0..=RTV_RING {
+                let bound_view = host.rtv(&bound, None);
+                assert_ne!(bound_view.ptr, clear_view.ptr);
+                // SAFETY: an open list and a fresh view of the live target.
+                unsafe {
+                    binds
+                        .list
+                        .OMSetRenderTargets(1, Some(&bound_view), false, None)
+                };
+            }
+            // SAFETY: an open list; this call still owns its clear slot.
+            unsafe {
+                clear
+                    .list
+                    .ClearRenderTargetView(clear_view, &[1.0, 0.0, 0.0, 1.0], None)
+            };
+        });
+
+        binds.close();
+        clear.close();
+        host.execute(&[&binds, &clear]);
+    }
+
     /// Run in isolation with VICTORY_PRESENT_MAX=1280x720. Exercise the
     /// real swap chain and its resize path without opening a visible window.
     #[test]
@@ -2033,7 +2105,28 @@ impl Host {
         desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
     ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
-        // SAFETY: a slot of our heap and a live resource.
+        self.write_rtv(slot, resource, desc)
+    }
+
+    /// Records a clear using the one RTV slot outside the binding ring.
+    /// Hold it until D3D12 has consumed the CPU descriptor.
+    pub(crate) fn with_clear_rtv(
+        &self,
+        resource: &ID3D12Resource,
+        desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
+        record: impl FnOnce(D3D12_CPU_DESCRIPTOR_HANDLE),
+    ) {
+        let _slot = self.clear_rtv.lock().unwrap_or_else(|e| e.into_inner());
+        record(self.write_rtv(CLEAR_RTV_SLOT, resource, desc));
+    }
+
+    fn write_rtv(
+        &self,
+        slot: u32,
+        resource: &ID3D12Resource,
+        desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
+    ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        // SAFETY: the slot is in our heap, and the resource is live.
         unsafe {
             let mut handle = self.rtvs.GetCPUDescriptorHandleForHeapStart();
             handle.ptr += (slot * self.rtv_size) as usize;

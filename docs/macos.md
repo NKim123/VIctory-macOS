@@ -216,7 +216,8 @@ those running on macOS under Wine.
   of 32 commands and finishes short streams when the list closes. If the
   worker queue is full, the calling thread translates the chunk. Color
   clears keep the host texture and copy the view description, color, and
-  rectangles at the call. Draws, dispatches and other operations that need
+  rectangles at the call. Clear recording reserves one CPU descriptor
+  until D3D12 consumes it. Draws, dispatches and other operations that need
   live descriptors or title memory flush the stream first. Submission
   waits until the list has closed.
 - `VICTORY_ASYNC_SUBMIT=1` lets title threads continue recording while one

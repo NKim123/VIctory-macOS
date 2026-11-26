@@ -73,10 +73,14 @@ impl ColorClear {
                     D3D12_RESOURCE_STATES(RENDER_TARGET as i32),
                 )]);
             }
-            let view = host.rtv(&texture.texture, self.desc.as_ref());
-            list.list
-                .ClearRenderTargetView(view, &self.color, Some(rects));
         }
+        host.with_clear_rtv(&texture.texture, self.desc.as_ref(), |view| {
+            // SAFETY: the list is open and this call holds the live RTV slot.
+            unsafe {
+                list.list
+                    .ClearRenderTargetView(view, &self.color, Some(rects))
+            };
+        });
     }
 }
 
