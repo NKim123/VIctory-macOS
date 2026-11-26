@@ -139,30 +139,37 @@ impl ListViews {
         index: u32,
         record: [u32; 3],
         view: &View,
+        backing: &std::sync::Arc<crate::shadow::Shadow>,
     ) -> bool {
         let Some(host) = host() else { return false };
         let count = self.made.len();
-        let template = match self.made.entry(record) {
-            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                if count >= Self::CAPACITY as usize {
-                    return false;
-                }
-                let at = D3D12_CPU_DESCRIPTOR_HANDLE {
+        let template = self.made.get(&record);
+        let matches = template
+            .and_then(|template| held_backing(&template.held))
+            .is_some_and(|cached| std::sync::Arc::ptr_eq(cached, backing));
+        if !matches {
+            let at = match template {
+                Some(template) => template.at,
+                None if count < Self::CAPACITY as usize => D3D12_CPU_DESCRIPTOR_HANDLE {
                     ptr: self.cpu + count * self.step,
-                };
-                let (kept, mark) = make_marked(view, at);
-                let Some(held) = kept.flatten() else {
-                    return false;
-                };
-                entry.insert(ListedView {
+                },
+                None => return false,
+            };
+            let (kept, mark) = make_marked_with_backing(view, at, Some(backing));
+            let Some(held) = kept.flatten() else {
+                return false;
+            };
+            self.made.insert(
+                record,
+                ListedView {
                     at,
                     held,
                     stride: view_stride(view) | view_kind(view),
                     mark,
-                })
-            }
-        };
+                },
+            );
+        }
+        let template = &self.made[&record];
         // SAFETY: initialized CPU-only source, live destination owned by
         // this list. The slot and its mark/stride are private to the list.
         unsafe {
@@ -556,7 +563,17 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
-        let (kept, mark) = make_marked(view, self.cpu(index));
+        self.make_at_with_backing(index, view, None);
+    }
+
+    /// Build a fresh-table view from the same backing its draw will refresh.
+    pub(crate) fn make_at_with_backing(
+        &self,
+        index: u32,
+        view: &View,
+        backing: Option<&std::sync::Arc<crate::shadow::Shadow>>,
+    ) {
+        let (kept, mark) = make_marked_with_backing(view, self.cpu(index), backing);
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
@@ -566,6 +583,16 @@ impl HostHeap {
         // A table made afresh: shaders reading a view's address there (e.g.
         // the BVH builder's base) index the view addresses at this slot.
         self.note_address(index, Some(view));
+    }
+
+    /// The backing of a buffer in a reused fresh table. The slot owns the
+    /// exact shadow its descriptor names, including a widened view's source.
+    pub(crate) fn table_backing(
+        &self,
+        index: u32,
+    ) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        held_backing(kept.get(index as usize)?).cloned()
     }
 
     /// Makes slot `index` (a dynamic one) a raw view, shader resource or
@@ -883,7 +910,7 @@ impl HostHeap {
         let stale = changed_records(first, &made[first as usize..last as usize], records);
         drop(made);
         for (index, record, previous) in stale {
-            let _ = self.mirror_record(index, false, Some(previous), || record);
+            let _ = self.mirror_record(index, false, Some((previous, at(index))), || record);
         }
     }
 
@@ -949,8 +976,21 @@ impl HostHeap {
         let key = u64::from(generation) << 32 | u64::from(i);
         // Made from this record already and readable as it is (what the
         // checks below find under the lock): nothing to make.
+        let ready = &self.ready[index as usize];
+        // A same-key live write still participates in snapshot publication:
+        // its release either precedes the snapshot's acquire, or the cleared
+        // ready key makes it take the lock and finish after publication.
+        let ready_for_record = || {
+            if for_draw {
+                ready.load(Ordering::Acquire) == key
+            } else {
+                ready
+                    .compare_exchange(key, key, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            }
+        };
         if tag == VIEW_TAG
-            && self.ready[index as usize].load(Ordering::Acquire) == key
+            && ready_for_record()
             && let Some(view) = view_at(i, generation)
             && !self.needs_remake(index, &view, for_draw)
         {
@@ -964,26 +1004,50 @@ impl HostHeap {
     }
 
     /// Materializes a captured record or the latest record at a live slot.
-    /// A snapshot never reads title memory again, and yields if a recorder
-    /// has already replaced the host slot it observed.
+    /// Snapshot publication closes the live-write fast path and validates
+    /// the capture under the slot lock. The title may have unmapped the
+    /// slot since capture, so validation reads through the kernel.
     fn mirror_record(
         &self,
         index: u32,
         for_draw: bool,
-        previous: Option<u64>,
+        snapshot: Option<(u64, u64)>,
         read: impl Fn() -> [u32; 3],
     ) -> Result<Option<ViewPin>, ()> {
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        if previous.is_some_and(|key| made[index as usize] != key) {
+        if snapshot.is_some_and(|(key, _)| made[index as usize] != key) {
             return Ok(None);
         }
-        let [tag, i, generation] = read();
+        let record = read();
+        let [tag, i, generation] = record;
+        let snapshot_changed = |made: u64| {
+            snapshot.is_some_and(|(previous, address)| {
+                if made != previous {
+                    return true;
+                }
+                let ready = &self.ready[index as usize];
+                let saved = ready.swap(0, Ordering::AcqRel);
+                let mut bytes = [0u8; 12];
+                let changed = !crate::host::read_into(address as *const u8, &mut bytes)
+                    || bytes
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .copied()
+                        .map(u32::from_le_bytes)
+                        .ne(record);
+                if changed {
+                    ready.store(saved, Ordering::Release);
+                }
+                changed
+            })
+        };
         let key = u64::from(generation) << 32 | u64::from(i);
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
-            if made[index as usize] != 0 {
+            if made[index as usize] != 0 && !snapshot_changed(made[index as usize]) {
                 self.ready[index as usize].store(0, Ordering::Relaxed);
                 made[index as usize] = 0;
                 self.make_null(index);
@@ -1013,10 +1077,6 @@ impl HostHeap {
             drop(made);
             prepare(&view);
             made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-            if previous.is_some_and(|key| made[index as usize] != key) {
-                drop(made);
-                return Ok(None);
-            }
             // For live writes, retry if the title replaced the record while
             // the slot lock was released. For snapshots `read` is constant.
             if read() != [tag, i, generation] {
@@ -1026,6 +1086,10 @@ impl HostHeap {
             if made[index as usize] == key && !needs_remake() {
                 return Ok(Some(view));
             }
+        }
+        if snapshot_changed(made[index as usize]) {
+            drop(made);
+            return Ok(None);
         }
         {
             self.ready[index as usize].store(0, Ordering::Relaxed);
@@ -1498,6 +1562,13 @@ enum HeldSource {
     ),
 }
 
+fn held_backing(held: &Held) -> Option<&std::sync::Arc<crate::shadow::Shadow>> {
+    match &held.1 {
+        Some(HeldSource::Shadow(shadow) | HeldSource::Widened(_, shadow)) => Some(shadow),
+        None => None,
+    }
+}
+
 /// What a slot made by [`make`] holds, if anything.
 type Kept = Option<Held>;
 
@@ -1505,11 +1576,23 @@ type Kept = Option<Held>;
 #[cfg(feature = "diagnostics")]
 static REFUSED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+fn descriptor_shadow(
+    start: u64,
+    len: u64,
+    element: u64,
+    backing: Option<&std::sync::Arc<crate::shadow::Shadow>>,
+) -> Option<(std::sync::Arc<crate::shadow::Shadow>, bool)> {
+    backing
+        .map(|shadow| (shadow.clone(), true))
+        .or_else(|| crate::shadow::for_view(start, len, element))
+}
+
 fn buffer_srv(
     address: u64,
     len: u64,
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    backing: Option<&std::sync::Arc<crate::shadow::Shadow>>,
 ) -> Option<Kept> {
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
@@ -1520,12 +1603,21 @@ fn buffer_srv(
     }
     // The copy its own bytes are in, its first element counted from there.
     let start = address + buffer.FirstElement * element;
-    let Some((shadow, own)) =
-        crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)
-    else {
+    let Some((shadow, own)) = descriptor_shadow(
+        start,
+        u64::from(buffer.NumElements) * element,
+        element,
+        backing,
+    ) else {
         #[cfg(feature = "diagnostics")]
         if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
-            tracing::info!(start = format_args!("{start:#x}"), len, element, count = buffer.NumElements, "refused buffer view: no host copy");
+            tracing::info!(
+                start = format_args!("{start:#x}"),
+                len,
+                element,
+                count = buffer.NumElements,
+                "refused buffer view: no host copy"
+            );
         }
         return None;
     };
@@ -1534,9 +1626,20 @@ fn buffer_srv(
     if !in_buffer(&shadow.buffer, first, count, element) {
         #[cfg(feature = "diagnostics")]
         if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
-            tracing::info!(start = format_args!("{start:#x}"), first, count, element, "refused buffer view: empty or past its copy");
+            tracing::info!(
+                start = format_args!("{start:#x}"),
+                first,
+                count,
+                element,
+                "refused buffer view: empty or past its copy"
+            );
         }
-        once!(first, count, element, "buffer view empty or past its host copy");
+        once!(
+            first,
+            count,
+            element,
+            "buffer view empty or past its host copy"
+        );
         return None;
     }
     let host = host()?;
@@ -1578,7 +1681,11 @@ fn in_buffer(buffer: &ID3D12Resource, first: u64, count: u32, element: u64) -> b
 }
 
 fn within(width: u64, first: u64, count: u32, element: u64) -> bool {
-    count > 0 && first.saturating_add(u64::from(count)).saturating_mul(element) <= width
+    count > 0
+        && first
+            .saturating_add(u64::from(count))
+            .saturating_mul(element)
+            <= width
 }
 
 /// An unordered access view of title buffer memory at `address` (`len`
@@ -1591,6 +1698,7 @@ fn buffer_uav(
     len: u64,
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    backing: Option<&std::sync::Arc<crate::shadow::Shadow>>,
 ) -> Option<Kept> {
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
@@ -1615,11 +1723,19 @@ fn buffer_uav(
     // so keep the Wine-wide guard until 4.0 is characterized. The caller
     // installs a null UAV and keeps no resource or mark.
     if typed_three_channel && crate::shader_cache::under_wine() {
-        once!(format, "three-channel typed unordered buffer view under Wine");
+        once!(
+            format,
+            "three-channel typed unordered buffer view under Wine"
+        );
         return None;
     }
     let start = address + buffer.FirstElement * element;
-    let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)?;
+    let (shadow, own) = descriptor_shadow(
+        start,
+        u64::from(buffer.NumElements) * element,
+        element,
+        backing,
+    )?;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
@@ -1630,7 +1746,12 @@ fn buffer_uav(
     buffer.CounterOffsetInBytes = 0;
     let (first, count) = (buffer.FirstElement, buffer.NumElements);
     if !in_buffer(&shadow.buffer, first, count, element) {
-        once!(first, count, element, "unordered buffer view empty or past its host copy");
+        once!(
+            first,
+            count,
+            element,
+            "unordered buffer view empty or past its host copy"
+        );
         return None;
     }
     let host = host()?;
@@ -1639,7 +1760,10 @@ fn buffer_uav(
         // the device does not advertise and a device already removed.
         // SAFETY: plain device queries.
         if unsafe { host.device.GetDeviceRemovedReason() }.is_err() || !typed_store(format as u32) {
-            once!(format, "three-channel typed unordered buffer view the host cannot make");
+            once!(
+                format,
+                "three-channel typed unordered buffer view the host cannot make"
+            );
             return None;
         }
     }
@@ -1656,7 +1780,10 @@ fn buffer_uav(
     // If it removed the native device, do not keep its descriptor or mark.
     // SAFETY: a plain device query.
     if typed_three_channel && unsafe { host.device.GetDeviceRemovedReason() }.is_err() {
-        once!(format, "device removed making a three-channel typed unordered buffer view");
+        once!(
+            format,
+            "device removed making a three-channel typed unordered buffer view"
+        );
         return None;
     }
     MARK.with(|m| m.set(shadow.mark_entry(start)));
@@ -1676,8 +1803,16 @@ thread_local! {
 /// buffer view whose writes shaders mark (`victory_shader::emit`, "Write
 /// marks").
 fn make_marked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> (Option<Kept>, Option<(u32, u32)>) {
+    make_marked_with_backing(view, at, None)
+}
+
+fn make_marked_with_backing(
+    view: &View,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    backing: Option<&std::sync::Arc<crate::shadow::Shadow>>,
+) -> (Option<Kept>, Option<(u32, u32)>) {
     MARK.with(|m| m.set(None));
-    let kept = make(view, at);
+    let kept = make(view, at, backing);
     (kept, MARK.with(std::cell::Cell::take))
 }
 
@@ -1805,12 +1940,16 @@ fn typed_store(format: u32) -> bool {
 /// Makes the host descriptor for `view` at `at` (in any host view heap):
 /// the host resource it views, if it can.
 pub(crate) fn make_view(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
-    make(view, at).flatten().map(|k| k.0)
+    make(view, at, None).flatten().map(|k| k.0)
 }
 
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
-fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
+fn make(
+    view: &View,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    backing: Option<&std::sync::Arc<crate::shadow::Shadow>>,
+) -> Option<Kept> {
     let host = host()?;
     let device = &host.device;
     match view {
@@ -1834,7 +1973,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     },
                 },
             };
-            buffer_srv(address, bytes, desc, at)
+            buffer_srv(address, bytes, desc, at, None)
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
@@ -1866,7 +2005,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
             {
-                buffer_srv(data as u64, len, srv_desc(desc), at)
+                buffer_srv(data as u64, len, srv_desc(desc), at, backing)
             } else {
                 None
             }
@@ -1876,7 +2015,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             let Some(copy) = crate::resource::host_copy(resource) else {
                 return match (crate::resource::buffer_bytes(resource), desc) {
                     (Some((data, len)), Some(desc)) => {
-                        buffer_uav(data as u64, len, uav_desc(desc), at)
+                        buffer_uav(data as u64, len, uav_desc(desc), at, backing)
                     }
                     _ => None,
                 };
@@ -1941,7 +2080,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         }
         View::Placed(unordered, resource, desc) => {
             if let Some(view) = placed_texture(view) {
-                return make(&view, at);
+                return make(&view, at, None);
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
@@ -1952,9 +2091,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
             let words: &[u32; 10] = desc[..10].try_into().unwrap_or(&[0; 10]);
             if *unordered {
-                buffer_uav(address, len, uav_desc(words), at)
+                buffer_uav(address, len, uav_desc(words), at, None)
             } else {
-                buffer_srv(address, len, srv_desc(words), at)
+                buffer_srv(address, len, srv_desc(words), at, None)
             }
         }
     }
@@ -2258,7 +2397,7 @@ mod tests {
                 },
             },
         };
-        let (resource, source) = buffer_srv(p as u64, len as u64, desc, at)
+        let (resource, source) = buffer_srv(p as u64, len as u64, desc, at, None)
             .expect("a view")
             .expect("a kept view");
         let Some(HeldSource::Widened(widened, _)) = source else {
@@ -2284,7 +2423,7 @@ mod tests {
             ptr: at.ptr + slot * step as usize,
         };
         let (second_resource, second_source) =
-            buffer_srv(p as u64, len as u64, desc, at_slot(1))
+            buffer_srv(p as u64, len as u64, desc, at_slot(1), None)
                 .expect("a second view")
                 .expect("a second kept view");
         let Some(HeldSource::Widened(second, _)) = second_source else {
@@ -2300,7 +2439,7 @@ mod tests {
             Format: DXGI_FORMAT_R32G32B32_UINT,
             ..desc
         };
-        let (uint_resource, uint_source) = buffer_srv(p as u64, len as u64, uint_desc, at_slot(2))
+        let (uint_resource, uint_source) = buffer_srv(p as u64, len as u64, uint_desc, at_slot(2), None)
             .expect("a uint view")
             .expect("a kept uint view");
         let Some(HeldSource::Widened(uint, _)) = uint_source else {
@@ -2310,7 +2449,7 @@ mod tests {
             Format: DXGI_FORMAT_R32G32B32_SINT,
             ..desc
         };
-        let (sint_resource, sint_source) = buffer_srv(p as u64, len as u64, sint_desc, at_slot(3))
+        let (sint_resource, sint_source) = buffer_srv(p as u64, len as u64, sint_desc, at_slot(3), None)
             .expect("a sint view")
             .expect("a kept sint view");
         let Some(HeldSource::Widened(sint, _)) = sint_source else {
@@ -2681,6 +2820,35 @@ mod tests {
         assert!(heap.made(0));
         assert!(!heap.made(1) && !heap.made(2));
         crate::watch::tests::free(memory);
+    }
+
+    #[test]
+    fn snapshot_cannot_replace_a_restored_live_record() {
+        let Some(heap) = HostHeap::new(true, 2) else {
+            return;
+        };
+        let null = std::ptr::null();
+        let mut slot = [0u32; 4];
+        let handle = slot.as_mut_ptr() as u64;
+        let mut sampler = [21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+        crate::descriptor::create_sampler(null, &sampler, handle);
+        let original = record_at(handle);
+        heap.mirror(0, handle, false).unwrap();
+        let previous = heap.made.lock().unwrap()[0];
+
+        sampler[0] = 0;
+        crate::descriptor::create_sampler(null, &sampler, handle);
+        let captured = record_at(handle);
+        assert_ne!(original, captured);
+        sampler[0] = 21;
+        crate::descriptor::create_sampler(null, &sampler, handle);
+        heap.mirror(0, handle, false).unwrap();
+        assert_eq!(heap.made.lock().unwrap()[0], previous);
+
+        // Capture of the changed sampler had already happened. The live
+        // write restored the original descriptor, so its host key never changed.
+        let _ = heap.mirror_record(0, false, Some((previous, handle)), || captured);
+        assert_eq!(heap.made.lock().unwrap()[0], previous);
     }
 
     #[test]

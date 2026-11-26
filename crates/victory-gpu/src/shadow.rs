@@ -1255,6 +1255,14 @@ fn changed() {
 /// hold it. Changed under `BUFFERS`' lock.
 static MAX_SPAN: AtomicU64 = AtomicU64::new(0);
 
+/// The registered ranges determine which shadow owns a table's buffer view,
+/// even when the newly registered buffer has not made a host copy yet.
+static BUFFER_LAYOUT: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn buffer_layout() -> u64 {
+    BUFFER_LAYOUT.load(Ordering::Acquire)
+}
+
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
     let mut map = buffers();
@@ -1266,12 +1274,19 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
             shadow: None,
         },
     );
+    BUFFER_LAYOUT.fetch_add(1, Ordering::Release);
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    if buffers().remove(&(start, resource)).is_some_and(|e| e.shadow.is_some()) {
-        changed();
+    let mut map = buffers();
+    if let Some(entry) = map.remove(&(start, resource)) {
+        BUFFER_LAYOUT.fetch_add(1, Ordering::Release);
+        if entry.shadow.is_some() {
+            changed();
+        }
+        drop(map);
+        drop(entry);
     }
 }
 

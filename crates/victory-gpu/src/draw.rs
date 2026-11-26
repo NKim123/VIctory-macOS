@@ -74,7 +74,9 @@ pub(crate) struct State {
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
     /// Tables made afresh in this list, and their first dynamic slots.
-    fresh_tables: std::collections::HashMap<TableRecords, u32>,
+    fresh_tables: std::collections::HashMap<TableRecords, (u32, u64)>,
+    #[cfg(test)]
+    force_fresh_tables: bool,
     /// CPU-only templates for buffer views shared by otherwise distinct tables.
     list_views: Option<Option<crate::descriptor::host::ListViews>>,
     /// The dynamic slots the list holds: title heap, first, count; given
@@ -1292,7 +1294,10 @@ impl State {
             let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
                 continue;
             };
-            if index >= host.count() {
+            let needs_fresh = index >= host.count();
+            #[cfg(test)]
+            let needs_fresh = needs_fresh || self.force_fresh_tables;
+            if needs_fresh {
                 fresh.push(u.slot);
             }
         }
@@ -1329,11 +1334,44 @@ impl State {
                 .map(|k| crate::descriptor::record_at(table + u64::from(k) * 32))
                 .collect::<Vec<_>>();
             let key = (table, records);
-            if let Some(&first) = self.fresh_tables.get(&key) {
+            let layout = crate::shadow::buffer_layout();
+            let reused = self
+                .fresh_tables
+                .get_mut(&key)
+                .and_then(|(first, checked)| {
+                    if *checked != layout
+                        && key.1.iter().enumerate().any(|(offset, &record)| {
+                            use crate::descriptor::host::{ListViews, view_copy};
+                            let Some(view) = crate::descriptor::recorded_view(record) else {
+                                return false;
+                            };
+                            if heap.samplers() || !ListViews::can_cache(&view) {
+                                return false;
+                            }
+                            let old = host.table_backing(*first + offset as u32);
+                            let new = view_copy(&view).map(|(shadow, _, _)| shadow);
+                            match (old, new) {
+                                (Some(old), Some(new)) => !std::sync::Arc::ptr_eq(&old, &new),
+                                (None, None) => false,
+                                _ => true,
+                            }
+                        })
+                    {
+                        return None;
+                    }
+                    *checked = layout;
+                    Some(*first)
+                });
+            if let Some(first) = reused {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
-                    let record = key.1[(u.table_offset_dwords / 8) as usize];
+                    let offset = u.table_offset_dwords / 8;
+                    let record = key.1[offset as usize];
                     if let Some(view) = crate::descriptor::recorded_view(record) {
-                        readable(list, u, &view, true);
+                        let range = host.table_backing(first + offset).and_then(|shadow| {
+                            let (address, len) = crate::descriptor::host::buffer_range(&view)?;
+                            Some((shadow, address, len))
+                        });
+                        readable_with_buffer(list, u, &view, true, range);
                     }
                 }
                 made.push((slot, first * 32));
@@ -1359,19 +1397,23 @@ impl State {
                 match crate::descriptor::recorded_view(record) {
                     Some(view) => {
                         use crate::descriptor::host::ListViews;
-                        let copied = if !heap.samplers() && ListViews::can_cache(&view) {
+                        let range = (!heap.samplers() && ListViews::can_cache(&view))
+                            .then(|| crate::descriptor::host::view_copy(&view))
+                            .flatten();
+                        let backing = range.as_ref().map(|(shadow, _, _)| shadow);
+                        let copied = backing.is_some_and(|backing| {
                             self.list_views
                                 .get_or_insert_with(ListViews::new)
                                 .as_mut()
-                                .is_some_and(|cache| cache.make(host, index, record, &view))
-                        } else {
-                            false
-                        };
+                                .is_some_and(|cache| {
+                                    cache.make(host, index, record, &view, backing)
+                                })
+                        });
                         if !copied {
-                            host.make_at(index, &view);
+                            host.make_at_with_backing(index, &view, backing);
                         }
                         if let Some(u) = used {
-                            readable(list, u, &view, true);
+                            readable_with_buffer(list, u, &view, true, range);
                         }
                     }
                     None => {
@@ -1382,7 +1424,7 @@ impl State {
                     }
                 }
             }
-            self.fresh_tables.insert(key, first);
+            self.fresh_tables.insert(key, (first, layout));
             made.push((slot, first * 32));
         }
         made
@@ -1916,6 +1958,16 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
 /// writes through the view mark their pages (every translated shader's do);
 /// the host's own (clears) do not.
 fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
+    readable_with_buffer(list, u, view, marked, None);
+}
+
+fn readable_with_buffer(
+    list: &HostList,
+    u: &UsedResource,
+    view: &View,
+    marked: bool,
+    backing: Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>,
+) {
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
@@ -1924,13 +1976,13 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
     // what shaders write through unordered access goes back to it after.
     // Constant buffers (raw views) to their copy's end at most; others in
     // the copy their host view reads.
-    let range = match *view {
+    let range = backing.or_else(|| match *view {
         View::Constant(address, size) => crate::shadow::find(address, 1).and_then(|s| {
             let len = u64::from(size).min(s.left(address));
             crate::shadow::find(address, len).map(|s| (s, address, len))
         }),
         _ => crate::descriptor::host::view_copy(view),
-    };
+    });
     if let Some((shadow, address, len)) = range
         && len > 0
     {
@@ -2776,8 +2828,9 @@ void main(uint3 id : SV_DispatchThreadID) {{
         let mut templates = ListViews::new().unwrap();
         let first = heap.dynamic(3).unwrap();
         assert!(ListViews::can_cache(&view));
-        assert!(templates.make(&heap, first, record, &view));
-        assert!(templates.make(&heap, first + 1, record, &view));
+        let (backing, _, _) = descriptor::host::view_copy(&view).unwrap();
+        assert!(templates.make(&heap, first, record, &view, &backing));
+        assert!(templates.make(&heap, first + 1, record, &view, &backing));
         let out = [39, 1, 0, 0, 1024, 0, 0, 0, 1, 0];
         let out_view = View::Unordered(dst as usize, 0, Some(out));
         heap.make_at(first + 2, &out_view);
@@ -2815,6 +2868,104 @@ void main(uint3 id : SV_DispatchThreadID) {{
     }
 
     #[test]
+    fn fresh_tables_follow_overlapping_buffer_creation_and_release() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        use crate::descriptor::{self, host::view_copy};
+        use std::sync::Arc;
+
+        let null = std::ptr::null();
+        let src = buffer(4096);
+        let (src_bytes, _) = crate::resource::buffer_bytes(src).unwrap();
+        let start = src_bytes as u64 + 1024;
+        let mut heap = null;
+        let heap_desc: [u32; 8] = [0, 4, 1, 0, 0, 0, 0, 0];
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(
+            descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap),
+            S_OK
+        );
+        let title = descriptor::heap(heap);
+        let slots = title.host().unwrap();
+        let raw = [39, 1, 0x1688, 0, 256, 0, 256, 0, 1, 0];
+        descriptor::create_srv(null, src, &raw, title.start);
+        descriptor::create_srv(null, src, &raw, title.start + 32);
+        let view = descriptor::view(title.start).unwrap();
+        let backing = || view_copy(&view).unwrap().0;
+        let original = backing();
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[heap]);
+        state.force_fresh_tables = true;
+        let mut bind = |handle| {
+            state.set_table(true, 0, handle);
+            let made = state.tables(&list, &[used(ResourceType::Srv)], true);
+            assert_eq!(made.len(), 1);
+            made[0].1 / 32
+        };
+        let first = bind(title.start);
+        assert!(Arc::ptr_eq(&slots.table_backing(first).unwrap(), &original));
+
+        let desc: [u32; 14] = [1, 0, 0, 0, 1024, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+        let iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let mut overlap = null;
+        assert_eq!(
+            crate::resource::create_at_address(
+                null,
+                start,
+                desc.as_ptr().cast(),
+                0,
+                std::ptr::null(),
+                &iid,
+                &mut overlap
+            ),
+            S_OK
+        );
+        let inside = backing();
+        assert!(!Arc::ptr_eq(&original, &inside));
+        // Reusing the same logical table must respect the new backing.
+        let second = bind(title.start);
+        assert_ne!(first, second);
+        assert!(Arc::ptr_eq(&slots.table_backing(second).unwrap(), &inside));
+        // A different table using the unchanged record can copy the template.
+        let third = bind(title.start + 32);
+        assert!(Arc::ptr_eq(&slots.table_backing(third).unwrap(), &inside));
+
+        assert_eq!(crate::object::release_ref(overlap), 0);
+        assert!(Arc::ptr_eq(&backing(), &original));
+        let fourth = bind(title.start + 32);
+        assert_ne!(third, fourth);
+        assert!(Arc::ptr_eq(
+            &slots.table_backing(fourth).unwrap(),
+            &original
+        ));
+        assert!(Arc::ptr_eq(&slots.table_backing(second).unwrap(), &inside));
+        list.close();
+        // SAFETY: the source is a live, writable title buffer.
+        unsafe { (start as *mut u32).write(0xCAFEBABE) };
+        host.execute(&[&list]);
+        // Both GPU backings used by the list must be refreshed, including
+        // the one whose title buffer was released before submission.
+        assert_eq!(original.read_host(start, 1), [0xCAFEBABE]);
+        assert_eq!(inside.read_host(start, 1), [0xCAFEBABE]);
+        drop(state);
+        drop(view);
+        crate::object::release_ref(heap);
+        crate::object::release_ref(src);
+    }
+
+    #[test]
     #[ignore = "synthetic recording benchmark"]
     fn bench_list_views() {
         use crate::descriptor::host::{HostHeap, ListViews};
@@ -2835,7 +2986,8 @@ void main(uint3 id : SV_DispatchThreadID) {{
                         let slot = first + table * 30 + i;
                         if cached {
                             assert!(ListViews::can_cache(view));
-                            assert!(cache.make(&heap, slot, [0, i, 0], view));
+                            let (shadow, _, _) = crate::descriptor::host::view_copy(view).unwrap();
+                            assert!(cache.make(&heap, slot, [0, i, 0], view, &shadow));
                         } else {
                             heap.make_at(slot, view);
                         }
