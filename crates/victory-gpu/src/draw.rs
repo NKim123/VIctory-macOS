@@ -95,6 +95,8 @@ pub(crate) struct State {
     /// Views made for root SRVs and UAVs in this list ([`State::root_view`]):
     /// (view heap, host copy, unordered access) → dynamic slot.
     root_slots: std::collections::HashMap<(usize, usize, bool), u32>,
+    /// Bounded CBV views by (heap, backing resource, offset, length).
+    root_cbv_slots: std::collections::HashMap<(usize, usize, u64, u64), u32>,
     /// The run of dynamic slots root views take from (view heap, next
     /// slot, end): taken [`ROOT_VIEW_RUN`] at a time, so that single slots
     /// do not break up the runs fresh tables need.
@@ -363,6 +365,7 @@ impl State {
         self.fresh_tables.clear();
         self.list_views.take();
         self.root_slots.clear();
+        self.root_cbv_slots.clear();
         self.memory = None;
         let fixed = std::mem::take(&mut self.fixed);
         if fixed.topology {
@@ -884,6 +887,17 @@ impl State {
                                 }
                             }
                         }
+                        None if u.root == RootType::Descriptor
+                            && u.dword == victory_shader::emit::ROOT_CBV_VIEW =>
+                        {
+                            match self.root_cbv_view(list, compute, u.slot) {
+                                Some(index) => index,
+                                None => {
+                                    not_run("a root CBV without a bounded raw view");
+                                    return false;
+                                }
+                            }
+                        }
                         None if is_root_view(u) => {
                             let uav = u.dword == victory_shader::emit::ROOT_UAV_VIEW;
                             let read_end = t
@@ -1039,14 +1053,7 @@ impl State {
             not_run("a root view the title did not set");
             return None;
         };
-        let (key, host) = match self.heaps[0] {
-            0 => (MEMORY_HEAP, crate::memory::heap()),
-            h => (
-                std::ptr::from_ref(crate::descriptor::heap(h as This)) as usize,
-                crate::descriptor::heap(h as This).host(),
-            ),
-        };
-        let Some(host) = host else {
+        let Some((key, host)) = root_view_heap(self.heaps[0]) else {
             not_run("a root view without a host view heap");
             return None;
         };
@@ -1087,6 +1094,61 @@ impl State {
         if let Some(&index) = self.root_slots.get(&(key, copy, uav)) {
             return Some((index, offset));
         }
+        let index = self.root_view_slot(key, host)?;
+        host.raw_view_at(index, Some(&shadow.buffer), 0, shadow.range().1 & !3, uav);
+        if uav {
+            host.set_mark(index, shadow.mark_entry(shadow.range().0));
+        }
+        self.root_slots.insert((key, copy, uav), index);
+        Some((index, offset))
+    }
+
+    /// Binds at most 64 KiB at the root address through a raw SRV.
+    /// Aliased memory needs neither a fill nor a shadow refresh. Other
+    /// buffers still use the normal submission-time shadow refresh.
+    fn root_cbv_view(&mut self, list: &HostList, compute: bool, slot: u8) -> Option<u32> {
+        let &Root::View(address) = self.roots_ref(compute).get(usize::from(slot))? else {
+            return None;
+        };
+        let (key, host) = root_view_heap(self.heaps[0])?;
+        if address == 0 {
+            return host.null_root_view(false);
+        }
+        let shadow = crate::shadow::find(address, 1)?;
+        let bytes = shadow.left(address).min(1 << 16) & !3;
+        if bytes == 0 {
+            return host.null_root_view(false);
+        }
+        let offset = shadow.offset(address);
+        if !offset.is_multiple_of(16) {
+            // The raw descriptor needs 16-byte alignment. Move an
+            // unaligned range into list-owned upload space.
+            let (buffer, offset, data) = list.upload(bytes)?;
+            let index = self.root_view_slot(key, host)?;
+            list.defer_fill(data, address as *const u8, bytes as usize);
+            host.raw_view_at(index, Some(&buffer), offset, bytes, false);
+            return Some(index);
+        }
+        if !shadow.is_aliased() {
+            shadow.refresh(list, address, bytes);
+        }
+        // The slot holds the resource for the list's lifetime, so its
+        // identity is stable even if an aliased shadow is unregistered.
+        let entry = (key, shadow.buffer.as_raw() as usize, offset, bytes);
+        if let Some(&index) = self.root_cbv_slots.get(&entry) {
+            return Some(index);
+        }
+        let index = self.root_view_slot(key, host)?;
+        host.raw_view_at(index, Some(&shadow.buffer), offset, bytes, false);
+        self.root_cbv_slots.insert(entry, index);
+        Some(index)
+    }
+
+    fn root_view_slot(
+        &mut self,
+        key: usize,
+        host: &crate::descriptor::host::HostHeap,
+    ) -> Option<u32> {
         let (run_heap, next, end) = self.root_run;
         if run_heap != key || next >= end {
             let Some(first) = host.dynamic(ROOT_VIEW_RUN) else {
@@ -1100,12 +1162,7 @@ impl State {
         let index = self.root_run.1;
         self.root_run.1 += 1;
         ROOT_VIEW_SLOTS.fetch_add(1, Ordering::Relaxed);
-        host.raw_view_at(index, Some(&shadow.buffer), 0, shadow.range().1 & !3, uav);
-        if uav {
-            host.set_mark(index, shadow.mark_entry(shadow.range().0));
-        }
-        self.root_slots.insert((key, copy, uav), index);
-        Some((index, offset))
+        Some(index)
     }
 
     /// Gives the host list the title's heaps if it has others.
@@ -2333,6 +2390,14 @@ fn describe(view: Option<&View>) -> String {
         }
         Some(v) => format!("{v:?}").chars().take(60).collect(),
     }
+}
+
+fn root_view_heap(heap: usize) -> Option<(usize, &'static crate::descriptor::host::HostHeap)> {
+    if heap == 0 {
+        return Some((MEMORY_HEAP, crate::memory::heap()?));
+    }
+    let heap = crate::descriptor::heap(heap as This);
+    Some((std::ptr::from_ref(heap) as usize, heap.host()?))
 }
 
 /// A user-data entry that takes the heap index of a root view's view.
@@ -3755,6 +3820,37 @@ void main() { dst.Store4(0, asuint(src[0])); }
             assert_eq!(out.read_host(dst_bytes as u64, 16), want, "round {round}");
             assert_eq!(source.read_host(sentinel, 1), [0x5a5a_5a5a], "bytes outside the refresh");
         }
+
+        // A root CBV starts at its own 16-byte-aligned address. Both the
+        // non-aliased shadow refresh and the raw descriptor must cover it.
+        list.reset();
+        let address = src + 4 * MIB - 16;
+        let mut state = State::default();
+        state.set_heaps(&[heap]);
+        state.set_view(true, 0, address);
+        state.set_view(true, 1, address - 16);
+        let index = state.root_cbv_view(&list, true, 0).unwrap();
+        assert_eq!(state.root_cbv_view(&list, true, 0), Some(index));
+        assert_ne!(state.root_cbv_view(&list, true, 1), Some(index));
+        // SAFETY: an open list; all descriptors are live through execution.
+        unsafe {
+            list.list
+                .SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list
+                .SetComputeRootDescriptorTable(0, heap_host.gpu(index));
+            list.list.SetComputeRootDescriptorTable(1, heap_host.gpu(1));
+            list.list
+                .SetComputeRoot32BitConstants(2, 2, [0u32; 2].as_ptr().cast(), 0);
+            list.list.SetPipelineState(&pso);
+            list.list.Dispatch(1, 1, 1);
+            (address as *mut u32).write(0xC0B0);
+        }
+        list.close();
+        host.execute(&[&list]);
+        let mut bounded = [0; 16];
+        bounded[0] = 0xC0B0;
+        assert_eq!(out.read_host(dst_bytes as u64, 16), bounded);
 
         // Rebind the same slots to a null SRV, then to a null UAV. The
         // previous round left nonzero words in the destination.

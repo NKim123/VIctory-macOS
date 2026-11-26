@@ -10,6 +10,54 @@ use crate::{io, ir, resource, structure};
 const S_ENDPGM: u32 = 0xBF81_0000;
 
 #[test]
+fn a_swap_does_not_make_a_lane_varying_destination_wave_uniform() {
+    use crate::ir::Reg;
+
+    let words = [
+        0x7E02_0280u32, // v_mov_b32 v1, 0
+        0x7E00_CB01,    // v_swap_b32 v0, v1
+        S_ENDPGM,
+    ];
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 8,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 0,
+            threads: [64, 1, 1],
+        }),
+        code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
+    };
+    let p = ir::build(&native.code, true, 8).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let swap = &p.blocks[0].insts[1];
+    assert_eq!(swap.name(), "v_swap_b32");
+    let uniform = super::halves::lane_uniform(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+        atomic_locks: false,
+        atomic_lock_rounds: false,
+        atomic_umax: false,
+        bias_as_gradients: false,
+        host_wave32: true,
+        narrow_waves: true,
+        view_marks: false,
+    });
+    assert!(!uniform.contains(&swap.write(Reg::V(1)).unwrap()));
+}
+
+#[test]
 fn direct_barycentric_modes_match_dxil_semantics() {
     use crate::io::Barycentric::*;
 

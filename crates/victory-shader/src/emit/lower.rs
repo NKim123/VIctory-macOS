@@ -2032,6 +2032,15 @@ impl<'a> Lower<'a> {
     /// [`Lower::root_view_offset`]. Host root views have no bounds; a view's
     /// reads past the copy give 0 and its writes there are dropped.
     fn root_view(&mut self, param: usize, uav: bool) -> V {
+        let view = if uav {
+            super::ROOT_UAV_VIEW
+        } else {
+            super::ROOT_SRV_VIEW
+        };
+        self.root_heap_view(param, view)
+    }
+
+    fn root_heap_view(&mut self, param: usize, view: u32) -> V {
         let rp = self.x.native.layout[param];
         // The descriptor's two user-data dwords hold its address on the
         // console; such a program never reads them as data (`user`).
@@ -2043,12 +2052,44 @@ impl<'a> Lower<'a> {
             index,
             slot: rp.slot,
             root: RootType::Descriptor,
-            dword: if uav { super::ROOT_UAV_VIEW } else { super::ROOT_SRV_VIEW },
+            dword: view,
         });
-        let props = if uav { (11 | 0x1000, 0) } else { (11, 0) };
+        let props = if view == super::ROOT_UAV_VIEW {
+            (11 | 0x1000, 0)
+        } else {
+            (11, 0)
+        };
         let h = self.s.heap_handle(self.s.entry, i, false, false, props);
         self.root_views.insert(index, h);
         h
+    }
+
+    /// Reuses the first root-address dword for a heap index only when
+    /// the shader does not also need the title's root addresses as data.
+    fn raw_root_cbv(&mut self, src: &Source) -> Option<V> {
+        if self.root_memory || !super::raw_root_cbvs() {
+            return None;
+        }
+        let Source::Built { address, .. } = src else {
+            return None;
+        };
+        let rp = self.x.native.layout.get(address.param)?;
+        if rp.root != RootType::Descriptor
+            || self
+                .used_kind(src)
+                .is_some_and(|u| u.kind != ResourceType::Cbv)
+        {
+            return None;
+        }
+        Some(self.root_heap_view(address.param, super::ROOT_CBV_VIEW))
+    }
+
+    /// The legacy CBV load reads the containing dword. Align the byte
+    /// address before issuing the raw load, which requires dword alignment.
+    fn raw_root_cbv_dword(&mut self, handle: V, byte: V) -> V {
+        let mask = self.s.m.i32(!3);
+        let address = self.s.m.bin(self.cur, Bin::And, byte, mask);
+        self.raw_dword(handle, address)
     }
 
     /// For a root SRV or UAV read through the view of its host copy
@@ -4590,6 +4631,15 @@ impl<'a> Lower<'a> {
                 let r = self.raw_buffer_load(c, &[h, a, u, mask, al]);
                 let x = self.s.m.extract(c, r, 0);
                 let x = self.as_int(x);
+                self.write(inst, Reg::S(code + k as u8), x, None);
+            }
+            return Ok(());
+        }
+        if let Some(h) = self.raw_root_cbv(src) {
+            for k in 0..count {
+                let off = self.s.m.i32(4 * k);
+                let a = self.s.m.bin(c, Bin::Add, addr, off);
+                let x = self.raw_root_cbv_dword(h, a);
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
@@ -10349,14 +10399,22 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(());
             }
-            let h = self.handle(site, src, false, (13, 0x1_0000))?;
+            let raw = self.raw_root_cbv(src);
+            let h = match raw {
+                Some(h) => h,
+                None => self.handle(site, src, false, (13, 0x1_0000))?,
+            };
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
             for k in 0..count {
                 let four = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, byte, four);
-                let x = self.cbuffer_dword(h, a);
+                let x = if raw.is_some() {
+                    self.raw_root_cbv_dword(h, a)
+                } else {
+                    self.cbuffer_dword(h, a)
+                };
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());

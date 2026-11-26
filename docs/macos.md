@@ -355,6 +355,21 @@ The switches add no allocator, staging, or snapshot pools.
 
 Under Rosetta with D3DMetal, memory the title commits read-write with `XMemVirtualAlloc`, in whole 64 KiB pages, is pointed at the pages of a D3DMetal buffer with `mach_vm_remap` (#204). The GPU then reads and writes the title's own memory, so those buffers need no host copy, no copy-back after a submission that wrote them, and no refresh before one. A probe at start-up falls back to the copies if the remap does not work, and `VICTORY_ALIAS_BUFFERS=0` keeps the copies.
 
+The title's low 32-bit graphics heap uses placeholder reservations and
+physical page mappings, so those pages do not pass through this committed
+virtual allocation path. The diagnostic `VICTORY_PHYSICAL_TILES=1` can
+back XMem physical pages with a D3DMetal heap, but this does not register
+contiguous title-buffer aliases for arbitrary physical mappings.
+
+`VICTORY_PORT_CBV=1` translates eligible root constant-buffer loads through
+bounded raw SRVs. They can read the existing buffer at a 16-byte-aligned
+offset, avoiding the upload fill required for a misaligned D3D12 root CBV.
+A non-aliased backing buffer still refreshes at submission. Programs that
+need the root address as data retain their CBV bindings. Constant buffers
+in title heaps and descriptor tables already use raw views in either mode.
+The switch is included in the translation cache key, and the host pipeline
+library hashes the resulting DXIL and root signature.
+
 ## Optional switches for slow storage, low memory and speed
 
 None of these changes the default. Each is read from the environment when the game starts, and all of them are tools for testers, so please post what you see on #131 or #135 when you try one.
