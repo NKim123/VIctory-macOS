@@ -3,7 +3,7 @@
 //! cache, scene depth and a slow mean to estimate light outside the view.
 //! See VIctory-7900XTX 82ca134 and 7da523a, based on beloooo's resolve hook.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock, RwLock, RwLockReadGuard};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -188,7 +188,15 @@ struct Settings {
 fn settings() -> Settings {
     static SETTINGS: OnceLock<Settings> = OnceLock::new();
     *SETTINGS.get_or_init(|| {
+        let mode = Mode::parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default());
         let mut shade = [1.0, 0.6];
+        if mode == Mode::Off {
+            return Settings {
+                mode,
+                shade,
+                air: 0.0,
+            };
+        }
         let value = std::env::var("VICTORY_AMBIENT_SHADE").unwrap_or_default();
         for (slot, word) in shade.iter_mut().zip(value.split(',')) {
             if let Ok(value) = word.trim().parse::<f32>()
@@ -199,7 +207,7 @@ fn settings() -> Settings {
             }
         }
         Settings {
-            mode: Mode::parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()),
+            mode,
             shade,
             air: positive(&std::env::var("VICTORY_AMBIENT_AIR").unwrap_or_default()).unwrap_or(0.0),
         }
@@ -225,8 +233,6 @@ const MEAN_BYTES: u64 = 16;
 const COMMON: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_COMMON;
 const READ: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 const WRITE: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-const COPY_SRC: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_COPY_SOURCE;
-const COPY_DST: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_COPY_DEST;
 
 struct Kernel {
     root: ID3D12RootSignature,
@@ -257,9 +263,10 @@ impl Kernel {
         words: &[u32; 12],
         groups: [u32; 3],
         views: &[D3D12_GPU_DESCRIPTOR_HANDLE],
-        reads: &[&ID3D12Resource],
-        output: Option<&ID3D12Resource>,
+        scratch: (&[&ID3D12Resource], Option<&ID3D12Resource>),
+        gate: Option<&Gate>,
     ) {
+        let (reads, output) = scratch;
         let mut barriers = Vec::with_capacity(reads.len() + usize::from(output.is_some()));
         barriers.extend(reads.iter().map(|r| transition(r, COMMON, READ)));
         barriers.extend(output.map(|r| transition(r, COMMON, WRITE)));
@@ -285,7 +292,11 @@ impl Kernel {
             if let Some(output) = output {
                 l.SetComputeRootUnorderedAccessView(slot, output.GetGPUVirtualAddress());
             }
-            l.Dispatch(groups[0], groups[1], groups[2]);
+            if let Some(gate) = gate {
+                gate.dispatch(l, groups);
+            } else {
+                l.Dispatch(groups[0], groups[1], groups[2]);
+            }
             barriers.clear();
             barriers.extend(reads.iter().map(|r| transition(r, READ, COMMON)));
             barriers.extend(output.map(|r| transition(r, WRITE, COMMON)));
@@ -299,6 +310,7 @@ impl Kernel {
 struct Estimate {
     keep: Kernel,
     mean: Kernel,
+    publish: Kernel,
     place: Kernel,
     gather: Kernel,
     raise: Kernel,
@@ -309,8 +321,8 @@ struct Estimate {
     next_mean: ID3D12Resource,
 }
 
-const DEPTH_TABLE: Param<'_> = Param::Table(&[compute::srv(0, 1)]);
-const IMAGE_TABLE: Param<'_> = Param::Table(&[compute::uav(0, 1)]);
+const DEPTH_TABLE: Param<'_> = Param::Table(&[compute::srv(0, 1).volatile()]);
+const IMAGE_TABLE: Param<'_> = Param::Table(&[compute::uav(0, 1).volatile()]);
 const OUTPUT: Param<'_> = Param::Uav { register: 1 };
 
 const fn scratch_read(register: u32) -> Param<'static> {
@@ -348,6 +360,7 @@ impl Estimate {
                 s!("ambient mean"),
                 &[scratch_read(1), scratch_read(2), OUTPUT],
             )?,
+            publish: Kernel::new("PUBLISH", s!("ambient publish"), &[scratch_read(2), OUTPUT])?,
             place: Kernel::new("PLACE", s!("ambient place"), &[DEPTH_TABLE, OUTPUT])?,
             gather: Kernel::new(
                 "GATHER",
@@ -368,7 +381,7 @@ impl Estimate {
             cells: buffer(CELLS_BYTES, true)?,
             positions: buffer(CELLS_BYTES, true)?,
             points: buffer(POINTS_BYTES, true)?,
-            history: buffer(MEAN_BYTES, false)?,
+            history: buffer(MEAN_BYTES, true)?,
             next_mean: buffer(MEAN_BYTES, true)?,
         })
     }
@@ -412,80 +425,158 @@ fn buffer(size: u64, writable: bool) -> Result<ID3D12Resource> {
     buffer.ok_or_else(Error::empty)
 }
 
-/// Checked bindings from the actual descriptors emitted into the title heap.
+/// A version of one host descriptor slot. Rewrites wait for an executing
+/// pair, and invalidate the version before writing a new descriptor.
+#[derive(Clone)]
+pub(crate) struct Watch(Arc<RwLock<bool>>);
+
+impl Watch {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(RwLock::new(true)))
+    }
+
+    pub(crate) fn invalidate(&self) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = false;
+    }
+
+    fn key(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+}
+
+pub(crate) struct Binding {
+    pub(crate) resource: ID3D12Resource,
+    pub(crate) view: TextureView,
+    pub(crate) handle: D3D12_GPU_DESCRIPTOR_HANDLE,
+    pub(crate) watch: Watch,
+}
+
 pub(crate) struct CheckedViews {
-    pub(crate) image: (ID3D12Resource, TextureView),
-    pub(crate) depth: Option<(ID3D12Resource, TextureView)>,
+    pub(crate) image: Binding,
+    pub(crate) depth: Option<Binding>,
     pub(crate) size: [u32; 3],
 }
 
-/// A small append-only heap for one host list. The title cannot rewrite
-/// these slots, and the resources and descriptors live until list reset.
-#[derive(Default)]
-pub(crate) struct Descriptors {
-    heap: Option<ID3D12DescriptorHeap>,
-    resources: Vec<ID3D12Resource>,
+/// One count word and space for the indirect arguments of a complete pass.
+const DISPATCH_BYTES: u64 = 64;
+pub(crate) const MAX_PASSES: usize = 64;
+pub(crate) const UPLOAD_BYTES: u64 = DISPATCH_BYTES * MAX_PASSES as u64;
+
+#[derive(Clone)]
+pub(crate) struct Candidate {
+    image: Watch,
+    depth: Option<Watch>,
+    count: usize,
 }
 
-impl Descriptors {
-    pub(crate) fn bind(&mut self, list: &HostList, views: &CheckedViews) -> Option<Views> {
-        const SLOTS: u32 = 128;
-        let entries = std::iter::once(&views.image).chain(views.depth.iter());
-        if self.resources.len() + 1 + usize::from(views.depth.is_some()) > SLOTS as usize {
-            return None;
+impl Candidate {
+    pub(crate) fn new(views: &CheckedViews, count: usize) -> Self {
+        Self {
+            image: views.image.watch.clone(),
+            depth: views.depth.as_ref().map(|depth| depth.watch.clone()),
+            count,
         }
-        let host = host()?;
-        // SAFETY: all writes are to distinct, unused slots of this live heap.
-        let (image, depth) = unsafe {
-            if self.heap.is_none() {
-                self.heap = host
-                    .device
-                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                        NumDescriptors: SLOTS,
-                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                        NodeMask: 0,
-                    })
-                    .ok();
-            }
-            let heap = self.heap.as_ref()?;
-            let cpu = heap.GetCPUDescriptorHandleForHeapStart();
-            let gpu = heap.GetGPUDescriptorHandleForHeapStart();
-            let step = host
-                .device
-                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-            let mut handles = entries.map(|(resource, view)| {
-                let offset = self.resources.len() as u32 * step;
-                let at = D3D12_CPU_DESCRIPTOR_HANDLE {
-                    ptr: cpu.ptr + offset as usize,
+    }
+
+    fn watches(&self) -> impl Iterator<Item = &Watch> {
+        std::iter::once(&self.image).chain(self.depth.iter())
+    }
+}
+
+/// Under the submission lock, after all heap sync and deferred CPU copies.
+/// Hold each version at most once, even if many passes share the same slot.
+pub(crate) fn arm(candidates: &[Candidate]) -> Vec<RwLockReadGuard<'_, bool>> {
+    let mut watches: Vec<_> = candidates.iter().flat_map(Candidate::watches).collect();
+    watches.sort_unstable_by_key(|w| w.key());
+    watches.dedup_by_key(|w| w.key());
+    let locks: Vec<_> = watches
+        .iter()
+        .map(|w| w.0.read().unwrap_or_else(|e| e.into_inner()))
+        .collect();
+    for pass in candidates {
+        let ready = pass.watches().all(|w| {
+            let index = watches.binary_search_by_key(&w.key(), |w| w.key()).unwrap();
+            *locks[index]
+        });
+        // SAFETY: a mapped word owned by the closed list, with no other
+        // instance executing (submissions hold the host lock).
+        unsafe { (pass.count as *mut u32).write_volatile(u32::from(ready)) };
+    }
+    locks
+}
+
+pub(crate) struct Gate {
+    buffer: ID3D12Resource,
+    signature: ID3D12CommandSignature,
+    base: u64,
+    data: usize,
+    next: std::cell::Cell<u64>,
+}
+
+impl Gate {
+    pub(crate) fn new(buffer: &ID3D12Resource, data: usize, pass: usize) -> Option<Self> {
+        static SIGNATURE: OnceLock<Option<ID3D12CommandSignature>> = OnceLock::new();
+        let signature = SIGNATURE
+            .get_or_init(|| {
+                let host = host()?;
+                let arg = D3D12_INDIRECT_ARGUMENT_DESC {
+                    Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+                    ..Default::default()
                 };
-                match view {
-                    TextureView::Srv(desc) => host.device.CreateShaderResourceView(
-                        resource,
-                        desc.as_ref().map(std::ptr::from_ref),
-                        at,
-                    ),
-                    TextureView::Uav(desc) => host.device.CreateUnorderedAccessView(
-                        resource,
-                        None::<&ID3D12Resource>,
-                        desc.as_ref().map(std::ptr::from_ref),
-                        at,
-                    ),
+                let desc = D3D12_COMMAND_SIGNATURE_DESC {
+                    ByteStride: 12,
+                    NumArgumentDescs: 1,
+                    pArgumentDescs: &arg,
+                    NodeMask: 0,
+                };
+                let mut signature = None;
+                // SAFETY: one dispatch argument, no root arguments.
+                unsafe {
+                    host.device.CreateCommandSignature(
+                        &desc,
+                        None::<&ID3D12RootSignature>,
+                        &mut signature,
+                    )
                 }
-                self.resources.push(resource.clone());
-                D3D12_GPU_DESCRIPTOR_HANDLE {
-                    ptr: gpu.ptr + u64::from(offset),
-                }
-            });
-            list.list.SetDescriptorHeaps(&[Some(heap.clone())]);
-            (handles.next().unwrap(), handles.next())
-        };
-        Some(Views {
-            resource: views.image.0.clone(),
-            image,
-            depth,
-            size: views.size,
+                .ok()?;
+                signature
+            })
+            .as_ref()?
+            .clone();
+        let base = pass as u64 * DISPATCH_BYTES;
+        let data = data + base as usize;
+        // SAFETY: one count and its arguments per pass in the mapped upload.
+        unsafe { (data as *mut u32).write(0) };
+        Some(Self {
+            buffer: buffer.clone(),
+            signature,
+            base,
+            data,
+            next: 4.into(),
         })
+    }
+
+    pub(crate) fn count(&self) -> usize {
+        self.data
+    }
+
+    fn dispatch(&self, list: &ID3D12GraphicsCommandList, groups: [u32; 3]) {
+        let at = self.next.get();
+        assert!(at + 12 <= DISPATCH_BYTES);
+        self.next.set(at + 12);
+        // SAFETY: distinct arguments in the mapped upload, written before
+        // submission. The same count gates every dispatch of this pass.
+        unsafe {
+            ((self.data + at as usize) as *mut [u32; 3]).write(groups);
+            list.ExecuteIndirect(
+                &self.signature,
+                1,
+                &self.buffer,
+                self.base + at,
+                Some(&self.buffer),
+                self.base,
+            );
+        }
     }
 }
 
@@ -494,6 +585,17 @@ pub(crate) struct Views {
     pub(crate) image: D3D12_GPU_DESCRIPTOR_HANDLE,
     pub(crate) depth: Option<D3D12_GPU_DESCRIPTOR_HANDLE>,
     pub(crate) size: [u32; 3],
+}
+
+impl CheckedViews {
+    pub(crate) fn handles(&self) -> Views {
+        Views {
+            resource: self.image.resource.clone(),
+            image: self.image.handle,
+            depth: self.depth.as_ref().map(|depth| depth.handle),
+            size: self.size,
+        }
+    }
 }
 
 fn uav_barrier(list: &HostList, resource: &ID3D12Resource) {
@@ -512,19 +614,21 @@ fn uav_barrier(list: &HostList, resource: &ID3D12Resource) {
     unsafe { list.list.ResourceBarrier(&[barrier]) };
 }
 
-/// Record after the title's dispatch with the list-owned heap bound.
+/// Record after the title's dispatch with the same view heap bound.
 /// Returns whether the host pipeline and compute root have been replaced.
-pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
+pub(crate) fn after(list: &HostList, role: Role, views: &Views, gate: &Gate) -> bool {
     #[cfg(test)]
-    if let Some(ran) =
-        TEST_RECORDER.with(|r| r.borrow().as_ref().map(|r| r.after(list, role, views)))
-    {
+    if let Some(ran) = TEST_RECORDER.with(|r| {
+        r.borrow()
+            .as_ref()
+            .map(|r| r.after(list, role, views, Some(gate)))
+    }) {
         return ran;
     }
     static RECORDER: OnceLock<Recorder> = OnceLock::new();
     RECORDER
         .get_or_init(|| Recorder::new(settings()))
-        .after(list, role, views)
+        .after(list, role, views, Some(gate))
 }
 
 #[cfg(test)]
@@ -560,7 +664,7 @@ impl Recorder {
         }
     }
 
-    fn after(&self, list: &HostList, role: Role, views: &Views) -> bool {
+    fn after(&self, list: &HostList, role: Role, views: &Views, gate: Option<&Gate>) -> bool {
         let words = constants(self.settings, views.size);
         let [width, height, slices] = views.size;
         let groups = [width.div_ceil(8), height.div_ceil(8), 1];
@@ -580,7 +684,14 @@ impl Recorder {
                     return false;
                 };
                 uav_barrier(list, &views.resource);
-                kernel.run(list, &words, groups, &[depth, views.image], &[], None);
+                kernel.run(
+                    list,
+                    &words,
+                    groups,
+                    &[depth, views.image],
+                    (&[], None),
+                    gate,
+                );
             }
             (Mode::Estimate(_), _, depth) => {
                 let Some(pass) = self
@@ -598,35 +709,25 @@ impl Recorder {
                             &words,
                             [8, 9, 1],
                             &[views.image],
-                            &[],
-                            Some(&pass.cells),
+                            (&[], Some(&pass.cells)),
+                            gate,
                         );
                         pass.mean.run(
                             list,
                             &words,
                             [1, 1, 1],
                             &[],
-                            &[&pass.cells, &pass.history],
-                            Some(&pass.next_mean),
+                            (&[&pass.cells, &pass.history], Some(&pass.next_mean)),
+                            gate,
                         );
-                        // SAFETY: scratch buffers are in COMMON and live for the process.
-                        unsafe {
-                            list.list.ResourceBarrier(&[
-                                transition(&pass.next_mean, COMMON, COPY_SRC),
-                                transition(&pass.history, COMMON, COPY_DST),
-                            ]);
-                            list.list.CopyBufferRegion(
-                                &pass.history,
-                                0,
-                                &pass.next_mean,
-                                0,
-                                MEAN_BYTES,
-                            );
-                            list.list.ResourceBarrier(&[
-                                transition(&pass.next_mean, COPY_SRC, COMMON),
-                                transition(&pass.history, COPY_DST, COMMON),
-                            ]);
-                        }
+                        pass.publish.run(
+                            list,
+                            &words,
+                            [1, 1, 1],
+                            &[],
+                            (&[&pass.next_mean], Some(&pass.history)),
+                            gate,
+                        );
                     }
                     (Role::Resolve, Some(depth)) => {
                         uav_barrier(list, &views.resource);
@@ -635,24 +736,27 @@ impl Recorder {
                             &words,
                             [8, 9, 1],
                             &[depth],
-                            &[],
-                            Some(&pass.positions),
+                            (&[], Some(&pass.positions)),
+                            gate,
                         );
                         pass.gather.run(
                             list,
                             &words,
                             [POINTS_X / 8, POINTS_Y, 1],
                             &[depth],
-                            &[&pass.cells, &pass.history, &pass.positions],
-                            Some(&pass.points),
+                            (
+                                &[&pass.cells, &pass.history, &pass.positions],
+                                Some(&pass.points),
+                            ),
+                            gate,
                         );
                         pass.raise.run(
                             list,
                             &words,
                             groups,
                             &[depth, views.image],
-                            &[&pass.history, &pass.points],
-                            None,
+                            (&[&pass.history, &pass.points], None),
+                            gate,
                         );
                     }
                     (Role::Air, _) if self.settings.air > 0.0 => {
@@ -675,8 +779,8 @@ impl Recorder {
                             &words,
                             [groups[0], groups[1], slices.div_ceil(2)],
                             &[views.image],
-                            &[&pass.history, &pass.points],
-                            None,
+                            (&[&pass.history, &pass.points], None),
+                            gate,
                         );
                     }
                     _ => return false,

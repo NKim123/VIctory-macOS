@@ -936,6 +936,8 @@ pub(crate) struct HostList {
     pub(crate) depth_bounds: Option<ID3D12GraphicsCommandList1>,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
+    /// Mapped dispatch counts and arguments, reused after list reset.
+    ambient_upload: OnceLock<Option<(ID3D12Resource, usize)>>,
     /// Upload memory for data the list's draws make (expanded vertices),
     /// reused after a reset.
     scratch: Mutex<Scratch>,
@@ -1157,7 +1159,7 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
-    ambient: crate::ambient::Descriptors,
+    ambient: Vec<crate::ambient::Candidate>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -1303,6 +1305,7 @@ impl Host {
                 depth_bounds: self.depth_bounds_supported.then(|| list.cast()).transpose()?,
                 list,
                 deferred: Mutex::default(),
+                ambient_upload: OnceLock::new(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
@@ -1595,6 +1598,22 @@ impl Host {
                 mark.arm(*submitted);
                 group.push(mark.list());
             }
+            // Capture slot versions only after sync, refreshes and deferred
+            // descriptor writes. Keep them stable until this group has run.
+            let pairings = if crate::ambient::enabled() {
+                let group_lists = if groups.len() > 1 {
+                    &runs[i..i + 1]
+                } else {
+                    runs
+                };
+                group_lists
+                    .iter()
+                    .flat_map(|l| l.deferred().ambient.clone())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let frozen = crate::ambient::arm(&pairings);
             let queue = self.queue();
             // SAFETY: closed lists; the fence and event are ours.
             let waited = unsafe {
@@ -1613,6 +1632,12 @@ impl Host {
                     }
                 }
             };
+            if !waited && !frozen.is_empty() {
+                fail(format_args!(
+                    "could not fence a submission with paired ambient descriptors"
+                ));
+            }
+            drop(frozen);
             if waited
                 && let Some(mark) = mark
                 && !mark.saw(*submitted)
@@ -2670,11 +2695,56 @@ impl HostList {
         Some(made)
     }
 
-    pub(crate) fn ambient_views(
+    /// The producer already prepared these exact resources in this list.
+    pub(crate) fn has_texture_state(
         &self,
+        resource: &ID3D12Resource,
+        state: D3D12_RESOURCE_STATES,
+    ) -> bool {
+        self.states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|(_, current, texture)| {
+                texture.texture == *resource && *current & state.0 as u32 != 0
+            })
+    }
+
+    /// Record the auxiliary operations in place, with a count word that
+    /// stays zero unless submission validates the same slot versions.
+    pub(crate) fn ambient_after(
+        &self,
+        role: crate::ambient::Role,
         views: &crate::ambient::CheckedViews,
-    ) -> Option<crate::ambient::Views> {
-        self.deferred().ambient.bind(self, views)
+    ) -> bool {
+        let pass = self.deferred().ambient.len();
+        if pass >= crate::ambient::MAX_PASSES {
+            return false;
+        }
+        let Some((buffer, data)) = self
+            .ambient_upload
+            .get_or_init(|| {
+                host()?
+                    .upload_buffer(crate::ambient::UPLOAD_BYTES)
+                    .map(|(b, data)| (b, data as usize))
+            })
+            .as_ref()
+        else {
+            return false;
+        };
+        let Some(gate) = crate::ambient::Gate::new(buffer, *data, pass) else {
+            return false;
+        };
+        if !crate::ambient::after(self, role, &views.handles(), &gate) {
+            return false;
+        }
+        if let Some(depth) = views.depth.as_ref() {
+            self.keep(&depth.resource);
+        }
+        self.deferred()
+            .ambient
+            .push(crate::ambient::Candidate::new(views, gate.count()));
+        true
     }
 
     /// Keeps `object` alive until the list is reset.

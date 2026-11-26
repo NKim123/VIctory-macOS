@@ -6,7 +6,7 @@
 //! reads it through a table and finds the slot changed.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -41,6 +41,8 @@ pub(crate) struct HostHeap {
     /// the title views through a fraction of the slots, and a dense table
     /// of them all was 37.7 MB, written when the heap was made.
     kept: Mutex<Paged<Held>>,
+    /// Whether any recorded ambient pass has watched a slot of this heap.
+    ambient_watched: AtomicBool,
     /// Unordered views of textures left null by [`HostHeap::evict`]
     /// (`VICTORY_EVICT_HEAP_UAV`), made again by
     /// [`HostHeap::remake_unordered`] once shaders write through heaps.
@@ -224,6 +226,7 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             ready: (0..count).map(|_| AtomicU64::new(0)).collect(),
             kept: Mutex::new(Paged::new((count + extra) as usize)),
+            ambient_watched: AtomicBool::new(false),
             nulled_unordered: Mutex::new(Vec::new()),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
@@ -452,6 +455,7 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
+        self.invalidate_ambient(index);
         let (kept, mark) = make_marked(view, self.cpu(index));
         if kept.is_none() {
             null_for(view, self.cpu(index));
@@ -469,6 +473,7 @@ impl HostHeap {
     /// (both multiples of 4), which it holds; a null one for no buffer, or
     /// for unordered access to a buffer shaders cannot write.
     pub(crate) fn raw_view_at(&self, index: u32, buffer: Option<&ID3D12Resource>, first: u64, bytes: u64, uav: bool) {
+        self.invalidate_ambient(index);
         let Some(host) = host() else { return };
         let writable = |b: &ID3D12Resource| {
             // SAFETY: a live buffer.
@@ -525,6 +530,7 @@ impl HostHeap {
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
+        self.invalidate_ambient(index);
         if self.sampler {
             self.null_sampler(index);
         } else {
@@ -674,6 +680,8 @@ impl HostHeap {
     /// (a multiple of 4) of `buffer`, which they hold; null views for no
     /// buffer.
     pub(crate) fn raw_pair_at(&self, index: u32, buffer: Option<&ID3D12Resource>, bytes: u64) {
+        self.invalidate_ambient(index);
+        self.invalidate_ambient(index + 1);
         let Some(host) = host() else { return };
         // shortcut: a buffer view holds at most 2^27 elements (512 MiB raw);
         // a longer copy's rest reads 0 through it.
@@ -730,13 +738,47 @@ impl HostHeap {
         }
     }
 
-    /// The texture and exact descriptor emitted together by `make`.
-    pub(crate) fn ambient_view(&self, index: u32) -> Option<(ID3D12Resource, TextureView)> {
-        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        let (resource, Some(HeldSource::Ambient(view))) = kept.get(index as usize)? else {
+    /// Watch the texture descriptor actually emitted into this slot.
+    pub(crate) fn ambient_view(&self, index: u32) -> Option<crate::ambient::Binding> {
+        // Title slots are mutated under made. Dynamic slots are owned by
+        // this recorder until it finishes recording the list.
+        let _made =
+            (index < self.count).then(|| self.made.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        let (resource, Some(HeldSource::Ambient(view))) =
+            kept.slot(index as usize, false)?.as_mut()?
+        else {
             return None;
         };
-        Some((resource.clone(), **view))
+        let watch = view
+            .watch
+            .get_or_insert_with(crate::ambient::Watch::new)
+            .clone();
+        self.ambient_watched.store(true, Ordering::Release);
+        Some(crate::ambient::Binding {
+            resource: resource.clone(),
+            view: view.desc,
+            handle: self.gpu(index),
+            watch,
+        })
+    }
+
+    fn invalidate_ambient(&self, index: u32) {
+        if !self.ambient_watched.load(Ordering::Acquire) {
+            return;
+        }
+        let watch = {
+            let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            kept.get(index as usize)
+                .and_then(|(_, source)| match source {
+                    Some(HeldSource::Ambient(view)) => view.watch.clone(),
+                    _ => None,
+                })
+        };
+        if let Some(watch) = watch {
+            // Wait for any submitted producer/helper pair consuming this version.
+            watch.invalidate();
+        }
     }
 
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
@@ -895,6 +937,7 @@ impl HostHeap {
             }
         }
         {
+            self.invalidate_ambient(index);
             self.ready[index as usize].store(0, Ordering::Relaxed);
             self.set_stride(index, Some(&view));
             self.note_address(index, Some(&view));
@@ -979,6 +1022,7 @@ impl HostHeap {
             }
             let key = made.get(index as usize).copied().unwrap_or(0);
             let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
+            self.invalidate_ambient(index);
             match &view {
                 Some(v) => null_for(v, self.cpu(index)),
                 None => null_view(self.cpu(index)),
@@ -1356,13 +1400,18 @@ type Held = (ID3D12Resource, Option<HeldSource>);
 #[allow(dead_code)]
 enum HeldSource {
     /// The effective host descriptor for an eligible ambient pass.
-    Ambient(Box<TextureView>),
+    Ambient(Box<AmbientTexture>),
     Shadow(std::sync::Arc<crate::shadow::Shadow>),
     /// A widened three-channel view and the normal shadow it reads.
     Widened(
         std::sync::Arc<crate::shadow::Widened>,
         std::sync::Arc<crate::shadow::Shadow>,
     ),
+}
+
+struct AmbientTexture {
+    desc: TextureView,
+    watch: Option<crate::ambient::Watch>,
 }
 
 #[derive(Clone, Copy)]
@@ -1372,34 +1421,47 @@ pub(crate) enum TextureView {
 }
 
 impl TextureView {
-    fn for_ambient(self) -> Option<HeldSource> {
+    fn for_ambient(self, texture: &ID3D12Resource) -> Option<HeldSource> {
         if !crate::ambient::enabled() {
             return None;
         }
+        let default_format = || {
+            // SAFETY: the descriptor was made from this live resource.
+            unsafe { texture.GetDesc() }.Format
+        };
+        let format = |d: Option<DXGI_FORMAT>| {
+            d.filter(|&value| value != DXGI_FORMAT_UNKNOWN)
+                .unwrap_or_else(default_format)
+        };
         let eligible = match self {
-            Self::Srv(Some(d)) => {
-                d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D
+            Self::Srv(d) => {
+                d.is_none_or(|d| d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D)
                     && matches!(
-                        d.Format,
-                        DXGI_FORMAT_UNKNOWN
-                            | DXGI_FORMAT_R32_FLOAT
+                        format(d.map(|d| d.Format)),
+                        DXGI_FORMAT_R32_FLOAT
                             | DXGI_FORMAT_R16_UNORM
                             | DXGI_FORMAT_R24_UNORM_X8_TYPELESS
                             | DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS
                     )
             }
-            Self::Uav(Some(d)) => {
-                matches!(
-                    d.ViewDimension,
-                    D3D12_UAV_DIMENSION_TEXTURE2D | D3D12_UAV_DIMENSION_TEXTURE3D
-                ) && matches!(
-                    d.Format,
-                    DXGI_FORMAT_UNKNOWN | DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R11G11B10_FLOAT
+            Self::Uav(d) => {
+                d.is_none_or(|d| {
+                    matches!(
+                        d.ViewDimension,
+                        D3D12_UAV_DIMENSION_TEXTURE2D | D3D12_UAV_DIMENSION_TEXTURE3D
+                    )
+                }) && matches!(
+                    format(d.map(|d| d.Format)),
+                    DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R11G11B10_FLOAT
                 )
             }
-            Self::Srv(None) | Self::Uav(None) => true,
         };
-        eligible.then(|| HeldSource::Ambient(Box::new(self)))
+        eligible.then(|| {
+            HeldSource::Ambient(Box::new(AmbientTexture {
+                desc: self,
+                watch: None,
+            }))
+        })
     }
 }
 
@@ -1769,7 +1831,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 };
                 Some(Some((
                     texture.clone(),
-                    TextureView::Srv(desc).for_ambient(),
+                    TextureView::Srv(desc).for_ambient(texture),
                 )))
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
@@ -1829,7 +1891,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 )
             };
             let source = (*counter == 0)
-                .then(|| TextureView::Uav(desc).for_ambient())
+                .then(|| TextureView::Uav(desc).for_ambient(texture))
                 .flatten();
             Some(Some((texture.clone(), source)))
         }

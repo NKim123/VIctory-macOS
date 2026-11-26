@@ -755,7 +755,7 @@ impl State {
             }
             if compute && let Some(role) = stage.shader.ambient {
                 self.ambient = self
-                    .ambient_views(role, &t.used, &made)
+                    .ambient_views(list, role, &t.used, &made)
                     .map(|views| (role, views));
             }
             // Root views a shader reads as title memory: the copies holding
@@ -1156,16 +1156,17 @@ impl State {
             && y != 0
             && z != 0
             && let Some((role, views)) = self.ambient.take()
-            && let Some(views) = list.ambient_views(&views)
+            && list.ambient_after(role, &views)
         {
-            ambient::after(list, role, &views);
-            self.host_state_lost();
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
         }
     }
 
-    /// Interpret only the expected full-size views in list-owned tables.
+    /// Interpret only expected full-size views prepared by the producer.
     fn ambient_views(
         &self,
+        list: &HostList,
         role: Role,
         used: &[UsedResource],
         made: &[(u8, u32)],
@@ -1178,27 +1179,35 @@ impl State {
                     && u.root == RootType::Table
                     && (u.slot, u.table_offset_dwords) == (slot, offset)
             })?;
-            // The title keeps late binding for shared slots. Capturing one
-            // of those here could pick a resource that the producer never
-            // accesses. Only use a table the producer already binds in
-            // list-owned dynamic slots.
-            let &(_, base) = made.iter().find(|m| m.0 == slot)?;
             let Root::Table(table) = self.compute.get(usize::from(slot))? else {
                 return None;
             };
             heap.index(*table)?;
-            heap.index(table.checked_add(u64::from(offset) * 4)?)?;
-            // Placed views already went through ordinary table resolution.
-            host.ambient_view((base / 4 + offset) / 8)
+            let original = heap.index(table.checked_add(u64::from(offset) * 4)?)?;
+            let index = made
+                .iter()
+                .find(|m| m.0 == slot)
+                .map_or(original, |m| (m.1 / 4 + offset) / 8);
+            // This is the same effective slot the producer uses.
+            host.ambient_view(index)
         };
         let image = entry(ResourceType::Uav, role.image())?;
         // SAFETY: the heap made a view of this live host resource.
-        let size = role.extent(image.1, unsafe { image.0.GetDesc() })?;
+        let size = role.extent(image.view, unsafe { image.resource.GetDesc() })?;
+        if !list.has_texture_state(&image.resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+            return None;
+        }
         let depth = if role == Role::Resolve {
             let depth = entry(ResourceType::Srv, Role::DEPTH)?;
             // SAFETY: the heap made a view of this live host resource.
-            let desc = unsafe { depth.0.GetDesc() };
-            if depth.0 == image.0 || !ambient::depth_matches(depth.1, desc, size) {
+            let desc = unsafe { depth.resource.GetDesc() };
+            if depth.resource == image.resource
+                || !ambient::depth_matches(depth.view, desc, size)
+                || !list.has_texture_state(
+                    &depth.resource,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                )
+            {
                 return None;
             }
             Some(depth)
@@ -2962,15 +2971,20 @@ void main(uint3 id : SV_DispatchThreadID) {{
 
     #[test]
     fn ambient_dispatch_preserves_late_binding_of_shared_slots() {
-        check_ambient_dispatch(false);
+        check_ambient_dispatch(false, true);
+    }
+
+    #[test]
+    fn ambient_dispatch_runs_with_unchanged_shared_slots() {
+        check_ambient_dispatch(false, false);
     }
 
     #[test]
     fn ambient_dispatch_uses_the_producers_list_owned_views() {
-        check_ambient_dispatch(true);
+        check_ambient_dispatch(true, true);
     }
 
-    fn check_ambient_dispatch(capped: bool) {
+    fn check_ambient_dispatch(capped: bool, rewrite: bool) {
         let Some(host) = crate::host::host() else {
             return;
         };
@@ -3100,22 +3114,24 @@ void main(uint3 id : SV_DispatchThreadID) {{
         let new_depth = crate::resource::texture_at(replace_depth_at, &depth_words).unwrap();
         assert_ne!(original, new_output);
         assert_ne!(old_depth, new_depth);
-        set_output(replacement);
-        set_depth(replace_depth_at);
-        if !capped {
-            // Resolve the late writes to both shared host slots before execution.
-            let indices = [
-                title_heap.index(output_slot).unwrap(),
-                title_heap.index(depth_slot).unwrap(),
-            ];
-            host_heap.mirror(indices[0], output_slot, true).unwrap();
-            host_heap.mirror(indices[1], depth_slot, true).unwrap();
-            let actual = host_heap.textures_at(&indices);
-            assert_eq!(
-                actual,
-                [new_output, new_depth]
-                    .map(|r| crate::resource::host_resource(r).unwrap().as_raw() as usize)
-            );
+        if rewrite {
+            set_output(replacement);
+            set_depth(replace_depth_at);
+            if !capped {
+                // Resolve the late writes before executing the same recorded list.
+                let indices = [
+                    title_heap.index(output_slot).unwrap(),
+                    title_heap.index(depth_slot).unwrap(),
+                ];
+                host_heap.mirror(indices[0], output_slot, true).unwrap();
+                host_heap.mirror(indices[1], depth_slot, true).unwrap();
+                let actual = host_heap.textures_at(&indices);
+                assert_eq!(
+                    actual,
+                    [new_output, new_depth]
+                        .map(|r| crate::resource::host_resource(r).unwrap().as_raw() as usize)
+                );
+            }
         }
 
         let read = |address| {
@@ -3165,7 +3181,11 @@ void main(uint3 id : SV_DispatchThreadID) {{
         // SAFETY: both mapped readback buffers hold a complete texture.
         unsafe {
             let packed = (14 << 27) | (241 << 18) | (251 << 9) | 256;
-            let expected = if capped { (packed, 0) } else { (0, SENTINEL) };
+            let expected = if rewrite && !capped {
+                (0, SENTINEL)
+            } else {
+                (packed, 0)
+            };
             assert_eq!(
                 (
                     original_data.cast::<u32>().read(),

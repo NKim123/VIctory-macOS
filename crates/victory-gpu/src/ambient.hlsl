@@ -50,6 +50,13 @@ void main() {
 }
 #endif
 
+#ifdef PUBLISH
+[numthreads(1, 1, 1)]
+void main() {
+    output.Store4(0, asuint(history[0]));
+}
+#endif
+
 #ifdef PLACE
 [numthreads(8, 4, 1)]
 void main(uint3 at : SV_DispatchThreadID) {

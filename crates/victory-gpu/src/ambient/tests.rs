@@ -1,5 +1,8 @@
 use super::*;
 
+const COPY_SRC: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_COPY_SOURCE;
+const COPY_DST: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_COPY_DEST;
+
 const WIDTH: u32 = 9;
 const HEIGHT: u32 = 9;
 const ROW: u32 = 256;
@@ -180,6 +183,39 @@ fn off_and_constant_settings() {
 }
 
 #[test]
+fn a_shared_slot_is_frozen_once_and_a_rewrite_disarms_every_pair() {
+    let image = Watch::new();
+    let depth = Watch::new();
+    let mut first = 0u32;
+    let mut second = 0u32;
+    let pairs = [
+        Candidate {
+            image: image.clone(),
+            depth: Some(depth.clone()),
+            count: (&raw mut first) as usize,
+        },
+        Candidate {
+            image: image.clone(),
+            depth: None,
+            count: (&raw mut second) as usize,
+        },
+    ];
+    let frozen = arm(&pairs);
+    assert_eq!((first, second, frozen.len()), (1, 1, 2));
+    assert!(image.0.try_write().is_err());
+    assert!(depth.0.try_write().is_err());
+    drop(frozen);
+
+    depth.invalidate();
+    drop(arm(&pairs));
+    assert_eq!((first, second), (0, 1));
+
+    image.invalidate();
+    drop(arm(&pairs));
+    assert_eq!((first, second), (0, 0));
+}
+
+#[test]
 fn only_expected_compute_roles_are_enabled() {
     let resolve = b"CS_ScreenProbes_TemporalResolve_Synthetic";
     let radiance = b"CS_CacheScreenSpaceRadiance_Synthetic";
@@ -305,15 +341,15 @@ fn title_indirect_light_and_air_read_back() {
         mode: Mode::Off,
         ..settings
     });
-    assert!(!off.after(&run, Role::Resolve, &light_view));
-    assert!(!off.after(&run, Role::Air, &air_view));
+    assert!(!off.after(&run, Role::Resolve, &light_view, None));
+    assert!(!off.after(&run, Role::Air, &air_view, None));
 
     let estimate = Recorder::new(settings);
-    assert!(estimate.after(&run, Role::Resolve, &light_view));
-    assert!(estimate.after(&run, Role::Air, &air_view));
+    assert!(estimate.after(&run, Role::Resolve, &light_view, None));
+    assert!(estimate.after(&run, Role::Air, &air_view, None));
     let startup_light = light.read(&run);
     let startup_air = air.read(&run);
-    assert!(estimate.after(&run, Role::Radiance, &radiance_view));
+    assert!(estimate.after(&run, Role::Radiance, &radiance_view, None));
     run.close();
     host.execute(&[&run]);
     assert_eq!(startup_light.texels(), original_light);
@@ -322,8 +358,8 @@ fn title_indirect_light_and_air_read_back() {
     let resolve = host.new_list().unwrap();
     // SAFETY: a live shader-visible heap and open command list.
     unsafe { resolve.list.SetDescriptorHeaps(&[Some(heap.clone())]) };
-    assert!(estimate.after(&resolve, Role::Resolve, &light_view));
-    assert!(estimate.after(&resolve, Role::Air, &air_view));
+    assert!(estimate.after(&resolve, Role::Resolve, &light_view, None));
+    assert!(estimate.after(&resolve, Role::Air, &air_view, None));
     let resolved = light.read(&resolve);
     let capped = air.read(&resolve);
     let retained = radiance.read(&resolve);
@@ -332,8 +368,8 @@ fn title_indirect_light_and_air_read_back() {
         mode: Mode::Constant(0.25),
         ..settings
     });
-    assert!(constant.after(&resolve, Role::Resolve, &light_view));
-    assert!(!constant.after(&resolve, Role::Air, &air_view));
+    assert!(constant.after(&resolve, Role::Resolve, &light_view, None));
+    assert!(!constant.after(&resolve, Role::Air, &air_view, None));
     let fixed = light.read(&resolve);
     resolve.close();
     host.execute(&[&resolve]);

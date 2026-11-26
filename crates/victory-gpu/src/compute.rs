@@ -31,6 +31,15 @@ pub(crate) struct Range {
     kind: D3D12_DESCRIPTOR_RANGE_TYPE,
     register: u32,
     count: u32,
+    flags: D3D12_DESCRIPTOR_RANGE_FLAGS,
+}
+
+impl Range {
+    /// The descriptor may change between recording and submission.
+    pub(crate) const fn volatile(mut self) -> Self {
+        self.flags = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE;
+        self
+    }
 }
 
 /// `count` shader resource views from `t{register}`.
@@ -39,6 +48,7 @@ pub(crate) const fn srv(register: u32, count: u32) -> Range {
         kind: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
         register,
         count,
+        flags: D3D12_DESCRIPTOR_RANGE_FLAG_NONE,
     }
 }
 
@@ -48,6 +58,7 @@ pub(crate) const fn uav(register: u32, count: u32) -> Range {
         kind: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
         register,
         count,
+        flags: D3D12_DESCRIPTOR_RANGE_FLAG_NONE,
     }
 }
 
@@ -119,7 +130,7 @@ pub(crate) fn root_signature(device: &ID3D12Device, params: &[Param]) -> Result<
                     NumDescriptors: r.count,
                     BaseShaderRegister: r.register,
                     RegisterSpace: 0,
-                    Flags: D3D12_DESCRIPTOR_RANGE_FLAG_NONE,
+                    Flags: r.flags,
                     OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
                 })
                 .collect(),
