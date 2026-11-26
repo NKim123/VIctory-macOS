@@ -417,9 +417,10 @@ those running on macOS under Wine.
   self-contained work. The worker holds up to four host lists including
   those on the GPU. It retains only committed color targets up to 16 MiB
   total or 1% of the texture budget when that is lower. The budget comes
-  from `VICTORY_GPU_BUDGET_MB` or the local DXGI budget. Lists with uploads,
-  live descriptors, title memory work, readbacks, render target bindings,
-  or resource-specific aliasing and UAV barriers stay synchronous.
+  from `VICTORY_GPU_BUDGET_MB` or the local DXGI budget. Bindings of these
+  targets, UAV barriers naming them, and immutable pipeline state are
+  eligible. Lists with aliasing barriers, uploads, live descriptors,
+  title memory work, or readbacks stay synchronous.
   Guest heap sync, texture eviction, copy-back, and retirement also stay
   on the synchronous path. Queue signals, waits, mapping changes, and
   presents drain the worker in order. Completed lists that the title reset
@@ -440,6 +441,8 @@ those running on macOS under Wine.
   worker. Split-prelude diagnostics and the wall-time profiler use serial
   waits. Lists that refer to title memory, even through an alias, still
   require the existing submission-time lifetime and visibility checks.
+  With the wall-time profiler off, the frame report logs the number of
+  fence waits saved by batching.
 
 
 Pipelining adds a bounded pool of completion marks. The switches reuse the existing command list, staging and snapshot allocations.

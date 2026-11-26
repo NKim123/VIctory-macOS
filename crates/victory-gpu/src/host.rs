@@ -224,6 +224,7 @@ static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
 ];
+static PIPELINE_WAITS_SAVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// After submissions: shader-written ranges compared and copied back into
 /// title memory (microseconds, bytes that differed), since the last
@@ -539,45 +540,49 @@ pub(crate) fn video_memory() -> Option<[(f64, f64); 2]> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use super::{Host, ID3D12Resource};
+
+    fn committed_color_target(gpu: &Host) -> ID3D12Resource {
+        use super::*;
+        let mut resource = None;
+        // SAFETY: a plain, 4x4 color target with no mapped memory.
+        unsafe {
+            gpu.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                        Width: 4,
+                        Height: 4,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                        SampleDesc: DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
+                        Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    None,
+                    &mut resource,
+                )
+                .unwrap();
+        }
+        resource.unwrap()
+    }
+
     #[test]
     fn clear_rtv_stays_reserved_through_a_ring_of_target_bindings() {
         use super::*;
         let Some(host) = host() else { return };
-        let target = || {
-            let mut resource = None;
-            // SAFETY: a plain, 4x4 color target with no mapped memory.
-            unsafe {
-                host.device
-                    .CreateCommittedResource(
-                        &D3D12_HEAP_PROPERTIES {
-                            Type: D3D12_HEAP_TYPE_DEFAULT,
-                            ..Default::default()
-                        },
-                        D3D12_HEAP_FLAG_NONE,
-                        &D3D12_RESOURCE_DESC {
-                            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-                            Width: 4,
-                            Height: 4,
-                            DepthOrArraySize: 1,
-                            MipLevels: 1,
-                            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                            SampleDesc: DXGI_SAMPLE_DESC {
-                                Count: 1,
-                                Quality: 0,
-                            },
-                            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-                            ..Default::default()
-                        },
-                        D3D12_RESOURCE_STATE_RENDER_TARGET,
-                        None,
-                        &mut resource,
-                    )
-                    .unwrap();
-            }
-            resource.unwrap()
-        };
-        let cleared = target();
-        let bound = target();
+        let cleared = committed_color_target(host);
+        let bound = committed_color_target(host);
         let clear = host.new_list().unwrap();
         let binds = host.new_list().unwrap();
 
@@ -606,6 +611,48 @@ pub(crate) mod tests {
         binds.close();
         clear.close();
         host.execute(&[&binds, &clear]);
+    }
+
+    #[test]
+    fn host_only_rtv_bindings_can_share_a_fence_for_distinct_targets() {
+        use super::*;
+        use std::sync::Arc;
+
+        let host = host().expect("a host GPU");
+        let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+        let target = || {
+            Arc::new(crate::resource::HostTexture::new(
+                committed_color_target(host),
+                state,
+                Vec::new(),
+            ))
+        };
+        let a = target();
+        let b = target();
+        let bind = |target: &Arc<crate::resource::HostTexture>| {
+            let list = host.new_list().unwrap();
+            let view = host.rtv(&target.texture, None);
+            list.keep_untracked_texture(target.clone());
+            // SAFETY: an open list and a fresh CPU descriptor for a retained target.
+            unsafe { list.list.OMSetRenderTargets(1, Some(&view), false, None) };
+            list.close();
+            assert_eq!(
+                list.submit_ahead_bytes(),
+                target.submission_retained_bytes()
+            );
+            list
+        };
+        let first = bind(&a);
+        let conflict = bind(&a);
+        let second = bind(&b);
+        drop((a, b));
+
+        let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let _holding = Holding::enter();
+        assert!(!host.execute_host_pipeline(&[&[&first], &[&conflict]], &mut submitted));
+        start_native_call_trace();
+        assert!(host.execute_host_pipeline(&[&[&first], &[&second]], &mut submitted));
+        assert_eq!(take_native_call_trace(), [(vec![2, 2], true)]);
     }
 
     #[test]
@@ -1291,7 +1338,8 @@ pub(crate) mod tests {
 
         list.bind_pipeline("test_pso", &pso, &root);
         list.bind_pipeline("test_pso", &pso, &root);
-        assert_eq!(list.deferred().kept.len(), 2);
+        assert!(list.deferred().kept.is_empty());
+        assert!(list.submit_ahead_bytes().is_some());
         assert_eq!(list.deferred().bound_pipelines.len(), 1);
 
         list.close();
@@ -1299,7 +1347,7 @@ pub(crate) mod tests {
         assert!(list.deferred().kept.is_empty());
         assert!(list.deferred().bound_pipelines.is_empty());
         list.bind_pipeline("test_pso", &pso, &root);
-        assert_eq!(list.deferred().kept.len(), 2);
+        assert_eq!(list.deferred().bound_pipelines.len(), 1);
         list.close();
     }
 
@@ -1590,18 +1638,16 @@ struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
-    /// Host objects the list's commands name (pipelines, root signatures,
-    /// descriptor heaps): the title may release its objects before it
-    /// submits the list.
+    /// Host objects whose contents or descriptors can depend on title work.
     kept: Vec<windows::core::IUnknown>,
     ambient: Vec<crate::ambient::Candidate>,
     /// Aliasing and UAV barriers, and render target bindings, can name
     /// textures without recording a state transition. Keep their allocations
-    /// alive until reset and keep these lists off the async submission lane.
+    /// alive until reset and include them in the async lane's bounds.
     untracked_textures:
         std::collections::HashMap<usize, std::sync::Arc<crate::resource::HostTexture>>,
-    /// Pipelines [`HostList::bind_pipeline`] already kept and noted since reset.
-    bound_pipelines: std::collections::HashSet<usize>,
+    /// Immutable pipelines and root signatures retained by the recording.
+    bound_pipelines: std::collections::HashMap<usize, (ID3D12PipelineState, ID3D12RootSignature)>,
     /// Unaligned root-CBV scratch copies (`(source, bytes)` → host GPU address)
     /// valid until the next title copy or list reset.
     filled_scratch: std::collections::HashMap<(usize, usize), u64>,
@@ -1632,8 +1678,8 @@ struct Deferred {
     /// Computed pages with full baselines own those pages before any
     /// post-fence merge can write CPU bytes into their shadows.
     computed_ownership: Vec<ComputedOwnership>,
-    /// A host library recorded commands whose dependencies are opaque to us.
-    external: bool,
+    /// Commands whose dependencies the submission worker cannot track.
+    synchronous: bool,
     texture_writes: crate::texback::Wanted,
     attempted_texture_writes: Option<crate::texback::Wanted>,
     texture_backs: Vec<crate::texback::Back>,
@@ -1668,11 +1714,14 @@ fn independent_parts(parts: &[&[&HostList]]) -> bool {
             if !lists.insert(std::ptr::from_ref(list)) {
                 return false;
             }
-            for (_, _, copy) in list
+            let deferred = list.deferred();
+            for copy in list
                 .states
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .values()
+                .map(|(_, _, copy)| copy)
+                .chain(deferred.untracked_textures.values())
             {
                 if resources
                     .insert(copy.texture.as_raw(), part)
@@ -2185,6 +2234,7 @@ impl Host {
         }
         SUBMISSION_US[0].fetch_add(prep.as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+        PIPELINE_WAITS_SAVED.fetch_add((parts.len() - 1) as u64, Ordering::Relaxed);
         let mut lost = 0;
         for (offset, mark) in marks[..parts.len()].iter().enumerate() {
             let value = first + offset as u64;
@@ -3752,11 +3802,12 @@ impl HostList {
     pub(crate) fn bind_pipeline(&self, name: &str, pso: &ID3D12PipelineState, root: &ID3D12RootSignature) {
         {
             let mut deferred = self.deferred();
-            if !deferred.bound_pipelines.insert(pso.as_raw() as usize) {
+            let std::collections::hash_map::Entry::Vacant(entry) =
+                deferred.bound_pipelines.entry(pso.as_raw() as usize)
+            else {
                 return;
-            }
-            deferred.kept.push(pso.clone().into());
-            deferred.kept.push(root.clone().into());
+            };
+            entry.insert((pso.clone(), root.clone()));
         }
         self.used_pipeline(name);
     }
@@ -3990,8 +4041,8 @@ impl HostList {
         self.deferred().waits.clone()
     }
 
-    pub(crate) fn note_external_recording(&self) {
-        self.deferred().external = true;
+    pub(crate) fn require_synchronous_submission(&self) {
+        self.deferred().synchronous = true;
     }
 
     /// Only self-contained host commands may finish after the submit call.
@@ -4002,23 +4053,6 @@ impl HostList {
         if timing() || crate::capture::listed(crate::queue::presented() + 1) {
             return None;
         }
-        let deferred = self.deferred();
-        if deferred.external
-            || !deferred.copies.is_empty()
-            || !deferred.uploads.is_empty()
-            || !deferred.kept.is_empty()
-            || !deferred.untracked_textures.is_empty()
-            || !deferred.after.is_empty()
-            || !deferred.computed_ownership.is_empty()
-            || !deferred.texture_backs.is_empty()
-            || !deferred.texture_fills.is_empty()
-            || !deferred.missed.is_empty()
-            || !deferred.writes.is_empty()
-            || !deferred.waits.is_empty()
-        {
-            return None;
-        }
-        drop(deferred);
         if self.budget.get().is_some_and(Option::is_some)
             || self
                 .arguments
@@ -4039,19 +4073,42 @@ impl HostList {
         {
             return None;
         }
+        let deferred = self.deferred();
+        if deferred.synchronous
+            || !deferred.copies.is_empty()
+            || !deferred.uploads.is_empty()
+            || !deferred.kept.is_empty()
+            || !deferred.ambient.is_empty()
+            || !deferred.after.is_empty()
+            || !deferred.computed_ownership.is_empty()
+            || !deferred.texture_backs.is_empty()
+            || !deferred.texture_fills.is_empty()
+            || !deferred.missed.is_empty()
+            || !deferred.writes.is_empty()
+            || !deferred.waits.is_empty()
+        {
+            return None;
+        }
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        states.values().try_fold(0u64, |total, (_, _, texture)| {
-            if texture
-                .staging
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_some()
-                || matches!(texture.twin.get(), Some(Some(_)))
-            {
-                return None;
-            }
-            total.checked_add(texture.submission_retained_bytes()?)
-        })
+        let mut counted = std::collections::HashSet::new();
+        let textures = states
+            .values()
+            .map(|(_, _, texture)| texture)
+            .chain(deferred.untracked_textures.values());
+        textures
+            .filter(|t| counted.insert(t.texture.as_raw()))
+            .try_fold(0u64, |total, texture| {
+                if texture
+                    .staging
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_some()
+                    || matches!(texture.twin.get(), Some(Some(_)))
+                {
+                    return None;
+                }
+                total.checked_add(texture.submission_retained_bytes()?)
+            })
     }
 
     /// Whether nothing has been recorded since the list was made or reset
@@ -5302,6 +5359,14 @@ impl Meter {
                 COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / report_frames
             });
             submission_profile::log(report_frames);
+            if pipeline_submissions() {
+                let waits = PIPELINE_WAITS_SAVED.swap(0, Ordering::Relaxed);
+                tracing::info!(
+                    waits,
+                    frames = report_frames,
+                    "GPU pipeline fence waits saved"
+                );
+            }
             let dropped = crate::draw::take_dropped() as f64 / report_frames;
             let indirect = crate::list::take_indirect() as f64 / report_frames;
             let root_views = crate::draw::take_root_view_slots() as f64 / report_frames;

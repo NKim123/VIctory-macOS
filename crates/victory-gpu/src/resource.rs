@@ -3133,7 +3133,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn untracked_texture_commands_pin_their_resources_and_stay_synchronous() {
+    fn untracked_texture_commands_pin_their_resources_and_bound_async_admission() {
         use std::sync::Arc;
 
         if crate::host::host().is_none() {
@@ -3212,9 +3212,15 @@ mod tests {
                 }
             }
             assert_eq!(close(list), S_OK);
+            let retained = (command != "aliasing barrier").then(|| {
+                weak_copies
+                    .iter()
+                    .map(|copy| copy.upgrade().unwrap().submission_retained_bytes().unwrap())
+                    .sum()
+            });
             assert_eq!(
                 crate::list::host_list(list).unwrap().submit_ahead_bytes(),
-                None,
+                retained,
                 "{command}"
             );
 
