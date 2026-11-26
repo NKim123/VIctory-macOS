@@ -323,13 +323,20 @@ impl Target {
             },
         };
         let mips = u32::from(desc.MipLevels);
-        let Some(end) = first.checked_add(count) else {
+        let slices = u32::from(desc.DepthOrArraySize);
+        // UINT_MAX in a 2D array UAV covers the remaining array slices.
+        let end = if count == u32::MAX {
+            slices
+        } else if let Some(end) = first.checked_add(count) {
+            end
+        } else {
             return;
         };
         if mip >= mips
-            || end > u32::from(desc.DepthOrArraySize)
+            || first >= end
+            || end > slices
             || mips as usize != self.layout.mips.len()
-            || u32::from(desc.DepthOrArraySize) != self.layout.slices
+            || slices != self.layout.slices
         {
             return;
         }
@@ -495,6 +502,57 @@ pub(crate) struct Back {
     _budget: Budget,
 }
 
+/// Marks only the elements visited by the layout walk, in any order.
+struct WrittenTexels {
+    words: Vec<u64>,
+    element: usize,
+}
+
+impl WrittenTexels {
+    fn new(bytes: usize, element: usize) -> Self {
+        Self {
+            words: vec![0; bytes.div_ceil(64 * element)],
+            element,
+        }
+    }
+
+    fn mark(&mut self, at: usize, len: usize) {
+        debug_assert!(at.is_multiple_of(self.element) && len.is_multiple_of(self.element));
+        let mut first = at / self.element;
+        let end = first + len / self.element;
+        while first < end {
+            let offset = first % 64;
+            let count = (end - first).min(64 - offset);
+            self.words[first / 64] |= (u64::MAX >> (64 - count)) << offset;
+            first += count;
+        }
+    }
+
+    fn find(&self, at: usize, written: bool) -> Option<usize> {
+        let first = at / 64;
+        let mut mask = u64::MAX << (at % 64);
+        for (i, &word) in self.words.iter().enumerate().skip(first) {
+            let bits = (if written { word } else { !word }) & mask;
+            if bits != 0 {
+                return Some(i * 64 + bits.trailing_zeros() as usize);
+            }
+            mask = u64::MAX;
+        }
+        None
+    }
+
+    /// Maximal byte ranges of written texels, in address order.
+    fn ranges(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        let mut at = 0;
+        std::iter::from_fn(move || {
+            let start = self.find(at, true)?;
+            let end = self.find(start, false).unwrap_or(self.words.len() * 64);
+            at = end;
+            Some((start * self.element, end * self.element))
+        })
+    }
+}
+
 impl Back {
     pub(crate) fn land(&self) {
         if !self.ticket.valid.load(Ordering::Relaxed)
@@ -523,7 +581,7 @@ impl Back {
 
     fn land_mapped(&self, data: *const u8) {
         let mut tiled = vec![0; self.layout.size as usize];
-        let mut texels = crate::ranges::Ranges::default();
+        let mut texels = WrittenTexels::new(tiled.len(), self.layout.desc.element_bytes as usize);
         for copy in &self.copies {
             if !bindings_live(&copy.bindings) {
                 continue;
@@ -543,7 +601,7 @@ impl Back {
                 |at, bytes| {
                     let end = at + bytes.len();
                     tiled[at..end].copy_from_slice(bytes);
-                    texels.insert(at, end, 0);
+                    texels.mark(at, bytes.len());
                 },
             );
             if let Err(error) = result {
@@ -564,7 +622,7 @@ impl Back {
         }
         let at = self.ticket.at;
         let _writing = crate::watch::writing(at, tiled.len());
-        for (start, end) in texels.iter() {
+        for (start, end) in texels.ranges() {
             crate::host::write_mapped(
                 (at + start) as *mut u8,
                 tiled[start..end].as_ptr(),

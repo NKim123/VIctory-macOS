@@ -4070,11 +4070,11 @@ void main(uint3 id : SV_DispatchThreadID) {
             WRITES,
         );
         let list = host.new_list().unwrap();
-        for (slot, (mip, slice)) in [(2, 1), (1, 0)].into_iter().enumerate() {
+        for (slot, (mip, slice, count)) in [(2, 1, u32::MAX), (1, 0, 1)].into_iter().enumerate() {
             let view = View::Unordered(
                 texture as usize,
                 0,
-                Some([16, 5, mip, slice, 1, 0, 0, 0, 0, 0]),
+                Some([16, 5, mip, slice, count, 0, 0, 0, 0, 0]),
             );
             slots.make(slot as u32, &view);
             crate::texback::TEST_KINDS.set(&[(128, 64, 15)]);
