@@ -539,6 +539,7 @@ enum MaskData {
 pub(super) const LDS_ACROSS: Why =
     "LDS one console wave64 shares without barriers, on a host of 32-lane waves";
 pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
+pub(super) const MASK_ACROSS: Why = "a lane mask read as data (wave64 on a 32-lane host)";
 pub(super) const REDUCTION_ACROSS: Why =
     "a wave reduction over both 32-lane halves (wave64 on a 32-lane host)";
 pub(super) const FIRST_ACROSS: Why = "a first-lane read of a value that may differ between 32-lane halves (wave64 on a 32-lane host)";
@@ -784,7 +785,7 @@ impl<'a> Lower<'a> {
                 // shortcut: a read in divergent code of what divergent code
                 // wrote gets no barrier (none could be placed there); the
                 // program then runs as before.
-                if let Some(b) = split_wave_barriers(p, x.st) {
+                if let Some(b) = split_wave_barriers(p, x.st, &x.res.waterfall.reads) {
                     split_barriers = b;
                     synced = true;
                 }
@@ -2022,7 +2023,7 @@ impl<'a> Lower<'a> {
         }
         if self.mask_ok && (self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v)) {
             return match self.mask_dword(v) {
-                Err(why @ (MASK_ELSEWHERE | halves::MASK_ACROSS))
+                Err(why @ (MASK_ELSEWHERE | MASK_ACROSS))
                     if self.mask_data == MaskData::Console =>
                 {
                     self.mask_op_on_numbers(v, 0).map(Val::I32).ok_or(why)
@@ -2358,7 +2359,7 @@ impl<'a> Lower<'a> {
                 let single_half = self.halves && self.one_host_wave();
                 let across = self.halves && !single_half;
                 if across {
-                    at = self.across_at(def).ok_or(halves::MASK_ACROSS)?;
+                    at = self.across_at(def).ok_or(MASK_ACROSS)?;
                 }
                 if !self.balloting.insert(lo) {
                     return Err("a lane mask whose lanes depend on its own value");

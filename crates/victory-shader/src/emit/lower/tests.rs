@@ -1397,7 +1397,9 @@ fn wave64(words: &[u32]) -> ir::Program {
 /// [`super::split_wave_barriers`] of a program.
 fn barriers_at(p: &ir::Program) -> Option<Vec<(usize, usize)>> {
     let st = structure::structure(p).unwrap();
-    let mut at: Vec<_> = super::split_wave_barriers(p, &st)?.into_iter().collect();
+    let mut at: Vec<_> = super::split_wave_barriers(p, &st, &[])?
+        .into_iter()
+        .collect();
     at.sort_unstable();
     Some(at)
 }

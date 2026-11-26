@@ -25,7 +25,11 @@ use super::*;
 /// A read may see a write from divergent code only where the region's
 /// only observable effect is an idempotent flag store. Other such reads
 /// return `None` because a group barrier cannot go in that region.
-pub(crate) fn split_wave_barriers(p: &Program, st: &Structured) -> Option<Set<(usize, usize)>> {
+pub(crate) fn split_wave_barriers(
+    p: &Program,
+    st: &Structured,
+    waterfall_reads: &[Value],
+) -> Option<Set<(usize, usize)>> {
     /// LDS accesses since the last barrier.
     #[derive(Clone, Copy, Default, PartialEq)]
     struct Since {
@@ -56,7 +60,7 @@ pub(crate) fn split_wave_barriers(p: &Program, st: &Structured) -> Option<Set<(u
     };
     let n = p.blocks.len();
     let succ = |b: usize| p.blocks[b].exit.successors();
-    let step = in_step(p, st, &[]);
+    let step = in_step(p, st, waterfall_reads);
     let divergent_writes = (0..n).any(|b| {
         !step[b]
             && p.blocks[b]
@@ -153,6 +157,7 @@ pub(crate) fn in_step(p: &Program, st: &Structured, waterfall_reads: &[Value]) -
     };
     let n = p.blocks.len();
     let scalar = |r: Reg| matches!(r, Reg::S(_) | Reg::Scc);
+    let group_branches = !st.group_branches.is_empty();
     // Not EXEC or VCC: lane masks.
     let mask = |r: Reg| matches!(r, Reg::S(k) if [EXEC, EXEC + 1, VCC, VCC + 1].contains(&k));
     // Scalar writes no host wave can compute alike: other lanes' values,
@@ -221,11 +226,11 @@ pub(crate) fn in_step(p: &Program, st: &Structured, waterfall_reads: &[Value]) -
                 let from = inst
                     .reads
                     .iter()
-                    .all(|&(r, v)| scalar(r) && !mask(r) && alike.contains(&v));
+                    .all(|&(r, v)| scalar(r) && (group_branches || !mask(r)) && alike.contains(&v));
                 // The one-console-wave retry broadcasts lane reads across
                 // the group where it is in step. A waterfall's per-lane
                 // replacement or a restored SGPR can still vary by lane.
-                let broadcast = !st.group_branches.is_empty()
+                let broadcast = group_branches
                     && step[b]
                     && matches!(inst.name(), "v_readfirstlane_b32" | "v_readlane_b32")
                     && inst.writes.iter().all(|&(_, v)| {
@@ -238,6 +243,14 @@ pub(crate) fn in_step(p: &Program, st: &Structured, waterfall_reads: &[Value]) -
                         .all(|&(r, v)| !scalar(r) || mask(r) || alike.contains(&v));
                 if (from && !own(inst)) || broadcast {
                     next.extend(inst.writes.iter().filter(|w| scalar(w.0)).map(|w| w.1));
+                }
+                if group_branches && step[b] {
+                    // Active mask dwords read as scalars are materialized
+                    // by a ballot across both halves at their definition.
+                    next.extend(inst.writes.iter().filter_map(|&(r, v)| {
+                        let low = st.highs.get(&v).copied().unwrap_or(v);
+                        (scalar(r) && st.active.contains(&low)).then_some(v)
+                    }));
                 }
             }
         }
