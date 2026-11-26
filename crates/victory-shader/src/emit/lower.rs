@@ -533,6 +533,9 @@ enum MaskData {
 }
 
 /// What a value holding a lane mask read as a number stops with.
+pub(super) const LDS_ACROSS: Why =
+    "LDS one console wave64 shares without barriers, on a host of 32-lane waves";
+pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
 const LANE_MASK: Why = "a lane mask read as data";
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
@@ -2001,7 +2004,14 @@ impl<'a> Lower<'a> {
             return Ok(val);
         }
         if self.mask_ok && (self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v)) {
-            return self.mask_dword(v).map(Val::I32);
+            return match self.mask_dword(v) {
+                Err(why @ (MASK_ELSEWHERE | halves::MASK_ACROSS))
+                    if self.mask_data == MaskData::Console =>
+                {
+                    self.mask_op_on_numbers(v, 0).map(Val::I32).ok_or(why)
+                }
+                other => other.map(Val::I32),
+            };
         }
         if let Some(Val::Missing(w)) = found {
             return Err(w);
@@ -2218,6 +2228,91 @@ impl<'a> Lower<'a> {
         Ok(self.memory(lo, hi, bytes, write, active))
     }
 
+    /// The number a 32-bit scalar bit operation (`s_and_b32`, `s_or_b32`,
+    /// ...) that structurisation took for a lane mask computes, where its
+    /// operands are numbers: constants, root constants, values lowered as
+    /// numbers (a join of a mask and data, `phis`), or such operations
+    /// again. Computed in the current block, which their definitions
+    /// dominate. Only with console lanes, where a mask joined as data is the
+    /// console's number. None where an operand is a lane mask.
+    fn mask_op_on_numbers(&mut self, v: Value, depth: u32) -> Option<V> {
+        if let Some(&Val::I32(x)) = self.vals.get(&v) {
+            // (A join read so is lowered as the number its paths bring.)
+            if self.phi_at.contains_key(&v) {
+                self.read_phis.insert(v);
+            }
+            return Some(x);
+        }
+        if self.mask_data != MaskData::Console || depth > 16 {
+            return None;
+        }
+        if self.params.contains_key(&v) {
+            return match self.get(v) {
+                Ok(Val::I32(x)) => Some(x),
+                _ => None,
+            };
+        }
+        let b = *self.def_block.get(&v)?;
+        let inst = self.x.p.blocks[b].insts.iter().find(|i| {
+            i.writes
+                .iter()
+                .any(|w| w.1 == v && matches!(w.0, Reg::S(_)))
+        })?;
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return None;
+        };
+        let op = inst.name().strip_prefix("s_")?.strip_suffix("_b32")?;
+        if inst.write(Reg::S(EXEC)).is_some() || inst.write(Reg::S(EXEC + 1)).is_some() {
+            return None;
+        }
+        let mut xs = Vec::with_capacity(2);
+        for o in src {
+            let n = match *o {
+                Operand::Scalar { code, .. } if code != NULL => {
+                    let r = inst.read(Reg::S(code))?;
+                    self.mask_op_on_numbers(r, depth + 1)?
+                }
+                Operand::Scalar { .. } => self.s.m.i32(0),
+                Operand::Literal(k) => self.s.m.i32(k),
+                Operand::Const(k) => self.s.m.i32(crate::resource::inline(k)?),
+                _ => return None,
+            };
+            xs.push(n);
+        }
+        let c = self.cur;
+        let ones = self.s.m.i32(u32::MAX);
+        let not = |l: &mut Self, a: V| l.s.m.bin(c, Bin::Xor, a, ones);
+        let r = match (op, &xs[..]) {
+            ("mov", &[a]) => a,
+            ("not", &[a]) => not(self, a),
+            ("and", &[a, b]) => self.s.m.bin(c, Bin::And, a, b),
+            ("or", &[a, b]) => self.s.m.bin(c, Bin::Or, a, b),
+            ("xor", &[a, b]) => self.s.m.bin(c, Bin::Xor, a, b),
+            ("andn2", &[a, b]) => {
+                let nb = not(self, b);
+                self.s.m.bin(c, Bin::And, a, nb)
+            }
+            ("orn2", &[a, b]) => {
+                let nb = not(self, b);
+                self.s.m.bin(c, Bin::Or, a, nb)
+            }
+            ("nand", &[a, b]) => {
+                let t = self.s.m.bin(c, Bin::And, a, b);
+                not(self, t)
+            }
+            ("nor", &[a, b]) => {
+                let t = self.s.m.bin(c, Bin::Or, a, b);
+                not(self, t)
+            }
+            ("xnor", &[a, b]) => {
+                let t = self.s.m.bin(c, Bin::Xor, a, b);
+                not(self, t)
+            }
+            _ => return None,
+        };
+        Some(r)
+    }
+
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
     /// taken in the block that writes the mask (see [`MaskData`]).
     fn mask_dword(&mut self, v: Value) -> Result<V, Why> {
@@ -2283,9 +2378,8 @@ impl<'a> Lower<'a> {
     /// no ballot there gives it: with console lanes, the scalar operation
     /// that writes it applied to its operands' numbers, as the console does.
     fn mask_number(&mut self, lo: Value) -> Result<(V, V), Why> {
-        const ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
         if self.mask_data != MaskData::Console {
-            return Err(ELSEWHERE);
+            return Err(MASK_ELSEWHERE);
         }
         let p = self.x.p;
         // A register the compiler reuses: a mask on one path, data on another.
@@ -2297,19 +2391,19 @@ impl<'a> Lower<'a> {
         {
             return Err("a register joining a lane mask and data, read as data");
         }
-        let &b = self.def_block.get(&lo).ok_or(ELSEWHERE)?;
+        let &b = self.def_block.get(&lo).ok_or(MASK_ELSEWHERE)?;
         let inst = p.blocks[b]
             .insts
             .iter()
             .find(|i| i.writes.iter().any(|w| w.1 == lo))
-            .ok_or(ELSEWHERE)?;
+            .ok_or(MASK_ELSEWHERE)?;
         let Fields::Sop {
             dst: Some(Operand::Scalar { code, .. }),
             src,
             ..
         } = &inst.fields
         else {
-            return Err(ELSEWHERE);
+            return Err(MASK_ELSEWHERE);
         };
         let wave64 = self.x.native.wave64;
         let width = if wave64 { "_b64" } else { "_b32" };
@@ -2317,9 +2411,9 @@ impl<'a> Lower<'a> {
             .name()
             .strip_prefix("s_")
             .and_then(|n| n.strip_suffix(width))
-            .ok_or(ELSEWHERE)?;
+            .ok_or(MASK_ELSEWHERE)?;
         if inst.write(Reg::S(*code)) != Some(lo) || inst.write(Reg::S(EXEC)).is_some() {
-            return Err(ELSEWHERE);
+            return Err(MASK_ELSEWHERE);
         }
         let at = if b == self.cur_ir {
             self.cur
@@ -2330,11 +2424,11 @@ impl<'a> Lower<'a> {
         let word = |l: &mut Self, k: usize, h: u8| -> Result<V, Why> {
             let x = match src.get(k) {
                 Some(&Operand::Scalar { code, .. }) if code != NULL => {
-                    let v = inst.read(Reg::S(code + h)).ok_or(ELSEWHERE)?;
+                    let v = inst.read(Reg::S(code + h)).ok_or(MASK_ELSEWHERE)?;
                     return l.i32_of(v);
                 }
                 Some(&Operand::Const(c)) => {
-                    let x = crate::resource::inline(c).ok_or(ELSEWHERE)?;
+                    let x = crate::resource::inline(c).ok_or(MASK_ELSEWHERE)?;
                     match h {
                         0 => x,
                         _ if (x as i32) < 0 => u32::MAX,
@@ -2343,7 +2437,7 @@ impl<'a> Lower<'a> {
                 }
                 Some(&Operand::Literal(x)) if h == 0 => x,
                 Some(Operand::Literal(_)) => 0,
-                _ => return Err(ELSEWHERE),
+                _ => return Err(MASK_ELSEWHERE),
             };
             Ok(l.s.m.i32(x))
         };
@@ -2356,7 +2450,7 @@ impl<'a> Lower<'a> {
                 "not" => self.s.m.bin(at, Bin::Xor, a, ones),
                 "cselect" => {
                     let c = word(self, 1, h)?;
-                    let scc = inst.read(Reg::Scc).ok_or(ELSEWHERE)?;
+                    let scc = inst.read(Reg::Scc).ok_or(MASK_ELSEWHERE)?;
                     let cond = match self.get(scc)? {
                         Val::Bit(x) => x,
                         Val::I32(x) => {
@@ -2379,7 +2473,7 @@ impl<'a> Lower<'a> {
                         "nand" => (Bin::And, false, true),
                         "nor" => (Bin::Or, false, true),
                         "xnor" => (Bin::Xor, false, true),
-                        _ => return Err(ELSEWHERE),
+                        _ => return Err(MASK_ELSEWHERE),
                     };
                     let c = if not_c {
                         self.s.m.bin(at, Bin::Xor, c, ones)

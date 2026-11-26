@@ -655,17 +655,14 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 /// [`translate`] made as `options` say.
 pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, ShaderError> {
     let prep = prepare(container)?;
-    emit_pruned(
-        &EmitInput {
-            c: &prep.c,
-            native: &prep.native,
-            p: &prep.p,
-            st: &prep.st,
-            io: &prep.io,
-            res: &prep.res,
-        },
+    emit_with(
+        &prep.c,
+        &prep.native,
+        &prep.p,
+        &prep.st,
+        &prep.io,
+        &prep.res,
         options,
-        None,
     )
 }
 
@@ -757,7 +754,7 @@ pub fn emit_with(
     res: &resource::Resources,
     options: Options,
 ) -> Result<HostShader, ShaderError> {
-    emit_pruned(
+    let original = emit_pruned(
         &EmitInput {
             c,
             native,
@@ -768,7 +765,41 @@ pub fn emit_with(
         },
         options,
         None,
-    )
+    );
+    if options.host_wave32
+        && native.wave64
+        && native.stage == HwStage::Cs
+        && let Err(ShaderError::Unsupported { what, .. }) = &original
+        && (what.contains("32-lane host")
+            || matches!(*what, lower::LDS_ACROSS | lower::MASK_ELSEWHERE))
+    {
+        // The original program stays preferred. Retrying with EXEC-empty
+        // paths kept lets both halves reach more exchanges together.
+        for early_outs_only in [true, false] {
+            if let Some(shader) =
+                ir::without_exec_skips(p, st, early_outs_only).and_then(|(p, st)| {
+                    let io = io::raise(&p, native).ok()?;
+                    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).ok()?;
+                    emit_pruned(
+                        &EmitInput {
+                            c,
+                            native,
+                            p: &p,
+                            st: &st,
+                            io: &io,
+                            res: &res,
+                        },
+                        options,
+                        None,
+                    )
+                    .ok()
+                })
+            {
+                return Ok(shader);
+            }
+        }
+    }
+    original
 }
 
 fn emit_pruned(

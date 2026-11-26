@@ -76,8 +76,7 @@ impl Lower<'_> {
     /// Why a program in halves cannot run: LDS a group of one console wave
     /// shares without barriers, split across two host waves.
     pub(super) fn halves_lds(group: u32, lds_dwords: u32) -> Option<Why> {
-        (lds_dwords > 0 && group > HALF && group <= 64)
-            .then_some("LDS one console wave64 shares without barriers, on a host of 32-lane waves")
+        (lds_dwords > 0 && group > HALF && group <= 64).then_some(LDS_ACROSS)
     }
 
     /// The flat thread id, relabelled so that each host wave holds a run of
