@@ -371,6 +371,11 @@ includes any GPU work still outstanding, so the report works when the
 adapter's D3D12 timestamps do not advance. Profiling uses the synchronous
 fence path for per-submission attribution.
 
+`VICTORY_WIDE_SCALAR_LOADS=1` groups up to four dwords from each scalar
+SRV buffer load into one DXIL call. The switch defaults to off and has
+separate shader cache entries for native warm-up and runtime. The lowering
+comes from avatarmanz/VIctory-7900XTX.
+
 ## GPU write-back through physical sections
 
 `VICTORY_LAND=1` enables post-fence buffer write-back through xmem's writable section views. The title's read-only write monitors stay in place. Other copies of the same physical page are dirtied, and only GPU-changed bytes are stored, so unrelated CPU writes survive. While landing is enabled, DirectStorage section writes and GPU write-back wait for overlapping writes to finish. Each GPU submission checks that its physical destination still has the same mapping, including when fault tracking is disabled. Computed-address writes without fault tracking use a pre-submit snapshot of the GPU shadow to distinguish GPU changes from concurrent CPU writes. An overlapping declared range also gets a complete page snapshot when it fits. Before any post-fence merge, computed marks with a complete snapshot take ownership of the whole shadow page, including its declared GPU writes. These snapshots share a 64 MiB budget per submission. Snapshot copying can reach that budget even when the shaders leave no computed-write marks. The opt-in path accepts this preparation cost and may omit shader outputs when it cannot determine which bytes the GPU wrote. If an untracked or overlapping computed write lacks a complete snapshot, the computed write is withheld and the shadow refreshes from title memory again. View marks on a shadow that straddles tracked and untracked pages also need a complete baseline for each untracked page before they can land.

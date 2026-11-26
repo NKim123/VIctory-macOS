@@ -426,6 +426,21 @@ pub fn raw_root_cbvs() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_PORT_CBV").as_deref() == Ok("1"))
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_WIDE_SCALAR_LOADS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether a single console scalar SRV load reads up to four dwords per call.
+pub fn wide_scalar_loads() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_WIDE_SCALAR_LOADS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_WIDE_SCALAR_LOADS").as_deref() == Ok("1"))
+}
+
 /// One dword of user data and the root parameter that fills it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UserData {
@@ -2588,6 +2603,123 @@ mod tests {
             ..texcoord(false)
         };
         emit_pixel(&words, vec![color], 1 << 1, &isg1, &osg1).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn wide_scalar_loads_preserve_raw_srv_values() {
+        use super::host::{Dispatch, Host, Root, Stride, View};
+        use crate::native::{ComputeIo, ResourceType, RootParam, StageIo, UsedResource};
+        use crate::{HwStage, RootType, io, ir, resource, structure};
+
+        let host = Host::new(!super::host::under_wine()).expect("a D3D12 device");
+        let mut words = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 32
+            0xF428_0404,
+            0x0000_0000, // s_buffer_load_dwordx4 s[16:19], s[8:11], s0
+        ];
+        for out in 0..4 {
+            words.extend([
+                0x7E02_0200 | (16 + out),            // v_mov_b32 v1, s<16+out>
+                0x38 << 26 | 0x1C << 18 | (4 * out), // buffer_store_dword v1, s[12:15]
+                0x80 << 24 | 3 << 16 | 1 << 8,
+            ]);
+        }
+        words.push(0xBF81_0000);
+        let table = |kind, at| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: at,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let native = super::NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![table(ResourceType::Srv, 0), table(ResourceType::Uav, 8)],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
+        };
+        let bytes = crate::dxbc::build(&[]);
+        let container = super::Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.code, false, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let translate = |wide| {
+            super::TEST_WIDE_SCALAR_LOADS.set(Some(wide));
+            let result = super::emit(&container, &native, &p, &st, &io, &res);
+            super::TEST_WIDE_SCALAR_LOADS.set(None);
+            result.unwrap()
+        };
+        let narrow = translate(false);
+        let wide = translate(true);
+        assert_ne!(narrow.dxil, wide.dxil);
+
+        let data = [
+            0xf00d,
+            0x8765_4321,
+            0x4000_0000,
+            0xdead_beef,
+            0x7fff_ffff,
+            0x8000_0000,
+        ];
+        for shader in [narrow, wide] {
+            let (root, pso) = host.compute_pipeline(&shader).unwrap();
+            for offset in [0, 4, 12, 16, 20, 24] {
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(vec![offset, 0, 0, 0, 0]))],
+                            views: &[
+                                View::Buffer {
+                                    data: &data,
+                                    stride: Stride::Raw,
+                                },
+                                View::RawUav(4),
+                            ],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap();
+                let expected = std::array::from_fn::<_, 4, _>(|i| {
+                    data.get(offset as usize / 4 + i).copied().unwrap_or(0)
+                });
+                assert_eq!(out[0], expected, "byte offset {offset}");
+            }
+        }
     }
 
     /// The LLVM text `dxc -dumpbin` prints for a DXIL container, when dxc
