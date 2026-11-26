@@ -17,6 +17,101 @@ use crate::startup_patch::{self, FaultSite, Saved};
 
 static FAULT_SITES: OnceLock<Vec<FaultSite>> = OnceLock::new();
 
+// Like the CLWB workaround, auto mode only enables a complete recognized set.
+const ZERO_LOOPS: usize = 10;
+const WAIT_PAIRS: usize = 2;
+const MONITORX: [u8; 3] = [0x0f, 0x01, 0xfa];
+const MWAITX: [u8; 3] = [0x0f, 0x01, 0xfb];
+// Both instructions are followed by a reload and a branch if the word is -1.
+const WAIT_CHECK: [u8; 7] = [0x48, 0x8b, 0x17, 0x48, 0x83, 0xfa, 0xff];
+
+fn wait_exit(code: &[u8], at: usize) -> Option<(usize, usize)> {
+    let tail = code.get(at + 3..)?.strip_prefix(&WAIT_CHECK)?;
+    let (len, displacement) = match tail {
+        [0x74, rel, ..] => (2, *rel as i8 as isize),
+        [0x0f, 0x84, a, b, c, d, ..] => (6, i32::from_le_bytes([*a, *b, *c, *d]) as isize),
+        _ => return None,
+    };
+    let end = at + 3 + WAIT_CHECK.len() + len;
+    Some((end, end.checked_add_signed(displacement)?))
+}
+
+/// Match the two checks of the same monitored word with the timed wait
+/// setup between them. Both equal branches must skip the complete pair.
+fn wait_pair(code: &[u8], monitor: usize) -> Option<(usize, Range<usize>)> {
+    let start = monitor.checked_sub(4)?;
+    if code.get(start..monitor + 3)? != [0x31, 0xc9, 0x31, 0xd2, 0x0f, 0x01, 0xfa] {
+        return None;
+    }
+    let (check, monitor_exit) = wait_exit(code, monitor)?;
+    let next = code.get(check..code.len().min(monitor + 64))?;
+    const SETUP: [u8; 7] = [0xb9, 2, 0, 0, 0, 0x31, 0xc0];
+    let offset = next.windows(3).position(|bytes| bytes == MWAITX)?;
+    let wait = check + offset;
+    if offset < SETUP.len() || code[wait - SETUP.len()..wait] != SETUP {
+        return None;
+    }
+    let (end, timed_exit) = wait_exit(code, wait)?;
+    let exits = end..code.len();
+    (exits.contains(&monitor_exit) && exits.contains(&timed_exit)).then_some((wait, start..end))
+}
+
+fn scan(prepared: &PreparedImage, zero: bool) -> Vec<Site> {
+    let mut selected = Vec::new();
+    let target = if zero { CLZERO } else { MONITORX };
+    let expected = if zero { ZERO_LOOPS } else { WAIT_PAIRS * 2 };
+    'sections: for section in &prepared.info.sections {
+        if section.characteristics & (EXECUTE | WRITE) != EXECUTE {
+            continue;
+        }
+        let base = section.rva as usize;
+        let file = section.file_offset as usize;
+        let size = match section.virtual_size {
+            0 => section.file_size,
+            size => size.min(section.file_size),
+        } as usize;
+        let Some(code) = prepared.bytes.get(file..file.saturating_add(size)) else {
+            continue;
+        };
+        for (at, _) in code
+            .windows(target.len())
+            .enumerate()
+            .filter(|(_, b)| *b == target)
+        {
+            let Some(mut site) = verify(prepared, base + at, zero) else {
+                continue;
+            };
+            if !zero {
+                let Some((wait, guard)) = wait_pair(code, at) else {
+                    continue;
+                };
+                let Some(mut wait) = verify(prepared, base + wait, false) else {
+                    continue;
+                };
+                site.guard_rva = base + guard.start;
+                site.expected = code[guard].to_vec();
+                wait.guard_rva = site.guard_rva;
+                wait.expected = site.expected.clone();
+                selected.push(wait);
+            }
+            selected.push(site);
+            if selected.len() > expected {
+                break 'sections;
+            }
+        }
+    }
+    if selected.len() != expected {
+        tracing::warn!(
+            zero,
+            found = selected.len(),
+            expected,
+            "AMD auto-scan did not match the supported loop set"
+        );
+        selected.clear();
+    }
+    selected
+}
+
 unsafe extern "system" fn remap_zero_fault(info: *mut EXCEPTION_POINTERS) -> i32 {
     if let Some(sites) = FAULT_SITES.get() {
         // SAFETY: Windows is dispatching the exception. GPU guards get first chance.
@@ -38,13 +133,17 @@ impl Patches {
             let Some(value) = std::env::var_os(key) else {
                 continue;
             };
+            if value == "1" || value == "auto" {
+                selected.extend(scan(prepared, zero));
+                continue;
+            }
             let Some(list) = value
                 .to_str()
                 .and_then(|v| sites(v, prepared.original_hash))
             else {
                 tracing::warn!(
                     key,
-                    "AMD patch requires the original BLAKE3 and a hex RVA list"
+                    "AMD patch expects auto, 1, or the original BLAKE3 and a hex RVA list"
                 );
                 continue;
             };
@@ -306,6 +405,33 @@ mod execution_tests {
     };
     use windows_sys::Win32::System::Memory::{PAGE_GUARD, PAGE_READONLY};
     use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+
+    #[test]
+    fn auto_waits_require_the_paired_setup_and_both_forward_exits() {
+        let mut code = vec![0x31, 0xc9, 0x31, 0xd2];
+        let monitor = code.len();
+        code.extend(MONITORX);
+        code.extend(WAIT_CHECK);
+        let monitor_branch = code.len();
+        code.extend([0x74, 0]);
+        code.extend([0xb9, 2, 0, 0, 0, 0x31, 0xc0]);
+        let wait = code.len();
+        code.extend(MWAITX);
+        code.extend(WAIT_CHECK);
+        let wait_branch = code.len();
+        code.extend([0x0f, 0x84, 2, 0, 0, 0]);
+        let end = code.len();
+        code.extend([0x90; 4]);
+        code[monitor_branch + 1] = (end - (monitor_branch + 2)) as u8;
+        assert_eq!(wait_pair(&code, monitor), Some((wait, 0..end)));
+
+        code[monitor_branch + 1] = 0;
+        assert!(wait_pair(&code, monitor).is_none());
+        code[monitor_branch + 1] = (end - (monitor_branch + 2)) as u8;
+        code[wait + 4] ^= 1;
+        assert!(wait_pair(&code, monitor).is_none());
+        assert!(wait_pair(&code[..wait_branch], monitor).is_none());
+    }
 
     static TEST_THREAD: AtomicU32 = AtomicU32::new(0);
     static ILLEGAL: AtomicUsize = AtomicUsize::new(0);
