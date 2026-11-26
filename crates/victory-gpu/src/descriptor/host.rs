@@ -556,18 +556,21 @@ impl HostHeap {
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = (at + n).min(self.dynamic) as usize;
         if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            // Detach the backing before exposing slots to another recorder.
-            // Drop it outside both locks because a shadow may return resources
-            // to the allocator as it is destroyed.
+            // Detach before exposing the slots to another recorder. Retire
+            // the COM references through the submission boundary, and drop
+            // the shadows outside both locks: destruction can return memory
+            // to the allocator.
             let released: Vec<_> = {
                 let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
                 (first as usize..self.count as usize + end)
-                    .filter_map(|index| kept.slot(index, false)?.as_mut()?.1.take())
+                    .filter_map(|index| kept.slot(index, false)?.take())
                     .collect()
             };
             slots.fill(false);
             drop(guard);
-            drop(released);
+            for (resource, _) in released {
+                crate::host::retire(resource);
+            }
         }
     }
 
@@ -899,9 +902,7 @@ impl HostHeap {
         let address = at(first);
         let end = at(last - 1) + 12;
         bytes.resize((end - address) as usize, 0);
-        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         if !crate::host::read_into(address as *const u8, bytes) {
-            drop(made);
             // The write watch's 64 KiB regions can cover multiple Windows
             // pages. Discard a failed read, then retry its smaller ranges so
             // an inaccessible page does not hide its readable neighbors.
@@ -918,8 +919,13 @@ impl HostHeap {
                 u32::from_le_bytes(record[4 * i..4 * i + 4].try_into().unwrap())
             })
         });
-        let stale = changed_records(first, &made[first as usize..last as usize], records);
-        drop(made);
+        // The page read is outside the slot lock. Any candidate must still
+        // match live title memory at publication, even when a concurrent
+        // recorder changed the host slot before this comparison.
+        let stale = {
+            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            changed_records(first, &made[first as usize..last as usize], records)
+        };
         for (index, record, previous) in stale {
             let _ = self.mirror_record(index, false, Some((previous, at(index))), || record);
         }
@@ -2815,6 +2821,35 @@ mod tests {
     }
 
     #[test]
+    fn heap_sync_stops_before_dynamic_slots() {
+        let Some(heap) = HostHeap::new(false, 1) else {
+            return;
+        };
+        let buffer = host().unwrap().shared_buffer(65536).unwrap().0;
+        let slot = heap.dynamic(1).unwrap();
+        assert_eq!(slot, heap.count());
+        heap.raw_view_at(slot, Some(&buffer), 0, 256, false);
+
+        // Simulate a title heap one slot larger than the host's mirrored
+        // range. Both title records are valid, but the second must leave the
+        // list's descriptor alone.
+        let mut records = [[0u32; 8]; 2];
+        let start = records.as_mut_ptr() as u64;
+        for index in 0..2 {
+            crate::descriptor::create_cbv(
+                std::ptr::null(),
+                &[0, 0, 256, 0],
+                start + 32 * index,
+            );
+        }
+        let mut bytes = Vec::new();
+        heap.sync_slots(0, 2, start, 32, &mut bytes);
+        assert_eq!(bytes.len(), 12, "only the mirrored header was read");
+        assert!(heap.made(0) && heap.kept(slot));
+        heap.release(slot, 1);
+    }
+
+    #[test]
     fn an_unreadable_neighbor_does_not_hide_readable_slot_headers() {
         use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, VirtualProtect};
 
@@ -3100,6 +3135,11 @@ mod tests {
             let samplers = HostHeap::new(true, 128).unwrap();
             assert!(samplers.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_SAMPLERS);
         }
+        let a = heap.dynamic(heap.dynamic - 100).unwrap();
+        let b = heap.dynamic(60).unwrap();
+        assert_eq!((a, b), (4, 4 + heap.dynamic - 100));
+        // 40 left at the end: 50 do not fit until something is given back.
+        assert_eq!(heap.dynamic(50), None);
         // A slot that stops viewing a resource leaves it alive until the GPU
         // work in flight has run (a read of a freed host texture otherwise).
         // SAFETY: a plain committed buffer; one reference taken and given back.
@@ -3132,25 +3172,25 @@ mod tests {
                 ((**unknown).AddRef)(raw);
                 ((**unknown).Release)(raw)
             };
-            let slot = heap.count + 2;
-            heap.raw_view_at(slot, Some(&buffer), 0, 256, false);
-            assert_eq!(references(&buffer), 2, "ours and the slot's");
-            heap.make_null(slot);
-            assert!(references(&buffer) >= 2, "the slot's, retired");
-            crate::host::release_retired();
-            // Released on a thread of its own.
-            let since = std::time::Instant::now();
-            while references(&buffer) > 1 && since.elapsed() < std::time::Duration::from_secs(5) {
-                std::thread::yield_now();
+            for release in [false, true] {
+                heap.raw_view_at(a, Some(&buffer), 0, 256, false);
+                assert_eq!(references(&buffer), 2, "ours and the slot's");
+                if release {
+                    heap.release(a, 50);
+                } else {
+                    heap.make_null(a);
+                }
+                assert!(!heap.kept(a), "the slot no longer owns the resource");
+                assert!(references(&buffer) >= 2, "the slot's reference is retired");
+                crate::host::release_retired();
+                // Released on a thread of its own.
+                let since = std::time::Instant::now();
+                while references(&buffer) > 1 && since.elapsed() < std::time::Duration::from_secs(5) {
+                    std::thread::yield_now();
+                }
+                assert_eq!(references(&buffer), 1, "ours");
             }
-            assert_eq!(references(&buffer), 1, "ours");
         }
-        let a = heap.dynamic(heap.dynamic - 100).unwrap();
-        let b = heap.dynamic(60).unwrap();
-        assert_eq!((a, b), (4, 4 + heap.dynamic - 100));
-        // 40 left at the end: 50 do not fit until something is given back.
-        assert_eq!(heap.dynamic(50), None);
-        heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
     }

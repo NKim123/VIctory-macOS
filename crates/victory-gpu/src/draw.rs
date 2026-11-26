@@ -2987,8 +2987,8 @@ void main(uint3 id : SV_DispatchThreadID) {{
             "released table slots cannot retain the inner shadow"
         );
         assert!(
-            slots.table_backing(second).is_none(),
-            "the heap is still live"
+            !slots.kept(second),
+            "the live heap no longer owns the slot's resource"
         );
         drop(view);
         crate::object::release_ref(heap);
