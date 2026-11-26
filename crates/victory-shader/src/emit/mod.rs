@@ -87,6 +87,11 @@
 //!   vertex shader's outputs completes each rectangle with its fourth
 //!   corner opposite the right angle ([`right_angle`]), as the console's
 //!   hardware does.
+//! * **Non-provoking vertex values** (#203): a pixel program's reads of
+//!   P10 and P20 (`v_interp_mov_f32`) are flat inputs of their own
+//!   ([`VERTEX_DELTAS`]), which a geometry shader made from the vertex
+//!   shader computes per triangle ([`vertex_delta_gs`]). The host's
+//!   `GetAttributeAtVertex` makes a pipeline D3DMetal runs as a no-op.
 //! * **Heap indices** (added 2026-11-24) are clamped to [`HEAP_VIEWS`] − 1
 //!   (samplers [`HEAP_SAMPLERS`] − 1): the host's heaps have at least that
 //!   many slots, those past its own null, so an index past the heap (data
@@ -180,7 +185,26 @@
 //!   chosen by a hash of the coordinates (texels that share one only wait
 //!   for each other), so such a shader sets [`HostShader::view_marks`] and
 //!   the host makes that buffer [`VIEW_WRITES_BYTES`] long, zeroed. Locks
-//!   are free again when the shader ends.
+//!   are free again when the shader ends. The lanes of a wave take turns,
+//!   one lane a turn. With [`Options::atomic_lock_rounds`] (added
+//!   2026-11-26, #240) every lane first tries its lock once in each of
+//!   [`ATOMIC_LOCK_ROUNDS`] rounds, the lanes that take it finishing in
+//!   that round together, and only the lanes still not done take turns,
+//!   in a branch a wave whose lanes all finished skips. On D3DMetal (M5 Pro)
+//!   a wave's 64-bit `umax` on distinct texels took 29 µs in turns and
+//!   6 µs in rounds. With [`Options::atomic_umax`] (also #240) a
+//!   glc-clear `umax` first reduces each texel's lanes of the wave to
+//!   their maximum key, one representative a group, in registers, so
+//!   only the representatives run the rounds and the turns. In a pixel
+//!   program helper lanes skip the lock in rounds: their atomics are
+//!   discarded, so they could never take it. A
+//!   lane waiting for a lock another wave holds gives up after
+//!   [`ATOMIC_LOCK_SPINS`] tries in compute and mesh programs
+//!   ([`ATOMIC_LOCK_SPINS_DRAWN`] in the others, whose draws macOS ends
+//!   when they run long) and goes on without it, so a lock nobody frees
+//!   cannot hang the GPU, but that lane's update can be lost (#240). A
+//!   lock is left taken when the host GPU ends a shader that held it, so
+//!   the host frees all of them after a submission it ended.
 //! * **Read marks** (with [`Options::view_marks`]; added 2026-11-25):
 //!   every image instruction that reads a texture shader view the program
 //!   takes from the resource heap itself (not through a table, whose slots
@@ -225,9 +249,13 @@ mod flow_tests;
 mod halves_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+#[cfg(all(test, windows))]
+mod image_store_tests;
 mod lower;
+mod deltas;
 mod rect;
 pub use container::sign as sign_container;
+pub use deltas::{VERTEX_DELTA_TOP, VERTEX_DELTAS, needs_vertex_deltas, vertex_delta_gs};
 pub use rect::{rectangle_gs, right_angle};
 #[cfg(all(test, windows))]
 mod memory_tests;
@@ -255,10 +283,10 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
 pub use shader::{
-    ATOMIC_LOCKS, ATOMIC_LOCKS_AT, HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW,
-    ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS,
-    VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
-    VIEW_WRITES_BYTES,
+    ATOMIC_LOCK_ROUNDS, ATOMIC_LOCK_SPINS, ATOMIC_LOCK_SPINS_DRAWN, ATOMIC_LOCKS, ATOMIC_LOCKS_AT,
+    HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE, SAMPLER_SPACE,
+    USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS, VIEW_READS, VIEW_SIGNED,
+    VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES, VIEW_WRITES_BYTES,
 };
 
 /// The loop limit without an override: 2^14.
@@ -323,6 +351,9 @@ pub struct HostShader {
     /// Root UAVs (raw buffers) the host binds as root descriptors:
     /// `u<index>` in [`ROOT_CBV_SPACE`] (likewise).
     pub root_uavs: Vec<u8>,
+    /// The exclusive byte end of reads from each raw root SRV whose offsets
+    /// are all known. An omitted slot may read anywhere in its buffer.
+    pub root_srv_bytes: Vec<(u8, u32)>,
     /// Whether the shader reads title memory at addresses it computes: the
     /// host binds the page table `t0` in [`MEMORY_SPACE`] (module notes,
     /// "Title memory").
@@ -400,6 +431,16 @@ pub struct Options {
     /// stores (module notes, "Atomic locks"), for hosts that claim the
     /// 64-bit atomics and leave the texels untouched (D3DMetal).
     pub atomic_locks: bool,
+    /// With [`Options::atomic_locks`]: every lane of a wave first tries its
+    /// lock in [`ATOMIC_LOCK_ROUNDS`] rounds, and only lanes still not done
+    /// take turns (module notes, "Atomic locks"). The translation differs,
+    /// so the shader cache keys on it.
+    pub atomic_lock_rounds: bool,
+    /// With [`Options::atomic_lock_rounds`]: a glc-clear 64-bit `umax`
+    /// first reduces each texel's lanes of a wave to their maximum key, one
+    /// representative a group locking (module notes, "Atomic locks"). The
+    /// translation differs, so the shader cache keys on it.
+    pub atomic_umax: bool,
     /// Compute-stage biased samples run as gradient samples with the quad
     /// gradients scaled by `2^bias`, for hosts that ignore the bias of a
     /// compute shader's sample (D3DMetal, #30).
@@ -790,6 +831,8 @@ fn emit_pruned(
         mesh_stride,
         view_marks: options.view_marks,
         atomic_locks: options.atomic_locks,
+        atomic_lock_rounds: options.atomic_lock_rounds,
+        atomic_umax: options.atomic_umax,
         bias_as_gradients: options.bias_as_gradients,
         host_wave32: options.host_wave32,
         narrow_waves: options.narrow_waves,
@@ -825,6 +868,7 @@ fn emit_pruned(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        root_srv_bytes: l.root_srv_bytes,
         memory: l.memory,
         memory_writes: l.memory_writes,
         view_addresses: l.view_addresses,
@@ -1475,6 +1519,7 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            root_srv_bytes: Vec::new(),
             memory: false,
             memory_writes: false,
             view_addresses: false,
@@ -1492,6 +1537,7 @@ mod tests {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                root_srv_bytes: Vec::new(),
                 memory: false,
                 memory_writes: false,
                 view_addresses: false,

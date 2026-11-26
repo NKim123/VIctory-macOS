@@ -357,7 +357,7 @@ impl Uploads {
 pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
     let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
     for (shadow, address, len, uav, bit) in inner.hulls.values() {
-        if !crate::watch::clean_bit(*bit) {
+        if !shadow.clean() && !crate::watch::clean_bit(*bit) {
             let (address, len) = if *uav && shadow.marked() {
                 shadow.page_range(*address, *len)
             } else {
@@ -379,9 +379,28 @@ pub(crate) fn refresh_slot(
     let Some(Seen::Buffer(shadow, address, len, _)) = inner.slots.get(&index) else {
         return;
     };
-    if !crate::watch::clean_bit(shadow.dirty_bit()) {
+    if !shadow.clean() && !crate::watch::clean_bit(shadow.dirty_bit()) {
         add(shadow, *address as usize, *len as usize);
     }
+}
+
+/// Heap UAV ranges that may need to refresh a widened SRV after a later
+/// buffer barrier. Computed heap indices do not name ordinary write steps.
+pub(crate) fn widened_writes(viewed: &Viewed) -> Vec<(Arc<Shadow>, usize, usize)> {
+    if !crate::shader_cache::under_wine() {
+        return Vec::new();
+    }
+    viewed
+        .inner
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .ranges
+        .iter()
+        .filter(|((_, address, end, uav), _)| *uav && address < end)
+        .map(|((_, address, end, _), (_, shadow))| {
+            (shadow.clone(), *address as usize, (end - address) as usize)
+        })
+        .collect()
 }
 
 /// Draws and dispatches run with heap-indexing shaders, those of them

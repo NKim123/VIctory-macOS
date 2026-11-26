@@ -17,6 +17,8 @@
 //! `present` (swap chain).
 
 #[cfg(windows)]
+mod alias;
+#[cfg(windows)]
 mod ambient;
 #[cfg(windows)]
 mod bindless;
@@ -63,6 +65,9 @@ pub mod queue;
 // Plain std, so its tests run everywhere.
 #[cfg(any(windows, test))]
 mod ranges;
+// Plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod recent;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
@@ -83,6 +88,8 @@ mod texture;
 mod twin;
 #[cfg(windows)]
 mod watch;
+#[cfg(windows)]
+mod widened;
 // Whether the host opens heaps over process memory (ignored by default).
 #[cfg(all(windows, test))]
 mod inplace_probe;
@@ -90,7 +97,11 @@ mod inplace_probe;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use copystat::CountingAlloc;
 #[cfg(windows)]
-pub use host::on_failure;
+pub use alias::{alias_region, enabled as alias_buffers, unalias_region};
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use alias::{PhysicalHeap, physical_heap};
+#[cfg(windows)]
+pub use host::{MeshSupport, host_mesh_support, on_failure};
 #[cfg(windows)]
 pub use land::{LandingPage, enabled as landing_enabled, next_mapping_epoch, use_landing_pages};
 #[cfg(windows)]
@@ -124,18 +135,8 @@ pub fn read_file(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
     }
 }
 
-/// Makes folder `dir` and its parents unless it is there. Not
-/// `std::fs::create_dir_all` alone, which on a folder that is there asks for
-/// its metadata (`Path::is_dir`): the same mount manager call as in
-/// [`read_file`]. The pipeline library makes its folder at every save, on
-/// the pipeline workers.
-pub fn make_dir(dir: &std::path::Path) -> std::io::Result<()> {
-    match std::fs::create_dir(dir) {
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir_all(dir),
-        made => made,
-    }
-}
+#[cfg(windows)]
+pub use victory_pipeline::make_dir;
 
 #[cfg(test)]
 mod read_file_tests {

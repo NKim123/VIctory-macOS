@@ -92,10 +92,19 @@ pub fn run(
     );
     // The file's bytes (the exe's size, 114 MB) are kept only to patch the
     // masked stores after the mapping.
-    let patching = victory_loader::masked::choice(
-        std::env::var("VICTORY_PATCH_MASKED").ok(),
-        victory_gpu::stores_need_patching(),
-    );
+    let needs_patch = victory_gpu::stores_need_patching();
+    let mut requested = std::env::var("VICTORY_PATCH_MASKED").ok();
+    // Rosetta can also fault midway through plain 256-bit vector stores in
+    // a few loops (#144). Their offsets are specific to Series 1.0.2.1, so
+    // they are added here only for that build, and an explicit
+    // `VICTORY_PATCH_MASKED` always wins.
+    if needs_patch
+        && requested.is_none()
+        && hash.as_str() == "b99f876b74d4a77f03af5f878223b27bd647b5c35a79d5decd9f716504239e93"
+    {
+        requested = Some("all,1e09b31,1e09b37,259509f,25950a5,1e759f0,1e759f7,1e759fe,1e75a05".into());
+    }
+    let patching = victory_loader::masked::choice(requested, needs_patch);
     let original = patching.is_some().then_some(original);
 
     let images = cfg.cache_subdir("images")?;
@@ -160,6 +169,15 @@ pub fn run(
             None => println!("hang watchdog  left on: unknown build"),
         }
     }
+    // The title's output size, render scale and upscaler (`VICTORY_OUTPUT`,
+    // `VICTORY_RENDER_SCALE`, `VICTORY_UPSCALER`; each
+    // off without it), ported from avatarmanz/VIctory-7900XTX.
+    #[cfg(windows)]
+    if execute {
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped and nothing of it has run yet.
+        unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+    }
     // Masked stores redone as plain stores Rosetta can resume, so fault
     // tracking (`VICTORY_FAULT_TRACKING=1`) can run under Rosetta (#50).
     if let (Some(which), Some(original)) = (patching, original) {
@@ -167,6 +185,16 @@ pub fn run(
         let n =
             victory_loader::masked::patch(image.base() as u64, image.info(), &original, &wanted);
         println!("masked stores  {n} patched to plain stores");
+    }
+    // Every other 256-bit store of the title split into 128-bit halves, from
+    // a list made offline (`cargo xtask wide-stores`): Rosetta cannot resume
+    // one that faults in its second page.
+    #[cfg(windows)]
+    if let Some(list) = std::env::var_os("VICTORY_PATCH_WIDE").filter(|v| !v.is_empty() && v != "0")
+    {
+        let (n, refused) =
+            victory_loader::wide::patch(image.base() as u64, std::path::Path::new(&list));
+        println!("wide stores    {n} split into 128-bit halves ({refused} refused)");
     }
     #[cfg(target_arch = "x86_64")]
     if let Some(patches) = amd_patches {

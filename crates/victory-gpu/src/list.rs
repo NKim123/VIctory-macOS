@@ -642,9 +642,11 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             .collect();
         // Buffers have host copies, not resources the barrier can name:
         // a barrier on one waits for every shader write before it.
-        if barriers.iter().any(|b| {
+        let buffer_barrier = barriers.iter().any(|b| {
             b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
-        }) {
+        });
+        let global_uav = barriers.iter().any(|b| b.kind == 2 && b.first.is_null());
+        if buffer_barrier {
             host.push(UAV_BARRIER);
         }
         if !host.is_empty() {
@@ -660,6 +662,9 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             };
             // SAFETY: an open list and live resources.
             unsafe { list.list.ResourceBarrier(host) };
+        }
+        if buffer_barrier || global_uav {
+            list.sync_widened();
         }
     }
     0
@@ -1197,9 +1202,8 @@ extern "system" fn clear_dsv(
 
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
 /// are title memory, copied at submission like buffer copies (`copy_mapped`:
-/// an unmapped source page reads as zeros). Ranges that overlap are moved
-/// with `memmove`, which the kernel's copy does not promise to do, once
-/// both are known to be committed, as work that may write anywhere.
+/// an unmapped source page reads as zeros). Overlapping ranges move with
+/// `memmove` when both ranges are committed.
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
     #[cfg(windows)]
     if let Some(list) = host_list(this)
@@ -1209,15 +1213,7 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
         if src.abs_diff(dst) >= len {
             list.defer_copy(dst as *mut u8, src as *const u8, len as usize);
         } else {
-            let len = len as usize;
-            list.defer(move || {
-                if crate::texture::committed(src as *const u8, len)
-                    && crate::texture::committed(dst as *const u8, len)
-                {
-                    // SAFETY: both ranges are committed title memory.
-                    unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
-                }
-            });
+            list.defer_move(dst as *mut u8, src as *const u8, len as usize);
         }
     }
     #[cfg(not(windows))]
@@ -1860,6 +1856,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
             unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
+        list.sync_widened();
     }
     #[cfg(not(windows))]
     let _ = (this, count);

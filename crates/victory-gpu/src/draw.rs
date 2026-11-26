@@ -65,6 +65,8 @@ pub(crate) struct State {
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
     depth: usize,
+    /// Last render target and depth keys set on the host list.
+    host_targets: Option<(Vec<TargetKey>, Option<TargetKey>)>,
     /// None leaves the host list's default bounds (0..1) in place.
     depth_bounds: Option<(f32, f32)>,
     /// The title's primitive topology (the host's may differ).
@@ -233,6 +235,19 @@ pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
 
+/// What a render target or depth view of the host is made from: the host
+/// texture (0 for a null view) and [`crate::descriptor::RtvRecord::key`].
+type TargetKey = (usize, (usize, [u32; 7]));
+
+fn bind_cache_enabled_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("0"))
+}
+
+fn bind_cache_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| bind_cache_enabled_value(std::env::var_os("VICTORY_BIND_CACHE").as_deref()))
+}
+
 /// The host address of a root view: its buffer's host copy, or for a
 /// constant buffer not 256-byte aligned there (the console needs 16) a
 /// copy in upload memory. What shaders write through a root UAV goes back
@@ -254,7 +269,7 @@ fn root_view(list: &HostList, address: u64, srv: bool, uav: bool) -> Option<u64>
         }
         return Some(gpu);
     }
-    list.fill_root_cb(address, len)
+    list.fill_scratch(address as *const u8, len)
 }
 
 macro_rules! once {
@@ -376,6 +391,7 @@ impl State {
     pub(crate) fn host_state_lost(&mut self) {
         // No title heaps (0) differ from what the host list has, too.
         (self.host_pipeline, self.host_roots, self.host_heaps) = (0, [0; 2], [usize::MAX; 2]);
+        self.host_targets = None;
     }
 
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
@@ -462,7 +478,8 @@ impl State {
             return;
         };
         self.targets.clear();
-        let mut rtvs = Vec::new();
+        let mut rtv_views = Vec::with_capacity(handles.len());
+        let mut rtv_keys = Vec::with_capacity(handles.len());
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -477,19 +494,42 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
-            rtvs.push(host.rtv(&texture.texture, record.desc().as_ref()));
-            list.keep_untracked_texture(texture);
+            rtv_keys.push((texture.texture.as_raw() as usize, record.key()));
+            rtv_views.push((texture, record.desc()));
         }
         self.depth = 0;
-        let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
-            let texture = crate::resource::host_copy(record.resource)?;
+        let mut dsv_view = None;
+        let mut dsv_key = None;
+        if let Some(record) = crate::descriptor::dsv_record(depth)
+            && let Some(texture) = crate::resource::host_copy(record.resource)
+        {
             self.depth = record.resource as usize;
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
-            let view = host.dsv(&texture.texture, record.depth_desc().as_ref());
+            dsv_key = Some((texture.texture.as_raw() as usize, record.key()));
+            dsv_view = Some((texture, record.depth_desc()));
+        }
+        if bind_cache_enabled()
+            && self
+                .host_targets
+                .as_ref()
+                .is_some_and(|(r, d)| r == &rtv_keys && d == &dsv_key)
+        {
+            return;
+        }
+        let rtvs: Vec<_> = rtv_views
+            .iter()
+            .map(|(texture, desc)| host.rtv(&texture.texture, desc.as_ref()))
+            .collect();
+        let dsv = dsv_view
+            .as_ref()
+            .map(|(texture, desc)| host.dsv(&texture.texture, desc.as_ref()));
+        for (texture, _) in rtv_views {
             list.keep_untracked_texture(texture);
-            Some(view)
-        });
+        }
+        if let Some((texture, _)) = dsv_view {
+            list.keep_untracked_texture(texture);
+        }
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
@@ -499,6 +539,7 @@ impl State {
                 dsv.as_ref().map(std::ptr::from_ref),
             )
         };
+        self.host_targets = Some((rtv_keys, dsv_key));
     }
 
     /// The user-data value of a root argument, as translated shaders read
@@ -576,14 +617,9 @@ impl State {
         }
     }
 
-    /// Brings the host list up to date for a draw; false if the draw cannot
-    /// run on the host.
-    fn prepare(&mut self, list: &HostList, indexed: bool) -> bool {
-        self.prepare_for(list, indexed, false)
-    }
-
-    /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
-    fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+    /// Brings the host list up to date for a draw (`mesh` false) or a mesh
+    /// dispatch; false if it cannot run on the host.
+    fn prepare(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
@@ -705,10 +741,8 @@ impl State {
                 self.apply_depth_bounds(list);
             }
             self.host_pipeline = p.pso.as_raw() as usize;
-            list.used_pipeline(&p.name);
             // The title may release the pipeline before it submits the list.
-            list.keep(&p.pso);
-            list.keep(&p.root);
+            list.bind_pipeline(&p.name, &p.pso, &p.root);
         }
         #[cfg(feature = "diagnostics")]
         crate::capture::binding(&p.name);
@@ -754,6 +788,12 @@ impl State {
                 .flatten()
             {
                 list.defer_heap(&host.viewed);
+                for buffer in host.widened_buffers() {
+                    list.mark_widened_read(&buffer);
+                }
+                if writes {
+                    list.mark_widened_heap(&host.viewed);
+                }
             }
             crate::bindless::note_draw(writes);
         }
@@ -846,7 +886,12 @@ impl State {
                         }
                         None if is_root_view(u) => {
                             let uav = u.dword == victory_shader::emit::ROOT_UAV_VIEW;
-                            match self.root_view(list, compute, u.slot, uav) {
+                            let read_end = t
+                                .host
+                                .root_srv_bytes
+                                .iter()
+                                .find_map(|&(slot, end)| (slot == u.slot).then_some(end));
+                            match self.root_view(list, compute, u.slot, uav, read_end) {
                                 Some((slot, _)) => slot,
                                 None => return false,
                             }
@@ -976,11 +1021,19 @@ impl State {
     /// (`victory_shader::emit`, "Root SRVs and root UAVs"). None if the
     /// draw must be dropped: no root view set, or no dynamic slot.
     /// The copy is brought up to date from the root address to its end: a
-    /// shader reaches wherever data its root view leads to lie (a vertex
-    /// fetch's streams sit at offsets in the root view's own header).
+    /// shader can follow offsets the root view itself contains. If the
+    /// translator proves all read offsets, only the corresponding prefix
+    /// needs refreshing. The host view still covers the whole copy.
     /// shortcut: what shaders write through a root UAV goes back to title
     /// memory for 1 MiB from its address, as before the views.
-    fn root_view(&mut self, list: &HostList, compute: bool, slot: u8, uav: bool) -> Option<(u32, u32)> {
+    fn root_view(
+        &mut self,
+        list: &HostList,
+        compute: bool,
+        slot: u8,
+        uav: bool,
+        read_end: Option<u32>,
+    ) -> Option<(u32, u32)> {
         let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) else {
             once!(slot, "a shader reads a root view the title did not set: dropped");
             not_run("a root view the title did not set");
@@ -1012,10 +1065,16 @@ impl State {
             not_run("a root view 4 GiB or more into its copy");
             return None;
         };
+        let len = shadow.left(address);
         let (refresh_at, refresh_len) = if uav && shadow.marked() {
-            shadow.page_range(address, shadow.left(address))
+            shadow.page_range(address, len)
+        } else if !uav
+            && offset.is_multiple_of(4)
+            && let Some(end) = read_end.filter(|&end| offset.checked_add(end).is_some())
+        {
+            (address, len.min(u64::from(end)))
         } else {
-            (address, shadow.left(address))
+            (address, len)
         };
         shadow.refresh(list, refresh_at, refresh_len);
         if uav {
@@ -1341,7 +1400,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let texture_writes = list.capture_texture_writes();
-        let ran = self.prepare_for(list, false, true)
+        let ran = self.prepare(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
@@ -1701,15 +1760,8 @@ impl State {
                 const COPY_SOURCE: u32 = 0x800;
                 const UNORDERED: u32 = 0x8;
                 // All UAV writes done before the copy.
-                let all = D3D12_RESOURCE_BARRIER {
-                    Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                        UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
-                    },
-                };
                 // SAFETY: an open list.
-                unsafe { list.list.ResourceBarrier(&[all]) };
+                unsafe { list.list.ResourceBarrier(&[crate::host::uav_barrier()]) };
                 crate::list::ensure_state(list, resource as This, COPY_SOURCE);
                 let read = crate::capture::read_back(&host.device, &list.list, &t);
                 crate::list::ensure_state(list, resource as This, UNORDERED);
@@ -1802,7 +1854,7 @@ impl State {
         // expanded into vertex buffers of their own.
         let rects = self.topology == RECTANGLES && !self.completes_rectangles();
         let texture_writes = list.capture_texture_writes();
-        let ran = self.prepare(list, false)
+        let ran = self.prepare(list, false, false)
             && (!rects || self.rectangles(list, vertices, first) || {
                 not_run("rectangle vertices outside their buffer");
                 false
@@ -1915,7 +1967,7 @@ impl State {
             not_run("indexed rectangles");
         }
         let texture_writes = list.capture_texture_writes();
-        let ran = !rects && self.prepare(list, true);
+        let ran = !rects && self.prepare(list, true, false);
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
@@ -2029,14 +2081,14 @@ impl State {
                 (self.topology != RECTANGLES || self.completes_rectangles() || {
                     not_run("rectangles");
                     false
-                }) && self.prepare(list, kind == INDEXED)
+                }) && self.prepare(list, kind == INDEXED, false)
             }
-            MESH => self.prepare_for(list, false, true),
+            MESH => self.prepare(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
                 Some(p) if p.compute => self.bind(list, p, true),
                 _ => false,
             },
-            _ => false,
+            _ => unreachable!("the signature check above admits only these kinds"),
         };
         if !ran {
             crate::indirect::done(list, &clamped);
@@ -2177,6 +2229,12 @@ fn prepare_readable(
         shadow.refresh(list, refresh_at, refresh_len);
         if uav {
             shadow.gpu_writes(list, address, len, marked);
+        } else if u.kind == ResourceType::Srv && crate::descriptor::host::three_channel_srv(view) {
+            for widened in
+                crate::shadow::widened_in(address as usize, (address + len) as usize)
+            {
+                list.mark_widened_read(&widened.buffer);
+            }
         }
     }
     match (view, u.kind) {
@@ -2727,7 +2785,7 @@ void main() {
         let mut state = State::default();
         state.set_heaps(&[heap]);
         state.set_view(true, 0, p as u64 + 4096);
-        let (index, offset) = state.root_view(&list, true, 0, true).expect("root uav");
+        let (index, offset) = state.root_view(&list, true, 0, true, None).expect("root uav");
         assert_eq!(offset, 4096);
         dispatch_marked_uav(&list, heap_host, &shader, index, index, offset, 0xBEEF_CAFE);
         list.close();
@@ -3313,6 +3371,314 @@ void main(uint3 id : SV_DispatchThreadID) {{
         }
     }
 
+    /// A widened RGB32 SRV sees a raw UAV write made earlier in the same
+    /// submission when the title issues a buffer barrier between them.
+    #[test]
+    fn a_widened_srv_sees_an_earlier_uav_write_in_the_same_submission() {
+        if !crate::shader_cache::under_wine() {
+            return;
+        }
+        let Some(host) = crate::host::host() else { return };
+        let (src, dst) = (buffer(48), buffer(256));
+        let (src_bytes, dst_bytes) = (
+            crate::resource::buffer_bytes(src).unwrap().0,
+            crate::resource::buffer_bytes(dst).unwrap().0,
+        );
+        let initial = [1000u32, 2000, 3000, 1003, 2003, 3003, 1006, 2006, 3006, 1009, 2009, 3009];
+        // SAFETY: the source buffer's 48 bytes.
+        unsafe { std::ptr::copy_nonoverlapping(initial.as_ptr().cast::<u8>(), src_bytes, 48) };
+
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 5, 1, 0, 0, 0, 0, 0];
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        let mut heap = null;
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let title_heap = crate::descriptor::heap(heap);
+        // The raw view starts inside the second RGB32 element. Its range is
+        // dword-aligned, so it shares the source shadow, while the widening
+        // copy has to refresh the whole touched elements.
+        let source_raw = [39, 1, 5, 0, 6, 0, 0, 0, 1, 0];
+        let output_raw = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        let srv_words = [6, 1, 0x1688, 0, 0, 0, 4, 0, 0, 0];
+        crate::descriptor::create_uav(null, src, null, &source_raw, title_heap.start);
+        crate::descriptor::create_srv(null, src, &srv_words, title_heap.start + 32);
+        crate::descriptor::create_uav(null, dst, null, &output_raw, title_heap.start + 64);
+        let first_result = [39, 1, 4, 0, 4, 0, 0, 0, 1, 0];
+        crate::descriptor::create_uav(null, dst, null, &first_result, title_heap.start + 128);
+        let heap_host = title_heap.host().expect("a host view heap");
+        assert!(heap_host.made(0) && heap_host.kept(0), "the source UAV is made");
+        assert!(heap_host.made(1) && heap_host.kept(1), "the widened SRV is made");
+        assert!(heap_host.made(2) && heap_host.kept(2), "the output UAV is made");
+        assert_eq!(heap_host.widened_buffers().len(), 1, "one live widened source view");
+
+        let writer = compile_cs(
+            r#"
+RWByteAddressBuffer src : register(u0);
+[numthreads(1, 1, 1)]
+void main() { src.Store4(0, uint4(9, 8, 7, 0)); }
+"#,
+            &[Param::Table(&[uav(0, 1)])],
+        );
+        let writer_again = compile_cs(
+            r#"
+RWByteAddressBuffer src : register(u0);
+[numthreads(1, 1, 1)]
+void main() { src.Store4(0, uint4(4, 5, 6, 7)); }
+"#,
+            &[Param::Table(&[uav(0, 1)])],
+        );
+        let reader = compile_cs(
+            r#"
+Buffer<uint4> src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+[numthreads(1, 1, 1)]
+void main() { dst.Store4(0, asuint(src[1])); }
+"#,
+            &[Param::Table(&[srv(0, 1)]), Param::Table(&[uav(0, 1)])],
+        );
+        let source_copy = crate::shadow::find(src_bytes as u64, 48).expect("the source copy");
+        source_copy.update(src_bytes as usize, 48);
+        let list = host.new_list().unwrap();
+        let source_view = crate::descriptor::view(title_heap.start).expect("the source UAV record");
+        readable(&list, &used(ResourceType::Uav), &source_view, false);
+        // SAFETY: an open list, live objects and descriptors in our heap.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+            list.list.SetComputeRootSignature(&writer.0);
+            list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(0));
+            list.list.SetPipelineState(&writer.1);
+            list.list.Dispatch(1, 1, 1);
+            list.list.ResourceBarrier(&[crate::host::uav_barrier()]);
+        }
+        list.sync_widened();
+        // The title makes another RGB32 view after the barrier. Its CPU copy
+        // predates the UAV write, so its first read must also consume the
+        // writes retained from earlier in this list.
+        let late_srv_words = [7, 1, 0x1688, 0, 0, 0, 4, 0, 0, 0];
+        crate::descriptor::create_srv(null, src, &late_srv_words, title_heap.start + 96);
+        assert!(heap_host.made(3) && heap_host.kept(3), "the late SRV is made");
+        assert_eq!(heap_host.widened_buffers().len(), 2, "a distinct late widened view");
+        let late_view = crate::descriptor::view(title_heap.start + 96).expect("the late SRV record");
+        readable(&list, &used(ResourceType::Srv), &late_view, false);
+        // SAFETY: the widening copy finished and the descriptors are live.
+        unsafe {
+            list.list.SetComputeRootSignature(&reader.0);
+            list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(3));
+            list.list.SetComputeRootDescriptorTable(1, heap_host.gpu(4));
+            list.list.SetPipelineState(&reader.1);
+            list.list.Dispatch(1, 1, 1);
+        }
+        // A second write to the same range after the view is current must be
+        // pending work, not deduplicated against the retained history.
+        readable(&list, &used(ResourceType::Uav), &source_view, false);
+        // SAFETY: an open list, live objects and descriptors in our heap.
+        unsafe {
+            list.list.SetComputeRootSignature(&writer_again.0);
+            list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(0));
+            list.list.SetPipelineState(&writer_again.1);
+            list.list.Dispatch(1, 1, 1);
+            list.list.ResourceBarrier(&[crate::host::uav_barrier()]);
+        }
+        list.sync_widened();
+        // SAFETY: the second widening copy finished.
+        unsafe {
+            list.list.SetComputeRootSignature(&reader.0);
+            list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(3));
+            list.list.SetComputeRootDescriptorTable(1, heap_host.gpu(2));
+            list.list.SetPipelineState(&reader.1);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(
+            source_copy.read_host(src_bytes as u64 + 20, 4),
+            [4, 5, 6, 7],
+            "the second raw UAV write reaches its shadow"
+        );
+        let out = crate::shadow::find(dst_bytes as u64, 256).expect("the output copy");
+        assert_eq!(
+            out.read_host(dst_bytes as u64 + 16, 4),
+            [1003, 2003, 9, 1],
+            "first write"
+        );
+        assert_eq!(
+            out.read_host(dst_bytes as u64, 4),
+            [1003, 2003, 4, 1],
+            "second write"
+        );
+    }
+
+    /// A heap-writing draw is sampled at its barrier. A widened view made
+    /// after that barrier must see the heap's then-current UAV range.
+    #[test]
+    fn a_late_widened_view_follows_a_bindless_write() {
+        if !crate::shader_cache::under_wine() {
+            return;
+        }
+        let Some(host) = crate::host::host() else { return };
+        let (src, dst) = (buffer(48), buffer(256));
+        let (src_bytes, dst_bytes) = (
+            crate::resource::buffer_bytes(src).unwrap().0,
+            crate::resource::buffer_bytes(dst).unwrap().0,
+        );
+        let initial = [1000u32, 2000, 3000, 1003, 2003, 3003, 1006, 2006, 3006, 1009, 2009, 3009];
+        // SAFETY: the source buffer's 48 bytes.
+        unsafe { std::ptr::copy_nonoverlapping(initial.as_ptr().cast::<u8>(), src_bytes, 48) };
+
+        let old_raw = [39, 1, 0, 0, 12, 0, 0, 0, 1, 0];
+        let new_raw = [39, 1, 3, 0, 9, 0, 0, 0, 1, 0];
+        let output_raw = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        let old = View::Unordered(src as usize, 0, Some(old_raw));
+        let new = View::Unordered(src as usize, 0, Some(new_raw));
+        let srv_view = View::Shader(src as usize, Some([7, 1, 0x1688, 0, 0, 0, 4, 0, 0, 0]));
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 3, 1, 0, 0, 0, 0, 0];
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        let mut heap = null;
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let title_heap = crate::descriptor::heap(heap);
+        crate::descriptor::create_uav(null, src, null, &old_raw, title_heap.start);
+        crate::descriptor::create_uav(null, dst, null, &output_raw, title_heap.start + 64);
+        let heap_host = title_heap.host().expect("a host view heap");
+        let viewed = std::sync::Arc::new(crate::bindless::Viewed::default());
+        viewed.set(0, Some(&old), true);
+        crate::shadow::find(src_bytes as u64, 48).expect("the source copy").update(src_bytes as usize, 48);
+
+        let writer = compile_cs(
+            r#"
+RWByteAddressBuffer src : register(u0);
+[numthreads(1, 1, 1)]
+void main() { src.Store4(0, uint4(9, 8, 7, 0)); }
+"#,
+            &[Param::Table(&[uav(0, 1)])],
+        );
+        let reader = compile_cs(
+            r#"
+Buffer<uint4> src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+[numthreads(1, 1, 1)]
+void main() { dst.Store4(0, asuint(src[1])); }
+"#,
+            &[Param::Table(&[srv(0, 1)]), Param::Table(&[uav(0, 1)])],
+        );
+        let list = host.new_list().unwrap();
+        list.mark_widened_heap(&viewed);
+        // SAFETY: an open list and live descriptors.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+            list.list.SetComputeRootSignature(&writer.0);
+            list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(0));
+            list.list.SetPipelineState(&writer.1);
+            list.list.Dispatch(1, 1, 1);
+        }
+        // The title rewrites the heap slot before its barrier. Both the GPU
+        // descriptor and the range sampled for widening must name the new view.
+        crate::descriptor::create_uav(null, src, null, &new_raw, title_heap.start);
+        viewed.set(0, Some(&new), true);
+        // SAFETY: an open list.
+        unsafe {
+            list.list.ResourceBarrier(&[crate::host::uav_barrier()]);
+        }
+        list.sync_widened();
+        // The range must be frozen at the barrier even when no widened view
+        // exists yet; the title can remove the heap slot before the first SRV.
+        viewed.set(0, None, true);
+        let srv_words = [7, 1, 0x1688, 0, 0, 0, 4, 0, 0, 0];
+        crate::descriptor::create_srv(null, src, &srv_words, title_heap.start + 32);
+        readable(&list, &used(ResourceType::Srv), &srv_view, false);
+        // SAFETY: the widening copy finished and the descriptors are live.
+        unsafe {
+            list.list.SetComputeRootSignature(&reader.0);
+            list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(1));
+            list.list.SetComputeRootDescriptorTable(1, heap_host.gpu(2));
+            list.list.SetPipelineState(&reader.1);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+        let source = crate::shadow::find(src_bytes as u64, 48).expect("the source copy");
+        assert_eq!(source.read_host(src_bytes as u64 + 12, 4), [9, 8, 7, 0]);
+        let out = crate::shadow::find(dst_bytes as u64, 256).expect("the output copy");
+        assert_eq!(out.read_host(dst_bytes as u64, 4), [9, 8, 7, 1]);
+    }
+
+    /// Root UAVs declare their writes outside `readable`; they must refresh a
+    /// widened SRV after a barrier just like table UAVs do.
+    #[test]
+    fn a_root_uav_write_reaches_a_widened_srv_in_the_same_submission() {
+        if !crate::shader_cache::under_wine() {
+            return;
+        }
+        let Some(host) = crate::host::host() else { return };
+        let (src, dst) = (buffer(48), buffer(256));
+        let (src_bytes, dst_bytes) = (
+            crate::resource::buffer_bytes(src).unwrap().0,
+            crate::resource::buffer_bytes(dst).unwrap().0,
+        );
+        let initial = [1000u32, 2000, 3000, 1003, 2003, 3003, 1006, 2006, 3006, 1009, 2009, 3009];
+        // SAFETY: the source buffer's 48 bytes.
+        unsafe { std::ptr::copy_nonoverlapping(initial.as_ptr().cast::<u8>(), src_bytes, 48) };
+
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 2, 1, 0, 0, 0, 0, 0];
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        let mut heap = null;
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let title_heap = crate::descriptor::heap(heap);
+        let srv_words = [6, 1, 0x1688, 0, 0, 0, 4, 0, 0, 0];
+        let output_raw = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        crate::descriptor::create_srv(null, src, &srv_words, title_heap.start);
+        crate::descriptor::create_uav(null, dst, null, &output_raw, title_heap.start + 32);
+        let heap_host = title_heap.host().expect("a host view heap");
+        let source_view = crate::descriptor::view(title_heap.start).expect("the source SRV");
+
+        let writer = compile_cs(
+            r#"
+RWByteAddressBuffer src : register(u0);
+[numthreads(1, 1, 1)]
+void main() { src.Store4(0, uint4(9, 8, 7, 0)); }
+"#,
+            &[Param::Table(&[uav(0, 1)])],
+        );
+        let reader = compile_cs(
+            r#"
+Buffer<float4> src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+[numthreads(1, 1, 1)]
+void main() { dst.Store4(0, asuint(src[0])); }
+"#,
+            &[Param::Table(&[srv(0, 1)]), Param::Table(&[uav(0, 1)])],
+        );
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[heap]);
+        state.set_view(true, 0, src_bytes as u64);
+        let (writer_slot, _) = state.root_view(&list, true, 0, true, None).expect("a root UAV");
+        // SAFETY: an open list, live objects and descriptors in our heap.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+            list.list.SetComputeRootSignature(&writer.0);
+            list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(writer_slot));
+            list.list.SetPipelineState(&writer.1);
+            list.list.Dispatch(1, 1, 1);
+            list.list.ResourceBarrier(&[crate::host::uav_barrier()]);
+        }
+        list.sync_widened();
+        readable(&list, &used(ResourceType::Srv), &source_view, false);
+        // SAFETY: the widening copy finished and the descriptors are live.
+        unsafe {
+            list.list.SetComputeRootSignature(&reader.0);
+            list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(0));
+            list.list.SetComputeRootDescriptorTable(1, heap_host.gpu(1));
+            list.list.SetPipelineState(&reader.1);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+        let out = crate::shadow::find(dst_bytes as u64, 256).expect("the output copy");
+        assert_eq!(out.read_host(dst_bytes as u64, 4), [9, 8, 7, 1.0f32.to_bits()]);
+    }
+
     /// Root views (`victory_shader::emit`, "Root SRVs and root UAVs") through
     /// our device: a raw view of the host copy holding the root address,
     /// brought up to date from there to the copy's end, so data 1.5 MiB past
@@ -3342,6 +3708,9 @@ void main(uint3 id : SV_DispatchThreadID) {{
         let list = host.new_list().unwrap();
         let out = crate::shadow::find(dst_bytes as u64, 256).expect("the output's host copy");
         let src = src_bytes as u64;
+        let source = crate::shadow::find(src, 4 * MIB).expect("the input's host copy");
+        let sentinel = src + 4 * MIB - 0x400;
+        source.write_host(sentinel, &[0x5a; 4]);
         let cases = [
             // Data 1.5 MiB past the root address.
             (src + 0x100, 0x18_0000u32, (0..16).map(|k| 0x5000 + k).collect::<Vec<u32>>()),
@@ -3356,10 +3725,11 @@ void main(uint3 id : SV_DispatchThreadID) {{
             let mut state = State::default();
             state.set_heaps(&[heap]);
             state.set_view(true, 0, address);
-            let (index, at) = state.root_view(&list, true, 0, false).expect("a root view");
+            let read_end = (round == 0).then_some(offset + 15 * 64 + 4);
+            let (index, at) = state.root_view(&list, true, 0, false, read_end).expect("a root view");
             assert_eq!(u64::from(at), address - src, "the root address's offset in the copy");
             state.set_view(true, 1, address - 0x40);
-            let other = state.root_view(&list, true, 1, false).expect("a root view");
+            let other = state.root_view(&list, true, 1, false, Some(4)).expect("a root view");
             assert_eq!(other, (index, at - 0x40), "one view per copy");
             let constants = [at, offset];
             // SAFETY: an open list, live objects of ours.
@@ -3383,6 +3753,7 @@ void main(uint3 id : SV_DispatchThreadID) {{
             }
             host.execute(&[&list]);
             assert_eq!(out.read_host(dst_bytes as u64, 16), want, "round {round}");
+            assert_eq!(source.read_host(sentinel, 1), [0x5a5a_5a5a], "bytes outside the refresh");
         }
 
         // Rebind the same slots to a null SRV, then to a null UAV. The
@@ -3391,11 +3762,11 @@ void main(uint3 id : SV_DispatchThreadID) {{
             list.reset();
             let mut state = State::default();
             state.set_heaps(&[heap]);
-            assert!(state.root_view(&list, true, 0, false).is_none(), "unset root");
+            assert!(state.root_view(&list, true, 0, false, None).is_none(), "unset root");
             state.set_view(true, 0, if null_uav { src + 0x18_0100 } else { 0 });
             state.set_view(true, 1, if null_uav { 0 } else { dst_bytes as u64 });
-            let (input, at) = state.root_view(&list, true, 0, false).unwrap();
-            let (output, out_at) = state.root_view(&list, true, 1, true).unwrap();
+            let (input, at) = state.root_view(&list, true, 0, false, None).unwrap();
+            let (output, out_at) = state.root_view(&list, true, 1, true, None).unwrap();
             assert_ne!(input, output);
             assert_eq!(state.root_slots.len(), 1, "only the real buffer needs a dynamic view");
             assert_eq!(out_at, 0);
@@ -3560,8 +3931,6 @@ void main(uint3 id : SV_DispatchThreadID) {{
             code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
         };
         let container = Container {
-            version: (1, 0),
-            digest: [0; 16],
             parts: Vec::new(),
         };
         let program = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
@@ -3795,7 +4164,9 @@ void main(uint3 id : SV_DispatchThreadID) {{
         let list = host.new_list().unwrap();
         if mode == Rewrite::DuringSubmission {
             let handle = title_heap.start;
-            list.defer(move || crate::descriptor::create_cbv(std::ptr::null(), &b_desc, handle));
+            list.defer_host(move || {
+                crate::descriptor::create_cbv(std::ptr::null(), &b_desc, handle)
+            });
         }
         let mut state = State::default();
         state.set_heaps(&[heap]);
@@ -5271,11 +5642,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let host_shader = emit_with(
-            &Container {
-                digest: [0; 16],
-                version: (1, 0),
-                parts: Vec::new(),
-            },
+            &Container { parts: Vec::new() },
             &native,
             &p,
             &st,
@@ -5284,6 +5651,8 @@ void main(uint3 id : SV_DispatchThreadID) {
             Options {
                 view_marks: true,
                 atomic_locks: false,
+                atomic_lock_rounds: false,
+                atomic_umax: false,
                 bias_as_gradients: false,
                 host_wave32: false,
                 narrow_waves: false,
@@ -5457,6 +5826,9 @@ void main(uint3 id : SV_DispatchThreadID) {
             assert_eq!(got, want, "round {round}");
         }
     }
+
+    #[path = "r16_volume_fixture.rs"]
+    mod r16_volume_fixture;
 
     /// A texture written through an unordered view and copied into a title
     /// buffer (a read back) reaches the buffer's title memory once the
@@ -6282,5 +6654,28 @@ void main(uint3 id : SV_DispatchThreadID) {
             assert_eq!(host.log_messages(), None, "case {case} D3D12 debug errors");
             let _ = kept_obj;
         }
+    }
+
+    #[test]
+    fn bind_cache_switch_defaults_on_and_disables_with_zero() {
+        use std::ffi::OsStr;
+        assert!(bind_cache_enabled_value(None));
+        assert!(bind_cache_enabled_value(Some(OsStr::new("1"))));
+        assert!(!bind_cache_enabled_value(Some(OsStr::new("0"))));
+    }
+
+    #[test]
+    fn set_targets_caches_keys_and_clears_on_host_state_lost() {
+        let Some(host) = crate::host::host() else { return };
+        let Ok(list) = host.new_list() else { return };
+        let mut state = State::default();
+        state.set_targets(&list, &[], 0);
+        assert!(state.host_targets.is_some());
+        let cached = state.host_targets.clone();
+        state.set_targets(&list, &[], 0);
+        assert_eq!(state.host_targets, cached);
+        state.host_state_lost();
+        assert!(state.host_targets.is_none());
+        list.close();
     }
 }

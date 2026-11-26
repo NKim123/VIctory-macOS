@@ -263,8 +263,14 @@ struct Stats {
 
 static STATS: std::sync::Mutex<Option<Stats>> = std::sync::Mutex::new(None);
 
-fn stats<R>(f: impl FnOnce(&mut Stats) -> R) -> R {
-    f(STATS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default())
+fn stats<R: Default>(f: impl FnOnce(&mut Stats) -> R) -> R {
+    if !tracing::event_enabled!(tracing::Level::INFO) {
+        return R::default();
+    }
+    f(STATS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_default())
 }
 
 /// `bytes` of a range shaders wrote through a view did not go back into
@@ -275,7 +281,13 @@ pub(crate) fn note_withheld(bytes: u64) {
 
 /// A draw or dispatch of `pipeline` uses title memory.
 pub(crate) fn note_use(pipeline: &str) {
-    stats(|s| *s.uses.entry(pipeline.to_owned()).or_default() += 1);
+    stats(|s| {
+        if let Some(count) = s.uses.get_mut(pipeline) {
+            *count += 1;
+        } else {
+            s.uses.insert(pipeline.to_owned(), 1);
+        }
+    });
 }
 
 /// Frames presented, and the last one in which a list using title memory
@@ -635,7 +647,7 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
     // without touching them (the table names every copy, ~4,700 in the world).
     for l in layout.iter() {
         for (c, bit) in l.copies.iter().zip(&l.bits) {
-            if !crate::watch::clean_bit(*bit) {
+            if !c.clean() && !crate::watch::clean_bit(*bit) {
                 let (start, len) = c.range();
                 add(c, start as usize, len as usize);
             }
@@ -831,6 +843,19 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
 mod tests {
     use super::*;
     use victory_formats::pagetable::table;
+
+    #[test]
+    fn memory_stats_follow_the_frame_report_filter() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        for (filter, expected) in [("warn,victory_gpu::host=info", false), ("info", true)] {
+            let subscriber =
+                tracing_subscriber::registry().with(tracing_subscriber::EnvFilter::new(filter));
+            tracing::subscriber::with_default(subscriber, || {
+                assert_eq!(stats(|_| true), expected);
+            });
+        }
+    }
 
     /// Writes of lists using title memory are held back from a frame with a
     /// miss through the next one, then go back again.

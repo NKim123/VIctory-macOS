@@ -77,6 +77,8 @@ fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
         prims: vec![],
         mesh_stride: 0,
         atomic_locks: false,
+        atomic_lock_rounds: false,
+            atomic_umax: false,
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
@@ -132,6 +134,8 @@ fn lower_wave(
         prims: vec![],
         mesh_stride: 0,
         atomic_locks: false,
+        atomic_lock_rounds: false,
+        atomic_umax: false,
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
@@ -414,6 +418,8 @@ fn perm_features(selector: u32) -> u64 {
         prims: vec![],
         mesh_stride: 0,
         atomic_locks: false,
+        atomic_lock_rounds: false,
+        atomic_umax: false,
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
@@ -1372,6 +1378,8 @@ fn lowered(words: &[u32], lanes: u32, narrow_waves: bool) -> super::Lowered {
         prims: vec![],
         mesh_stride: 0,
         atomic_locks: false,
+        atomic_lock_rounds: false,
+        atomic_umax: false,
         bias_as_gradients: false,
         narrow_waves,
         host_wave32: false,
@@ -1487,6 +1495,8 @@ fn ds_bpermute_wave64_preserves_32_lane_half() {
             prims: vec![],
             mesh_stride: 0,
             atomic_locks: false,
+            atomic_lock_rounds: false,
+        atomic_umax: false,
             bias_as_gradients: false,
             narrow_waves: false,
             host_wave32: false,
@@ -1522,4 +1532,148 @@ fn ds_bpermute_refuses_gds() {
         lowers(&words, 0),
         Err(crate::ShaderError::Unsupported { what: "GDS", .. })
     ));
+}
+
+fn lower_ps_for_early_z(
+    extra: &[u32],
+    export: [u32; 2],
+    outputs: Vec<crate::emit::container::SigElement>,
+    db_shader_control: u32,
+    view_marks: bool,
+) -> Lowered {
+    use crate::native::{HwStage, NativeProgram, RootParam, RootType, StageIo};
+    const S_WAITCNT_ALL: u32 = 0xBF8C_0000;
+    let mut w = vec![
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF40C_0302, // s_load_dwordx8 s[12:19], s[4:5], 32
+        0xFA00_0020,
+        S_WAITCNT_ALL,
+        0x7E00_0280, // v_mov_b32 v0, 0
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0xF000_1F08, // image_load v[2:5], v[0:1], s[12:19] dmask:0xf dim:2D unorm
+        0x0003_0200,
+        S_WAITCNT_ALL,
+    ];
+    w.extend_from_slice(extra);
+    w.extend_from_slice(&export);
+    w.push(S_ENDPGM);
+    let native = NativeProgram {
+        stage: HwStage::Ps,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![RootParam {
+            root: RootType::ResourceHeap,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 4,
+            slot: 0,
+        }],
+        used: Vec::new(),
+        io: StageIo::Ps {
+            inputs: Vec::new(),
+            input_addr: 0,
+            db_shader_control,
+            patches: Vec::new(),
+        },
+        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = crate::ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = crate::structure::structure(&p).expect("structure");
+    let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = crate::io::raise(&p, &native).expect("io::raise");
+    lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs,
+        prims: Vec::new(),
+        mesh_stride: 0,
+        atomic_locks: false,
+        atomic_lock_rounds: false,
+        atomic_umax: false,
+        bias_as_gradients: false,
+        narrow_waves: false,
+        host_wave32: false,
+        view_marks,
+    })
+    .expect("lower")
+}
+
+#[test]
+fn pixel_shader_with_only_read_marks_enables_early_depth_stencil() {
+    let lowered = lower_ps_for_early_z(&[], [0xF800_180F, 0x0504_0302], Vec::new(), 0, true);
+    assert!(lowered.view_marks);
+    assert!(lowered.early_depth_stencil);
+    #[cfg(windows)]
+    if let Ok(mut v) = crate::emit::validator::Validator::load(
+        crate::emit::validator::Validator::default_path().as_deref(),
+    ) {
+        v.validate(&mut lowered.dxil.clone()).unwrap();
+    }
+}
+
+#[test]
+fn pixel_shader_skips_early_depth_stencil_with_discard_depth_or_uav() {
+    // 1. No view_marks -> no injected UAV, no need for ForceEarlyDepthStencil.
+    let no_marks = lower_ps_for_early_z(&[], [0xF800_180F, 0x0504_0302], Vec::new(), 0, false);
+    assert!(!no_marks.early_depth_stencil);
+
+    // 2. Depth export (exp mrtz v2, off, off, off done vm).
+    let depth_out = vec![crate::emit::container::SigElement {
+        name: "SV_Depth".into(),
+        index: 0,
+        kind: 17,
+        comp: 9,
+        interp: 0,
+        row: None,
+        col: 0,
+        cols: 1,
+        usage: 1,
+        half: false,
+    }];
+    let depth = lower_ps_for_early_z(&[], [0xF800_1881, 0x0000_0002], depth_out, 0, true);
+    assert!(!depth.early_depth_stencil);
+
+    // 3. Stencil / POPS (db_shader_control bit 16).
+    let pops = lower_ps_for_early_z(&[], [0xF800_180F, 0x0504_0302], Vec::new(), 1 << 16, true);
+    assert!(!pops.early_depth_stencil);
+
+    // 4. Conditional discard (divergent forward exit to `exp null done`).
+    let discard = lower_ps_for_early_z(
+        &[
+            0xBE88_037E, // s_mov_b32 s8, exec_lo
+            0x7C22_0480, // v_cmpx_lt_f32 exec, 0, v2
+            0x8A08_7E08, // s_andn2_b32 s8, s8, exec_lo
+            0xBF84_0004, // s_cbranch_scc0 -> kill (past s_mov + exp mrt0 + s_endpgm)
+            0xBEFE_0308, // s_mov_b32 exec_lo, s8
+            0xF800_180F, // exp mrt0 v2, v3, v4, v5 done vm
+            0x0504_0302,
+            S_ENDPGM,
+        ],
+        [0xF800_1890, 0x0000_0000], // kill: exp null done vm
+        Vec::new(),
+        0,
+        true,
+    );
+    assert!(!discard.early_depth_stencil);
+
+    // 5. Title UAV store (`buffer_store_dword` through heap slot 2).
+    let uav = lower_ps_for_early_z(
+        &[
+            0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 64
+            0xFA00_0040,
+            0xBF8C_0000, // s_waitcnt lgkmcnt(0)
+            0xE070_0000, // buffer_store_dword v2, off, s[8:11], 0
+            0x8002_0000,
+        ],
+        [0xF800_180F, 0x0504_0302],
+        Vec::new(),
+        0,
+        true,
+    );
+    assert!(!uav.early_depth_stencil);
 }

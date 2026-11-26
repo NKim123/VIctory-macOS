@@ -595,6 +595,15 @@ const RTV_TAG: u32 = u32::from_le_bytes(*b"vRTV");
 const _: () = assert!(size_of::<RtvRecord>() <= 112);
 
 impl RtvRecord {
+    /// All the view it records is made from: records with equal keys have
+    /// equal views (of the same host texture).
+    #[cfg(windows)]
+    pub(crate) fn key(&self) -> (usize, [u32; 7]) {
+        let mut words = [self.described; 7];
+        words[1..].copy_from_slice(&self.desc);
+        (self.resource as usize, words)
+    }
+
     /// The view description in the host's type (the same layout).
     #[cfg(windows)]
     pub(crate) fn desc(
@@ -785,12 +794,21 @@ fn record(handle: u64, view: View) {
     mirror(handle);
 }
 
+/// Bumped whenever [`forget`] invalidates a recorded view while holding `VIEWS`.
+static VIEWS_FORGOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[cfg(any(windows, test))]
+pub(crate) fn views_forgot() -> u64 {
+    VIEWS_FORGOT.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
     let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
+    let mut removed = false;
     for i in entries {
         let (view, generation) = views.list[i as usize].clone();
         // Entries freed through a view's other resource may hold another
@@ -803,6 +821,10 @@ pub(crate) fn forget(resource: usize) {
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
+        removed = true;
+    }
+    if removed {
+        VIEWS_FORGOT.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -890,15 +912,13 @@ fn view_at(i: u32, generation: u32) -> Option<ViewPin> {
 /// there. An obsolete generation is equivalent to a null descriptor.
 #[cfg(windows)]
 fn changed_records(
-    first: u32,
     made: &[u64],
-    records: impl Iterator<Item = [u32; 3]>,
+    candidates: impl Iterator<Item = (u32, [u32; 3])>,
 ) -> Vec<(u32, [u32; 3], u64)> {
     let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
-    records
-        .zip(made)
-        .enumerate()
-        .filter_map(|(index, (record, &old))| {
+    candidates
+        .filter_map(|(index, record)| {
+            let old = made[index as usize];
             let [tag, i, generation] = record;
             let current = tag == VIEW_TAG
                 && views
@@ -910,7 +930,7 @@ fn changed_records(
             } else {
                 0
             };
-            (old != wanted).then_some((first + index as u32, record, old))
+            (old != wanted).then_some((index, record, old))
         })
         .collect()
 }

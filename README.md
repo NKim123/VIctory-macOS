@@ -53,7 +53,7 @@ Several people who own the game have run it on their Macs and reported back in t
 | M5 MacBook Air | Got past the early Rosetta hang. The intro animation and the menu appeared with a local workaround that showed the game's 3840x2160 image directly, and the first scene's audio played. Without the workaround the window stays black. | #1, #15 |
 | M5 Pro | With the Series S profile the game presented 64 frames of real drawing, all of them black, and then stopped on one of the game's own checks during start-up. Packages kept one per subfolder made it stop even earlier, and VIctory now says so at start-up. | #24 |
 | M5 | At the Player prompt the game's 3840x2160 image held the picture while the 1920x1080 image sent to the window was black. | #15 |
-| M2 Max | Account selection, the first setup screens with keyboard input, and the loading artwork all worked, and then the window went black. | #28 |
+| M2 Max, 32 GB, Series X | On 25 and 26 November, with CrossOver 26.3 and D3DMetal 4.0 beta 3, #167, #178 and local unmerged patches (mesh output counting and linking, and an opt-out of the wave32 path), the game reached the in-world prologue cinematics and the opening credits, with `VICTORY_KEYS` passing the prompts. In one earlier run the gameplay HUD appeared on screen; that player control responds has not been verified. Compiler disconnects fell to 0 and one mesh-size rejection remained. Heavy frames took about 2 to 10 s. Some runs ended in the game's heartbeat check, at different times in the world, and others reached a 30-minute cap. In the two runs that held A for 30 s during the opening cinematic, the picture went almost empty, which the runs without that hold did not do. | #28 |
 | M5 Pro, 24 GB, Series X | On 25 November, with the store patch and fault tracking on, the account picker, the setup screens and the legal notices ran at 25 to 30 fps. About three minutes in, the game reached the "Vice City, two years ago" title card at 2 to 5 seconds per frame and stayed alive there. | #65 |
 | M5 Pro, Series X | On 25 November, with no variables set, the game ran its intro and loading at 25 to 30 fps, then its draw count jumped to 3,000 to 3,900 per frame, which suggests it was drawing the world, though the screen stayed grey at 0.1 fps. A later run with `VICTORY_PATCH_MASKED=all` only went on into the world and drew a dark city skyline, still at 0.1 fps. After the freeze fixes, plain main with `VICTORY_PATCH_MASKED=all VICTORY_FAULT_TRACKING=1` loaded into the world with up to 5,400 draws per frame and no freeze, at 0.2 fps. With #111 (fewer memory mappings under Wine's one memory lock) world frames fell from 4.5 s to about 2.4 to 2.9 s while it copied 57 to 83 GB of memory per frame. With the store patch and fault tracking on, copies stayed under a few MB per frame through loading, and it froze about three minutes in. That freeze led to #63. | #50 |
 | M3 Max, Series X | On 25 November the picture showed with no workaround. The intro played and the game reached the "Vice City, two years ago" title card, where it froze while Apple's shader compiler kept crashing. A second run with a warm shader cache had no compiler crashes, but the window went black after the loading artwork. In a later run the game world appeared on screen before the game's own watchdog stopped it, with frames taking up to 28 seconds, most of it copying memory. With the store patch from #59 and #60 and fault tracking on, loading ran at 26 fps instead of 8 and copies fell from 158.7 MB to under 1 MB per frame, until a freeze about three minutes in. After the freeze fixes, plain main stayed in the world for over 20 minutes without freezing, at 0.1 to 0.2 fps, with far fewer shader compiler crashes (37 against about 150). With today's speed changes frames there were 14% faster, and a later run stayed in the world for 11 minutes before the game's own timing checks gave up at about 12 seconds per frame. | #50 |
@@ -98,8 +98,10 @@ The setup installs what it needs with Homebrew. It then builds the x86_64 librar
 When it says **Setup finished**, you can check that VIctory starts:
 
 ```bash
-tools/macos/victory.sh config
+tools/macos/victory.sh --version
 ```
+
+Once `game_dir` in `victory.toml` points at your copy of the game (below), `tools/macos/victory.sh config` checks your paths too.
 
 ## Running the game
 
@@ -110,6 +112,13 @@ tools/macos/victory.sh run --execute <the game's executable>
 ```
 
 For now this gets as far as VIctory does on Windows, as the note at the top explains.
+
+Set `VICTORY_WINDOW_SECONDARY=1` to open the game window on the only non-primary
+display. This requires two extended displays. If VIctory cannot select a single
+secondary display, it leaves the game window hidden. With more than one extra display,
+`VICTORY_WINDOW_SECONDARY=x,y` picks the one that holds that desktop point instead.
+`VICTORY_WINDOW_MAX=WIDTHxHEIGHT`
+can further limit the window size without changing the render target.
 
 ## Warming the pipeline cache
 
@@ -180,6 +189,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
 | `VICTORY_POKE=<rva>:<byte>,...` | writes a title byte twice a second (a hang watchdog's tick, say) |
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
+| `VICTORY_FRAME_HZ=60` | tests a 60 Hz frame interval for the runtime's flip events |
 | `VICTORY_CRASH_BREAKPOINTS=1` | appends first-chance breakpoints to `crashes.log`, including ones a handler may recover from |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
