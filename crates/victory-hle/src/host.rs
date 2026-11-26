@@ -74,12 +74,18 @@ impl HostPolicy {
         if !self.allows(dll) {
             return None;
         }
-        imp::resolve(dll, symbol)
+        let address = imp::resolve(dll, symbol)?;
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        if let ImportSymbol::Name { name, .. } = symbol {
+            return Some(victory_gpu::port_descriptors::import(name, address));
+        }
+        Some(address)
     }
 }
 
 /// The host's own `name` from the System32 DLL `dll`: what a title import
 /// of it is bound to when we do not override it.
+#[cfg(windows)]
 pub(crate) fn function(dll: &str, name: &str) -> Option<usize> {
     let name = ImportSymbol::Name {
         hint: 0,

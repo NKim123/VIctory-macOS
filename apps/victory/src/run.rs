@@ -1,6 +1,8 @@
 use std::path::Path;
 
-use anyhow::{Context, Result};
+#[cfg(windows)]
+use anyhow::Context;
+use anyhow::Result;
 
 use crate::{Console, Unimplemented};
 
@@ -75,9 +77,14 @@ pub fn run(
         }
         None => println!("build          unknown ({hash})"),
     }
+    const SERIES_1021_HASH: &str =
+        "b99f876b74d4a77f03af5f878223b27bd647b5c35a79d5decd9f716504239e93";
     // Rosetta cannot resume these when they fault partway (#14, #50).
     let masked = victory_loader::masked::masked_stores(&prepared.info, &original);
-    println!("masked stores  {}", victory_loader::masked::summary(&masked));
+    println!(
+        "masked stores  {}",
+        victory_loader::masked::summary(&masked)
+    );
     // Under Rosetta, tracking is off unless asked for, and the stores it
     // cannot resume are patched when it is on (`victory_gpu::fault_tracking`).
     println!(
@@ -98,11 +105,9 @@ pub fn run(
     // a few loops (#144). Their offsets are specific to Series 1.0.2.1, so
     // they are added here only for that build, and an explicit
     // `VICTORY_PATCH_MASKED` always wins.
-    if needs_patch
-        && requested.is_none()
-        && hash.as_str() == "b99f876b74d4a77f03af5f878223b27bd647b5c35a79d5decd9f716504239e93"
-    {
-        requested = Some("all,1e09b31,1e09b37,259509f,25950a5,1e759f0,1e759f7,1e759fe,1e75a05".into());
+    if needs_patch && requested.is_none() && hash.as_str() == SERIES_1021_HASH {
+        requested =
+            Some("all,1e09b31,1e09b37,259509f,25950a5,1e759f0,1e759f7,1e759fe,1e75a05".into());
     }
     let patching = victory_loader::masked::choice(requested, needs_patch);
     let original = patching.is_some().then_some(original);
@@ -186,14 +191,44 @@ pub fn run(
             victory_loader::masked::patch(image.base() as u64, image.info(), &original, &wanted);
         println!("masked stores  {n} patched to plain stores");
     }
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    let mut descriptor_windows = Vec::new();
+    #[cfg(all(windows, not(target_arch = "x86_64")))]
+    let descriptor_windows = [];
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    if execute && victory_gpu::port_descriptors::on() {
+        use victory_loader::descriptor_sites::{SITES, apply};
+        // The offsets and surrounding instruction bytes belong to this build.
+        if hash.as_str() == SERIES_1021_HASH {
+            // SAFETY: the image stays mapped and its code has yet to run.
+            descriptor_windows = unsafe {
+                apply(
+                    image.base(),
+                    image.info().size_of_image as usize,
+                    victory_gpu::port_descriptors::marks_address(),
+                )
+            }?;
+            if descriptor_windows.len() == SITES.len() {
+                victory_gpu::port_descriptors::enable();
+            }
+        }
+        println!(
+            "descriptor stores {} of {} patched",
+            descriptor_windows.len(),
+            SITES.len()
+        );
+    }
     // Every other 256-bit store of the title split into 128-bit halves, from
     // a list made offline (`cargo xtask wide-stores`): Rosetta cannot resume
     // one that faults in its second page.
     #[cfg(windows)]
     if let Some(list) = std::env::var_os("VICTORY_PATCH_WIDE").filter(|v| !v.is_empty() && v != "0")
     {
-        let (n, refused) =
-            victory_loader::wide::patch(image.base() as u64, std::path::Path::new(&list));
+        let (n, refused) = victory_loader::wide::patch_except(
+            image.base() as u64,
+            std::path::Path::new(&list),
+            &descriptor_windows,
+        );
         println!("wide stores    {n} split into 128-bit halves ({refused} refused)");
     }
     #[cfg(target_arch = "x86_64")]

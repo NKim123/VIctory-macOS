@@ -411,3 +411,21 @@ None of these changes the default. Each is read from the environment when the ga
 | `VICTORY_STEP_OVER=pool` | Steps over the title's "no free element" traps: an `int3` followed by `xor r, r`, the shape of a full fixed-size pool's allocator, whose caller then gets the NULL it already checks for. Series 1.0.2.1 hits one at `+0x5149aec` (the instance lists' pool, Marvisak/VIctory#698) about 20 minutes into the opening when frames take seconds. A list of hex offsets also works. |
 | `VICTORY_WINDOW_SECONDARY=1` | Opens the game window on the only non-primary display. |
 | `VICTORY_WINDOW_SECONDARY=x,y` | Opens the game window on the display that holds the desktop point `x,y`, for layouts with more than one extra display (a Sidecar iPad beside two monitors, say). |
+
+## Descriptor and buffer refresh experiments
+
+These switches port work from avatarmanz/VIctory-7900XTX (GPL-3.0).
+
+| Switch | What it does |
+| --- | --- |
+| `VICTORY_PORT_DESCRIPTORS=1` | On the known Series 1.0.2.1 image, six byte-checked table stores and the host CRT copy imports mark written slots in the first eligible placed view heap. All six store hooks must install before marks replace per-submission page scans. The first sync and every eighth frame also scan the watched changes, or the eligible heap range when fault tracking is off. Writes through uninstrumented paths can first appear at that audit. Off by default. |
+| `VICTORY_SYNC_IN_PLACE=0` | Use kernel snapshots for each descriptor sweep. By default on x86-64, verified 32-byte slots are compared to the host mirror as their headers are read. A failed read retries through the existing kernel path. |
+| `VICTORY_SYNC_FINE=1` | Capture large descriptor scan ranges in 128-slot jobs through the existing bounded texture worker pool. The submitting thread still creates and publishes the host views. Off by default. |
+| `VICTORY_SPANS_QUICK=0` | Take the bindless view lock on every slot update. By default, an occupancy bit lets updates that would neither add nor remove a tracked view leave that lock alone. |
+| `VICTORY_UNDER_FUSED=1` | During a refresh that overlaps a pending GPU write baseline, compare and apply title bytes to the mapped shadow from at most 64 KiB of scratch per worker. Update the baseline from the same read even when shadow bytes already match. Off by default. |
+
+Descriptor trampolines use the same two 128-bit stores as the wide-store
+workaround. The wide-store pass skips their verified windows. The write-site
+profiler can still observe other title stores, and leaves modified windows
+alone. The descriptor marks use at most about 2 MiB for one heap over the
+life of the process.
