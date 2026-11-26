@@ -4934,6 +4934,10 @@ impl<'a> Lower<'a> {
             }
             _ => return Err("a scalar memory read as data"),
         };
+        let stride = (props.0 & 0xff == 12)
+            .then(|| Self::raw_structured_stride(used))
+            .flatten();
+        let props = if stride.is_some() { (11 | u, 0) } else { props };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
         let i32t = self.s.t.i32;
@@ -4984,7 +4988,16 @@ impl<'a> Lower<'a> {
                 let d3 = self.s.m.bin(c, Bin::Or, base, last);
                 vec![(1, d1), (2, d2), (3, d3), (4, depth)]
             }
-            None => vec![(2, field(self, 0))],
+            None => {
+                let count = field(self, 0);
+                let count = if let Some(stride) = stride {
+                    let stride = self.s.m.i32(stride);
+                    self.s.m.bin(c, Bin::UDiv, count, stride)
+                } else {
+                    count
+                };
+                vec![(2, count)]
+            }
         };
         for k in 0..count {
             let rel = k.wrapping_sub(u32::from(first));
@@ -6011,6 +6024,17 @@ impl<'a> Lower<'a> {
             }
             _ => Ok((0, None)),
         }
+    }
+
+    /// A structured descriptor table entry backed by a host raw view.
+    fn raw_structured_stride(used: Option<&UsedResource>) -> Option<u32> {
+        let used = used?;
+        (super::raw_structured_views()
+            && used.root == RootType::Table
+            && used.kind != ResourceType::Cbv
+            && used.stride >= 4
+            && used.stride.is_multiple_of(4))
+        .then_some(used.stride)
     }
 
     /// The byte stride of the structured buffer that the used-resource entry
@@ -10559,6 +10583,17 @@ impl<'a> Lower<'a> {
                 None
             }
             index => index,
+        };
+        // The descriptor itself is raw in this mode. Preserve the title's
+        // structured address calculation before using the byte-view handle.
+        let index = match (index, Self::raw_structured_stride(used)) {
+            (Some(index), Some(stride)) if !typed && format.is_none() => {
+                let stride = self.s.m.i32(stride);
+                let row = self.s.m.bin(c, Bin::Mul, index, stride);
+                off = self.s.m.bin(c, Bin::Add, row, off);
+                None
+            }
+            _ => index,
         };
         let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };

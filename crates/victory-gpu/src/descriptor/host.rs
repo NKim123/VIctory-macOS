@@ -2050,82 +2050,53 @@ fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     }
 }
 
-/// The byte stride of a buffer view (its element size, at least 1), 0 for
-/// other views: what the view-stride table holds for it.
-fn view_stride(view: &View) -> u32 {
-    let (unordered, words): (bool, &[u32; 10]) = match view {
-        // Read as raw buffers (`make`).
-        View::Constant(..) => return 4,
+/// Format, structure stride and raw flag from a console buffer descriptor.
+fn buffer_layout(view: &View) -> Option<(DXGI_FORMAT, u32, bool)> {
+    let (unordered, words) = match view {
         View::Shader(_, Some(desc)) => (false, desc),
         View::Unordered(_, _, Some(desc)) => (true, desc),
         View::Placed(unordered, resource, desc) if resource[0] == 1 => {
-            match desc[..10].try_into() {
-                Ok(words) => (*unordered, words),
-                Err(_) => return 0,
-            }
+            (*unordered, desc[..10].try_into().ok()?)
         }
-        _ => return 0,
+        _ => return None,
     };
-    // The view dimension: buffer (1) for shader and unordered views alike.
     if words[1] != 1 {
-        return 0;
+        return None;
     }
-    let element = if unordered {
+    if unordered {
         let desc = uav_desc(words);
-        // SAFETY: a buffer view's union member.
+        // SAFETY: dimension 1 selects the buffer union member.
         let buffer = unsafe { desc.Anonymous.Buffer };
         let raw = buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
-        buffer_element(buffer.StructureByteStride, raw, desc.Format.0).unwrap_or(0)
-    } else {
-        element_size(&srv_desc(words))
-    };
-    // Nonzero: shaders taking views at computed indices read the null buffer
-    // view where the table holds 0 (`victory_shader::emit`).
-    element.max(1) as u32
-}
-
-/// The view-stride table's format-kind bits of a buffer view: a typed view
-/// (no structure stride, not raw) of an integer format gets
-/// `VIEW_INTEGER`, a signed one also `VIEW_SIGNED`; anything else none.
-/// Translated shaders select integer typed-buffer overloads for such views,
-/// and pass their 16-bit typed data as bits (`victory_shader::emit`, "d16").
-fn view_kind(view: &View) -> u32 {
-    use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
-    let (unordered, words): (bool, &[u32; 10]) = match view {
-        View::Shader(_, Some(desc)) => (false, desc),
-        View::Unordered(_, _, Some(desc)) => (true, desc),
-        View::Placed(unordered, resource, desc) if resource[0] == 1 => {
-            match desc[..10].try_into() {
-                Ok(words) => (*unordered, words),
-                Err(_) => return 0,
-            }
-        }
-        _ => return 0,
-    };
-    // Buffer views only (dimension 1); a structured or raw one is no typed view.
-    let (format, typed) = if unordered {
-        let desc = uav_desc(words);
-        // SAFETY: a buffer view's union member.
-        let b = unsafe { desc.Anonymous.Buffer };
-        let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
-        (
-            desc.Format.0 as u32,
-            typed_buffer(b.StructureByteStride, raw),
-        )
+        Some((desc.Format, buffer.StructureByteStride, raw))
     } else {
         let desc = srv_desc(words);
-        // SAFETY: a buffer view's union member.
-        let b = unsafe { desc.Anonymous.Buffer };
-        let raw = b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
-        (
-            desc.Format.0 as u32,
-            typed_buffer(b.StructureByteStride, raw),
-        )
+        // SAFETY: dimension 1 selects the buffer union member.
+        let buffer = unsafe { desc.Anonymous.Buffer };
+        let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
+        Some((desc.Format, buffer.StructureByteStride, raw))
+    }
+}
+
+/// The console byte stride in the shader's view-stride table. A zero
+/// tells heap-indexed shaders to read the null buffer view.
+fn view_stride(view: &View) -> u32 {
+    if matches!(view, View::Constant(..)) {
+        return 4;
+    }
+    let Some((format, stride, raw)) = buffer_layout(view) else {
+        return 0;
     };
-    match (words[1] == 1 && typed)
-        .then(|| integer_format(format))
-        .flatten()
-    {
+    buffer_element(stride, raw, format.0).unwrap_or(0).max(1) as u32
+}
+
+/// The view-stride table's format-kind bits of a typed integer buffer view.
+fn view_kind(view: &View) -> u32 {
+    use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
+    let Some((format, 0, false)) = buffer_layout(view) else {
+        return 0;
+    };
+    match integer_format(format.0 as u32) {
         Some(true) => VIEW_INTEGER | VIEW_SIGNED,
         Some(false) => VIEW_INTEGER,
         None => 0,
@@ -2155,21 +2126,8 @@ fn widened_w(format: i32) -> Option<u32> {
 /// Whether `view` is a typed three-channel 32-bit SRV backed by a widened
 /// host copy under Wine.
 pub(crate) fn three_channel_srv(view: &View) -> bool {
-    let words: &[u32; 10] = match view {
-        View::Shader(_, Some(desc)) => desc,
-        View::Placed(false, resource, desc) if resource[0] == 1 => match desc[..10].try_into() {
-            Ok(words) => words,
-            Err(_) => return false,
-        },
-        _ => return false,
-    };
-    let desc = srv_desc(words);
-    // SAFETY: a buffer view's union member.
-    let buffer = unsafe { desc.Anonymous.Buffer };
-    let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
-    desc.ViewDimension == D3D12_SRV_DIMENSION_BUFFER
-        && matches!(desc.Format.0, 6..=8)
-        && typed_buffer(buffer.StructureByteStride, raw)
+    matches!(view, View::Shader(..) | View::Placed(false, ..))
+        && matches!(buffer_layout(view), Some((DXGI_FORMAT(6..=8), 0, false)))
 }
 
 /// Whether a DXGI format is an integer one, and if so whether signed:
@@ -2350,12 +2308,36 @@ pub(crate) fn view_owner(view: &View) -> Option<BufferView> {
     Some((crate::shadow::find(address, len)?, address, len))
 }
 
+/// The host uses a raw descriptor for a structured view of whole dwords.
+fn structured_as_raw(format: DXGI_FORMAT, stride: u32) -> bool {
+    format == DXGI_FORMAT_UNKNOWN
+        && stride >= 4
+        && stride.is_multiple_of(4)
+        && victory_shader::emit::raw_structured_views()
+}
+
+/// D3DMetal accepts dword offsets for raw descriptors (tested under Wine).
+/// Keep D3D12's base alignment on native drivers.
+fn raw_structured_alignment() -> u64 {
+    if crate::under_wine() {
+        4
+    } else {
+        u64::from(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)
+    }
+}
+
 /// The exact copy the host view reads, including an alignment copy when needed.
 pub(crate) fn align_view_copy(
     view: &View,
     (owner, address, len): BufferView,
 ) -> Option<BufferView> {
-    let (shadow, _) = crate::shadow::view_in(owner, address, len, u64::from(view_stride(view)))?;
+    let (format, stride, raw) = buffer_layout(view)?;
+    let alignment = if structured_as_raw(format, stride) {
+        raw_structured_alignment()
+    } else {
+        buffer_element(stride, raw, format.0).unwrap_or(1)
+    };
+    let (shadow, _) = crate::shadow::view_in(owner, address, len, alignment)?;
     Some((shadow, address, len))
 }
 
@@ -2494,26 +2476,39 @@ fn buffer_srv(
     }
     // The copy its own bytes are in, its first element counted from there.
     let start = address + buffer.FirstElement * element;
-    let Some((shadow, own)) = descriptor_shadow(
-        start,
-        u64::from(buffer.NumElements) * element,
-        element,
-        backing,
-    ) else {
+    let count = buffer.NumElements;
+    let bytes = u64::from(count) * element;
+    let as_raw = structured_as_raw(desc.Format, buffer.StructureByteStride);
+    let alignment = if as_raw {
+        raw_structured_alignment()
+    } else {
+        element
+    };
+    let Some((shadow, own)) = descriptor_shadow(start, bytes, alignment, backing) else {
         #[cfg(feature = "diagnostics")]
         if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
             tracing::info!(
                 start = format_args!("{start:#x}"),
                 len,
                 element,
-                count = buffer.NumElements,
+                count,
                 "refused buffer view: no host copy"
             );
         }
         return None;
     };
+    let count = if as_raw {
+        desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        buffer.StructureByteStride = 0;
+        buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+        buffer.NumElements = u32::try_from(bytes / 4).ok()?;
+        buffer.NumElements
+    } else {
+        count
+    };
+    let element = if as_raw { 4 } else { element };
     buffer.FirstElement = shadow.offset(start) / element;
-    let (first, count) = (buffer.FirstElement, buffer.NumElements);
+    let first = buffer.FirstElement;
     if !in_buffer(&shadow.buffer, first, count, element) {
         #[cfg(feature = "diagnostics")]
         if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
@@ -2535,22 +2530,13 @@ fn buffer_srv(
     }
     let host = host()?;
     if crate::under_wine()
-        && matches!(desc.Format.0, 6..=8)
-        && let Some(w) = widened_w(desc.Format.0)
-        && let Some(widened) = shadow.widened(start, u64::from(count) * 12, w)
+        && typed_buffer(
+            buffer.StructureByteStride,
+            buffer.Flags == D3D12_BUFFER_SRV_FLAG_RAW,
+        )
+        && let Some(widened) = widen_srv(&host.device, &shadow, start, count, desc, at)
     {
-        desc.Format = widened_format(desc.Format.0).expect("a three-channel format");
-        buffer.FirstElement = 0;
-        buffer.NumElements = count;
-        // SAFETY: a live widened buffer and a slot of our heap.
-        unsafe {
-            host.device
-                .CreateShaderResourceView(&widened.buffer, Some(&desc), at)
-        };
-        return Some(Some((
-            widened.buffer.clone(),
-            Some(HeldSource::Widened(widened, shadow.clone())),
-        )));
+        return Some(widened);
     }
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -2560,6 +2546,28 @@ fn buffer_srv(
     Some(Some((
         shadow.buffer.clone(),
         own.then(|| HeldSource::Shadow(shadow)),
+    )))
+}
+
+fn widen_srv(
+    device: &ID3D12Device,
+    source: &std::sync::Arc<crate::shadow::Shadow>,
+    start: u64,
+    count: u32,
+    mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+) -> Option<Kept> {
+    let w = widened_w(desc.Format.0)?;
+    let widened = source.widened(start, u64::from(count) * 12, w)?;
+    desc.Format = widened_format(desc.Format.0)?;
+    // SAFETY: a buffer SRV and a live widened buffer in a slot of our heap.
+    unsafe {
+        desc.Anonymous.Buffer.FirstElement = 0;
+        device.CreateShaderResourceView(&widened.buffer, Some(&desc), at);
+    }
+    Some(Some((
+        widened.buffer.clone(),
+        Some(HeldSource::Widened(widened, source.clone())),
     )))
 }
 
@@ -2615,18 +2623,27 @@ fn buffer_uav(
         return None;
     }
     let start = address + buffer.FirstElement * element;
-    let (shadow, own) = descriptor_shadow(
-        start,
-        u64::from(buffer.NumElements) * element,
-        element,
-        backing,
-    )?;
+    let bytes = u64::from(buffer.NumElements) * element;
+    let as_raw = structured_as_raw(desc.Format, buffer.StructureByteStride);
+    let alignment = if as_raw {
+        raw_structured_alignment()
+    } else {
+        element
+    };
+    let (shadow, own) = descriptor_shadow(start, bytes, alignment, backing)?;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
         once!("unordered access to a buffer whose host copy shaders cannot write");
         return None;
     }
+    if as_raw {
+        desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        buffer.StructureByteStride = 0;
+        buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        buffer.NumElements = u32::try_from(bytes / 4).ok()?;
+    }
+    let element = if as_raw { 4 } else { element };
     buffer.FirstElement = shadow.offset(start) / element;
     buffer.CounterOffsetInBytes = 0;
     let (first, count) = (buffer.FirstElement, buffer.NumElements);
@@ -3154,7 +3171,21 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         View::Constant(..) => return null_buffer_view(at),
         _ => return null_view(at),
     };
-    let desc = if buffer {
+    let desc = if buffer_layout(view)
+        .is_some_and(|(format, stride, _)| structured_as_raw(format, stride))
+    {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    NumElements: 1,
+                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                    ..Default::default()
+                },
+            },
+        }
+    } else if buffer {
         D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_UINT,
             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
@@ -3342,6 +3373,122 @@ mod tests {
         assert_eq!(widened_w(7), Some(1));
         assert_eq!(widened_w(8), Some(1));
         assert_eq!(widened_w(2), None);
+    }
+
+    #[test]
+    fn off_element_structured_views_use_raw_descriptors_on_d3dmetal() {
+        if !crate::under_wine() || !victory_shader::emit::raw_structured_views() {
+            return;
+        }
+        let host = host().unwrap();
+        let alias = |data: &[u32]| {
+            let (buffer, mapped) = host.shared_buffer(65536).unwrap();
+            let base = mapped as u64;
+            // SAFETY: live mapping with room for all the initial dwords.
+            let gpu = unsafe {
+                std::ptr::copy_nonoverlapping(data.as_ptr(), mapped.cast::<u32>(), data.len());
+                buffer.GetGPUVirtualAddress()
+            };
+            crate::shadow::Shadow::new_aliased(buffer, mapped, gpu, base, 65536)
+        };
+        let source = alias(&[10, 20, 30, 40, 50, 60]);
+        let dest = alias(&[u32::MAX; 7]);
+        let start = source.range().0 + 4;
+        let end = dest.range().0 + 4;
+        let view = |uav, addr: u64, mut words: [u32; 16]| {
+            words[10] = addr as u32;
+            words[11] = (addr >> 32) as u32;
+            View::Placed(uav, [1, 0, 0, 0, 65536, 0, 1, 0, 0, 1, 0, 0, 0, 0], words)
+        };
+        let srv = view(
+            false,
+            start,
+            [
+                0,
+                1,
+                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                0,
+                0,
+                0,
+                1,
+                12,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+        let uav = view(true, end, [0, 1, 0, 0, 1, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(view_stride(&srv), 12);
+        assert_eq!(view_stride(&uav), 20);
+        let (srv_backing, _, _) = align_view_copy(&srv, (source.clone(), start, 12)).unwrap();
+        let (uav_backing, _, _) = align_view_copy(&uav, (dest.clone(), end, 20)).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&srv_backing, &source));
+        assert!(std::sync::Arc::ptr_eq(&uav_backing, &dest));
+        // SAFETY: plain descriptor heap creation.
+        let heap: ID3D12DescriptorHeap = unsafe {
+            host.device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 2,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    ..Default::default()
+                })
+        }
+        .unwrap();
+        // SAFETY: a live heap and the increment for this heap type.
+        let (cpu, gpu, step) = unsafe {
+            (
+                heap.GetCPUDescriptorHandleForHeapStart(),
+                heap.GetGPUDescriptorHandleForHeapStart(),
+                host.device
+                    .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
+            )
+        };
+        let (srv_buffer, _) = make(&srv, cpu, Some(&srv_backing)).flatten().unwrap();
+        let uav_cpu = D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: cpu.ptr + step as usize,
+        };
+        let uav_gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
+            ptr: gpu.ptr + u64::from(step),
+        };
+        let (uav_buffer, _) = make(&uav, uav_cpu, Some(&uav_backing)).flatten().unwrap();
+        assert_eq!(srv_buffer, source.buffer);
+        assert_eq!(uav_buffer, dest.buffer);
+        let (root, pso) = crate::compute::pipeline(
+            "ByteAddressBuffer src : register(t0);
+             RWByteAddressBuffer dst : register(u0);
+             [numthreads(1, 1, 1)] void main() {
+                 dst.Store4(0, uint4(src.Load(0), src.Load(4), src.Load(8), src.Load(12)));
+             }",
+            windows::core::s!("off-element raw views"),
+            0,
+            &[
+                crate::compute::Param::Table(&[crate::compute::srv(0, 1)]),
+                crate::compute::Param::Table(&[crate::compute::uav(0, 1)]),
+            ],
+        )
+        .unwrap();
+        let list = host.new_list().unwrap();
+        // SAFETY: an open list and live resources.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetComputeRootDescriptorTable(0, gpu);
+            list.list.SetComputeRootDescriptorTable(1, uav_gpu);
+            list.list.SetPipelineState(&pso);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(
+            dest.read_host(dest.range().0, 7),
+            [u32::MAX, 20, 30, 40, 0, u32::MAX, u32::MAX]
+        );
     }
 
     /// Three-channel 32-bit SRVs are backed by a widened copy on hosts that

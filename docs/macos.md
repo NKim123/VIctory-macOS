@@ -484,6 +484,13 @@ in title heaps and descriptor tables already use raw views in either mode.
 The switch is included in the translation cache key, and the host pipeline
 library hashes the resulting DXIL and root signature.
 
+Set `VICTORY_RAW_STRUCTURED_VIEWS=1` to use raw host SRVs and UAVs for
+structured buffers with strides that are multiples of four bytes. The
+shaders still use the title's stride to compute addresses and record counts.
+D3DMetal can then read or write an aliased or tiled buffer in place at a
+dword-aligned offset. Native D3D12 keeps its 16-byte raw descriptor alignment.
+The setting has its own shader-cache key.
+
 ## Experimental write tracking and descriptor sync
 
 `VICTORY_PORT_GUARD=1` lets write faults and refreshes share access to the
