@@ -1687,8 +1687,14 @@ impl Step {
     }
 }
 
-type ComputedOwnership = Box<dyn Fn(&mut crate::memory::ComputedBaselines) + Send>;
-type AfterWork = Box<dyn Fn(&mut crate::memory::ComputedBaselines, bool) + Send>;
+type AfterCallback = Box<dyn Fn(&mut crate::memory::ComputedBaselines, bool) + Send>;
+
+enum AfterWork {
+    Callback(AfterCallback),
+    Computed(crate::memory::Feedback),
+}
+
+#[cfg(test)]
 type MissedCheck = Box<dyn Fn(&crate::memory::ComputedBaselines) -> bool + Send>;
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -1740,9 +1746,6 @@ struct Deferred {
     view_writes: bool,
     /// Shader-visible heaps and the objects behind their descriptors.
     title_heaps: std::collections::HashMap<usize, Arc<crate::descriptor::host::HostHeap>>,
-    /// Computed pages with full baselines own those pages before any
-    /// post-fence merge can write CPU bytes into their shadows.
-    computed_ownership: Vec<ComputedOwnership>,
     /// Commands whose dependencies the submission worker cannot track.
     synchronous: bool,
     texture_writes: crate::texback::Wanted,
@@ -1751,6 +1754,7 @@ struct Deferred {
     /// Asked once the list has run, before anything goes back: whether its
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
+    #[cfg(test)]
     missed: Vec<MissedCheck>,
     /// Host copies filled by this list, available once its submission ran.
     texture_fills: Vec<crate::texture::Fill>,
@@ -1761,6 +1765,30 @@ struct Deferred {
 const DEFERRED_CACHE_ENTRIES: usize = 1024;
 
 impl Deferred {
+    fn has_computed_feedback(&self) -> bool {
+        self.after
+            .iter()
+            .any(|work| matches!(work, AfterWork::Computed(_)))
+    }
+
+    fn has_missed_checks(&self) -> bool {
+        #[cfg(test)]
+        if !self.missed.is_empty() {
+            return true;
+        }
+        self.has_computed_feedback()
+    }
+
+    fn missed(&self, baselines: &crate::memory::ComputedBaselines) -> bool {
+        #[cfg(test)]
+        if self.missed.iter().any(|check| check(baselines)) {
+            return true;
+        }
+        self.after
+            .iter()
+            .any(|work| matches!(work, AfterWork::Computed(feedback) if feedback.missed(baselines)))
+    }
+
     fn title_written(&mut self) {
         self.refreshed.clear();
         self.slots.clear();
@@ -2445,8 +2473,9 @@ impl Host {
             // The global bitmap can require synchronous completion of this
             // submission. Previous flights cannot need shadow copy-back,
             // so preparation can overlap until any real memory dependency.
-            runs.iter().find_map(|list| list.inflight_barrier(false))
+            runs.iter().find_map(|list| list.inflight_barrier(None))
         };
+        let mut overlapped = false;
         let owned = if let Some(why) = fallback {
             self.note_sync(submission, why);
             None
@@ -2462,7 +2491,7 @@ impl Host {
                 .iter()
                 .all(|&list| unique.insert(std::ptr::from_ref(list)))
             {
-                self.note_overlap(submission);
+                overlapped = self.note_overlap(submission);
                 owned
             } else {
                 self.note_sync(submission, Boundary::ReusedList);
@@ -2650,14 +2679,20 @@ impl Host {
         }
         batch.flush();
         let mut computed = crate::memory::ComputedBaselines::default();
-        if landing.is_some() {
+        if landing.is_some() || owned.is_some() {
             for list in runs {
                 for step in &list.deferred().copies {
                     if let Step::Memory(heap) = *step {
-                        computed.capture(heap);
+                        if landing.is_some() {
+                            computed.capture(heap);
+                        } else {
+                            computed.capture_layout(heap);
+                        }
                     }
                 }
             }
+        }
+        if landing.is_some() {
             for list in runs {
                 for step in &list.deferred().copies {
                     if let Step::GpuWrite(copy, address, len, _, _) = step {
@@ -2674,8 +2709,10 @@ impl Host {
             crate::copystat::C::FaultsPrep,
             crate::copystat::page_faults().saturating_sub(faults),
         );
-        let late_fallback =
-            owned.and_then(|_| runs.iter().find_map(|list| list.inflight_barrier(true)));
+        let mut late_fallback = owned.and_then(|_| {
+            runs.iter()
+                .find_map(|list| list.inflight_barrier(Some(&computed)))
+        });
         if let Some(owned) = owned
             && late_fallback.is_none()
             && uploads
@@ -2689,20 +2726,35 @@ impl Host {
             if self.make_flight_room(submission, owned.len(), bytes)
                 && let Some(marks) = self.flight_marks(submission, native_boundaries.len() + 1)
             {
-                SUBMISSION_US[0]
-                    .fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
-                self.enqueue_flight(
-                    submission,
-                    marks,
-                    lists,
-                    &native_boundaries,
-                    owned,
-                    uploads.and_then(crate::bindless::Uploads::into_owned),
-                    batch,
-                    std::mem::take(pending_pins),
-                    bytes,
-                );
-                return None;
+                let needs_feedback = runs.iter().any(|list| list.deferred().view_writes);
+                let feedback = needs_feedback
+                    .then(|| self.flight_feedback(submission))
+                    .flatten();
+                if !needs_feedback || feedback.is_some() {
+                    let computed = runs
+                        .iter()
+                        .any(|list| list.deferred().has_computed_feedback())
+                        .then_some(computed);
+                    SUBMISSION_US[0]
+                        .fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
+                    self.enqueue_flight(
+                        submission,
+                        marks,
+                        lists,
+                        &native_boundaries,
+                        owned,
+                        uploads.and_then(crate::bindless::Uploads::into_owned),
+                        batch,
+                        std::mem::take(pending_pins),
+                        bytes,
+                        feedback,
+                        computed,
+                        overlapped,
+                    );
+                    return None;
+                }
+                self.recycle_flight_marks(submission, marks);
+                late_fallback = Some(Boundary::MarkedBack);
             }
         }
         if owned.is_some() {
@@ -2993,13 +3045,13 @@ impl Host {
         // builder in one list, run light13).
         let missed: Vec<bool> = runs
             .iter()
-            .map(|list| list.deferred().missed.iter().any(|check| check(&computed)))
+            .map(|list| list.deferred().missed(&computed))
             .collect();
         crate::memory::note_submission(missed.contains(&true));
         let withholding = crate::memory::withholding();
         for (list, &missed) in runs.iter().zip(&missed) {
             let deferred = list.deferred();
-            let missed = missed || withholding && !deferred.missed.is_empty();
+            let missed = missed || withholding && deferred.has_missed_checks();
             for step in &deferred.copies {
                 if let Step::GpuWrite(shadow, address, len, _, memory) = step {
                     let key = (std::sync::Arc::as_ptr(shadow) as usize, *address, *len);
@@ -3036,8 +3088,10 @@ impl Host {
             .collect();
         if accept_landing && !withholding && computed.has_snapshots() {
             for list in runs {
-                for plan in &list.deferred().computed_ownership {
-                    plan(&mut computed);
+                for work in &list.deferred().after {
+                    if let AfterWork::Computed(feedback) = work {
+                        feedback.plan_ownership(&mut computed);
+                    }
                 }
             }
         }
@@ -3107,7 +3161,7 @@ impl Host {
         let can_land_texture = |i, list: &HostList, missed| {
             ran(i)
                 && !unconfirmed_lists.contains(&std::ptr::from_ref(list))
-                && !(missed || withholding && !list.deferred().missed.is_empty())
+                && !(missed || withholding && list.deferred().has_missed_checks())
         };
         // Retiling reads only this list's fence-completed readback. Prepare
         // at most one texture while the worker merges buffer shadows, and
@@ -3147,7 +3201,12 @@ impl Host {
                     }
                 }
                 for work in &deferred.after {
-                    work(&mut computed, accept_landing);
+                    match work {
+                        AfterWork::Callback(work) => work(&mut computed, accept_landing),
+                        AfterWork::Computed(feedback) => {
+                            feedback.finish(&mut computed, accept_landing, false);
+                        }
+                    }
                 }
             }
         });
@@ -4255,6 +4314,7 @@ impl HostList {
 
     /// After the list has run, before its writes go back: `check` says
     /// whether its shaders read title memory with no copy.
+    #[cfg(test)]
     pub(crate) fn defer_missed(
         &self,
         check: impl Fn(&crate::memory::ComputedBaselines) -> bool + Send + 'static,
@@ -4273,12 +4333,8 @@ impl HostList {
         self.defer_after_with_baselines(move |_, _| work());
     }
 
-    /// Plans computed page ownership after the GPU and before write-back.
-    pub(crate) fn defer_computed_ownership(
-        &self,
-        work: impl Fn(&mut crate::memory::ComputedBaselines) + Send + 'static,
-    ) {
-        self.deferred().computed_ownership.push(Box::new(work));
+    pub(crate) fn defer_memory_feedback(&self, feedback: crate::memory::Feedback) {
+        self.deferred().after.push(AfterWork::Computed(feedback));
     }
 
     /// Consumes computed-memory write-back marks with this submission's
@@ -4287,7 +4343,9 @@ impl HostList {
         &self,
         work: impl Fn(&mut crate::memory::ComputedBaselines, bool) + Send + 'static,
     ) {
-        self.deferred().after.push(Box::new(work));
+        self.deferred()
+            .after
+            .push(AfterWork::Callback(Box::new(work)));
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
@@ -4313,21 +4371,35 @@ impl HostList {
         self.deferred().synchronous = true;
     }
 
-    fn inflight_barrier(&self, shared_marks: bool) -> Option<Boundary> {
+    fn inflight_barrier(
+        &self,
+        computed: Option<&crate::memory::ComputedBaselines>,
+    ) -> Option<Boundary> {
         let d = self.deferred();
+        #[cfg(test)]
+        if !d.missed.is_empty() {
+            return Some(Boundary::ComputedBack);
+        }
         if d.synchronous {
             Some(Boundary::Synchronous)
         } else if !d.texture_fills.is_empty() {
             Some(Boundary::Descriptors)
         } else if !d.texture_backs.is_empty() {
             Some(Boundary::TextureBack)
-        } else if !d.after.is_empty() || !d.missed.is_empty() || !d.computed_ownership.is_empty() {
+        } else if d.after.iter().any(|work| match work {
+            AfterWork::Callback(_) => true,
+            AfterWork::Computed(feedback) => {
+                computed.is_some_and(|b| !feedback.only_plain_tiles(b))
+            }
+        }) {
             Some(Boundary::ComputedBack)
-        } else if d.copies.iter().any(
-            |step| matches!(step, Step::GpuWrite(copy, ..) if !copy.is_aliased() || !copy.clean()),
-        ) {
+        } else if d.copies.iter().any(|step| {
+            matches!(step, Step::GpuWrite(copy, address, len, ..)
+                if !copy.is_aliased()
+                    || copy.refresh_range(*address, address.saturating_add(*len)).is_some())
+        }) {
             Some(Boundary::ShadowBack)
-        } else if shared_marks && d.view_writes && crate::shadow::has_copy_back_marks() {
+        } else if computed.is_some() && d.view_writes && crate::shadow::has_copy_back_marks() {
             Some(Boundary::MarkedBack)
         } else {
             None
@@ -4417,10 +4489,9 @@ impl HostList {
             || !deferred.kept.is_empty()
             || !deferred.ambient.is_empty()
             || !deferred.after.is_empty()
-            || !deferred.computed_ownership.is_empty()
             || !deferred.texture_backs.is_empty()
             || !deferred.texture_fills.is_empty()
-            || !deferred.missed.is_empty()
+            || deferred.has_missed_checks()
             || !deferred.writes.is_empty()
             || !deferred.waits.is_empty()
         {
@@ -4460,7 +4531,7 @@ impl HostList {
             && d.after.is_empty()
             && d.texture_backs.is_empty()
             && d.texture_fills.is_empty()
-            && d.missed.is_empty();
+            && !d.has_missed_checks();
         drop(d);
         deferred_empty
             && self.states.lock().unwrap_or_else(|e| e.into_inner()).is_empty()

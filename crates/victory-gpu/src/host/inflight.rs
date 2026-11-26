@@ -32,6 +32,7 @@ pub(super) struct Submission {
     pub(super) value: u64,
     flights: VecDeque<InFlight>,
     marks: Vec<Vec<Mark>>,
+    feedback: Vec<MarkFeedback>,
     upload_list: Option<Box<HostList>>,
     bytes: u64,
     lists: usize,
@@ -41,6 +42,7 @@ pub(super) struct InFlight {
     value: u64,
     marks: Vec<Mark>,
     active_marks: usize,
+    feedback: Option<MarkFeedback>,
     native_lists: Vec<Option<ID3D12CommandList>>,
     lists: Vec<Arc<HostList>>,
     upload: Option<crate::bindless::OwnedUpload>,
@@ -49,10 +51,84 @@ pub(super) struct InFlight {
     _batch: Batch,
     _pins: Vec<crate::descriptor::ViewPin>,
     _retired: Vec<crate::descriptor::host::Held>,
+    computed: Option<crate::memory::ComputedBaselines>,
     bytes: u64,
     writes: Vec<BottomWrite>,
     shared_writes: bool,
     signals: Vec<TitleSignal>,
+}
+
+/// A slot's readback of the page bits. Read marks and atomic lock words stay
+/// in the shared UAV. Only this slot's fence allows the CPU to see its copy.
+pub(super) struct MarkFeedback {
+    list: ID3D12GraphicsCommandList,
+    _allocator: ID3D12CommandAllocator,
+    _readback: ID3D12Resource,
+    data: usize,
+    mark: Mark,
+}
+
+impl MarkFeedback {
+    fn new(host: &Host) -> Option<Self> {
+        use crate::shadow::WRITE_MARK_BYTES as BYTES;
+        let sources = crate::shadow::write_mark_buffers()?;
+        static ZERO: OnceLock<Option<ID3D12Resource>> = OnceLock::new();
+        let zero = ZERO
+            .get_or_init(|| {
+                let (buffer, data) = host.mapped_buffer(BYTES, false)?;
+                // SAFETY: new upload storage of BYTES bytes, only read after
+                // publication by the OnceLock.
+                unsafe { data.write_bytes(0, BYTES as usize) };
+                Some(buffer)
+            })
+            .as_ref()?;
+        let (readback, data) = host.mapped_buffer(2 * BYTES, true)?;
+        // SAFETY: a fresh allocator and a separate ExecuteCommandLists
+        // call. D3D12 buffers decay to COMMON between calls, so the page
+        // copies follow all writes in this flight and precede the next.
+        unsafe {
+            let allocator: ID3D12CommandAllocator = host
+                .device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .ok()?;
+            let list: ID3D12GraphicsCommandList = host
+                .device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                .ok()?;
+            for (index, &source) in sources.iter().enumerate() {
+                list.ResourceBarrier(&[transition(
+                    source,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                list.CopyBufferRegion(&readback, index as u64 * BYTES, source, 0, BYTES);
+                list.ResourceBarrier(&[transition(
+                    source,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )]);
+                list.CopyBufferRegion(source, 0, zero, 0, BYTES);
+            }
+            list.Close().ok()?;
+            name(&list, || "in-flight UAV page feedback".into());
+            Some(Self {
+                list,
+                _allocator: allocator,
+                _readback: readback,
+                data: data as usize,
+                mark: Mark::new(host).ok()?,
+            })
+        }
+    }
+
+    fn notify(&self) {
+        let words = (crate::shadow::WRITE_MARK_BYTES / 4) as usize;
+        // SAFETY: a completed fence for both sections of this slot.
+        let bits = unsafe { std::slice::from_raw_parts(self.data as *const u32, 2 * words) };
+        for map in bits.chunks_exact(words) {
+            crate::shadow::notify_aliased_marks(map);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -114,7 +190,9 @@ pub(super) enum Boundary {
 }
 
 static QUEUED: AtomicU64 = AtomicU64::new(0);
+static QUEUED_COMPUTED: AtomicU64 = AtomicU64::new(0);
 static OVERLAPPED: AtomicU64 = AtomicU64::new(0);
+static QUEUED_OVERLAPPED: AtomicU64 = AtomicU64::new(0);
 static FALLBACKS: [AtomicU64; Boundary::Fence as usize + 1] =
     [const { AtomicU64::new(0) }; Boundary::Fence as usize + 1];
 static DRAINS: [AtomicU64; Boundary::Fence as usize + 1] =
@@ -133,14 +211,19 @@ pub(super) fn log(frames: f64) {
         Boundary::ShadowBack,
     ];
     let [texture_back, computed_back, marked_back, shadow_back] = back.map(sync);
+    let (mark_copies, mark_widened) = crate::shadow::mark_landing_owners();
     tracing::info!(
         frames,
         queued = QUEUED.swap(0, Ordering::Relaxed),
+        queued_computed = QUEUED_COMPUTED.swap(0, Ordering::Relaxed),
         overlapped = OVERLAPPED.swap(0, Ordering::Relaxed),
+        queued_overlapped = QUEUED_OVERLAPPED.swap(0, Ordering::Relaxed),
         synchronous_copy_back = texture_back + computed_back + marked_back + shadow_back,
         synchronous_texture_back = texture_back,
         synchronous_computed_back = computed_back,
         synchronous_marked_back = marked_back,
+        mark_copies,
+        mark_widened,
         synchronous_shadow_back = shadow_back,
         synchronous_bottom_of_pipe = sync(Boundary::BottomOfPipe),
         synchronous_descriptors = sync(Boundary::Descriptors),
@@ -304,9 +387,18 @@ impl Host {
         let mut completions = Vec::new();
         while s.flights.front().is_some_and(|f| f.value <= completed) {
             let f = s.flights.pop_front().expect("completed flight");
+            let mut feedback_ran = true;
+            if let Some(feedback) = f.feedback {
+                feedback_ran = feedback.mark.saw(f.value);
+                if feedback_ran {
+                    feedback.notify();
+                }
+                s.feedback.push(feedback);
+            }
             let ran = f.marks[..f.active_marks]
                 .iter()
-                .all(|mark| submission_ran(mark, f.value));
+                .all(|mark| submission_ran(mark, f.value))
+                && feedback_ran;
             if !ran && recovery_mark.is_none() {
                 DRAINS[Boundary::Recovery as usize].fetch_add(1, Ordering::Relaxed);
                 if let Some(last) = s.flights.back()
@@ -339,6 +431,19 @@ impl Host {
                 }
                 s.recycle_upload(upload.list);
             }
+            let missed = f.computed.as_ref().is_some_and(|baselines| {
+                f.lists.iter().any(|list| list.deferred().missed(baselines))
+            });
+            crate::memory::note_submission(missed);
+            if let Some(mut baselines) = f.computed {
+                for list in &f.lists {
+                    for work in &list.deferred().after {
+                        if let AfterWork::Computed(feedback) = work {
+                            feedback.finish(&mut baselines, ran, true);
+                        }
+                    }
+                }
+            }
             for list in f.lists {
                 list.notify_aliased_writes();
                 crate::list::recycle(list);
@@ -351,7 +456,6 @@ impl Host {
             if !f.writes.is_empty() || !f.signals.is_empty() {
                 completions.push((f.writes, f.signals));
             }
-            crate::memory::note_submission(false);
         }
         if let Some(marks) = recovery_mark {
             self.lost(&mut s.value, &marks[0]);
@@ -412,6 +516,14 @@ impl Host {
         Some(marks)
     }
 
+    pub(super) fn flight_feedback(&self, s: &mut Submission) -> Option<MarkFeedback> {
+        s.feedback.pop().or_else(|| MarkFeedback::new(self))
+    }
+
+    pub(super) fn recycle_flight_marks(&self, s: &mut Submission, marks: Vec<Mark>) {
+        s.marks.push(marks);
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn enqueue_flight(
         &self,
@@ -424,8 +536,14 @@ impl Host {
         batch: Batch,
         pins: Vec<crate::descriptor::ViewPin>,
         bytes: u64,
+        feedback: Option<MarkFeedback>,
+        computed: Option<crate::memory::ComputedBaselines>,
+        overlapped: bool,
     ) {
         let started = Instant::now();
+        if computed.is_some() {
+            QUEUED_COMPUTED.fetch_add(1, Ordering::Relaxed);
+        }
         let mut writes = Vec::new();
         for list in lists {
             writes.extend_from_slice(&list.deferred().writes);
@@ -445,7 +563,7 @@ impl Host {
             None
         };
         let active_marks = boundaries.len() + 1;
-        let mut marked = Vec::with_capacity(native_lists.len() + active_marks);
+        let mut marked = Vec::with_capacity(native_lists.len() + active_marks + 2);
         let mut first = 0;
         for (&end, mark) in boundaries.iter().chain([&native_lists.len()]).zip(&marks) {
             mark.arm(value);
@@ -463,6 +581,15 @@ impl Host {
             unsafe { queue.ExecuteCommandLists(&marked[here..]) };
             first = end;
         }
+        if let Some(feedback) = &feedback {
+            feedback.mark.arm(value);
+            let here = marked.len();
+            marked.push(feedback.list.cast().ok());
+            marked.push(feedback.mark.list());
+            // SAFETY: follows the title work on the same queue, in a
+            // separate call. Both lists are retained by the flight.
+            unsafe { queue.ExecuteCommandLists(&marked[here..]) };
+        }
         #[cfg(feature = "diagnostics")]
         crate::resource::life::note(0, crate::resource::life::SUBMITTED, value, 0);
         s.lists += lists.len();
@@ -471,6 +598,7 @@ impl Host {
             value,
             marks,
             active_marks,
+            feedback,
             native_lists: marked,
             lists: lists.to_vec(),
             upload,
@@ -479,6 +607,7 @@ impl Host {
             _batch: batch,
             _pins: pins,
             _retired: take_retired(),
+            computed,
             bytes,
             writes,
             shared_writes,
@@ -488,6 +617,9 @@ impl Host {
             self.flight_device_removed(s);
         }
         QUEUED.fetch_add(1, Ordering::Relaxed);
+        if overlapped {
+            QUEUED_OVERLAPPED.fetch_add(1, Ordering::Relaxed);
+        }
         SUBMISSION_US[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 
@@ -498,14 +630,16 @@ impl Host {
         }
     }
 
-    pub(super) fn note_overlap(&self, s: &Submission) {
+    pub(super) fn note_overlap(&self, s: &Submission) -> bool {
         if let Some(last) = s.flights.back() {
             // SAFETY: a live fence. An earlier GPU submission was still
             // pending when this caller acquired the lock to prepare work.
             if unsafe { self.fence.GetCompletedValue() } < last.value {
                 OVERLAPPED.fetch_add(1, Ordering::Relaxed);
+                return true;
             }
         }
+        false
     }
 
     /// Publish the emulated fence, including its raw title-visible address,
