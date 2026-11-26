@@ -17,6 +17,9 @@ use super::{VIEW_TAG, View, ViewPin, changed_records, record_at, view_at, views_
 use crate::host::host;
 use crate::resource::HostTexture;
 
+mod templates;
+use templates::Templates;
+
 /// Opt-in. Use null SRVs in shared title slots until the first upload runs.
 pub(crate) fn show_after() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -71,6 +74,7 @@ struct Mirrored {
     keys: Vec<u64>,
     /// Unpublished texture SRVs, guarded by the same lock as the records.
     pending: BTreeMap<u32, PendingTexture>,
+    templates: OnceLock<Option<Templates>>,
 }
 
 /// Header and index captured in one scan. The x86-64 scanner writes this layout.
@@ -84,6 +88,12 @@ pub(super) struct Candidate {
 struct SlotScan {
     candidates: Vec<Candidate>,
     forgot: u64,
+}
+
+enum Publication {
+    Clear(u32),
+    View(u32, ViewPin, Option<BufferView>),
+    Skipped(ViewPin),
 }
 
 const SYNC_BLOCK_SLOTS: u32 = 128;
@@ -428,6 +438,7 @@ impl HostHeap {
             made: Mutex::new(Mirrored {
                 keys: vec![0; count as usize],
                 pending: BTreeMap::new(),
+                templates: OnceLock::new(),
             }),
             made_nonzero: (0..(count as usize).div_ceil(64))
                 .map(|_| AtomicU64::new(0))
@@ -807,9 +818,18 @@ impl HostHeap {
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
+        self.clear_descriptor(index, None);
+        if index < self.count {
+            self.viewed.set(index, None, false);
+        }
+    }
+
+    fn clear_descriptor(&self, index: u32, template: Option<D3D12_CPU_DESCRIPTOR_HANDLE>) {
         self.invalidate_ambient(index);
         self.invalidate_texture_binding(index);
-        if self.sampler {
+        if let Some(src) = template {
+            templates::copy(self.sampler, self.cpu(index), src);
+        } else if self.sampler {
             self.null_sampler(index);
         } else {
             null_view(self.cpu(index));
@@ -818,9 +838,6 @@ impl HostHeap {
         self.set_stride(index, None);
         self.set_mark(index, None);
         self.note_address(index, None);
-        if index < self.count {
-            self.viewed.set(index, None, false);
-        }
     }
 
     /// Enters the byte stride of `view` (0 for none or not a buffer view)
@@ -929,6 +946,13 @@ impl HostHeap {
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         // A slot that held nothing and gets nothing is left alone (no page).
         if let Some(slot) = kept.slot(index as usize, resource.is_some()) {
+            if let (Some((old, old_source)), Some((new, new_source))) =
+                (slot.as_ref(), resource.as_ref())
+                && windows::core::Interface::as_raw(old) == windows::core::Interface::as_raw(new)
+                && same_lease(old_source.as_ref(), new_source.as_ref())
+            {
+                return;
+            }
             let old_widened = slot.as_ref().and_then(|(_, source)| match source {
                 Some(HeldSource::Widened(view, _)) => Some(view.clone()),
                 _ => None,
@@ -1339,9 +1363,19 @@ impl HostHeap {
             };
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::SyncChanged, stale.len() as u64);
-            for (index, record, previous) in stale {
+            let mut rest = stale.as_slice();
+            let mut published = Vec::new();
+            while let Some(&(index, record, previous)) = rest.first() {
+                if templates::enabled() {
+                    let n = self.publish_templates(rest, start, step, &mut published);
+                    if n != 0 {
+                        rest = &rest[n..];
+                        continue;
+                    }
+                }
                 let address = start + u64::from(index) * step;
                 let _ = self.mirror_record(index, false, Some((previous, address)), || record);
+                rest = &rest[1..];
             }
         }
 
@@ -1352,6 +1386,115 @@ impl HostHeap {
                 self.block_forgot[b as usize].store(forgot, Ordering::Release);
             }
         }
+    }
+
+    /// Publish a run of already-made templates. Hold the mirror lock
+    /// through the bindless updates, then expose the ready keys together.
+    /// A miss keeps the caller's slot order and takes the ordinary path.
+    fn publish_templates(
+        &self,
+        records: &[(u32, [u32; 3], u64)],
+        start: u64,
+        step: u64,
+        published: &mut Vec<Publication>,
+    ) -> usize {
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let mut taken = 0;
+        for &(index, record, previous) in records.iter().take(64) {
+            let Some(templates) = made.templates.get().and_then(Option::as_ref) else {
+                break;
+            };
+            let address = start + u64::from(index) * step;
+            if made.keys[index as usize] != previous {
+                taken += 1;
+                continue;
+            }
+            if record[0] != VIEW_TAG {
+                taken += 1;
+                if self.snapshot_matches(index, address, record) {
+                    let null = templates.null();
+                    self.clear_record(&mut made, index, Some(null));
+                    published.push(Publication::Clear(index));
+                }
+                continue;
+            }
+            let key = record_key(record);
+            let Some(hit) = templates.get(key, crate::shadow::lookup_epoch()) else {
+                break;
+            };
+            let Some(view) = view_at(record[1], record[2]) else {
+                break;
+            };
+            taken += 1;
+            if !self.snapshot_matches(index, address, record) {
+                published.push(Publication::Skipped(view));
+                continue;
+            }
+            self.begin_record(&mut made, index, key, &view);
+            made.pending.remove(&index);
+            templates::copy(self.sampler, self.cpu(index), hit.at);
+            self.set_mark(index, hit.mark);
+            self.keep(index, hit.held);
+            published.push(Publication::View(index, view, hit.backing));
+        }
+        let mut bindings = self.viewed.updates();
+        let mut hits = 0;
+        for publication in published.iter_mut() {
+            match publication {
+                Publication::Clear(index) => bindings.clear(*index),
+                Publication::View(index, view, backing) => {
+                    if let Some(backing) = backing.take() {
+                        let uav = matches!(**view, View::Unordered(..) | View::Placed(true, ..));
+                        bindings.buffer(*index, backing, uav);
+                    }
+                    self.ready[*index as usize].store(view.key, Ordering::Release);
+                    hits += 1;
+                }
+                Publication::Skipped(_pin) => {}
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::SyncTemplateHits, hits);
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = hits;
+        // ViewPins can release a resource and retire its bindless entries.
+        drop(bindings);
+        drop(made);
+        published.clear();
+        taken
+    }
+
+    fn begin_record(&self, made: &mut Mirrored, index: u32, key: u64, view: &View) {
+        self.invalidate_ambient(index);
+        self.ready[index as usize].store(0, Ordering::Relaxed);
+        self.invalidate_texture_binding(index);
+        self.set_stride(index, Some(view));
+        self.note_address(index, Some(view));
+        made.keys[index as usize] = key;
+        self.set_made_nonzero(index, true);
+    }
+
+    fn clear_record(
+        &self,
+        made: &mut Mirrored,
+        index: u32,
+        template: Option<D3D12_CPU_DESCRIPTOR_HANDLE>,
+    ) {
+        self.ready[index as usize].store(0, Ordering::Relaxed);
+        made.keys[index as usize] = 0;
+        made.pending.remove(&index);
+        self.set_made_nonzero(index, false);
+        self.clear_descriptor(index, template);
+    }
+
+    fn snapshot_matches(&self, index: u32, address: u64, record: [u32; 3]) -> bool {
+        let ready = &self.ready[index as usize];
+        let saved = ready.swap(0, Ordering::AcqRel);
+        let matches = header_matches(address, record);
+        if !matches {
+            ready.store(saved, Ordering::Release);
+        }
+        matches
     }
 
     /// Whether the view made in slot `index` must be made again for a draw
@@ -1465,13 +1608,7 @@ impl HostHeap {
                 if made != previous {
                     return true;
                 }
-                let ready = &self.ready[index as usize];
-                let saved = ready.swap(0, Ordering::AcqRel);
-                let changed = !header_matches(address, record);
-                if changed {
-                    ready.store(saved, Ordering::Release);
-                }
-                changed
+                !self.snapshot_matches(index, address, record)
             })
         };
         let key = record_key(record);
@@ -1480,12 +1617,13 @@ impl HostHeap {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
             if made.keys[index as usize] != 0 && !snapshot_changed(made.keys[index as usize]) {
-                self.ready[index as usize].store(0, Ordering::Relaxed);
-                made.keys[index as usize] = 0;
-                made.pending.remove(&index);
-                self.set_made_nonzero(index, false);
-                self.make_null(index);
-                self.note_address(index, None);
+                let template = made
+                    .templates
+                    .get()
+                    .and_then(Option::as_ref)
+                    .map(Templates::null);
+                self.clear_record(&mut made, index, template);
+                self.viewed.set(index, None, false);
             }
             return Ok(None);
         };
@@ -1509,6 +1647,12 @@ impl HostHeap {
         // staging copy) for each of the ~20,000 the title has views of
         // ran the host out of memory (run b2).
         let later = !for_draw && is_placed_texture(&view);
+        let cache = snapshot.is_some() && !later && templates::enabled();
+        let epoch = if cache {
+            crate::shadow::lookup_epoch()
+        } else {
+            0
+        };
         let backing = if !later {
             // What the view needs (the texture it views, the copy of the
             // memory) is made without the slot lock, which title threads
@@ -1534,31 +1678,34 @@ impl HostHeap {
             return Ok(None);
         }
         {
-            self.invalidate_ambient(index);
-            self.ready[index as usize].store(0, Ordering::Relaxed);
-            self.invalidate_texture_binding(index);
-            self.set_stride(index, Some(&view));
-            self.note_address(index, Some(&view));
+            self.begin_record(&mut made, index, key, &view);
             if later {
                 // Made once a shader reads it (`crate::shadow::take_reads`).
                 crate::shadow::forget_read(index);
             }
-            made.keys[index as usize] = key;
-            self.set_made_nonzero(index, true);
             if !self.sampler && show_after() {
                 made.pending.remove(&index);
-                if !later && self.mirror_texture(index, &view, record, &mut made.pending) {
+                if !later
+                    && backing.is_none()
+                    && self.mirror_texture(index, &view, record, &mut made.pending)
+                {
                     return Ok(Some(view));
                 }
             }
             let (kept, mark) = if later {
                 (None, None)
             } else {
-                make_marked_with_backing(
-                    &view,
-                    self.cpu(index),
-                    backing.as_ref().map(|(shadow, _, _)| shadow),
-                )
+                let dst = self.cpu(index);
+                if cache && (backing.is_some() || self.sampler) {
+                    made.templates.get_or_init(|| Templates::new(self.sampler));
+                    if let Some(templates) = made.templates.get_mut().and_then(Option::as_mut) {
+                        templates.make(dst, key, epoch, &view, backing.as_ref())
+                    } else {
+                        make_marked_with_backing(&view, dst, backing.as_ref().map(|b| &b.0))
+                    }
+                } else {
+                    make_marked_with_backing(&view, dst, backing.as_ref().map(|b| &b.0))
+                }
             };
             self.set_mark(index, mark);
             if kept.is_none() && !self.sampler {
@@ -1696,7 +1843,7 @@ impl HostHeap {
             }
         }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        let Mirrored { keys, pending } = &mut *made;
+        let Mirrored { keys, pending, .. } = &mut *made;
         pending.retain(|&index, texture| {
             let Some(copy) = texture.copy.upgrade() else {
                 keys[index as usize] = 0;
@@ -2391,6 +2538,17 @@ pub(crate) enum HeldSource {
     ),
 }
 
+fn same_lease(a: Option<&HeldSource>, b: Option<&HeldSource>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(HeldSource::Shadow(a)), Some(HeldSource::Shadow(b))) => Arc::ptr_eq(a, b),
+        (Some(HeldSource::Widened(a, aa)), Some(HeldSource::Widened(b, bb))) => {
+            Arc::ptr_eq(a, b) && Arc::ptr_eq(aa, bb)
+        }
+        _ => false,
+    }
+}
+
 fn held_backing(held: &Held) -> Option<&std::sync::Arc<crate::shadow::Shadow>> {
     match &held.1 {
         Some(HeldSource::Shadow(shadow) | HeldSource::Widened(_, shadow)) => Some(shadow),
@@ -2999,7 +3157,9 @@ fn make(
             // (`victory_shader::emit`, "Constant buffers in the heap"): the
             // console needs 16-byte alignment, a host constant buffer view
             // 256, which most of the title's do not have on the host.
-            let shadow = crate::shadow::find(address, u64::from(size))?;
+            let shadow = backing
+                .cloned()
+                .or_else(|| crate::shadow::find(address, u64::from(size)))?;
             let bytes = u64::from(size).min(shadow.left(address));
             let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
                 Format: DXGI_FORMAT_R32_TYPELESS,
@@ -3013,11 +3173,14 @@ fn make(
                     },
                 },
             };
-            buffer_srv(address, bytes, desc, at, None)
+            buffer_srv(address, bytes, desc, at, backing)
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
-            if let Some(copy) = crate::resource::host_copy(resource) {
+            if let (Some((data, len)), Some(desc)) = (crate::resource::buffer_bytes(resource), desc)
+            {
+                buffer_srv(data as u64, len, srv_desc(desc), at, backing)
+            } else if let Some(copy) = crate::resource::host_copy(resource) {
                 copy.viewed
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 let desc = texture_srv_desc(resource, &copy, desc.as_ref())?;
@@ -3026,24 +3189,17 @@ fn make(
                     copy.texture.clone(),
                     TextureView::Srv(desc).for_ambient(&copy.texture),
                 )))
-            } else if let (Some((data, len)), Some(desc)) =
-                (crate::resource::buffer_bytes(resource), desc)
-            {
-                buffer_srv(data as u64, len, srv_desc(desc), at, backing)
             } else {
                 None
             }
         }
         View::Unordered(resource, counter, desc) => {
             let resource = *resource as crate::object::This;
-            let Some(copy) = crate::resource::host_copy(resource) else {
-                return match (crate::resource::buffer_bytes(resource), desc) {
-                    (Some((data, len)), Some(desc)) => {
-                        buffer_uav(data as u64, len, uav_desc(desc), at, backing)
-                    }
-                    _ => None,
-                };
-            };
+            if let (Some((data, len)), Some(desc)) = (crate::resource::buffer_bytes(resource), desc)
+            {
+                return buffer_uav(data as u64, len, uav_desc(desc), at, backing);
+            }
+            let copy = crate::resource::host_copy(resource)?;
             copy.viewed
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             // Shaders indexing the heap write through this view without
@@ -3133,6 +3289,12 @@ fn prepare(view: &View) -> Option<BufferView> {
     #[cfg(test)]
     tests::while_preparing();
     match view {
+        &View::Constant(address, size) => {
+            let owner = crate::shadow::find(address, u64::from(size))?;
+            let bytes = u64::from(size).min(owner.left(address));
+            let (shadow, _) = crate::shadow::for_view(address, bytes / 4 * 4, 4)?;
+            Some((shadow, address, bytes))
+        }
         View::Placed(..) if is_placed_texture(view) => {
             let _ = placed_texture(view);
             None
@@ -4131,6 +4293,64 @@ mod tests {
         );
         host.sync_slots(0, 4, 1, 32, &mut bytes);
         assert!(host.made(0), "an inaccessible scan leaves the slot alone");
+    }
+
+    #[test]
+    fn shared_templates_copy_the_slot_and_follow_buffer_replacement() {
+        let Some(heap) = HostHeap::new(false, 3) else {
+            return;
+        };
+        if !templates::enabled() {
+            return;
+        }
+        let allocation = crate::watch::tests::pool(1);
+        let base = allocation as u64;
+        let address = base + 256;
+        crate::shadow::register(1, base, crate::watch::PAGE as u64);
+        let original = crate::shadow::find(address, 256).unwrap();
+        let mut slots = [[0u64; 4]; 3];
+        let start = slots.as_mut_ptr() as u64;
+        crate::descriptor::create_cbv(
+            std::ptr::null(),
+            &[address as u32, (address >> 32) as u32, 256, 0],
+            start,
+        );
+        slots[1] = slots[0];
+        // Only the header supplies the view. Padding on a byte copy is opaque.
+        slots[1][3] = u64::MAX;
+        let record = record_at(start);
+        let key = record_key(record);
+        let mut bytes = Vec::new();
+        heap.sync_slots(0, 2, start, 32, &mut bytes);
+        assert!(Arc::ptr_eq(&heap.table_backing(0).unwrap(), &original));
+        assert!(Arc::ptr_eq(&heap.table_backing(1).unwrap(), &original));
+        {
+            let made = heap.made.lock().unwrap();
+            let template = made.templates.get().unwrap().as_ref().unwrap();
+            assert!(template.get(key, crate::shadow::lookup_epoch()).is_some());
+        }
+
+        // The title address and record stay the same when an inner buffer
+        // supersedes the original range.
+        crate::shadow::register(2, address, 4096);
+        let replacement = crate::shadow::find(address, 256).unwrap();
+        assert!(!Arc::ptr_eq(&original, &replacement));
+        {
+            let made = heap.made.lock().unwrap();
+            let template = made.templates.get().unwrap().as_ref().unwrap();
+            assert!(template.get(key, crate::shadow::lookup_epoch()).is_none());
+        }
+        slots[2] = slots[0];
+        heap.sync_slots(2, 3, start, 32, &mut bytes);
+        assert!(Arc::ptr_eq(&heap.table_backing(2).unwrap(), &replacement));
+        slots[1] = [0; 4];
+        heap.sync_slots(1, 2, start, 32, &mut bytes);
+        assert!(!heap.made(1) && heap.table_backing(1).is_none());
+        std::hint::black_box(&slots);
+        crate::shadow::unregister(2, address);
+        crate::shadow::unregister(1, base);
+        drop((heap, original, replacement));
+        crate::watch::tests::free(allocation);
     }
 
     #[test]

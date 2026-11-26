@@ -2014,6 +2014,11 @@ fn lookup_changed() {
     LOOKUP_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
+/// Version of the address-to-shadow mapping, including aliases and loose windows.
+pub(crate) fn lookup_epoch() -> u64 {
+    LOOKUP_EPOCH.load(Ordering::Acquire)
+}
+
 fn changed() {
     GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
     lookup_changed();
@@ -2371,7 +2376,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     if !lookup_cache_enabled() {
         return find_uncached(address, end);
     }
-    let epoch = LOOKUP_EPOCH.load(Ordering::Acquire);
+    let epoch = lookup_epoch();
     let hit = LOOKUP_CACHE.with(|cell| {
         let mut guard = cell.borrow_mut();
         guard

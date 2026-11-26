@@ -549,10 +549,13 @@ These switches port work from avatarmanz/VIctory-7900XTX (GPL-3.0).
 
 | Switch | What it does |
 | --- | --- |
-| `VICTORY_PORT_DESCRIPTORS=1` | On the known Series 1.0.2.1 image, six byte-checked table stores and the host CRT copy imports mark written slots in the first eligible placed view heap. All six store hooks must install before marks replace per-submission page scans. The first sync and every eighth frame also scan the watched changes, or the eligible heap range when fault tracking is off. Writes through uninstrumented paths can first appear at that audit. Off by default. |
+| `VICTORY_PORT_DESCRIPTORS=1` | On the known Series 1.0.2.1 image, six byte-checked table stores and the host CRT copy imports mark written slots in the first eligible placed view heap. All six store hooks must install before marks replace per-submission page scans. The first sync sweeps the watched changes, or the eligible range without a watch. Subsequent audits take queued dirty pages in address order with wraparound. Writes through uninstrumented paths can stay invisible until their page's turn. Off by default. |
+| `VICTORY_DESCRIPTOR_AUDIT_PAGES` | Maximum number of 4 KiB dirty pages visited per frame after the first sync of the marked heap. Defaults to 16. Set to 0 for the previous full audit at each watch poll. With no watch, visits successive pages through the whole eligible range. |
+| `VICTORY_DESCRIPTOR_AUDIT_FRAMES` | Frames between polling the marked heap's write watch. Defaults to 8. |
+| `VICTORY_DESCRIPTOR_CACHE=0` | Bypass CPU descriptor templates during shared-heap publication. The default uses at most 16,384 buffer templates per host view heap and 256 per sampler heap, with weak resource references. |
 | `VICTORY_SYNC_IN_PLACE=0` | Use kernel snapshots for each descriptor sweep. By default on x86-64, verified 32-byte slots are compared to the host mirror as their headers are read. A failed read retries through the existing kernel path. |
 | `VICTORY_SYNC_FINE=0` | Capture dirty descriptor ranges on the submitting thread. By default, scans of at least 4,096 slots use the bounded texture worker pool when they can be split. The submitting thread creates and publishes the host views in both modes. |
-| `VICTORY_SPANS_QUICK=0` | Take the bindless view lock on every slot update. By default, an occupancy bit lets updates that would neither add nor remove a tracked view leave that lock alone. |
+| `VICTORY_SPANS_QUICK=0` | Consult the bindless binding map even for clears of slots known to be empty. By default, an occupancy bit skips these clears. |
 | `VICTORY_UNDER_FUSED=1` | During a refresh that overlaps a pending GPU write baseline, compare and apply title bytes to the mapped shadow from at most 64 KiB of scratch per worker. Update the baseline from the same read even when shadow bytes already match. Off by default. |
 
 Descriptor trampolines use the same two 128-bit stores as the wide-store
