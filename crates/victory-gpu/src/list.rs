@@ -597,7 +597,10 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             };
             let first = copy(b.first)?;
             let second = if b.kind == 1 {
-                copy(b.second as This)?
+                let second = copy(b.second as This)?;
+                // Aliasing can order effects that neither texture tracks.
+                list.require_synchronous_submission();
+                second
             } else {
                 None
             };

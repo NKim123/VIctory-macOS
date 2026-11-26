@@ -41,7 +41,7 @@ pub fn record<R>(
 ) -> Option<R> {
     let mut out = None;
     crate::list::with_state(list, |host, state| {
-        host.note_external_recording();
+        host.require_synchronous_submission();
         out = Some(f(&host.list));
         state.host_state_lost();
     });

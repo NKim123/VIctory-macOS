@@ -181,7 +181,13 @@ pub fn run(
     if execute {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped and nothing of it has run yet.
-        unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+        unsafe {
+            victory_loader::resolution::apply_asked(
+                image.base(),
+                size,
+                matches!(console, Console::SeriesS),
+            )
+        };
     }
     #[cfg(all(windows, target_arch = "x86_64"))]
     if execute && let Some(ms) = victory_gpu::frame::interval_override_ms() {

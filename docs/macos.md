@@ -373,6 +373,11 @@ includes any GPU work still outstanding, so the report works when the
 adapter's D3D12 timestamps do not advance. Profiling uses the synchronous
 fence path for per-submission attribution.
 
+`VICTORY_WIDE_SCALAR_LOADS=1` groups up to four dwords from each scalar
+SRV buffer load into one DXIL call. The switch defaults to off and has
+separate shader cache entries for native warm-up and runtime. The lowering
+comes from avatarmanz/VIctory-7900XTX.
+
 ## GPU write-back through physical sections
 
 `VICTORY_LAND=1` enables post-fence buffer write-back through xmem's writable section views. The title's read-only write monitors stay in place. Other copies of the same physical page are dirtied, and only GPU-changed bytes are stored, so unrelated CPU writes survive. While landing is enabled, DirectStorage section writes and GPU write-back wait for overlapping writes to finish. Each GPU submission checks that its physical destination still has the same mapping, including when fault tracking is disabled. Computed-address writes without fault tracking use a pre-submit snapshot of the GPU shadow to distinguish GPU changes from concurrent CPU writes. An overlapping declared range also gets a complete page snapshot when it fits. Before any post-fence merge, computed marks with a complete snapshot take ownership of the whole shadow page, including its declared GPU writes. These snapshots share a 64 MiB budget per submission. Snapshot copying can reach that budget even when the shaders leave no computed-write marks. The opt-in path accepts this preparation cost and may omit shader outputs when it cannot determine which bytes the GPU wrote. If an untracked or overlapping computed write lacks a complete snapshot, the computed write is withheld and the shadow refreshes from title memory again. View marks on a shadow that straddles tracked and untracked pages also need a complete baseline for each untracked page before they can land.
@@ -414,9 +419,10 @@ those running on macOS under Wine.
   self-contained work. The worker holds up to four host lists including
   those on the GPU. It retains only committed color targets up to 16 MiB
   total or 1% of the texture budget when that is lower. The budget comes
-  from `VICTORY_GPU_BUDGET_MB` or the local DXGI budget. Lists with uploads,
-  live descriptors, title memory work, readbacks, render target bindings,
-  or resource-specific aliasing and UAV barriers stay synchronous.
+  from `VICTORY_GPU_BUDGET_MB` or the local DXGI budget. Bindings of these
+  targets, UAV barriers naming them, and immutable pipeline state are
+  eligible. Lists with aliasing barriers, uploads, live descriptors,
+  title memory work, or readbacks stay synchronous.
   Guest heap sync, texture eviction, copy-back, and retirement also stay
   on the synchronous path. Queue signals, waits, mapping changes, and
   presents drain the worker in order. Completed lists that the title reset
@@ -437,6 +443,8 @@ those running on macOS under Wine.
   worker. Split-prelude diagnostics and the wall-time profiler use serial
   waits. Lists that refer to title memory, even through an alias, still
   require the existing submission-time lifetime and visibility checks.
+  With the wall-time profiler off, the frame report logs the number of
+  fence waits saved by batching.
 
 
 Pipelining adds a bounded pool of completion marks. The switches reuse the existing command list, staging and snapshot allocations.
@@ -493,8 +501,8 @@ None of these changes the default. Each is read from the environment when the ga
 | `VICTORY_GPU_BUDGET_MB=<MB>` | Sets the budget that host textures are kept under, in place of the device's. |
 | `VICTORY_PATCH_WIDE=<list>` | Splits the 256-bit stores listed by `cargo xtask wide-stores` into 128-bit halves, so fault tracking does not stop Rosetta on them (see above). |
 | `VICTORY_MESH_OVER_LIMIT=1` | Makes mesh pipelines whose outputs are over Metal's 32 KiB anyway (refused under Wine by default, as they hang the queue; see above). |
-| `VICTORY_OUTPUT=<W>x<H>` | Sets the title's output size, one of its own modes: 1280x720, 1664x936, 1920x1080, 2560x1440 or 3840x2160. It patches the title's code at load, only where the bytes match build 1.0.2.1, and logs `resolution: ... Done` for each site. On a 16 GB M4 (Series X), 1280x720 brought the GPU time of a world frame from about 8.4 s to 0.86 s. Ported from avatarmanz/VIctory-7900XTX. |
-| `VICTORY_RENDER_SCALE=<s>` | 0.5 to 1.0: the title's own upscaler's render scale (2/3 by default, Series X). Not yet tested on a Mac. |
+| `VICTORY_OUTPUT=<W>x<H>` | Sets the Series X title output size to 1280x720, 1664x936, 1920x1080, 2560x1440 or 3840x2160. It patches the title's code at load, only where the bytes match build 1.0.2.1, and logs `resolution: ... Done` for each site. On a 16 GB M4, 1280x720 brought the GPU time of a world frame from about 8.4 s to 0.86 s. Series S keeps title-managed sizes because forcing 720p caused a FidelityFX jitter-phase divide by zero. Use `VICTORY_PRESENT_MAX` for a Series S host presentation cap. Ported from avatarmanz/VIctory-7900XTX. |
+| `VICTORY_RENDER_SCALE=<s>` | 0.5 to 1.0 for the title's own upscaler on Series X (2/3 by default). Series S keeps its title-managed scale. |
 | `VICTORY_UPSCALER=<6\|7>` | Makes the title pick its own upscaler (6) or FidelityFX (7). Not yet tested on a Mac. |
 | `VICTORY_STEP_OVER=pool` | Steps over the title's "no free element" traps: an `int3` followed by `xor r, r`, the shape of a full fixed-size pool's allocator, whose caller then gets the NULL it already checks for. Series 1.0.2.1 hits one at `+0x5149aec` (the instance lists' pool, Marvisak/VIctory#698) about 20 minutes into the opening when frames take seconds. A list of hex offsets also works. |
 | `VICTORY_WINDOW_SECONDARY=1` | Opens the game window on the only non-primary display. |

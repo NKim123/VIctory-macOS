@@ -4740,15 +4740,25 @@ impl<'a> Lower<'a> {
         if srv || root_uav {
             let (h, addr) = self.raw_view(site, src, addr, 4 * count, (11, 0), false, None)?;
             let c = self.cur;
-            for k in 0..count {
-                let off = self.s.m.i32(4 * k);
+            // 7900XTX's wide scalar SRV loads. Each call stays within the
+            // same console instruction and uses its four-byte alignment.
+            let width = if srv && !root_uav && super::wide_scalar_loads() {
+                4
+            } else {
+                1
+            };
+            for first in (0..count).step_by(width as usize) {
+                let dwords = (count - first).min(width);
+                let off = self.s.m.i32(4 * first);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
-                let mask = self.s.m.i8(1);
+                let mask = self.s.m.i8((1u8 << dwords) - 1);
                 let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
                 let r = self.raw_buffer_load(c, &[h, a, u, mask, al]);
-                let x = self.s.m.extract(c, r, 0);
-                let x = self.as_int(x);
-                self.write(inst, Reg::S(code + k as u8), x, None);
+                for k in 0..dwords {
+                    let x = self.s.m.extract(c, r, k);
+                    let x = self.as_int(x);
+                    self.write(inst, Reg::S(code + (first + k) as u8), x, None);
+                }
             }
             return Ok(());
         }

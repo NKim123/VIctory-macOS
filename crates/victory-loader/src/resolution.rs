@@ -323,19 +323,24 @@ type Group = Vec<(&'static Site, Vec<u8>)>;
 /// The image of `size` bytes at `base` stays mapped and no thread runs its
 /// code yet.
 #[cfg(windows)]
-pub unsafe fn apply_asked(base: usize, size: usize) {
+pub unsafe fn apply_asked(base: usize, size: usize, series_s: bool) {
     // Sites that only make sense together go in one group, written all or
     // none: a smaller output with the pool check left in stops the title,
     // and the check gone without a smaller output is pointless.
     let mut asked: Vec<(Group, String)> = Vec::new();
-    if let Some((w, h)) = asked_output() {
+    let output = asked_output();
+    let render_scale = asked_render_scale();
+    if series_s && (output.is_some() || render_scale.is_some()) {
+        tracing::warn!("resolution: keeping title-managed sizes on Series S");
+    }
+    if let Some((w, h)) = output.filter(|_| !series_s) {
         let mut group = vec![(&OUTPUT, output_code(w, h))];
         if (w, h) != (3840, 2160) {
             group.push((&POOL_CHECK, pool_check_code()));
         }
         asked.push((group, format!("{w}x{h}")));
     }
-    if let Some(s) = asked_render_scale() {
+    if let Some(s) = render_scale.filter(|_| !series_s) {
         asked.push((vec![(&OWN_SCALE, own_scale_code(s))], format!("{s}")));
     }
     if let Some(kind) = asked_upscaler() {
