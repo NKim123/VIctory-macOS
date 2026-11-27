@@ -610,9 +610,11 @@ impl Shader {
         );
         let h = self.annotate(block, h, props.0, props.1);
         // Unordered typed, raw and structured buffers (kinds 10-12), and
-        // typed buffers read (their format kind, `Lower::view_word`).
+        // typed buffers and textures read (their format kind, `Lower::view_word`).
         let kind = props.0 & 0xFF;
-        if !sampler && (kind == 10 || props.0 & 0x1000 != 0 && (11..=12).contains(&kind)) {
+        if !sampler
+            && ((1..=10).contains(&kind) || props.0 & 0x1000 != 0 && (11..=12).contains(&kind))
+        {
             self.view_index.insert(h, index);
         }
         // Texture shader views (kinds 1-9).

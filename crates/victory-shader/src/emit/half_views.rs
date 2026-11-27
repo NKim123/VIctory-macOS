@@ -185,7 +185,7 @@ impl<'a> Lower<'a> {
         self.raw_dword(table, at)
     }
 
-    /// Whether the typed buffer view a handle names has an integer format,
+    /// Whether the typed view a handle names has an integer format,
     /// and whether a signed one, from the view-stride table; `None` if the
     /// handle's heap index is not known.
     pub(super) fn integer_view(&mut self, h: V) -> Option<(V, V)> {

@@ -384,6 +384,8 @@ impl Lower<'_> {
         let h = self.handle(site, src, false, props)?;
         let fu = self.s.m.undef(self.s.t.f32);
         let iu = self.s.m.undef(self.s.t.i32);
+        let texture = (site, src, props);
+        let mut typed = None;
         let r = if sample {
             let ss = self
                 .descriptors
@@ -401,7 +403,7 @@ impl Lower<'_> {
                     .map(|k| addr_val(self, k))
                     .collect::<Result<Vec<_>, _>>()?;
                 let lod = inst.read(Reg::V(regs[n - 1])).ok_or("an image address")?;
-                return self.gather_at_level(inst, h, ss, &a, lod, guard);
+                return self.gather_at_level(inst, (texture, h), ss, &a, lod, guard);
             }
             // Comparison: the reference value is the first address after
             // the bias, and the sampler is a comparison sampler.
@@ -680,14 +682,8 @@ impl Lower<'_> {
                     }
                     args.extend(&os[..2]);
                     args.push(self.s.m.i32(dmask.trailing_zeros()));
-                    self.s.op(
-                        c,
-                        "textureGather.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        73,
-                        &args,
-                    )
+                    typed = Some(self.texture_read(texture, 73, &args, [0, 1, 2, 3], *d16)?);
+                    self.s.m.undef(self.s.t.res_ret)
                 }
             }
         } else {
@@ -707,14 +703,8 @@ impl Lower<'_> {
             let mut args = vec![h, mip];
             args.extend(&cs);
             args.extend([iu, iu, iu]);
-            self.s.op(
-                c,
-                "textureLoad.f32",
-                Attr::ReadOnly,
-                self.s.t.res_ret,
-                66,
-                &args,
-            )
+            typed = Some(self.texture_read(texture, 66, &args, [0, 1, 2, 3], *d16)?);
+            self.s.m.undef(self.s.t.res_ret)
         };
         let Operand::Vector { reg, .. } = *data else {
             return Err("an image result");
@@ -724,17 +714,21 @@ impl Lower<'_> {
         } else {
             (0..4).filter(|ch| dmask >> ch & 1 != 0).collect()
         };
-        let mut xs = Vec::new();
-        for ch in channels {
-            let x = self.s.m.extract(c, r, ch);
-            xs.push(if *d16 {
-                // shortcut: d16 results are taken as floats (rounded to
-                // nearest even); integer formats would keep 16 bits.
-                self.f32_to_f16(c, x)
-            } else {
-                self.as_int(x)
-            });
-        }
+        let c = self.cur;
+        let mut xs: Vec<_> = channels
+            .into_iter()
+            .map(|ch| {
+                if let Some(values) = typed {
+                    return values[ch as usize];
+                }
+                let x = self.s.m.extract(c, r, ch);
+                if *d16 {
+                    self.f32_to_f16(c, x)
+                } else {
+                    self.as_int(x)
+                }
+            })
+            .collect();
         if *d16 {
             // Two channels per VGPR, low half first (an odd last high half 0).
             let k16 = self.s.m.i32(16);
@@ -753,6 +747,88 @@ impl Lower<'_> {
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
+    }
+
+    fn texture_read<const N: usize>(
+        &mut self,
+        texture: (Site, &Source, (u32, u32)),
+        opcode: u32,
+        args: &[V],
+        channels: [u32; N],
+        d16: bool,
+    ) -> Result<[V; N], Why> {
+        let (site, src, props) = texture;
+        let float_handle = args[0];
+        let read = |l: &mut Self, handle: V, integer: bool| {
+            let c = l.cur;
+            let name = match (opcode, integer) {
+                (66, false) => "textureLoad.f32",
+                (66, true) => "textureLoad.i32",
+                (73, false) => "textureGather.f32",
+                (73, true) => "textureGather.i32",
+                _ => unreachable!(),
+            };
+            let ty = if integer {
+                l.s.t.res_ret_i32
+            } else {
+                l.s.t.res_ret
+            };
+            let mut args = args.to_vec();
+            args[0] = handle;
+            let result = l.s.op(c, name, Attr::ReadOnly, ty, opcode, &args);
+            channels.map(|ch| {
+                let x = l.s.m.extract(c, result, ch);
+                if !d16 {
+                    l.as_int(x)
+                } else if integer {
+                    let mask = l.s.m.i32(0xffff);
+                    l.s.m.bin(c, Bin::And, x, mask)
+                } else {
+                    l.f32_to_f16(c, x)
+                }
+            })
+        };
+        let Some((integer, signed)) = self.integer_view(float_handle) else {
+            return Ok(read(self, float_handle, false));
+        };
+        let head = self.cur;
+        let (float, int, signed_block, unsigned_block, join) = (
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+        );
+        self.s.m.terminate(head, Term::CondBr(integer, int, float));
+        self.s
+            .m
+            .terminate(int, Term::CondBr(signed, signed_block, unsigned_block));
+        self.cur = float;
+        let floats = read(self, float_handle, false);
+        self.s.m.terminate(self.cur, Term::Br(join));
+        self.cur = signed_block;
+        let handle = self.handle_made(site, src, false, (props.0, TYPED_I32_PROPS), None)?;
+        let signed_values = read(self, handle, true);
+        let signed_end = self.cur;
+        self.s.m.terminate(signed_end, Term::Br(join));
+        self.cur = unsigned_block;
+        let handle = self.handle_made(site, src, false, (props.0, TYPED_U32_PROPS), None)?;
+        let unsigned_values = read(self, handle, true);
+        let unsigned_end = self.cur;
+        self.s.m.terminate(unsigned_end, Term::Br(join));
+        self.cur = join;
+        Ok(std::array::from_fn(|ch| {
+            let phi = self.s.m.phi(join, self.s.t.i32);
+            self.s.m.set_phi(
+                phi,
+                vec![
+                    (floats[ch], float),
+                    (signed_values[ch], signed_end),
+                    (unsigned_values[ch], unsigned_end),
+                ],
+            );
+            phi
+        }))
     }
 
     /// The direction a cube sample's face coordinates stand for: the
@@ -803,7 +879,7 @@ impl Lower<'_> {
     fn gather_at_level(
         &mut self,
         inst: &Inst,
-        h: V,
+        (texture, h): ((Site, &Source, (u32, u32)), V),
         sampler: &Source,
         a: &[V],
         lod: Value,
@@ -896,16 +972,7 @@ impl Lower<'_> {
         .enumerate()
         {
             let args = [h, level, x, y, iu, iu, iu, iu];
-            let r = self.s.op(
-                c,
-                "textureLoad.f32",
-                Attr::ReadOnly,
-                self.s.t.res_ret,
-                66,
-                &args,
-            );
-            let v = self.s.m.extract(c, r, dmask.trailing_zeros());
-            let v = self.as_int(v);
+            let [v] = self.texture_read(texture, 66, &args, [dmask.trailing_zeros()], false)?;
             self.write(inst, Reg::V(reg + k as u8), v, guard);
         }
         Ok(())

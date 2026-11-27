@@ -1457,6 +1457,8 @@ fn transition(
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
+    /// An RGBA32 integer texture SRV, with texels supplied as channel bits.
+    IntegerTexture(u32, u32, DXGI_FORMAT, &'a [[f32; 4]]),
     /// An RGBA32F texture SRV with mips (width, height, levels, texels of
     /// each level in turn).
     Mipped(u32, u32, u32, &'a [[f32; 4]]),
@@ -1528,6 +1530,7 @@ pub fn view_strides(views: &[View]) -> Vec<u32> {
             View::Buffer { stride: Stride::Typed, .. } => 16,
             View::Buffer { stride: Stride::Structured(n), .. } => n,
             View::Buffer { stride: Stride::Format(f, n), .. } | View::TypedUav(f, _, n) => n | kind(f),
+            View::IntegerTexture(_, _, f, _) => kind(f),
             View::HalfUav(_) => 8,
             View::HalfUintUav(_) => 8 | super::VIEW_INTEGER,
             _ => 0,
@@ -1726,17 +1729,23 @@ impl Host {
                 at.ptr += i * view_size;
                 match *v {
                     View::Texture(..)
+                    | View::IntegerTexture(..)
                     | View::Cube(..)
                     | View::Mipped(..)
                     | View::MippedCube(..) => {
                         let (w0, h0, mut texels, faces, levels) = match *v {
+                            View::IntegerTexture(w, h, _, t) => (w, h, t, 1, 1),
                             View::Texture(w, h, t) => (w, h, t, 1, 1),
                             View::Mipped(w, h, l, t) => (w, h, t, 1, l),
                             View::Cube(n, t) => (n, n, t, 6, 1),
                             View::MippedCube(n, l, t) => (n, n, t, 6, l),
                             _ => unreachable!(),
                         };
-                        let mut desc = texture(w0, h0, D3D12_RESOURCE_FLAG_NONE);
+                        let format = match *v {
+                            View::IntegerTexture(_, _, format, _) => format,
+                            _ => DXGI_FORMAT_R32G32B32A32_FLOAT,
+                        };
+                        let mut desc = texture_as(w0, h0, D3D12_RESOURCE_FLAG_NONE, format);
                         desc.DepthOrArraySize = faces as u16;
                         desc.MipLevels = levels as u16;
                         let tex = make(
@@ -1773,7 +1782,7 @@ impl Host {
                                 0,
                                 0,
                                 0,
-                                &footprint(&upload, w, h),
+                                &footprint_as(&upload, w, h, format, 4),
                                 None,
                             );
                             keep.push(upload);

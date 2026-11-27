@@ -1190,8 +1190,21 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
                 &Dispatch {
                     roots: vec![
                         (0, Root::Constants(ud)),
-                        (1, Root::View { srv: true, data: vec![super::VIEW_MARK_NONE; 4] }),
-                        (2, Root::Uav(words)),
+                        (
+                            1,
+                            Root::View {
+                                srv: true,
+                                data: vec![0; 2],
+                            },
+                        ),
+                        (
+                            2,
+                            Root::View {
+                                srv: true,
+                                data: vec![super::VIEW_MARK_NONE; 4],
+                            },
+                        ),
+                        (3, Root::Uav(words)),
                     ],
                     views: &[View::Texture(1, 1, &texel), View::Texture(1, 1, &texel)],
                     samplers: &[],
@@ -1864,11 +1877,13 @@ fn early_depth_stencil_skips_occluded_read_mark_pixel_shaders() {
                 }]);
                 list.SetGraphicsRootSignature(&root);
                 list.SetDescriptorHeaps(&[Some(srv_heap.clone())]);
-                // PS root indices: 0 = VS b0, 1 = PS b0, 2 = PS t2 (marks), 3 = PS u1 (bitmap).
-                list.SetGraphicsRootConstantBufferView(0, ud_buf.GetGPUVirtualAddress());
-                list.SetGraphicsRootConstantBufferView(1, ud_buf.GetGPUVirtualAddress());
-                list.SetGraphicsRootShaderResourceView(2, marks_buf.GetGPUVirtualAddress());
-                list.SetGraphicsRootUnorderedAccessView(3, bitmap.GetGPUVirtualAddress());
+                // Float textures have zero kind bits in the stride table.
+                let zero = 0u32;
+                list.SetGraphicsRoot32BitConstants(0, 1, std::ptr::from_ref(&zero).cast(), 0);
+                list.SetGraphicsRoot32BitConstants(1, 1, std::ptr::from_ref(&zero).cast(), 0);
+                list.SetGraphicsRootShaderResourceView(2, ud_buf.GetGPUVirtualAddress());
+                list.SetGraphicsRootShaderResourceView(3, marks_buf.GetGPUVirtualAddress());
+                list.SetGraphicsRootUnorderedAccessView(4, bitmap.GetGPUVirtualAddress());
                 list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                 list.IASetVertexBuffers(
                     0,

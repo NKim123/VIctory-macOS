@@ -1804,6 +1804,101 @@ fn user_data_cs32(shader: &HostShader, k: u32) -> Vec<u32> {
     ud
 }
 
+#[test]
+fn integer_texture_loads_and_gathers_keep_exact_bits() {
+    use windows::Win32::Graphics::{Direct3D12::*, Dxgi::Common::*};
+
+    let mut words = vec![s_mov_b32(5, 128), s_mov_b32(7, 128)];
+    for (op, dst, base, offset) in [(3u32, 8u32, 4u32, 0u32), (2, 20, 4, 32), (2, 16, 6, 0)] {
+        words.extend([
+            0x3D << 26 | op << 18 | dst << 6 | base >> 1,
+            125 << 25 | offset,
+        ]);
+    }
+    // Load texel (0, 0); gather around the middle of the 2x2 texture.
+    words.extend([
+        vop1(1, 1, 128),
+        vop1(1, 2, 128),
+        0xF000_0108,
+        1 | 3 << 8 | 2 << 16,
+    ]);
+    words.extend([
+        vop1(1, 1, 240),
+        vop1(1, 2, 240),
+        0xF11C_0108,
+        1 | 4 << 8 | 2 << 16 | 4 << 21,
+    ]);
+    for k in 0..5u8 {
+        words.extend(buffer_store_dword(3 + k, 20, 4 * u16::from(k)));
+    }
+    words.push(S_ENDPGM);
+    let shader = lower_cs32(
+        &words,
+        &[
+            (4, ResourceType::Srv, 0, 8),
+            (4, ResourceType::Uav, 8, 4),
+            (6, ResourceType::Sampler, 0, 4),
+        ],
+        true,
+    );
+    assert_eq!(shader.root_srvs, [super::VIEW_STRIDES]);
+    let sampler = D3D12_SAMPLER_DESC {
+        Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        MaxAnisotropy: 1,
+        MaxLOD: f32::MAX,
+        ..Default::default()
+    };
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let bits = [0x7fc1_2345, 0x8000_0001, 1, 0xffff_fffe];
+    let texels = bits.map(|b| [f32::from_bits(b), 0.0, 0.0, 0.0]);
+    let floats = [[1.0, 0.0, 0.0, 0.0]; 4];
+    let mut ran = 0;
+    for warp in [false, true] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root, pso) = host.compute_pipeline(&shader).unwrap();
+        for (view, want) in [
+            (
+                View::IntegerTexture(2, 2, DXGI_FORMAT_R32G32B32A32_UINT, &texels),
+                [bits[0], bits[2], bits[3], bits[1], bits[0]],
+            ),
+            (
+                View::IntegerTexture(2, 2, DXGI_FORMAT_R32G32B32A32_SINT, &texels),
+                [bits[0], bits[2], bits[3], bits[1], bits[0]],
+            ),
+            (View::Texture(2, 2, &floats), [1.0f32.to_bits(); 5]),
+        ] {
+            let views = [view, View::RawUav(5)];
+            let result = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(user_data_cs32(&shader, 0))),
+                            (
+                                1,
+                                Root::View {
+                                    srv: true,
+                                    data: super::host::view_strides(&views),
+                                },
+                            ),
+                        ],
+                        views: &views,
+                        samplers: &[sampler],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            assert_eq!(result[0], want);
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "integer texture test needs an SM 6.6 device");
+}
+
 /// Image addresses with `a16` after a whole-VGPR operand (the offset or
 /// bias keeps a VGPR; the coordinates share the next) and the clamp of
 /// `image_sample_d_cl` (after the coordinates). Program 1: a biased sample
@@ -1927,12 +2022,22 @@ fn image_addresses_of_16_bits_and_clamps() {
             let (root, pso) = host
                 .compute_pipeline(shader)
                 .unwrap_or_else(|e| panic!("{label}: {e}"));
+            let mut roots = vec![(0, Root::Constants(user_data_cs32(shader, k)))];
+            if shader.root_srvs.contains(&super::VIEW_STRIDES) {
+                roots.push((
+                    1,
+                    Root::View {
+                        srv: true,
+                        data: super::host::view_strides(&views),
+                    },
+                ));
+            }
             let out = host
                 .dispatch(
                     &root,
                     &pso,
                     &Dispatch {
-                        roots: vec![(0, Root::Constants(user_data_cs32(shader, k)))],
+                        roots,
                         views: &views,
                         samplers: &samplers,
                         groups: [1, 1, 1],

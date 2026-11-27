@@ -2581,41 +2581,80 @@ pub(crate) fn view_stride(view: &View) -> u32 {
     element.max(1) as u32
 }
 
-/// The view-stride table's format-kind bits of a buffer view: a typed view
-/// (no structure stride, not raw) of an integer format gets
-/// `VIEW_INTEGER`, a signed one also `VIEW_SIGNED`; anything else none.
-/// Translated shaders select integer typed-buffer overloads for such views,
-/// and pass their 16-bit typed data as bits (`victory_shader::emit`, "d16").
+/// The view-stride table's integer format bits for typed textures and buffers.
 fn view_kind(view: &View) -> u32 {
     use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
-    let (unordered, words): (bool, &[u32; 10]) = match view {
-        View::Shader(_, Some(desc)) => (false, desc),
-        View::Unordered(_, _, Some(desc)) => (true, desc),
-        View::Placed(unordered, resource, desc) if resource[0] == 1 => match desc[..10].try_into() {
-            Ok(words) => (*unordered, words),
-            Err(_) => return 0,
-        },
+    let resource_format = |resource| {
+        crate::resource::title_format(resource as crate::object::This)
+            .map_or(0, crate::resource::pc_format)
+    };
+    let kind = |format| match integer_format(format) {
+        Some(true) => VIEW_INTEGER | VIEW_SIGNED,
+        Some(false) => VIEW_INTEGER,
+        None => 0,
+    };
+    let (unordered, words, default_format): (bool, &[u32; 10], u32) = match view {
+        View::Shader(resource, None) | View::Unordered(resource, _, None) => {
+            return kind(resource_format(*resource));
+        }
+        View::Shader(resource, Some(desc)) => (
+            false,
+            desc,
+            if desc[0] == 0 && desc[1] >= 2 {
+                resource_format(*resource)
+            } else {
+                0
+            },
+        ),
+        View::Unordered(resource, _, Some(desc)) => (
+            true,
+            desc,
+            if desc[0] == 0 && desc[1] >= 2 {
+                resource_format(*resource)
+            } else {
+                0
+            },
+        ),
+        View::Placed(unordered, resource, desc) => {
+            // DXGI format in the resource description, after mip levels.
+            (
+                *unordered,
+                desc[..10].try_into().unwrap(),
+                crate::resource::pc_format(resource[8]),
+            )
+        }
         _ => return 0,
     };
-    // Buffer views only (dimension 1); a structured or raw one is no typed view.
-    let (format, typed) = if unordered {
+    // Buffer union members only describe dimension 1; textures are typed.
+    let (format, typed) = if words[1] != 1 {
+        (
+            if words[0] == 0 {
+                default_format
+            } else {
+                words[0]
+            },
+            words[1] >= 2,
+        )
+    } else if unordered {
         let desc = uav_desc(words);
         // SAFETY: a buffer view's union member.
         let b = unsafe { desc.Anonymous.Buffer };
         let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
-        (desc.Format.0 as u32, typed_buffer(b.StructureByteStride, raw))
+        (
+            desc.Format.0 as u32,
+            typed_buffer(b.StructureByteStride, raw),
+        )
     } else {
         let desc = srv_desc(words);
         // SAFETY: a buffer view's union member.
         let b = unsafe { desc.Anonymous.Buffer };
         let raw = b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
-        (desc.Format.0 as u32, typed_buffer(b.StructureByteStride, raw))
+        (
+            desc.Format.0 as u32,
+            typed_buffer(b.StructureByteStride, raw),
+        )
     };
-    match (words[1] == 1 && typed).then(|| integer_format(format)).flatten() {
-        Some(true) => VIEW_INTEGER | VIEW_SIGNED,
-        Some(false) => VIEW_INTEGER,
-        None => 0,
-    }
+    if typed { kind(format) } else { 0 }
 }
 
 /// The four-channel host format for a three-channel 32-bit typed SRV.
@@ -3745,6 +3784,18 @@ mod tests {
         // Format, dimension, mapping, first element, count, stride, flags.
         let srv = View::Shader(0, Some([62, 1, 5768, 0, 0, 0, 64, 0, 0, 0]));
         assert_eq!(view_kind(&srv), VIEW_INTEGER, "R8_UINT");
+        for (format, kind) in [
+            (42, VIEW_INTEGER),
+            (59, VIEW_INTEGER | VIEW_SIGNED),
+            (62, VIEW_INTEGER),
+            (41, 0),
+        ] {
+            let mut words = [0; 10];
+            words[0] = format;
+            words[1] = 4; // texture 2D
+            assert_eq!(view_kind(&View::Shader(0, Some(words))), kind);
+            assert_eq!(view_kind(&View::Unordered(0, 0, Some(words))), kind);
+        }
         assert_eq!(view_stride(&uav(12, 0, 0)) | view_kind(&uav(12, 0, 0)), 8 | VIEW_INTEGER);
         assert_eq!(widened_format(6), Some(DXGI_FORMAT_R32G32B32A32_FLOAT));
         assert_eq!(widened_format(7), Some(DXGI_FORMAT_R32G32B32A32_UINT));
