@@ -3793,6 +3793,13 @@ fn texture_srv_desc(
     {
         desc.Format = DXGI_FORMAT(format as i32);
     }
+    if copy.base_level != 0
+        && let Some(desc) = desc.as_mut()
+    {
+        // SAFETY: a live host copy, with the retained mip count.
+        let own_mips = u32::from(unsafe { copy.texture.GetDesc() }.MipLevels);
+        from_base(desc, copy.base_level, own_mips);
+    }
     fits(
         &copy.texture,
         &copy.castable,
@@ -3800,6 +3807,58 @@ fn texture_srv_desc(
         false,
     )
     .then_some(desc)
+}
+
+fn from_base(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32, own_mips: u32) {
+    if own_mips == 0 {
+        return;
+    }
+    let clamp = |most: &mut u32, levels: &mut u32, lod: &mut f32| {
+        let lost = base.saturating_sub(*most);
+        *most = most.saturating_sub(base).min(own_mips - 1);
+        if *levels != u32::MAX {
+            *levels = levels.saturating_sub(lost).clamp(1, own_mips - *most);
+        }
+        *lod = (*lod - base as f32).max(0.0);
+    };
+    // SAFETY: each arm selects the union member named by the dimension.
+    unsafe {
+        match desc.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE2D => {
+                let t = &mut desc.Anonymous.Texture2D;
+                clamp(
+                    &mut t.MostDetailedMip,
+                    &mut t.MipLevels,
+                    &mut t.ResourceMinLODClamp,
+                );
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                let t = &mut desc.Anonymous.Texture2DArray;
+                clamp(
+                    &mut t.MostDetailedMip,
+                    &mut t.MipLevels,
+                    &mut t.ResourceMinLODClamp,
+                );
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBE => {
+                let t = &mut desc.Anonymous.TextureCube;
+                clamp(
+                    &mut t.MostDetailedMip,
+                    &mut t.MipLevels,
+                    &mut t.ResourceMinLODClamp,
+                );
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+                let t = &mut desc.Anonymous.TextureCubeArray;
+                clamp(
+                    &mut t.MostDetailedMip,
+                    &mut t.MipLevels,
+                    &mut t.ResourceMinLODClamp,
+                );
+            }
+            _ => {}
+        }
+    }
 }
 
 fn write_texture_srv(
@@ -4392,6 +4451,42 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capped_texture_array_views_clamp_mips_and_keep_slices() {
+        let mut desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                    MostDetailedMip: 1,
+                    MipLevels: 8,
+                    FirstArraySlice: 2,
+                    ArraySize: 3,
+                    ResourceMinLODClamp: 4.0,
+                    ..Default::default()
+                },
+            },
+            ..Default::default()
+        };
+        from_base(&mut desc, 3, 4);
+        // SAFETY: this is the same union member initialized above.
+        let t = unsafe { desc.Anonymous.Texture2DArray };
+        assert_eq!(
+            (t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp),
+            (0, 4, 1.0)
+        );
+        assert_eq!((t.FirstArraySlice, t.ArraySize), (2, 3));
+
+        desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV {
+            MostDetailedMip: 99,
+            MipLevels: u32::MAX,
+            ..t
+        };
+        from_base(&mut desc, 3, 4);
+        // SAFETY: the view dimension stayed the same.
+        let t = unsafe { desc.Anonymous.Texture2DArray };
+        assert_eq!((t.MostDetailedMip, t.MipLevels), (3, u32::MAX));
+    }
 
     #[test]
     fn table_cbv_reads_a_bounded_raw_view_of_a_live_alias() {
