@@ -236,6 +236,7 @@
 //!   console never exports them).
 
 mod bitcode;
+pub use bitcode::census;
 #[cfg(test)]
 mod census_tests;
 #[cfg(all(test, windows))]

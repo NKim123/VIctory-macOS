@@ -9,6 +9,9 @@ use std::collections::HashMap;
 
 use crate::structure::Map;
 
+pub mod census;
+mod opt;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Ty(u32);
 
@@ -510,34 +513,46 @@ impl Module {
         self.named.push((name.into(), nodes));
     }
 
-    /// Whether body instruction `i` is written even if nothing reads it: it
-    /// has effects (stores, atomics, calls of operations that are neither
-    /// read-none nor read-only).
-    fn rooted(&self, i: u32) -> bool {
+    /// Whether body instruction `i` has effects even if nothing reads it.
+    fn rooted(&self, effects: &[opt::Effect], i: u32) -> bool {
         match &self.insts[i as usize].op {
-            Op::Call(f, _) => !matches!(self.funcs[*f as usize].attr, Some(Attr::ReadNone | Attr::ReadOnly)),
+            Op::Call(f, _) => effects[*f as usize] == opt::Effect::Writes,
             Op::Store(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) => true,
             _ => false,
         }
     }
 
-    /// What the instructions [`Module::write`] writes use, of what the
-    /// shader flags declare (which must match it, or the validator refuses
-    /// the module: "Flags must match usage").
-    pub fn uses(&self) -> Uses {
+    /// Optimizes the finished body before the caller emits feature flags.
+    /// DXIL validation requires the flags to match the written instructions.
+    pub fn uses(&mut self) -> Uses {
+        self.optimise(opt::ALL);
+        self.written_uses()
+    }
+
+    fn written_uses(&self) -> Uses {
         let plan = self.plan();
         let wide = |t: Ty| self.types[t.0 as usize] == TypeDef::Int(64);
         let mut u = Uses::default();
         for b in plan.layout.iter().map(|&b| &self.blocks[b]) {
-            for &i in b.phis.iter().chain(&b.body).filter(|&&i| plan.live[i as usize]) {
+            for &i in b
+                .phis
+                .iter()
+                .chain(&b.body)
+                .filter(|&&i| plan.live[i as usize])
+            {
                 let inst = &self.insts[i as usize];
                 u.int64 |= wide(inst.ty);
                 for_each_operand(&inst.op, |v| u.int64 |= wide(self.type_of(v)));
-                let Op::Call(f, args) = &inst.op else { continue };
+                let Op::Call(f, args) = &inst.op else {
+                    continue;
+                };
                 let name = self.funcs[*f as usize].name.as_str();
                 if name.starts_with("dx.op.createHandleFromHeap") {
                     // Arguments: opcode, index, sampler heap, non-uniform.
-                    let sampler = args.get(2).and_then(|&a| self.int_value(a)).is_some_and(|x| x != 0);
+                    let sampler = args
+                        .get(2)
+                        .and_then(|&a| self.int_value(a))
+                        .is_some_and(|x| x != 0);
                     u.heap |= !sampler;
                     u.sampler_heap |= sampler;
                 }
@@ -553,7 +568,8 @@ impl Module {
     /// descriptor words no path reads, 556 of ActivateRays' 587). A worklist
     /// visits each instruction once, so a long chain of merges costs one
     /// pass, not one pass per merge.
-    fn live(&self) -> Vec<bool> {
+    fn live(&self, reached: &[bool]) -> Vec<bool> {
+        let effects = self.effects();
         let mut live = vec![false; self.insts.len()];
         let mut work: Vec<u32> = Vec::new();
         let mark = |live: &mut [bool], work: &mut Vec<u32>, v: V| {
@@ -564,8 +580,8 @@ impl Module {
                 work.push(i);
             }
         };
-        for b in &self.blocks {
-            for &i in b.body.iter().filter(|&&i| self.rooted(i)) {
+        for (b, _) in self.blocks.iter().zip(reached).filter(|&(_, &r)| r) {
+            for &i in b.body.iter().filter(|&&i| self.rooted(&effects, i)) {
                 mark(&mut live, &mut work, V::Inst(i));
             }
             if let Some(Term::CondBr(c, ..)) = b.term {
@@ -746,7 +762,12 @@ impl Module {
             }
         }
         for b in plan.layout.iter().map(|&b| &self.blocks[b]) {
-            for &i in b.phis.iter().chain(&b.body).filter(|&&i| plan.live[i as usize]) {
+            for &i in b
+                .phis
+                .iter()
+                .chain(&b.body)
+                .filter(|&&i| plan.live[i as usize])
+            {
                 let op = &self.insts[i as usize].op;
                 if let Op::Call(f, _) = *op {
                     called[f as usize] = true;
@@ -768,7 +789,13 @@ impl Module {
                 .collect();
             (ids, n)
         };
-        let globals = number(&mut self.globals.iter().zip(&read).map(|(g, &r)| g.init.is_none() || r));
+        let globals = number(
+            &mut self
+                .globals
+                .iter()
+                .zip(&read)
+                .map(|(g, &r)| g.init.is_none() || r),
+        );
         let funcs = number(&mut self.funcs.iter().zip(&called).map(|(f, &c)| f.body || c));
         (globals, funcs)
     }
@@ -788,7 +815,6 @@ impl Module {
     /// preheaders, as DXC emits them), or its predecessor would reach the
     /// target twice (the target's phis have one entry per predecessor).
     fn plan(&self) -> Plan {
-        let live = self.live();
         let succs = |b: usize| successors(self.term(b));
         let mut seen = vec![false; self.blocks.len()];
         let mut post = Vec::new();
@@ -821,7 +847,7 @@ impl Module {
             }
         }
         let mut plan = Plan {
-            live,
+            live: self.live(&seen),
             seen,
             layout: Vec::new(),
             pos: Vec::new(),
@@ -829,7 +855,12 @@ impl Module {
         };
         for &b in &post {
             let blk = &self.blocks[b];
-            let empty = b != 0 && blk.phis.iter().chain(&blk.body).all(|&i| !plan.live[i as usize]);
+            let empty = b != 0
+                && blk
+                    .phis
+                    .iter()
+                    .chain(&blk.body)
+                    .all(|&i| !plan.live[i as usize]);
             if let (Some(Term::Br(h)), true, [p]) = (self.term(b), empty, &preds[b][..])
                 && plan.to(h) != b
             {
@@ -841,7 +872,10 @@ impl Module {
                 }
             }
         }
-        plan.layout = post.into_iter().filter(|&b| plan.fold[b].is_none()).collect();
+        plan.layout = post
+            .into_iter()
+            .filter(|&b| plan.fold[b].is_none())
+            .collect();
         plan.pos = vec![u64::MAX; self.blocks.len()];
         for (n, &b) in plan.layout.iter().enumerate() {
             plan.pos[b] = n as u64;
@@ -921,7 +955,13 @@ impl Module {
             ),
         );
         let first_const = u64::from(g_n) + u64::from(n);
-        for g in self.globals.iter().zip(&kept_globals).filter(|(_, k)| **k != u32::MAX).map(|(g, _)| g) {
+        for g in self
+            .globals
+            .iter()
+            .zip(&kept_globals)
+            .filter(|(_, k)| **k != u32::MAX)
+            .map(|(g, _)| g)
+        {
             // [type, address space << 2 | explicit type | constant, init id
             // + 1, linkage (external 0, internal 3), log2 alignment + 1,
             // section]
@@ -941,7 +981,13 @@ impl Module {
                 ],
             );
         }
-        for f in self.funcs.iter().zip(&kept).filter(|(_, k)| **k != u32::MAX).map(|(f, _)| f) {
+        for f in self
+            .funcs
+            .iter()
+            .zip(&kept)
+            .filter(|(_, k)| **k != u32::MAX)
+            .map(|(f, _)| f)
+        {
             // [type, cc, isproto, linkage, paramattr, align, section,
             // visibility, gc, unnamed_addr, prologue, dllstorage, comdat, prefix]
             let attr = f.attr.map_or(0, |a| a as u64);
@@ -1062,8 +1108,18 @@ impl Module {
         w.exit();
 
         w.enter(VALUE_SYMTAB_BLOCK, 4);
-        let names = self.globals.iter().zip(&kept_globals).filter(|(_, k)| **k != u32::MAX).map(|(g, _)| &g.name);
-        let kept_names = self.funcs.iter().zip(&kept).filter(|(_, k)| **k != u32::MAX).map(|(f, _)| &f.name);
+        let names = self
+            .globals
+            .iter()
+            .zip(&kept_globals)
+            .filter(|(_, k)| **k != u32::MAX)
+            .map(|(g, _)| &g.name);
+        let kept_names = self
+            .funcs
+            .iter()
+            .zip(&kept)
+            .filter(|(_, k)| **k != u32::MAX)
+            .map(|(f, _)| &f.name);
         for (i, name) in names.chain(kept_names).enumerate() {
             let mut r = vec![i as u64];
             r.extend(chars(name));
@@ -1140,7 +1196,9 @@ impl Module {
         }
         w.exit();
         w.exit();
-        w.finish()
+        let bitcode = w.finish();
+        census::note(self, &plan, &bitcode);
+        bitcode
     }
 }
 
@@ -1435,9 +1493,10 @@ mod tests {
     /// Liveness as `write` computed it before the worklist: whole passes over
     /// the instructions until one changes nothing.
     fn live_by_passes(m: &Module) -> Vec<bool> {
+        let effects = m.effects();
         let mut live = vec![false; m.insts.len()];
         for b in &m.blocks {
-            for &i in b.body.iter().filter(|&&i| m.rooted(i)) {
+            for &i in b.body.iter().filter(|&&i| m.rooted(&effects, i)) {
                 live[i as usize] = true;
             }
             if let Some(Term::CondBr(V::Inst(c), ..)) = b.term {
@@ -1467,7 +1526,7 @@ mod tests {
     fn worklist_liveness_matches_passes() {
         for (regs, stages, read) in [(1, 0, 1), (1, 1, 1), (4, 3, 1), (8, 17, 3), (16, 40, 16)] {
             let m = synthetic(regs, stages, read);
-            let live = m.live();
+            let live = m.plan().live;
             assert_eq!(live, live_by_passes(&m), "{regs} regs x {stages} stages");
         }
     }
@@ -1499,7 +1558,7 @@ mod tests {
             V::Inst(i) => i as usize,
             _ => unreachable!(),
         };
-        let live = m.live();
+        let live = m.plan().live;
         assert!(live[ids(read)] && live[ids(sum)]);
         assert!(!live[ids(unread)] && !live[ids(cyc_a)] && !live[ids(cyc_b)]);
         assert_eq!(live, live_by_passes(&m));
@@ -1563,7 +1622,9 @@ mod tests {
     #[test]
     fn a_constant_branch_drops_its_other_side_and_that_side_s_phi_entry() {
         let (mut m, b, sink) = module(6);
-        let [entry, p, q, a, dead, join] = b[..] else { unreachable!() };
+        let [entry, p, q, a, dead, join] = b[..] else {
+            unreachable!()
+        };
         let i32t = m.int(32);
         let (one, two, three) = (m.i32(1), m.i32(2), m.i32(3));
         let x = m.cmp(entry, pred::EQ, one, two);
@@ -1582,7 +1643,10 @@ mod tests {
         let plan = m.plan();
         assert!(!plan.seen[dead] && !plan.layout.contains(&dead));
         assert!(!plan.edge(&m, dead, join), "the dead side's entry goes");
-        assert!(plan.edge(&m, a, join) && plan.edge(&m, q, join), "the others stay");
+        assert!(
+            plan.edge(&m, a, join) && plan.edge(&m, q, join),
+            "the others stay"
+        );
         // `q` splits a critical edge (entry has two successors, the join
         // two predecessors): it stays.
         assert_eq!(plan.fold[q], None);
@@ -1595,7 +1659,9 @@ mod tests {
     #[test]
     fn a_loop_whose_back_edge_is_never_taken() {
         let (mut m, b, sink) = module(4);
-        let [entry, head, latch, exit] = b[..] else { unreachable!() };
+        let [entry, head, latch, exit] = b[..] else {
+            unreachable!()
+        };
         let i32t = m.int(32);
         let (zero, one) = (m.i32(0), m.i32(1));
         m.terminate(entry, Term::Br(head));
@@ -1620,7 +1686,9 @@ mod tests {
     #[test]
     fn empty_blocks_before_a_phi_fold_only_where_the_entry_can_move() {
         let (mut m, b, sink) = module(7);
-        let [entry, f, t, p2, f2, q2, t2] = b[..] else { unreachable!() };
+        let [entry, f, t, p2, f2, q2, t2] = b[..] else {
+            unreachable!()
+        };
         let i32t = m.int(32);
         let (one, two) = (m.i32(1), m.i32(2));
         // entry branches to `t` both directly and through empty `f`, with
@@ -1679,16 +1747,25 @@ mod tests {
         m.store(entry, cell, one);
         let old = m.atomic(entry, Rmw::Add, cell, two);
         m.terminate(entry, Term::Ret);
-        let live = m.live();
+        let live = m.plan().live;
         let at = |v: V| match v {
             V::Inst(i) => live[i as usize],
             _ => unreachable!(),
         };
-        assert!(!at(x) && !at(unread) && !at(p) && !at(r), "unread pure values");
-        assert!(at(kept) && at(s) && at(bar) && at(old), "effects and what they read");
+        assert!(
+            !at(x) && !at(unread) && !at(p) && !at(r),
+            "unread pure values"
+        );
+        assert!(
+            at(kept) && at(s) && at(bar) && at(old),
+            "effects and what they read"
+        );
         // The store has no value of its own: it is the instruction after the
         // atomic's operand list, kept as its body entry.
-        let store = m.blocks[entry].body.iter().any(|&i| matches!(m.insts[i as usize].op, Op::Store(..)) && live[i as usize]);
+        let store = m.blocks[entry]
+            .body
+            .iter()
+            .any(|&i| matches!(m.insts[i as usize].op, Op::Store(..)) && live[i as usize]);
         assert!(store);
         let _ = m.write();
     }
@@ -1714,8 +1791,13 @@ mod tests {
         m.terminate(entry, Term::Ret);
         let plan = m.plan();
         let ((globals, n), _) = m.kept(&plan);
-        let (V::Global(u), V::Global(r)) = (unread, read) else { unreachable!() };
-        assert_eq!((globals[u as usize], globals[r as usize], n), (u32::MAX, 0, 1));
+        let (V::Global(u), V::Global(r)) = (unread, read) else {
+            unreachable!()
+        };
+        assert_eq!(
+            (globals[u as usize], globals[r as usize], n),
+            (u32::MAX, 0, 1)
+        );
         let _ = m.write();
     }
 
@@ -1725,11 +1807,18 @@ mod tests {
     #[test]
     fn uses_count_only_what_is_written() {
         let (mut m, b, sink) = module(3);
-        let [entry, live, dead] = b[..] else { unreachable!() };
+        let [entry, live, dead] = b[..] else {
+            unreachable!()
+        };
         let (i32t, i64t, handle_t) = (m.int(32), m.int(64), m.int(8));
         let i1t = m.int(1);
         let heap_ty = m.func_ty(handle_t, vec![i32t, i32t, i1t, i1t]);
-        let heap = m.function("dx.op.createHandleFromHeap", heap_ty, Some(Attr::ReadNone), false);
+        let heap = m.function(
+            "dx.op.createHandleFromHeap",
+            heap_ty,
+            Some(Attr::ReadNone),
+            false,
+        );
         let (op, zero, no) = (m.i32(218), m.i32(0), m.bool(false));
         let yes = m.bool(true);
         // An unread heap handle and 64-bit add where the program goes; a
@@ -1745,13 +1834,13 @@ mod tests {
         let _ = m.call(dead, sink, vec![one]);
         let _ = h;
         m.terminate(dead, Term::Ret);
-        assert_eq!(m.uses(), Uses::default());
+        assert_eq!(m.written_uses(), Uses::default());
         // Read where the program goes: counted.
         let h = m.call(live, heap, vec![op, zero, no, no]);
         let wide = m.bin(live, Bin::Add, five, five);
         let t = m.cast(live, Cast::Trunc, wide, i32t);
         let _ = (m.call(live, sink, vec![t]), h);
-        let u = m.uses();
+        let u = m.written_uses();
         assert!(u.int64 && !u.heap && !u.sampler_heap, "{u:?}");
     }
 
