@@ -1899,6 +1899,30 @@ fn integer_texture_loads_and_gathers_keep_exact_bits() {
     assert!(ran > 0, "integer texture test needs an SM 6.6 device");
 }
 
+#[test]
+fn converts_double_bits_to_float_without_double_support() {
+    let shader = build_valu_cs(&[vop1(0x00f, 0, vgpr(1))]);
+    let values = [
+        0.,
+        -0.,
+        1.0 + 2f64.powi(-24),
+        2f64.powi(-149),
+        2f64.powi(-150),
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+    ];
+    let inputs = values.map(|x| [x.to_bits() as u32, (x.to_bits() >> 32) as u32, 0, 0]);
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        let want = values[i] as f32;
+        if want.is_nan() {
+            assert!(f32::from_bits(got).is_nan(), "{backend}");
+        } else {
+            assert_eq!(got, want.to_bits(), "{backend}, input {}", values[i]);
+        }
+    });
+}
+
 /// Image addresses with `a16` after a whole-VGPR operand (the offset or
 /// bias keeps a VGPR; the coordinates share the next) and the clamp of
 /// `image_sample_d_cl` (after the coordinates). Program 1: a biased sample

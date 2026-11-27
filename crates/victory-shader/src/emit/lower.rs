@@ -814,7 +814,7 @@ impl<'a> Lower<'a> {
                     || n.starts_with("v_mbcnt")
                     || matches!(
                         n,
-                        "v_readlane_b32" | "v_writelane_b32" | "v_permlanex16_b32"
+                        "v_readlane_b32" | "v_writelane_b32" | "v_permlane16_b32" | "v_permlanex16_b32"
                     )
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
@@ -3078,6 +3078,15 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, keep, r, t)
     }
 
+    fn is_nan_f32(&mut self, f: V) -> V {
+        let c = self.cur;
+        let bits = self.as_int(f);
+        let mask = self.s.m.i32(0x7FFF_FFFF);
+        let abs = self.s.m.bin(c, Bin::And, bits, mask);
+        let inf = self.s.m.i32(0x7F80_0000);
+        self.s.m.cmp(c, pred::IUGT, abs, inf)
+    }
+
     /// The median of three. With a NaN among them the hardware gives the
     /// minimum of the three instead (the host's minimum skips NaNs, so that
     /// is the smallest number among them).
@@ -3089,8 +3098,8 @@ impl<'a> Lower<'a> {
         let t = self.max_min_flushed(false, hi, third);
         let median = self.max_min_flushed(true, lo, t);
         let least = self.max_min_flushed(false, lo, third);
-        let ab = self.s.m.cmp(c, pred::UNO, a, b);
-        let nan3 = self.s.m.cmp(c, pred::UNO, third, third);
+        let [na, nb, nan3] = [a, b, third].map(|v| self.is_nan_f32(v));
+        let ab = self.s.m.bin(c, Bin::Or, na, nb);
         let nan = self.s.m.bin(c, Bin::Or, ab, nan3);
         self.s.m.select(c, nan, least, median)
     }
@@ -3678,11 +3687,53 @@ impl<'a> Lower<'a> {
         )
     }
 
-    /// `x` of lane `src` (in this lane's quad) through quad reads, whose
-    /// lane must be a constant.
-    fn quad_pick(&mut self, x: V, src: V) -> V {
+    fn dpp8_quad_pattern(sel: u32) -> Option<Option<u8>> {
+        if (0..8).any(|i| ((sel >> (3 * i)) ^ i) & 4 != 0) {
+            return None;
+        }
+        let pack = |base| {
+            (0..4).fold(0u8, |mask, i| {
+                mask | ((((sel >> (3 * (base + i))) & 3u32) as u8) << (2 * i))
+            })
+        };
+        let low = pack(0);
+        Some((low == pack(4)).then_some(low))
+    }
+
+    /// Read this quad, including pixel helpers across a triangle edge.
+    /// Common broadcasts and exchanges need only one native quad operation.
+    fn quad_pick(&mut self, x: V, src: V, pattern: Option<u8>) -> V {
+        if pattern == Some(0xe4) {
+            return x;
+        }
         self.s.flags |= flags::WAVE_OPS;
         let c = self.cur;
+        match pattern {
+            Some(p @ (0x00 | 0x55 | 0xaa | 0xff)) => {
+                let lane = self.s.m.i32(u32::from(p & 3));
+                return self.s.op(
+                    c,
+                    "quadReadLaneAt.i32",
+                    Attr::NoUnwind,
+                    self.s.t.i32,
+                    122,
+                    &[x, lane],
+                );
+            }
+            Some(p @ (0xb1 | 0x4e | 0x1b)) => {
+                // The low two bits select lane 0's partner: XOR 1, 2, or 3.
+                let direction = self.s.m.i8((p & 3) - 1);
+                return self.s.op(
+                    c,
+                    "quadOp.i32",
+                    Attr::NoUnwind,
+                    self.s.t.i32,
+                    123,
+                    &[x, direction],
+                );
+            }
+            _ => {}
+        }
         let three = self.s.m.i32(3);
         let q = self.s.m.bin(c, Bin::And, src, three);
         let mut r = x;
@@ -3773,13 +3824,14 @@ impl<'a> Lower<'a> {
         src: V,
         guard: Option<V>,
         mesh_quad: bool,
+        pattern: Option<u8>,
     ) -> Option<V> {
         let c = self.cur;
         if self.s.pixel {
             let g = guard?;
             let (one, zero) = (self.s.m.i32(1), self.s.m.i32(0));
             let active_i32 = self.s.m.select(c, g, one, zero);
-            let picked = self.quad_pick(active_i32, src);
+            let picked = self.quad_pick(active_i32, src, pattern);
             return Some(self.s.m.cmp(c, pred::NE, picked, zero));
         }
         if !mesh_quad
@@ -3894,9 +3946,10 @@ impl<'a> Lower<'a> {
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
             let use_quad = mesh_quad || self.helpers_read(quad);
-            let src_ok = self.src_lane_active(inst, src, guard, mesh_quad);
+            let pattern = (offset & 0x8000 != 0).then_some(offset as u8);
+            let src_ok = self.src_lane_active(inst, src, guard, mesh_quad, pattern);
             let mut r = if use_quad {
-                self.quad_pick(x, src)
+                self.quad_pick(x, src, pattern)
             } else {
                 let safe_src = match src_ok {
                     Some(ok) => self.s.m.select(c, ok, src, lane),
@@ -4145,7 +4198,7 @@ impl<'a> Lower<'a> {
             "min_u32" => Some(Rmw::UMin),
             "max_u32" => Some(Rmw::UMax),
             "wrxchg_b32" => Some(Rmw::Xchg),
-            "cmpst_b32" => None,
+            "cmpst_b32" | "max_f32" | "min_f32" => None,
             _ => return Err("an LDS operation"),
         };
         let v0 = self.vgprs(inst, data.first().ok_or("an LDS atomic")?, 1)?[0];
@@ -4169,6 +4222,9 @@ impl<'a> Lower<'a> {
         let g = on(self, inside);
         let at = self.begin_guarded(Some(g));
         let r = match rmw {
+            _ if matches!(op.as_str(), "max_f32" | "min_f32") => {
+                self.lds_float_min_max(p, v0, op == "max_f32")
+            }
             Some(op) => self.s.m.atomic(self.cur, op, p, v0),
             // Compare with data0, store data1.
             None => self
@@ -4181,6 +4237,88 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg), r, None);
         }
         Ok(())
+    }
+
+    /// `ds_max_f32` (`max`) or `ds_min_f32` on the LDS dword at `p` with
+    /// the float bits `data`; the old bits return.
+    ///
+    /// DXIL has no float atomics on group-shared memory, so this is a
+    /// compare-exchange loop around [`Lower::lds_float_pick`], which gives
+    /// what RDNA2 writes (measured on gfx1036, reported on the pull
+    /// request): an sNaN, data first, then memory, is written quieted;
+    /// otherwise a NaN loses to a number (two quiet NaNs give the data);
+    /// numbers compare as floats with -0 below +0.
+    // shortcut: f32 denormals compare as kept; with the console's MODE
+    // flushing them they would order as ±0 first (MODE is not modelled).
+    fn lds_float_min_max(&mut self, p: V, data: V, max: bool) -> V {
+        let pre = self.cur;
+        let init = self.s.m.load(pre, p);
+        let (lp, exit) = (self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(pre, Term::Br(lp));
+        let i32t = self.s.t.i32;
+        let old = self.s.m.phi(lp, i32t);
+        self.cur = lp;
+        let new = self.lds_float_pick(old, data, max);
+        let prev = self.s.m.cmpxchg(lp, p, old, new);
+        let done = self.s.m.cmp(lp, pred::EQ, prev, old);
+        self.s.m.set_phi(old, vec![(init, pre), (prev, lp)]);
+        self.s.m.terminate(lp, Term::CondBr(done, exit, lp));
+        self.cur = exit;
+        old
+    }
+
+    /// What `ds_max_f32` (`max`) or `ds_min_f32` writes over the dword
+    /// `mem` with `data` (float bits; see [`Lower::lds_float_min_max`]).
+    fn lds_float_pick(&mut self, mem: V, data: V, max: bool) -> V {
+        let c = self.cur;
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let (abs_mask, inf, quiet, zero) = (
+            k(self, 0x7FFF_FFFF),
+            k(self, 0x7F80_0000),
+            k(self, 0x40_0000),
+            k(self, 0),
+        );
+        let nan = |l: &mut Self, x: V| {
+            let m = l.s.m.bin(c, Bin::And, x, abs_mask);
+            l.s.m.cmp(c, pred::IUGT, m, inf)
+        };
+        let snan = |l: &mut Self, x: V| {
+            let n = nan(l, x);
+            let q = l.s.m.bin(c, Bin::And, x, quiet);
+            let sig = l.s.m.cmp(c, pred::EQ, q, zero);
+            l.s.m.bin(c, Bin::And, n, sig)
+        };
+        // A total order of the numbers as signed integers, -0 below +0:
+        // negative floats' magnitude bits reversed.
+        let key = |l: &mut Self, x: V| {
+            let k31 = l.s.m.i32(31);
+            let sign = l.s.m.bin(c, Bin::AShr, x, k31);
+            let flip = l.s.m.bin(c, Bin::And, sign, abs_mask);
+            l.s.m.bin(c, Bin::Xor, x, flip)
+        };
+        let (dk, mk) = (key(self, data), key(self, mem));
+        let take = self
+            .s
+            .m
+            .cmp(c, if max { pred::SGT } else { pred::SLT }, dk, mk);
+        let r = self.s.m.select(c, take, data, mem);
+        let (dn, mn) = (nan(self, data), nan(self, mem));
+        // One NaN: the number; two quiet NaNs: the data.
+        let r = self.s.m.select(c, mn, data, r);
+        let both = self.s.m.bin(c, Bin::And, dn, mn);
+        let only_data = {
+            let t = self.s.m.bool(true);
+            let not_both = self.s.m.bin(c, Bin::Xor, both, t);
+            self.s.m.bin(c, Bin::And, dn, not_both)
+        };
+        let r = self.s.m.select(c, only_data, mem, r);
+        // Signalling NaNs win, quieted: the data's first.
+        let qm = self.s.m.bin(c, Bin::Or, mem, quiet);
+        let sm = snan(self, mem);
+        let r = self.s.m.select(c, sm, qm, r);
+        let qd = self.s.m.bin(c, Bin::Or, data, quiet);
+        let sd = snan(self, data);
+        self.s.m.select(c, sd, qd, r)
     }
 
     /// Thread-group sync with a shared-memory fence, and a UAV fence when
@@ -6763,8 +6901,12 @@ impl<'a> Lower<'a> {
             return Err("a DPP operand");
         };
         let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("a DPP operand")?)?;
-        // Quad permutations and DPP8 stay in groups the pixel layout shares.
-        let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
+        // Quad-local DPP8 can use quad reads even when its two permutations differ.
+        let pattern = match dpp {
+            Dpp::Row { ctrl, .. } => (ctrl <= 0xff).then_some(Some(ctrl as u8)),
+            Dpp::Lanes { sel, .. } => Self::dpp8_quad_pattern(sel),
+        };
+        let quad = pattern.is_some();
         let mesh_quad = self.s.mesh.is_some() && quad;
         if !mesh_quad {
             self.cross_lane(quad)?;
@@ -6849,14 +6991,14 @@ impl<'a> Lower<'a> {
         let src_active = if fi {
             None
         } else {
-            self.src_lane_active(inst, src, guard, mesh_quad)
+            self.src_lane_active(inst, src, guard, mesh_quad, pattern.flatten())
         };
         let valid = match (inside, src_active) {
             (Some(in_b), Some(act)) => Some(self.s.m.bin(c, Bin::And, in_b, act)),
             (a, b) => a.or(b),
         };
         let mut r = if use_quad {
-            self.quad_pick(x, src)
+            self.quad_pick(x, src, pattern.flatten())
         } else {
             let safe_src = match valid {
                 Some(ok) => self.s.m.select(c, ok, src, lane),
@@ -7184,6 +7326,156 @@ impl<'a> Lower<'a> {
                 let r = self.fmad(a, bb, cc);
                 float(self, r)
             }
+            "v_div_scale_f32" => {
+                // RDNA2 ISA: src0 = value to scale, src1 = denominator, src2 = numerator.
+                let (a, den, num) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
+                let (ai, ni, di) = (self.as_int(a), self.as_int(num), self.as_int(den));
+                let (k23, k255, kabs) = (
+                    self.s.m.i32(23),
+                    self.s.m.i32(0xFF),
+                    self.s.m.i32(0x7FFF_FFFF),
+                );
+                let (zero, k23_exp, k232_exp, k96) = (
+                    self.s.m.i32(0),
+                    self.s.m.i32(23),
+                    self.s.m.i32(232),
+                    self.s.m.i32(96),
+                );
+                let exp_of = |l: &mut Self, x: V| {
+                    let s = l.s.m.bin(c, Bin::LShr, x, k23);
+                    l.s.m.bin(c, Bin::And, s, k255)
+                };
+                let (e1, e2) = (exp_of(self, ni), exp_of(self, di));
+                let n_abs = self.s.m.bin(c, Bin::And, ni, kabs);
+                let d_abs = self.s.m.bin(c, Bin::And, di, kabs);
+                let z1 = self.s.m.cmp(c, pred::EQ, n_abs, zero);
+                let z2 = self.s.m.cmp(c, pred::EQ, d_abs, zero);
+                let any_zero = self.s.m.bin(c, Bin::Or, z1, z2);
+                let special = {
+                    let s1 = self.s.m.cmp(c, pred::EQ, e1, k255);
+                    let s2 = self.s.m.cmp(c, pred::EQ, e2, k255);
+                    let a12 = self.s.m.bin(c, Bin::Or, s1, s2);
+                    self.s.m.bin(c, Bin::Or, a12, any_zero)
+                };
+                let is_den = self.s.m.cmp(c, pred::EQ, ai, di);
+                let diff = self.s.m.bin(c, Bin::Sub, e2, e1);
+                let den_tiny = self.s.m.cmp(c, pred::IULE, e2, k23_exp);
+                let den_huge = self.s.m.cmp(c, pred::IUGE, e2, k232_exp);
+                let num_tiny_exp = self.s.m.cmp(c, pred::IULE, e1, k23_exp);
+                let num_huge = self.s.m.cmp(c, pred::IUGE, e1, k232_exp);
+                let num_gap = self.s.m.cmp(c, pred::SGE, diff, k96);
+                let not_den_huge = {
+                    let t = self.s.m.bool(true);
+                    self.s.m.bin(c, Bin::Xor, den_huge, t)
+                };
+                let num_gap = self.s.m.bin(c, Bin::And, num_gap, not_den_huge);
+                let num_tiny = self.s.m.bin(c, Bin::Or, num_tiny_exp, num_gap);
+                let up_raw = self.s.m.select(c, is_den, den_tiny, num_tiny);
+                let dn_raw = self.s.m.select(c, is_den, den_huge, num_huge);
+                let not_special = {
+                    let t = self.s.m.bool(true);
+                    self.s.m.bin(c, Bin::Xor, special, t)
+                };
+                let up = self.s.m.bin(c, Bin::And, up_raw, not_special);
+                let dn = self.s.m.bin(c, Bin::And, dn_raw, not_special);
+                let uncancelled = {
+                    let x_tiny = self.s.m.bin(c, Bin::Xor, den_tiny, num_tiny);
+                    let x_huge = self.s.m.bin(c, Bin::Xor, den_huge, num_huge);
+                    self.s.m.bin(c, Bin::Or, x_tiny, x_huge)
+                };
+                let flag_raw = self.s.m.select(c, is_den, uncancelled, up_raw);
+                let flag = self.s.m.bin(c, Bin::And, flag_raw, not_special);
+                let k_up = self.s.m.f32(0x5F80_0000);
+                let k_dn = self.s.m.f32(0x1F80_0000);
+                let a_up = self.s.m.bin(c, Bin::Mul, a, k_up);
+                let a_dn = self.s.m.bin(c, Bin::Mul, a, k_dn);
+                let r = self.s.m.select(c, dn, a_dn, a);
+                let r = self.s.m.select(c, up, a_up, r);
+                let qnan = self.s.m.f32(0x7FC0_0000);
+                let r = self.s.m.select(c, any_zero, qnan, r);
+                float(self, r)?;
+                if let Some(Operand::Scalar { code, .. }) = v.carry
+                    && let Some(w) = inst.write(Reg::S(code))
+                {
+                    self.lane_bits.insert(w, flag);
+                }
+                for &(_, w) in &inst.writes {
+                    self.vals
+                        .entry(w)
+                        .or_insert(Val::Missing("a lane mask read as data"));
+                }
+                Ok(())
+            }
+            "v_div_fmas_f32" => {
+                let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
+                let m = inst
+                    .read(Reg::S(crate::ir::VCC))
+                    .and_then(|v| {
+                        self.x
+                            .st
+                            .select_mask(v, inst.read(Reg::S(crate::ir::VCC + 1)))
+                    })
+                    .ok_or("v_div_fmas_f32 without VCC")?;
+                let vcc = self.boolean(m, c)?;
+                let tmp = self.fmad(a, bb, cc);
+                let ci = self.as_int(cc);
+                let (k23, k255, k128) = (self.s.m.i32(23), self.s.m.i32(0xFF), self.s.m.i32(128));
+                let sh = self.s.m.bin(c, Bin::LShr, ci, k23);
+                let exp = self.s.m.bin(c, Bin::And, sh, k255);
+                let exp_ge = self.s.m.cmp(c, pred::IUGE, exp, k128);
+                let (k_up, k_dn) = (self.s.m.f32(0x5F80_0000), self.s.m.f32(0x1F80_0000));
+                let scale = self.s.m.select(c, exp_ge, k_up, k_dn);
+                let scaled = self.s.m.bin(c, Bin::Mul, tmp, scale);
+                let r = self.s.m.select(c, vcc, scaled, tmp);
+                float(self, r)
+            }
+            "v_div_fixup_f32" => {
+                let (q, den, num) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
+                let (qi, di, ni) = (self.as_int(q), self.as_int(den), self.as_int(num));
+                let (ksign, kabs, kinf) = (
+                    self.s.m.i32(0x8000_0000),
+                    self.s.m.i32(0x7FFF_FFFF),
+                    self.s.m.i32(0x7F80_0000),
+                );
+                let (kqnan_bit, kneg_qnan, zero) = (
+                    self.s.m.i32(0x0040_0000),
+                    self.s.m.i32(0xFFC0_0000),
+                    self.s.m.i32(0),
+                );
+                let sign = {
+                    let x = self.s.m.bin(c, Bin::Xor, ni, di);
+                    self.s.m.bin(c, Bin::And, x, ksign)
+                };
+                let q_abs = self.s.m.bin(c, Bin::And, qi, kabs);
+                let d_abs = self.s.m.bin(c, Bin::And, di, kabs);
+                let n_abs = self.s.m.bin(c, Bin::And, ni, kabs);
+                let q_nan = self.s.m.cmp(c, pred::IUGT, q_abs, kinf);
+                let d_nan = self.s.m.cmp(c, pred::IUGT, d_abs, kinf);
+                let n_nan = self.s.m.cmp(c, pred::IUGT, n_abs, kinf);
+                let d_inf = self.s.m.cmp(c, pred::EQ, d_abs, kinf);
+                let n_inf = self.s.m.cmp(c, pred::EQ, n_abs, kinf);
+                let d_zero = self.s.m.cmp(c, pred::EQ, d_abs, zero);
+                let n_zero = self.s.m.cmp(c, pred::EQ, n_abs, zero);
+                let both_inf = self.s.m.bin(c, Bin::And, n_inf, d_inf);
+                let both_zero = self.s.m.bin(c, Bin::And, n_zero, d_zero);
+                let invalid = self.s.m.bin(c, Bin::Or, both_inf, both_zero);
+                let make_inf = {
+                    let t = self.s.m.bin(c, Bin::Or, n_inf, d_zero);
+                    self.s.m.bin(c, Bin::Or, t, q_nan)
+                };
+                let make_zero = self.s.m.bin(c, Bin::Or, d_inf, n_zero);
+                let signed_q = self.s.m.bin(c, Bin::Or, sign, q_abs);
+                let signed_inf = self.s.m.bin(c, Bin::Or, sign, kinf);
+                let n_qnan = self.s.m.bin(c, Bin::Or, ni, kqnan_bit);
+                let d_qnan = self.s.m.bin(c, Bin::Or, di, kqnan_bit);
+                let r = self.s.m.select(c, make_zero, sign, signed_q);
+                let r = self.s.m.select(c, make_inf, signed_inf, r);
+                let r = self.s.m.select(c, invalid, kneg_qnan, r);
+                let r = self.s.m.select(c, d_nan, d_qnan, r);
+                let r = self.s.m.select(c, n_nan, n_qnan, r);
+                let rf = self.as_float(r);
+                float(self, rf)
+            }
             "v_fmac_f32" | "v_mac_f32" | "v_mac_legacy_f32" => {
                 let (a, bb) = (f(self, 0)?, f(self, 1)?);
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
@@ -7323,6 +7615,12 @@ impl<'a> Lower<'a> {
                     r = self.s.m.select(c, nan, sat, r);
                 }
                 int(self, r)
+            }
+            "v_cvt_f32_f64" => {
+                let (lo, hi) = self.f64_pair(inst, 0)?;
+                let bits = self.f64_to_f32_bits(lo, hi);
+                let r = self.as_float(bits);
+                float(self, r)
             }
             "v_cvt_f32_u32" => {
                 // WARP can misround a full-width uitofp. Each 16-bit
@@ -7643,7 +7941,7 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.select(c, is, a, old);
                 int(self, r)
             }
-            "v_permlanex16_b32" => {
+            "v_permlane16_b32" | "v_permlanex16_b32" => {
                 self.cross_lane(false)?;
                 let (value, low, high) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
                 let lane = self.lane_index();
@@ -7660,7 +7958,11 @@ impl<'a> Lower<'a> {
                 let pick = self.s.m.bin(c, Bin::LShr, selectors, shift);
                 let pick = self.s.m.bin(c, Bin::And, pick, fifteen);
                 let row = self.s.m.bin(c, Bin::And, lane, row_mask);
-                let row = self.s.m.bin(c, Bin::Xor, row, sixteen);
+                let row = if name == "v_permlanex16_b32" {
+                    self.s.m.bin(c, Bin::Xor, row, sixteen)
+                } else {
+                    row
+                };
                 let source = self.s.m.bin(c, Bin::Or, row, pick);
                 let value = self.read_lane(value, source);
 
@@ -7940,6 +8242,157 @@ impl<'a> Lower<'a> {
     /// 16-bit operations, computed in f32 or i32: f16 sums, differences and
     /// products are exact there and round once to f16 (f32 has the 2 x 11 +
     /// 2 bits that make double rounding harmless); `None` if `name` is none.
+    fn f64_pair(&mut self, inst: &Inst, k: usize) -> Result<(V, V), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.sdwa.is_some() || v.dpp.is_some() {
+            return Err("64-bit operand modifiers");
+        }
+        let op = *v.src.get(k).ok_or("a missing operand")?;
+        let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<(V, V), Why> {
+            let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
+            let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
+            Ok((lo, hi))
+        };
+        let (lo, mut hi) = match op {
+            Operand::Vector { reg, .. } => pair(self, Reg::V(reg), Reg::V(reg + 1))?,
+            Operand::Scalar { code, .. } if code != NULL => {
+                pair(self, Reg::S(code), Reg::S(code + 1))?
+            }
+            Operand::Const(128) => (self.s.m.i32(0), self.s.m.i32(0)),
+            Operand::Const(c @ 240..=248) => {
+                const INLINE_F64: [f64; 9] = [
+                    0.5,
+                    -0.5,
+                    1.0,
+                    -1.0,
+                    2.0,
+                    -2.0,
+                    4.0,
+                    -4.0,
+                    1.0 / std::f64::consts::TAU,
+                ];
+                let bits = INLINE_F64[(c - 240) as usize].to_bits();
+                (self.s.m.i32(bits as u32), self.s.m.i32((bits >> 32) as u32))
+            }
+            // GFX10 places a 32-bit literal in the high 32 bits of a 64-bit float operand.
+            Operand::Literal(x) => (self.s.m.i32(0), self.s.m.i32(x)),
+            _ => return Err("a 64-bit float operand"),
+        };
+        let c = self.cur;
+        if v.abs >> k & 1 != 0 {
+            let mask = self.s.m.i32(0x7FFF_FFFF);
+            hi = self.s.m.bin(c, Bin::And, hi, mask);
+        }
+        if v.neg >> k & 1 != 0 {
+            let sign = self.s.m.i32(0x8000_0000);
+            hi = self.s.m.bin(c, Bin::Xor, hi, sign);
+        }
+        Ok((lo, hi))
+    }
+
+    /// Converts IEEE-754 binary64 `(lo, hi)` to binary32 bits with round-to-nearest-even,
+    /// without requiring host `DOUBLES` (`f64`) support.
+    fn f64_to_f32_bits(&mut self, lo: V, hi: V) -> V {
+        let c = self.cur;
+        let k0 = self.s.m.i32(0);
+        let k1 = self.s.m.i32(1);
+        let sign_mask = self.s.m.i32(0x8000_0000);
+        let sign = self.s.m.bin(c, Bin::And, hi, sign_mask);
+
+        let k20 = self.s.m.i32(20);
+        let k7ff = self.s.m.i32(0x7FF);
+        let exp64 = self.s.m.bin(c, Bin::LShr, hi, k20);
+        let exp64 = self.s.m.bin(c, Bin::And, exp64, k7ff);
+
+        let frac_mask = self.s.m.i32(0x000F_FFFF);
+        let frac_hi = self.s.m.bin(c, Bin::And, hi, frac_mask);
+        let frac_any = self.s.m.bin(c, Bin::Or, frac_hi, lo);
+        let frac_nz = self.s.m.cmp(c, pred::NE, frac_any, k0);
+
+        let k3 = self.s.m.i32(3);
+        let k29 = self.s.m.i32(29);
+        let m23_hi = self.s.m.bin(c, Bin::Shl, frac_hi, k3);
+        let m23_lo = self.s.m.bin(c, Bin::LShr, lo, k29);
+        let m23 = self.s.m.bin(c, Bin::Or, m23_hi, m23_lo);
+
+        let rem_mask = self.s.m.i32(0x1FFF_FFFF);
+        let rem = self.s.m.bin(c, Bin::And, lo, rem_mask);
+        let half_rem = self.s.m.i32(0x1000_0000);
+        let gt_half = self.s.m.cmp(c, pred::IUGT, rem, half_rem);
+        let eq_half = self.s.m.cmp(c, pred::EQ, rem, half_rem);
+        let m23_odd_bit = self.s.m.bin(c, Bin::And, m23, k1);
+        let m23_odd = self.s.m.cmp(c, pred::NE, m23_odd_bit, k0);
+        let tie_up = self.s.m.bin(c, Bin::And, eq_half, m23_odd);
+        let norm_round = self.s.m.bin(c, Bin::Or, gt_half, tie_up);
+        let norm_inc = self.s.m.select(c, norm_round, k1, k0);
+
+        // Normal range: exp64 in [897, 1150] -> exp32 in [1, 254].
+        let k896 = self.s.m.i32(896);
+        let k23 = self.s.m.i32(23);
+        let exp32 = self.s.m.bin(c, Bin::Sub, exp64, k896);
+        let exp32_sh = self.s.m.bin(c, Bin::Shl, exp32, k23);
+        let norm_body = self.s.m.bin(c, Bin::Add, exp32_sh, m23);
+        let norm_body = self.s.m.bin(c, Bin::Add, norm_body, norm_inc);
+        let norm_res = self.s.m.bin(c, Bin::Or, sign, norm_body);
+
+        // Subnormal range: exp64 in [874, 896] -> shift in [1, 23].
+        let k897 = self.s.m.i32(897);
+        let k32 = self.s.m.i32(32);
+        let k31 = self.s.m.i32(31);
+        let imp = self.s.m.i32(0x0080_0000);
+        let sig24 = self.s.m.bin(c, Bin::Or, imp, m23);
+        let raw_shift = self.s.m.bin(c, Bin::Sub, k897, exp64);
+        // Clamp shift to [1, 23] so shifts never produce poison outside the subnormal branch.
+        let lt1 = self.s.m.cmp(c, pred::IULT, raw_shift, k1);
+        let shift = self.s.m.select(c, lt1, k1, raw_shift);
+        let gt23 = self.s.m.cmp(c, pred::IUGT, shift, k23);
+        let shift = self.s.m.select(c, gt23, k23, shift);
+        let sub_m = self.s.m.bin(c, Bin::LShr, sig24, shift);
+        let inv_shift = self.s.m.bin(c, Bin::Sub, k32, shift);
+        let lost = self.s.m.bin(c, Bin::Shl, sig24, inv_shift);
+        let round_bit = self.s.m.bin(c, Bin::LShr, lost, k31);
+        let round_on = self.s.m.cmp(c, pred::NE, round_bit, k0);
+        let low31 = self.s.m.i32(0x7FFF_FFFF);
+        let lost_lo = self.s.m.bin(c, Bin::And, lost, low31);
+        let sticky = self.s.m.bin(c, Bin::Or, lost_lo, rem);
+        let sticky_on = self.s.m.cmp(c, pred::NE, sticky, k0);
+        let sub_odd_bit = self.s.m.bin(c, Bin::And, sub_m, k1);
+        let sub_odd = self.s.m.cmp(c, pred::NE, sub_odd_bit, k0);
+        let sub_tie = self.s.m.bin(c, Bin::Or, sticky_on, sub_odd);
+        let sub_round = self.s.m.bin(c, Bin::And, round_on, sub_tie);
+        let sub_inc = self.s.m.select(c, sub_round, k1, k0);
+        let sub_body = self.s.m.bin(c, Bin::Add, sub_m, sub_inc);
+        let sub_res = self.s.m.bin(c, Bin::Or, sign, sub_body);
+
+        // Underflow range: exp64 < 874. Only exp64 == 873 with non-zero fraction rounds up to min subnormal (1).
+        let k873 = self.s.m.i32(873);
+        let eq873 = self.s.m.cmp(c, pred::EQ, exp64, k873);
+        let round_min = self.s.m.bin(c, Bin::And, eq873, frac_nz);
+        let min_bit = self.s.m.select(c, round_min, k1, k0);
+        let under_res = self.s.m.bin(c, Bin::Or, sign, min_bit);
+
+        // Overflow / Inf / NaN: exp64 >= 1151.
+        let is_exp_all = self.s.m.cmp(c, pred::EQ, exp64, k7ff);
+        let is_nan = self.s.m.bin(c, Bin::And, is_exp_all, frac_nz);
+        let inf_bits = self.s.m.i32(0x7F80_0000);
+        let qnan_bits = self.s.m.i32(0x7FC0_0000);
+        let nan_body = self.s.m.bin(c, Bin::Or, qnan_bits, m23);
+        let over_body = self.s.m.select(c, is_nan, nan_body, inf_bits);
+        let over_res = self.s.m.bin(c, Bin::Or, sign, over_body);
+
+        // Select final result by exponent range.
+        let k874 = self.s.m.i32(874);
+        let k1151 = self.s.m.i32(1151);
+        let is_under = self.s.m.cmp(c, pred::IULT, exp64, k874);
+        let is_sub = self.s.m.cmp(c, pred::IULT, exp64, k897);
+        let is_over = self.s.m.cmp(c, pred::IUGE, exp64, k1151);
+        let r = self.s.m.select(c, is_over, over_res, norm_res);
+        let r = self.s.m.select(c, is_sub, sub_res, r);
+        self.s.m.select(c, is_under, under_res, r)
+    }
+
     fn valu16(&mut self, inst: &Inst, name: &str, guard: Option<V>) -> Option<Result<(), Why>> {
         const FLOAT2: &[&str] = &[
             "v_add_f16",

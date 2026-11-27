@@ -974,6 +974,9 @@ fn effects(
                 }
                 _ => {}
             }
+            if name == "v_div_fmas_f32" {
+                r.extend(mask(VCC));
+            }
             if name.starts_with("v_interp_") || src_indexed || dst_indexed {
                 r.push((Reg::S(M0), NONE));
             }

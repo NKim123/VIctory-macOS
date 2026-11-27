@@ -353,12 +353,29 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             exec = ((exec & 0xFFFF_FFFF) | ((k & 0xFFFF_FFFF) << 32)) & all;
             continue;
         }
-        if let Fields::Sop { src, .. } = &inst.fields {
+        if let Fields::Sop { dst, src, .. } = &inst.fields {
             if name.starts_with("s_and_b")
                 && src.iter().any(|o| matches!(*o, Operand::Scalar { code, .. } if inst.read(Reg::S(code)).is_some_and(|v| masked.contains(&v))))
                 && let Some(&(_, w)) = inst.writes.iter().find(|w| matches!(w.0, Reg::S(_)))
             {
                 masked.push(w);
+            }
+            if name == "s_mov_b32"
+                && let (Some(Operand::Scalar { code: dc, .. }), Some(s0)) = (dst, src.first())
+                && *dc != NULL
+                && let Some(w) = inst.write(Reg::S(*dc))
+            {
+                let sym = match *s0 {
+                    Operand::Scalar { code, .. } if code != NULL => {
+                        inst.read(Reg::S(code)).map_or(Sym::Unknown, |x| {
+                            uni.get(&x).copied().unwrap_or(Sym::Uni(x))
+                        })
+                    }
+                    Operand::Const(c) => crate::resource::inline(c).map_or(Sym::Unknown, Sym::K),
+                    Operand::Literal(x) => Sym::K(x),
+                    _ => Sym::Unknown,
+                };
+                uni.insert(w, sym);
             }
             for &(_, w) in &inst.writes {
                 uni.entry(w).or_insert(Sym::Unknown);
@@ -958,6 +975,25 @@ mod tests {
             );
             assert_eq!(sec.shapes.get(&v4_val), None);
         }
+    }
+
+    #[test]
+    fn scalar_moves_keep_constants_in_whole_wave_sections() {
+        let p = build(
+            &[
+                sop1(2, 0x03, 135), // s_mov_b32 s2, 7
+                sop1(3, 0x03, 2),   // s_mov_b32 s3, s2
+                0x7E02_0203,        // v_mov_b32 v1, s3
+                0xBF81_0000,
+            ],
+            false,
+        );
+        let insts = &p.blocks[0].insts;
+        let dst = insts[2].write(Reg::V(1)).unwrap();
+        assert_eq!(
+            simulate(insts, 32, Value(u32::MAX)).get(&dst),
+            Some(&Shape::K(7))
+        );
     }
 
     #[test]

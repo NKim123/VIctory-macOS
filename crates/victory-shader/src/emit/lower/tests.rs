@@ -202,6 +202,59 @@ fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
 }
 
 #[test]
+fn quad_local_dpp8_recovers_only_a_shared_quad_permutation() {
+    let encode = |lanes: [u32; 8]| {
+        lanes
+            .into_iter()
+            .enumerate()
+            .fold(0, |sel, (i, lane)| sel | lane << (3 * i))
+    };
+    assert_eq!(
+        super::Lower::dpp8_quad_pattern(encode([0, 1, 2, 3, 4, 5, 6, 7])),
+        Some(Some(0xe4))
+    );
+    assert_eq!(
+        super::Lower::dpp8_quad_pattern(encode([1, 0, 3, 2, 5, 4, 7, 6])),
+        Some(Some(0xb1))
+    );
+    assert_eq!(
+        super::Lower::dpp8_quad_pattern(encode([0, 0, 0, 0, 5, 5, 5, 5])),
+        Some(None)
+    );
+    assert_eq!(
+        super::Lower::dpp8_quad_pattern(encode([4, 1, 2, 3, 0, 5, 6, 7])),
+        None
+    );
+}
+
+#[test]
+fn lds_float_min_and_max_lower_to_compare_exchange() {
+    for opcode in [0x12, 0x13] {
+        let words = [
+            0x7E02_02F2, // v1 = 1.0
+            0xD800_0000 | opcode << 18,
+            0x0000_0100, // ds_min/max_f32 v0, v1
+            S_ENDPGM,
+        ];
+        lowers(&words, 1 << 15).unwrap();
+    }
+}
+
+#[test]
+fn lowers_division_helpers_and_binary64_conversion_without_doubles() {
+    let div_scale = 0xD56D_6A00; // v_div_scale_f32 v0, vcc_lo, v1, v2, v3
+    let operands = 257 | 258 << 9 | 259 << 18;
+    for body in [
+        vec![div_scale, operands],
+        vec![div_scale, operands, 0xD56F_0000, operands], // v_div_fmas_f32
+        vec![0xD55F_0000, operands],                      // v_div_fixup_f32
+        vec![0x7E00_1F01],                                // v_cvt_f32_f64 v0, v[1:2]
+    ] {
+        lowers_valu(&body).unwrap_or_else(|e| panic!("{body:x?}: {e}"));
+    }
+}
+
+#[test]
 fn vop3_conversion_modifiers_affect_the_lowering() {
     for (op, first, second, modifier) in [
         (0x0Au32, 1 << 15, 0, "clamp"),
@@ -624,8 +677,8 @@ fn a_waterfall_loop_that_only_sizes_takes_the_kind_of_the_sampled_one() {
 }
 
 #[test]
-fn permlanex16_lowers_in_wave32_and_wave64() {
-    let words = [
+fn permlane16_forms_lower_in_wave32_and_wave64() {
+    let mut words = [
         0xD778_0001,
         0x0004_0100, // v_permlanex16_b32 v1, v0, s0, s1
         0xD834_0000,
@@ -636,9 +689,12 @@ fn permlanex16_lowers_in_wave32_and_wave64() {
         sgprs: 2,
         ..root(RootType::Constants, 0, 0)
     }];
-    for wave64 in [false, true] {
-        let result = lower_wave(&words, layout.clone(), vec![], wave64).unwrap();
-        assert!(result.wave_ops);
+    for op in [0xD777_0001, 0xD778_0001] {
+        words[0] = op;
+        for wave64 in [false, true] {
+            let result = lower_wave(&words, layout.clone(), vec![], wave64).unwrap();
+            assert!(result.wave_ops);
+        }
     }
 }
 
