@@ -32,6 +32,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use crate::backend::HostMemory;
 use crate::host::{HostList, host};
 use crate::object::This;
+use crate::ranges::Ranges;
 use crate::resource::HostTexture;
 use windows::core::Interface;
 
@@ -185,10 +186,10 @@ struct Last {
     uploaded: bool,
     /// Tracked memory: per-subresource content state last detiled.
     states: Vec<TrackedSubresource>,
-    /// Tracked memory: 64 KiB page numbers known to be unmapped from earlier
+    /// Tracked memory: whole pages known to be unmapped from earlier
     /// `take_split` calls, cleared when a later `take_split` reports them
     /// mapped.
-    unmapped: std::collections::BTreeSet<usize>,
+    unmapped: Ranges,
 }
 
 /// Per subresource of `layout` (`mips` per array slice; a 3D texture's
@@ -1078,14 +1079,12 @@ impl Staging {
             }
             let page = crate::watch::PAGE;
             for &(f, e) in &copy {
-                for p in f / page..e.div_ceil(page) {
-                    last.unmapped.remove(&p);
-                }
+                last.unmapped
+                    .remove(f / page * page, e.next_multiple_of(page));
             }
             for &(f, e) in &zero {
-                for p in f / page..e.div_ceil(page) {
-                    last.unmapped.insert(p);
-                }
+                last.unmapped
+                    .insert(f / page * page, e.next_multiple_of(page), 0);
             }
             // Only the subresources in the pages that changed (streamed
             // textures change page by page; a whole re-read and detile of
@@ -1576,19 +1575,8 @@ fn compare_range(
 
 /// Whether every 64 KiB page overlapping `[a0, b0)` is currently known
 /// unmapped.
-fn all_pages_unmapped(
-    unmapped: &std::collections::BTreeSet<usize>,
-    a0: usize,
-    b0: usize,
-) -> bool {
-    if a0 >= b0 {
-        return true;
-    }
-    if unmapped.is_empty() {
-        return false;
-    }
-    let page = crate::watch::PAGE;
-    (a0 / page..b0.div_ceil(page)).all(|p| unmapped.contains(&p))
+fn all_pages_unmapped(unmapped: &Ranges, a: usize, b: usize) -> bool {
+    a >= b || unmapped.missing(a, b).next().is_none()
 }
 
 /// Reads `[a, b)` of a texture starting at `start` into `read[a..b]`, filling
@@ -1599,52 +1587,23 @@ fn read_span_skipping_unmapped(
     start: usize,
     a: usize,
     b: usize,
-    unmapped: &std::collections::BTreeSet<usize>,
+    unmapped: &Ranges,
     mut read_mapped: impl FnMut(usize, &mut [u8]),
 ) -> (usize, usize) {
     if a >= b {
         return (0, 0);
     }
-    let page = crate::watch::PAGE;
-    let (a0, b0) = (start + a, start + b);
-    if unmapped.is_empty() || unmapped.range(a0 / page..b0.div_ceil(page)).next().is_none() {
-        read_mapped(a, &mut read[a..b]);
-        return (b - a, 0);
+    let mut mapped_bytes = 0;
+    let mut cursor = a;
+    for (from, to) in unmapped.missing(start + a, start + b) {
+        let (from, to) = (from - start, to - start);
+        read[cursor..from].fill(0);
+        read_mapped(from, &mut read[from..to]);
+        mapped_bytes += to - from;
+        cursor = to;
     }
-    let (mut mapped_bytes, mut zeroed_bytes) = (0usize, 0usize);
-    let mut cursor = a0;
-    while cursor < b0 {
-        if unmapped.contains(&(cursor / page)) {
-            let mut end = (cursor / page)
-                .saturating_add(1)
-                .saturating_mul(page)
-                .min(b0);
-            while end < b0 && unmapped.contains(&(end / page)) {
-                end = (end / page)
-                    .saturating_add(1)
-                    .saturating_mul(page)
-                    .min(b0);
-            }
-            read[cursor - start..end - start].fill(0);
-            zeroed_bytes += end - cursor;
-            cursor = end;
-        } else {
-            let mut end = (cursor / page)
-                .saturating_add(1)
-                .saturating_mul(page)
-                .min(b0);
-            while end < b0 && !unmapped.contains(&(end / page)) {
-                end = (end / page)
-                    .saturating_add(1)
-                    .saturating_mul(page)
-                    .min(b0);
-            }
-            read_mapped(cursor - start, &mut read[cursor - start..end - start]);
-            mapped_bytes += end - cursor;
-            cursor = end;
-        }
-    }
-    (mapped_bytes, zeroed_bytes)
+    read[cursor..b].fill(0);
+    (mapped_bytes, b - a - mapped_bytes)
 }
 
 /// Whether any changed run of a texture's memory (offset, length) touches
@@ -2305,7 +2264,7 @@ mod tests {
         let page = crate::watch::PAGE;
         let base = 100 * page;
         let backing: Vec<u8> = (0..4 * page).map(|i| ((i % 251) + 1) as u8).collect();
-        let mut unmapped = std::collections::BTreeSet::new();
+        let mut unmapped = Ranges::default();
 
         // Empty unmapped set: single mapped read over the entire span.
         let mut out = vec![0xee; 4 * page];
@@ -2326,8 +2285,8 @@ mod tests {
         assert_eq!(&out[1000..3 * page + 500], &backing[1000..3 * page + 500]);
 
         // Unmapped hole in page 101 and page 103: unaligned start in 100, end in 103.
-        unmapped.insert(101);
-        unmapped.insert(103);
+        unmapped.insert(base + page, base + 2 * page, 0);
+        unmapped.insert(base + 3 * page, base + 4 * page, 0);
         out.fill(0xee);
         calls.clear();
         let (mapped, zeroed) = read_span_skipping_unmapped(
@@ -2350,8 +2309,8 @@ mod tests {
         assert!(out[3 * page..3 * page + 500].iter().all(|&b| b == 0));
 
         // All pages in span unmapped: zero mapped reads.
-        unmapped.insert(100);
-        unmapped.insert(102);
+        unmapped.insert(base, base + page, 0);
+        unmapped.insert(base + 2 * page, base + 3 * page, 0);
         out.fill(0xee);
         calls.clear();
         let (mapped, zeroed) = read_span_skipping_unmapped(
