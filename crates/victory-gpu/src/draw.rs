@@ -2191,6 +2191,7 @@ impl State {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
                 n.hash(&mut h);
+                crate::shadow::generation().hash(&mut h);
                 for k in 0..n {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
