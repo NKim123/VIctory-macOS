@@ -505,7 +505,7 @@ impl Target {
             );
             return None;
         };
-        let buffer = host.readback_buffer(total)?;
+        let buffer = host.unmapped_readback_buffer(total)?;
         if let Some(barrier) =
             list.move_texture(&self.copy, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32)
         {

@@ -181,6 +181,7 @@ pub(crate) fn start<R: Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::HostGpu;
     use crate::watch::PAGE;
     use std::sync::atomic::AtomicUsize;
     use windows::core::s;

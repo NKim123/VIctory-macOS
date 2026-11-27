@@ -571,7 +571,9 @@ pub(crate) fn done(list: &HostList, arguments: &ID3D12Resource) {
 
 #[cfg(test)]
 mod tests {
+    use crate::backend::{HostGpu, HostMemory};
     use windows::Win32::Graphics::Direct3D12::*;
+
 
     #[test]
     #[ignore = "requires VICTORY_PHYSICAL_TILES=1 VICTORY_INDIRECT_BATCH=2 VICTORY_INDIRECT_BATCH_ALIASED=1"]
@@ -657,6 +659,7 @@ void main(uint3 group : SV_GroupID) { dst.Store(group.x * 4, 7); }
                     heap: false,
                     heap_writes: false,
                     view_marks: false,
+                    half_views: Vec::new(),
                 },
                 used: vec![],
             },
@@ -776,7 +779,6 @@ void main(uint3 group : SV_GroupID) { dst.Store(group.x * 4, 7); }
             }
         }
     }
-
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {

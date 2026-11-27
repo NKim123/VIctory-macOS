@@ -109,9 +109,7 @@ fn build(wave32: bool) -> &'static [u8; 32] {
             ENCODING,
             limit,
             wave32,
-            victory_shader::emit::raw_root_cbvs(),
-            victory_shader::emit::wide_scalar_loads(),
-            victory_shader::emit::shader_opt(),
+            LoweringSwitches::read(),
         )
     })
 }
@@ -121,7 +119,7 @@ fn build(wave32: bool) -> &'static [u8; 32] {
 /// on, as the pipeline library does); none without one.
 #[cfg(windows)]
 fn host_wave32() -> bool {
-    crate::host::host().is_some_and(crate::host::Host::wave32)
+    crate::host::host().is_some_and(crate::backend::HostGpu::wave32)
 }
 
 #[cfg(not(windows))]
@@ -132,29 +130,46 @@ fn host_wave32() -> bool {
 /// This file, whose `encode` and `decode` define the entries.
 const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
 
+#[derive(Clone, Copy, Default)]
+struct LoweringSwitches {
+    port_cbv: bool,
+    raw_structured_views: bool,
+    wide_scalar_loads: bool,
+    shader_opt: u32,
+}
+
+impl LoweringSwitches {
+    fn read() -> Self {
+        Self {
+            port_cbv: victory_shader::emit::raw_root_cbvs(),
+            raw_structured_views: victory_shader::emit::raw_structured_views(),
+            wide_scalar_loads: victory_shader::emit::wide_scalar_loads(),
+            shader_opt: victory_shader::emit::shader_opt(),
+        }
+    }
+}
+
 fn key(
     translator: &str,
     encoding: &[u8],
     limit: u32,
     wave32: bool,
-    port_cbv: bool,
-    wide_scalar_loads: bool,
-    shader_opt: u32,
+    switches: LoweringSwitches,
 ) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(translator.as_bytes());
     h.update(blake3::hash(encoding).as_bytes());
     h.update(&limit.to_le_bytes());
-    h.update(&[u8::from(wave32), u8::from(port_cbv)]);
-    if port_cbv {
+    h.update(&[u8::from(wave32), u8::from(switches.port_cbv)]);
+    if switches.port_cbv {
         // The flag changes both root binding and table load lowering.
         h.update(b"bounded root CBVs and grouped table CBV loads");
     }
-    h.update(&shader_opt.to_le_bytes());
-    if wide_scalar_loads {
+    h.update(&switches.shader_opt.to_le_bytes());
+    if switches.wide_scalar_loads {
         h.update(b"wide scalar loads");
     }
-    if victory_shader::emit::raw_structured_views() {
+    if switches.raw_structured_views {
         h.update(b"raw structured views");
     }
     *h.finalize().as_bytes()
@@ -359,7 +374,7 @@ fn cached(
     )
 }
 
-const MAGIC: &[u8; 4] = b"VSH2";
+const MAGIC: &[u8; 4] = b"VSH3";
 /// A container that does not translate: the reason follows.
 const REFUSED: &[u8; 4] = b"VSHE";
 const STAGES: [HwStage; 8] = [
@@ -422,6 +437,7 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
         heap,
         heap_writes,
         view_marks,
+        half_views,
     } = s;
     let mut out = MAGIC.to_vec();
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
@@ -478,6 +494,11 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
             | u32::from(*heap_writes) << 4
             | u32::from(*view_marks) << 5,
     );
+    word(&mut out, half_views.len() as u32);
+    for &(slot, dword) in half_views {
+        word(&mut out, u32::from(slot));
+        word(&mut out, dword);
+    }
     out
 }
 
@@ -544,6 +565,11 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
         root_srv_bytes.push((u8::try_from(r.word()?).ok()?, r.word()?));
     }
     let memory = r.word()?;
+    let n = r.word()? as usize;
+    let mut half_views = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        half_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
+    }
     r.0.is_empty().then_some(Ok(HostShader {
         stage,
         dxil,
@@ -560,6 +586,7 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
         heap: memory & 8 != 0,
         heap_writes: memory & 16 != 0,
         view_marks: memory & 32 != 0,
+        half_views,
     }))
 }
 
@@ -605,6 +632,7 @@ mod tests {
             heap: true,
             heap_writes: true,
             view_marks: true,
+            half_views: vec![(0, 8), (4, 0)],
         }
     }
 
@@ -692,22 +720,25 @@ mod tests {
         let version = "0123456789abcdef";
         let encoding = b"encoding";
         let limit = 1 << 20;
-        let k = key(version, encoding, limit, false, false, false, 0);
-        assert_eq!(k, key(version, encoding, limit, false, false, false, 0));
-        assert_ne!(
-            k,
-            key("0123456789abcdee", encoding, limit, false, false, false, 0)
-        );
-        assert_ne!(k, key(version, b"encoding.", limit, false, false, false, 0));
-        assert_ne!(k, key(version, encoding, limit / 2, false, false, false, 0));
-        assert_ne!(k, key(version, encoding, limit, true, false, false, 0));
-        assert_ne!(k, key(version, encoding, limit, false, true, false, 0));
-        assert_ne!(k, key(version, encoding, limit, false, false, true, 0));
-        for passes in [1, 2, 4, 8, 16, 32, 64] {
-            assert_ne!(
-                k,
-                key(version, encoding, limit, false, false, false, passes)
-            );
+        let switches = LoweringSwitches::default();
+        let k = key(version, encoding, limit, false, switches);
+        assert_eq!(k, key(version, encoding, limit, false, switches));
+        assert_ne!(k, key("0123456789abcdee", encoding, limit, false, switches));
+        assert_ne!(k, key(version, b"encoding.", limit, false, switches));
+        assert_ne!(k, key(version, encoding, limit / 2, false, switches));
+        assert_ne!(k, key(version, encoding, limit, true, switches));
+
+        let mut seen = std::collections::HashSet::new();
+        for flags in 0..8 {
+            for shader_opt in 0..128 {
+                let switches = LoweringSwitches {
+                    port_cbv: flags & 1 != 0,
+                    raw_structured_views: flags & 2 != 0,
+                    wide_scalar_loads: flags & 4 != 0,
+                    shader_opt,
+                };
+                assert!(seen.insert(key(version, encoding, limit, false, switches)));
+            }
         }
         assert_eq!(
             *build(host_wave32()),
@@ -716,9 +747,7 @@ mod tests {
                 ENCODING,
                 victory_shader::emit::loop_limit(),
                 host_wave32(),
-                victory_shader::emit::raw_root_cbvs(),
-                victory_shader::emit::wide_scalar_loads(),
-                victory_shader::emit::shader_opt(),
+                LoweringSwitches::read(),
             )
         );
         // The encoding part is this file as built.
@@ -730,16 +759,29 @@ mod tests {
     }
 
     #[test]
-    fn view_marks_have_separate_translation_keys() {
-        for wine in [false, true] {
-            let options = options_for(wine, wine);
-            let key = |view_marks| {
-                translation_build(Options {
-                    view_marks,
-                    ..options
-                })
-            };
-            assert_ne!(key(true), key(false));
+    fn effective_host_workarounds_have_separate_translation_keys() {
+        let atomic_modes = [
+            (false, false, false, false),
+            (true, false, false, false),
+            (true, true, false, false),
+            (true, true, true, false),
+            (true, true, true, true),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for (atomic_locks, atomic_lock_rounds, atomic_umax, atomic_early_exit) in atomic_modes {
+            for flags in 0..16 {
+                let options = Options {
+                    atomic_locks,
+                    atomic_lock_rounds,
+                    atomic_umax,
+                    atomic_early_exit,
+                    bias_as_gradients: flags & 1 != 0,
+                    narrow_waves: flags & 2 != 0,
+                    host_wave32: flags & 4 != 0,
+                    view_marks: flags & 8 != 0,
+                };
+                assert!(seen.insert(translation_build(options)));
+            }
         }
     }
 

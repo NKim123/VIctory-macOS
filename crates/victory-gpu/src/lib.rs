@@ -18,6 +18,9 @@
 
 #[cfg(windows)]
 mod alias;
+pub mod bench;
+#[cfg(windows)]
+mod backend;
 #[cfg(windows)]
 mod ambient;
 #[cfg(windows)]
@@ -42,6 +45,8 @@ pub mod dxgi;
 pub mod external;
 pub mod fence;
 pub mod frame;
+#[cfg(any(windows, test))]
+mod hdr_probe;
 mod hold;
 #[cfg(windows)]
 mod host;
@@ -115,7 +120,7 @@ pub use tiled::{MAX_TILED_BUFFER, TiledAlias, with_inflight_mapping, with_physic
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, fault_tracking, rosetta, stores_need_patching, title_memory_aliased,
-    title_memory_moving, title_memory_remapped, title_memory_restored, title_memory_splitting,
+    title_memory_unmapping, title_memory_moving, title_memory_remapped, title_memory_restored, title_memory_splitting,
     writing as kernel_will_write, writing_beside as kernel_will_write_beside,
 };
 #[cfg(all(windows, target_arch = "x86_64"))]

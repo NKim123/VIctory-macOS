@@ -9,6 +9,9 @@ use std::sync::{Arc, Mutex, Weak};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
 
+use crate::backend::HostGpu;
+#[cfg(feature = "diagnostics")]
+use crate::backend::HostMemory;
 use crate::alias::{PhysicalHeap, physical_tiles_enabled};
 use crate::host::host;
 use crate::ranges::Ranges;

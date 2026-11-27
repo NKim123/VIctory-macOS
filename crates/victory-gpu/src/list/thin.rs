@@ -313,14 +313,21 @@ pub(super) fn use_calling_thread(this: This, list: &List) {
     }
 }
 
+fn close_recording(this: This) {
+    with_state(this, |host, state| {
+        state.flush_hdr_probe(host);
+        host.close();
+    });
+}
+
 pub(super) fn close(this: This, list: &List) {
     if let Some(front) = &list.thin {
         let mut front = lock(front);
         front.put(this, Op::Close, &[], |_| {});
         front.schedule(this);
         front.lane.wait();
-    } else if let Some(host) = current_host(list) {
-        host.close();
+    } else {
+        close_recording(this);
     }
 }
 
@@ -685,11 +692,7 @@ extern "system" fn copy_texture_x(
 
 fn replay_complex(this: This, op: Op, mut packet: Packet<'_>, views: &[Option<ViewPin>]) {
     match op {
-        Op::Close => {
-            if let Some(host) = title_list(this).and_then(current_host) {
-                host.close();
-            }
-        }
+        Op::Close => close_recording(this),
         Op::Viewports => {
             let values = packet.array();
             state::viewports(this, values.len() as u32, values.as_ptr());
@@ -1158,6 +1161,7 @@ mod tests {
                     heap: false,
                     heap_writes: false,
                     view_marks: false,
+                    half_views: Vec::new(),
                 },
                 used: vec![],
             },

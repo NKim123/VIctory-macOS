@@ -172,6 +172,7 @@ fn lower(native: &NativeProgram) -> Result<HostShader, ShaderError> {
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
+        half_views: lowered.half_views,
     })
 }
 

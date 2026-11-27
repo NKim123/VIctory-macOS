@@ -1218,6 +1218,7 @@ impl Tracked {
 
     /// The caller made pages (page numbers) of its copy equal to title
     /// memory itself (what shaders wrote went back): taken and guarded.
+    /// Untracked pages (never guarded) are skipped.
     pub(crate) fn taken(&self, pages: &[usize]) {
         if port_guard() {
             for group in pages.chunks(CLAIM_BATCH) {
@@ -1232,12 +1233,23 @@ impl Tracked {
     }
 
     fn taken_claimed(&self, g: &Guards, pages: &[usize]) {
-        let mut pages = pages.to_vec();
+        let mut pages: Vec<_> = pages.iter().copied()
+            .filter(|&page| !self.is_untracked(page)).collect();
         pages.sort_unstable();
         pages.dedup();
         for page in protect_with_aliases(g, &pages, &mut Vec::new()) {
             self.changed.clear_page(page);
         }
+    }
+
+    /// Whether any byte of page `page` (a page number) lies in the tracker's
+    /// untracked parts (never guarded, copied whole at each use).
+    pub(crate) fn is_untracked(&self, page: usize) -> bool {
+        let (a, b) = (
+            page.saturating_mul(PAGE),
+            page.saturating_add(1).saturating_mul(PAGE),
+        );
+        self.untracked.iter().any(|&(u, v)| u < b && a < v)
     }
 
     /// Whether no page changed since it was taken: then [`Tracked::take`]
@@ -1865,6 +1877,10 @@ pub struct Writing {
 
 impl Drop for Writing {
     fn drop(&mut self) {
+        // An unmapping with tracking off: nothing was noted.
+        if self.first == self.last {
+            return;
+        }
         let mut g = guards();
         if let Some(i) = g.busy.iter().position(|&r| r == (self.first, self.last)) {
             g.busy.swap_remove(i);
@@ -1927,12 +1943,15 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// Blocks texture write-back during a physical view split. The same
 /// physical pages at the same title addresses retain their read-back tickets.
 #[must_use = "keep the guard until all surviving pages have been restored"]
-pub struct TitleMemorySplit(crate::texback::MappingChange);
+pub struct TitleMemorySplit {
+    _writing: Writing,
+    change: crate::texback::MappingChange,
+}
 
 impl TitleMemorySplit {
     /// Discards tickets where the old mapping was removed or could not be restored.
     pub fn discard(&mut self, at: usize, len: usize) {
-        self.0.discard(at, len);
+        self.change.discard(at, len);
     }
 }
 
@@ -1942,18 +1961,72 @@ pub fn title_memory_splitting(
     removed_at: usize,
     removed_len: usize,
 ) -> TitleMemorySplit {
-    let mut split = TitleMemorySplit(crate::texback::mapping_change());
+    let change = crate::texback::mapping_change();
+    let mut split = TitleMemorySplit { change, _writing: unmapping_watch(at, len) };
     split.discard(removed_at, removed_len);
-    title_memory_restored(at, len);
     split
 }
 
 /// Resets watch state while a split rebuilds the same mapping at this address.
 pub fn title_memory_restored(at: usize, len: usize) {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    remapped(&mut guards(), first, last);
+}
+
+/// Before title memory `[at, at + len)` is unmapped or freed (`len` 0: the
+/// whole allocation at `at`, as `VirtualFree` with `MEM_RELEASE` frees):
+/// as [`title_memory_remapped`], and its pages stay unguarded until the
+/// result is dropped, after the memory went.
+///
+/// A page guarded while it goes stays in the guard set after it went.
+/// Memory allocated at that address later (the title's pools are freed
+/// and allocated again; nothing tells the guards of an allocation) then
+/// counts as guarded already and is never made read-only: its writes go
+/// unseen, and copies of it keep stale bytes. So the runtime calls this
+/// around its unmappings and the title's frees, and a tracker taking the
+/// pages meanwhile leaves them changed, as during a kernel write.
+pub fn title_memory_unmapping(at: usize, len: usize) -> TitleMemorySplit {
+    let len = if len == 0 && at != 0 && (fault_tracking() || crate::texback::enabled() || cfg!(test)) {
+        allocation_len(at)
+    } else {
+        len
+    };
+    title_memory_splitting(at, len, at, len)
+}
+
+fn unmapping_watch(at: usize, len: usize) -> Writing {
+    if !fault_tracking() || at == 0 || len == 0 {
+        return Writing { first: 0, last: 0, beside: false };
+    }
+    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
+    g.busy.push((first, last));
+    remapped(&mut g, first, last);
+    Writing { first, last, beside: false }
+}
+
+/// The bytes of the allocation that starts at `at`: its regions while they
+/// share that allocation base (guarded and open pages are regions of their
+/// own). 0 if nothing is allocated there.
+fn allocation_len(at: usize) -> usize {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let mut len = 0usize;
+    loop {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery((at + len) as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 || info.AllocationBase as usize != at || info.RegionSize == 0 {
+            return len;
+        }
+        len += info.RegionSize;
+    }
+}
+
+/// [`title_memory_remapped`] of pages `[first, last)`, under the guard lock.
+fn remapped(g: &mut Guards, first: usize, last: usize) {
     // What it showed is gone already: nothing to keep.
-    changed(&g, first, last, false);
+    changed(g, first, last, false);
     // What it showed is not what it shows now: its links go, both ways.
     let stale: Vec<usize> = g.alias_of.range(first..last).map(|(&p, _)| p).collect();
     for page in stale {
@@ -2548,6 +2621,8 @@ pub(crate) mod tests {
         // SAFETY: inside our reservation.
         assert!(!unsafe { VirtualAlloc((base + 2 * PAGE) as *const _, 2 * PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null());
         let t = track(base, 4 * PAGE, true).expect("reserved memory counts as runtime memory");
+        assert!(!t.is_untracked(base / PAGE) && !t.is_untracked(base / PAGE + 1));
+        assert!(t.is_untracked(base / PAGE + 2) && t.is_untracked(base / PAGE + 3));
         let _ = t.take(base, base + 4 * PAGE);
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -3414,6 +3489,60 @@ pub(crate) mod tests {
         drop(busy_c);
     }
 
+    /// Memory given up while a tracker holds it guarded (a pool page
+    /// decommitted here; the title frees and allocates its pools again,
+    /// which no one tells the guards of) is guarded when it comes back: the
+    /// guard goes with it, and a take while it goes leaves it unguarded. A
+    /// guard set that still named the page would skip it as guarded already,
+    /// and the new memory's writes would go unseen.
+    #[test]
+    fn memory_given_up_under_a_guard_is_guarded_when_it_comes_back() {
+        use windows_sys::Win32::System::Memory::MEM_DECOMMIT;
+        let p = pool(2);
+        let page = p + PAGE;
+        let t = track(p, 2 * PAGE, true).expect("pool memory is tracked");
+        assert_eq!(t.take(p, p + 2 * PAGE), [(p, p + 2 * PAGE)]);
+        assert!(read_only(page));
+        let going = title_memory_unmapping(page, PAGE);
+        assert!(writable(page), "given up: no guard while it goes");
+        assert_eq!(
+            t.take(p, p + 2 * PAGE),
+            [(page, p + 2 * PAGE)],
+            "changed, and taken"
+        );
+        assert!(writable(page), "a take while it goes guards nothing");
+        // SAFETY: the second page of our pool; the reservation stays.
+        let freed = unsafe { VirtualFree(page as *mut _, PAGE, MEM_DECOMMIT) };
+        assert_ne!(freed, 0);
+        drop(going);
+        // SAFETY: the same page of our reservation, committed again.
+        let back =
+            unsafe { VirtualAlloc(page as *const _, PAGE, MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_eq!(back, page);
+        assert_eq!(t.take(p, p + 2 * PAGE), [(page, p + 2 * PAGE)]);
+        assert!(read_only(page), "the memory that came back is guarded");
+        // SAFETY: a byte of the page, guarded: the handler opens it.
+        unsafe { ((page + 8) as *mut u8).write_volatile(1) };
+        assert!(t.changed(page / PAGE), "and its writes are seen");
+        drop(t);
+        free(p);
+    }
+
+    /// With length 0, the whole allocation at the address goes (as
+    /// `VirtualFree` with `MEM_RELEASE` frees it).
+    #[test]
+    fn unmapping_with_no_length_takes_the_whole_allocation() {
+        let p = pool(3);
+        let t = track(p, 3 * PAGE, true).expect("pool memory is tracked");
+        assert_eq!(t.take(p, p + 3 * PAGE), [(p, p + 3 * PAGE)]);
+        let going = title_memory_unmapping(p, 0);
+        assert!((0..3).all(|k| writable(p + k * PAGE)));
+        assert_eq!(t.take(p, p + 3 * PAGE), [(p, p + 3 * PAGE)]);
+        drop(going);
+        drop(t);
+        free(p);
+    }
+
     /// A write or mapping that runs past the end of the address space (a
     /// title's `fread` with a huge count) covers up to the end; the sum used
     /// to overflow. Up there no test has guarded blocks.
@@ -3422,5 +3551,33 @@ pub(crate) mod tests {
         let top = usize::MAX - 16;
         drop(writing(top, PAGE));
         title_memory_remapped(top, usize::MAX);
+    }
+
+    /// `Tracked::taken` must never guard pages outside the tracker's runtime
+    /// pages (such as plain committed memory inside a wider shadow window).
+    #[test]
+    fn taken_never_guards_untracked_pages() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualQuery,
+        };
+        // SAFETY: plain reservation and commit of our own memory.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert_ne!(base, 0);
+        // SAFETY: inside our reservation.
+        assert!(!unsafe { VirtualAlloc((base + 2 * PAGE) as *const _, 2 * PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        let t = track(base, 4 * PAGE, true).expect("reserved memory counts as runtime memory");
+        assert!(!t.is_untracked(base / PAGE) && !t.is_untracked(base / PAGE + 1));
+        assert!(t.is_untracked(base / PAGE + 2) && t.is_untracked(base / PAGE + 3));
+        let _ = t.take(base, base + 4 * PAGE);
+        t.taken(&[base / PAGE + 2, base / PAGE + 3]);
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        unsafe { VirtualQuery((base + 2 * PAGE) as *const _, &mut info, size_of_val(&info)) };
+        assert_eq!(info.Protect, PAGE_READWRITE, "untracked plain memory must stay writable");
+        drop(t);
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
     }
 }

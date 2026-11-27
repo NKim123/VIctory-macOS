@@ -224,6 +224,7 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::HostGpu;
 
     #[test]
     fn submission_worker_recycles_an_early_reset_list() {

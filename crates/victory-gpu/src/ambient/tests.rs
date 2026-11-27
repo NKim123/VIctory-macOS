@@ -1,3 +1,4 @@
+use crate::backend::{HostGpu, HostMemory};
 use super::*;
 
 const COPY_SRC: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_COPY_SOURCE;

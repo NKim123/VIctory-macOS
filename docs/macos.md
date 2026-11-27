@@ -128,6 +128,8 @@ The other, `ntdll-skip-host-mappings.patch`, is for thread creation. To find roo
 
 `./setup.sh` compares a stamp of the patches with `target/wine-cx/.victory-patches`. A Wine built before a patch was added or changed gets only its server and `ntdll.so` (ntdll's Unix library) rebuilt and installed, which takes a few minutes. That is because `make install` would put Wine's own DLLs back over D3DMetal's, and D3DMetal replaces neither of those two. A patch that changes anything outside `server/` and `dlls/ntdll/unix/` needs a new Wine: remove `target/wine-cx` and run `./setup.sh` again.
 
+To avoid triggering `try_map_free_area` scans across host Metal mappings when running under an unpatched CrossOver build as well, `xmem::low_guards` leaves 2.75 GiB of bottom-up slack below 4 GiB under Wine (keeping the top ~1 GiB below 4 GiB reserved for 32-bit `XMemVirtualAlloc` requests; `VICTORY_LOW_GUARDS=0` disables the low-address guards), and DirectStorage's whole-section and fallback `xmem` views request addresses at or above 2 TiB via `MapViewOfFile3`.
+
 Mixed, aligned page-mapping batches retain each independently mapped 64 KiB alias page that already shows the requested physical memory. A batch with one changed page out of eight issues one new host mapping. A batch where all eight change still needs eight mappings. Each alias keeps its own host view so Wine can replace it individually. The 7900XTX fork’s general `VICTORY_MAP_RUNS` coalescing remains deferred.
 
 ## Use D3DMetal 4.0 beta 3
@@ -522,9 +524,15 @@ submit. One worker can collect dirty ranges covering up to 64 MiB of heap
 addresses. Submission still checks for later writes and reads and publishes
 the descriptor records under the host submission lock.
 
+## The title's output size on a Mac
+
+The title takes its output size from its own settings (`settings.xml`, `video/resolutionFullscreen`), which a Series X wrote as 3840x2160, so a run without `VICTORY_OUTPUT` drew the world at 3840x2160. On a Mac running the Series X title the default output size is 1280x720, the smallest of the title's own modes: `victory-loader/src/resolution.rs` writes it into the title's code at load, where the bytes match build 1.0.2.1, and logs `resolution: ... Done` for each site. On a 16 GB M4 (Series X), 1280x720 brought the GPU time of a world frame from about 8.4 s to 0.86 s.
+
+`VICTORY_OUTPUT=<W>x<H>` asks for another of the title's modes, as before. `VICTORY_OUTPUT=0`, or `none`, leaves the title's own size alone, for a run that wants the picture at the size its settings carry. On Windows, without the switch, the title uses its own settings. Series S uses its own settings on both hosts.
+
 ## Optional switches for slow storage, low memory and speed
 
-None of these changes the default. Each is read from the environment when the game starts, and all of them are tools for testers, so please post what you see on #131 or #135 when you try one.
+None of these changes the default, except `VICTORY_OUTPUT`, which sets the title's output size on a Mac (see above). Each is read from the environment when the game starts, and all of them are tools for testers, so please post what you see on #131 or #135 when you try one.
 
 | Switch | What it does |
 | --- | --- |
@@ -532,12 +540,13 @@ None of these changes the default. Each is read from the environment when the ga
 | `VICTORY_DSTORAGE_WORKERS=<n>` | Reads with `n` workers (1 to 256) instead of one per core, for storage with a long wait per read such as a network share. |
 | `VICTORY_EVICT_HEAP_UAV=1` | Lets textures viewed for unordered access in shader-visible heaps be given up until a shader writes through a heap, then made again. About 1.5 GB on an 8 GB Mac (#135). |
 | `VICTORY_SPILL_SHADERS=1` | Keeps shader containers on disk until they are translated. The title passes tens of thousands of containers and draws with a few hundred, and holding them all took about 700 MB of an 8 GB Mac (#135). |
+| `VICTORY_RAM_LOW=<share>`, `VICTORY_RAM_FREE=<share>` | Set when host textures are given up for the computer's free memory, each as a share of its memory from 0 to 0.5: below `VICTORY_RAM_LOW` free (0.10 by default), until `VICTORY_RAM_FREE` is (0.15, or 0.05 above a `VICTORY_RAM_LOW` set alone). On a 24 GB Mac macOS was already compressing about 800 MB a second with 14 % free, and 0.20 and 0.26 brought the wired peak from 13.9 to 12.9 GB and a frame in the playable yard from 516 to about 490 ms. More textures are given up and made again (#454). |
 | `VICTORY_READ_STATS=1` | Logs the requests and bytes read from each file, every 30 seconds, for the 30 most read. It shows which files a slow share serves most, so you can copy those to fast local storage. |
 | `VICTORY_GPU_BUDGET_MB=<MB>` | Sets the budget that host textures are kept under, in place of the device's. |
 | `VICTORY_PATCH_WIDE=<list>` | Splits the 256-bit stores listed by `cargo xtask wide-stores` into 128-bit halves, so fault tracking does not stop Rosetta on them (see above). |
 | `VICTORY_MESH_OVER_LIMIT=1` | Makes mesh pipelines whose outputs are over Metal's 32 KiB anyway (refused under Wine by default, as they hang the queue; see above). |
-| `VICTORY_OUTPUT=<W>x<H>` | Sets the Series X title output size to 1280x720, 1664x936, 1920x1080, 2560x1440 or 3840x2160. It patches the title's code at load, only where the bytes match build 1.0.2.1, and logs `resolution: ... Done` for each site. On a 16 GB M4, 1280x720 brought the GPU time of a world frame from about 8.4 s to 0.86 s. Series S keeps title-managed sizes because forcing 720p caused a FidelityFX jitter-phase divide by zero. Use `VICTORY_PRESENT_MAX` for a Series S host presentation cap. Ported from avatarmanz/VIctory-7900XTX. |
-| `VICTORY_RENDER_SCALE=<s>` | 0.5 to 1.0 for the title's own upscaler on Series X (2/3 by default). Series S keeps its title-managed scale. |
+| `VICTORY_OUTPUT=<W>x<H>` | Sets the Series X title's output size, one of its own modes: 1280x720, 1664x936, 1920x1080, 2560x1440 or 3840x2160. It patches the title's code at load, only where the bytes match build 1.0.2.1, and logs `resolution: ... Done` for each site. Without it the size is 1280x720 on a Mac with Series X (see above) and the title's own size elsewhere; `0`, or `none`, leaves the title's own size alone. On a 16 GB M4 (Series X), 1280x720 brought the GPU time of a world frame from about 8.4 s to 0.86 s. Series S keeps title-managed sizes. Use `VICTORY_PRESENT_MAX` for a Series S host presentation cap. Ported from avatarmanz/VIctory-7900XTX. |
+| `VICTORY_RENDER_SCALE=<s>` | 0.5 to 1.0: the title's own upscaler's render scale (2/3 by default, Series X). Series S keeps its title-managed scale. |
 | `VICTORY_UPSCALER=<6\|7>` | Makes the title pick its own upscaler (6) or FidelityFX (7). Not yet tested on a Mac. |
 | `VICTORY_STEP_OVER=pool` | Steps over the title's "no free element" traps: an `int3` followed by `xor r, r`, the shape of a full fixed-size pool's allocator, whose caller then gets the NULL it already checks for. Series 1.0.2.1 hits one at `+0x5149aec` (the instance lists' pool, Marvisak/VIctory#698) about 20 minutes into the opening when frames take seconds. A list of hex offsets also works. |
 | `VICTORY_WINDOW_SECONDARY=1` | Opens the game window on the only non-primary display. |

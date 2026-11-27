@@ -9,10 +9,13 @@
 //! such shaders first brings all of them up to date (what changed since,
 //! `crate::watch`).
 
-use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::{self, Relaxed}};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
+use crate::backend::HostGpu;
+#[cfg(test)]
+use crate::backend::HostMemory;
 use crate::descriptor::{View, host::Paged};
 use crate::host::HostList;
 use crate::object::This;
@@ -84,7 +87,7 @@ struct Inner {
 
 #[derive(Default)]
 struct TextureUse {
-    slots: u32,
+    slots: BTreeSet<u32>,
     copy: Weak<crate::resource::HostTexture>,
 }
 
@@ -121,16 +124,16 @@ impl Inner {
         let was_occupied = old.is_some();
         let occupied = seen.is_some();
         if let Some(seen) = seen {
-            self.count(&seen, true);
+            self.count(index, &seen, true);
             *self.slots.slot(index as usize, true).unwrap() = Some(seen);
         }
         if let Some(old) = old {
-            self.count(&old, false);
+            self.count(index, &old, false);
         }
         (occupied != was_occupied).then_some(occupied)
     }
 
-    fn count(&mut self, seen: &Seen, add: bool) {
+    fn count(&mut self, index: u32, seen: &Seen, add: bool) {
         let step = |n: &mut u32| {
             if add {
                 *n += 1
@@ -196,9 +199,13 @@ impl Inner {
                 }
             }
             Seen::Texture(r) => {
-                let tracked = self.textures.entry(*r).or_default();
-                step(&mut tracked.slots);
-                if tracked.slots == 0 {
+                let slots = &mut self.textures.entry(*r).or_default().slots;
+                if add {
+                    slots.insert(index);
+                } else {
+                    slots.remove(&index);
+                }
+                if slots.is_empty() {
                     self.textures.remove(r);
                 }
             }
@@ -206,6 +213,22 @@ impl Inner {
             Seen::DirectBuffer => {}
             #[cfg(feature = "diagnostics")]
             Seen::Left(_) => {}
+        }
+    }
+
+    /// The title released the texture `resource`: the slots viewing it go.
+    fn forget(&mut self, resource: usize, occupied: &[AtomicU64]) {
+        if let Some(TextureUse { slots, .. }) = self.textures.remove(&resource) {
+            #[cfg(feature = "diagnostics")]
+            {
+                FORGOTTEN[0].fetch_add(1, Relaxed);
+                FORGOTTEN[1].fetch_add(slots.len() as u64, Relaxed);
+            }
+            for index in slots {
+                let index = index as usize;
+                self.slots.slot(index, false).unwrap().take();
+                occupied[index / 64].fetch_and(!(1 << (index % 64)), Ordering::Release);
+            }
         }
     }
 }
@@ -705,10 +728,13 @@ pub(crate) fn widened_writes(viewed: &Viewed) -> Vec<(Arc<Shadow>, usize, usize)
 }
 
 /// Draws and dispatches run with heap-indexing shaders, those of them
-/// writing through the heap, textures uploaded for heaps (diagnostics).
+/// writing through the heap, textures uploaded for heaps, released textures
+/// a heap viewed and the slots taken with them (diagnostics).
 static HEAP_DRAWS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 #[cfg(feature = "diagnostics")]
 static UPLOADED: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "diagnostics")]
+static FORGOTTEN: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
 /// A draw or dispatch runs a shader that indexes the heap (and writes
 /// through it).
@@ -759,20 +785,7 @@ pub(crate) fn forget(resource: usize) {
     let heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner()).clone();
     for viewed in heaps.iter().filter_map(std::sync::Weak::upgrade) {
         let mut inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.textures.remove(&resource).is_some() {
-            let slots: Vec<_> = inner
-                .slots
-                .iter()
-                .filter_map(|(i, seen)| {
-                    matches!(seen, Seen::Texture(r) if *r == resource).then_some(i)
-                })
-                .collect();
-            for index in slots {
-                inner.slots.slot(index, false).unwrap().take();
-                viewed.occupied[index / 64]
-                    .fetch_and(!(1 << (index % 64)), std::sync::atomic::Ordering::Release);
-            }
-        }
+        inner.forget(resource, &viewed.occupied);
     }
 }
 
@@ -782,6 +795,7 @@ pub(crate) fn forget(resource: usize) {
 pub(crate) fn log(frames: f64) {
     let [draws, writes] = [0, 1].map(|i| HEAP_DRAWS[i].swap(0, Relaxed) as f64 / frames);
     let uploaded = UPLOADED.swap(0, Relaxed) as f64 / frames;
+    let [forgotten, taken] = [0, 1].map(|i| FORGOTTEN[i].swap(0, Relaxed) as f64 / frames);
     let heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner()).clone();
     for viewed in heaps.iter().filter_map(std::sync::Weak::upgrade) {
         let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -823,7 +837,8 @@ pub(crate) fn log(frames: f64) {
         let all_bytes: u64 = all.iter().map(|s| s.range().1).sum();
         tracing::info!(
             "heap views: {draws:.0} draws/frame index the heap ({writes:.0} writing through it), \
-             {uploaded:.0} textures uploaded/frame; slots: {buffers} buffer views ({} ranges, \
+             {uploaded:.0} textures uploaded/frame, {forgotten:.1} released textures/frame viewed in a heap \
+             ({taken:.1} slots); slots: {buffers} buffer views ({} ranges, \
              {:.1} MB, {copies} copies), {textures} title-written textures ({} distinct); \
              left null: {} (placed textures at {} addresses, {placed_mb:.0} MB); \
              host copies of title memory: {} ({:.1} MB); hulls {:.1} MB, unordered {:.1} MB",
@@ -1071,6 +1086,25 @@ void main(uint3 id : SV_DispatchThreadID) {
         std::hint::black_box(memory);
     }
 
+    #[test]
+    fn forget_takes_the_texture_slots_only() {
+        let viewed = Viewed::new(4);
+        {
+            let mut update = viewed.updates();
+            update.texture(0, Some(0x10));
+            update.texture(1, Some(0x20));
+            update.texture(2, Some(0x10));
+        }
+        let mut inner = viewed.inner.lock().unwrap();
+        inner.forget(0x10, &viewed.occupied);
+        assert!(inner.slots.get(0).is_none());
+        assert!(matches!(inner.slots.get(1), Some(Seen::Texture(0x20))));
+        assert!(inner.slots.get(2).is_none());
+        assert_eq!(viewed.occupied[0].load(Relaxed), 0b0010);
+        inner.forget(0x30, &viewed.occupied);
+        assert_eq!(viewed.occupied[0].load(Relaxed), 0b0010);
+    }
+
     /// The title writes a buffer and a texture, and views of them and of an
     /// output buffer into its heap; a shader reaching them only through the
     /// heap (no table entry names them) reads what the title wrote at
@@ -1204,7 +1238,7 @@ fn spans_quick_tracks_insertion_and_removal() {
         let _locked = viewed.inner.lock().unwrap();
         viewed.set(65, None, false);
     }
-    viewed.set(65, Some(&View::Constant(0, 0)), false);
+    viewed.updates().texture(65, Some(0x10));
     assert_ne!(viewed.occupied[1].load(Relaxed) & 2, 0);
     assert!(viewed.inner.lock().unwrap().slots.get(65).is_some());
     viewed.set(65, None, false);
