@@ -268,6 +268,7 @@ pub use deltas::{VERTEX_DELTA_TOP, VERTEX_DELTAS, needs_vertex_deltas, vertex_de
 pub use rect::{rectangle_gs, right_angle};
 #[cfg(all(test, windows))]
 mod memory_tests;
+mod own_bits;
 mod sampler;
 #[cfg(all(test, windows))]
 mod semantics_tests;

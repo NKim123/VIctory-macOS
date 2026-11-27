@@ -61,6 +61,7 @@
 //! wave ([`lane_uniform`]): justrealyme's analysis (chippy01/VIctory#1),
 //! ported from fxceless/victory-fork (#497 there).
 
+use super::super::own_bits::{self, OwnBits};
 use super::*;
 
 /// Console lanes per host wave in halves.
@@ -71,6 +72,41 @@ impl Lower<'_> {
     /// halves: the host's waves are 32 lanes at most.
     pub(super) fn halves_wanted(x: &Parts, needs_wave: bool) -> bool {
         needs_wave && x.native.wave64 && x.host_wave32
+    }
+
+    /// Recognize local wave ORs only on the per-lane structured form.
+    pub(super) fn local_own_bits(x: &Parts) -> OwnBits {
+        if x.st.literal || super::super::loop_limit() < 32 || !own_bits::enabled() {
+            return OwnBits::default();
+        }
+        own_bits::find(
+            x.p,
+            x.native.vgprs,
+            x.st,
+            std::env::var_os("VICTORY_WAVE_WHY").is_some(),
+        )
+    }
+
+    pub(super) fn half_predication(
+        x: &Parts,
+        one_wave_lds: bool,
+        local: &mut OwnBits,
+    ) -> predicate::PredicatePlan {
+        let base_step = in_step(x.p, x.st);
+        let build = |step, local: &OwnBits| {
+            predicate::PredicatePlan::build(x.p, x.st, step, one_wave_lds, x.host_wave32, local)
+        };
+        if local.totals.is_empty() {
+            return build(base_step, local);
+        }
+        let plan = build(base_step.clone(), local);
+        if plan.is_empty() {
+            return plan;
+        }
+        // Other operations still need predication. Use the original plan so
+        // flattening cannot change an own-bit loop's paths.
+        *local = Default::default();
+        build(base_step, local)
     }
 
     /// Why a program in halves cannot run: LDS a group of one console wave

@@ -183,7 +183,7 @@ fn lower_halves(
 }
 
 #[cfg(windows)]
-fn shader(l: lower::Lowered) -> super::HostShader {
+pub(super) fn shader(l: lower::Lowered) -> super::HostShader {
     super::HostShader {
         stage: HwStage::Cs,
         dxil: l.dxil,

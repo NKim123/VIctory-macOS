@@ -138,12 +138,13 @@ impl PredicatePlan {
         base_step: Vec<bool>,
         one_wave_lds: bool,
         host_wave32: bool,
+        local: &super::super::own_bits::OwnBits,
     ) -> Self {
         let n = p.blocks.len();
         if n <= 1 {
             return Self::empty(base_step);
         }
-        let needs = candidate_blocks(p, st, one_wave_lds);
+        let needs = candidate_blocks(p, st, one_wave_lds, local);
         if !(0..n).any(|b| needs[b] && !base_step[b]) {
             return Self::empty(base_step);
         }
@@ -328,7 +329,12 @@ impl PredicatePlan {
 /// Blocks that contain an operation needing `in_step` in `halves` mode
 /// (cross-half wave ops, mask-as-data reads and their transitive mask sources,
 /// `v_readlane`/`v_readfirstlane`, or split-wave LDS accesses).
-fn candidate_blocks(p: &Program, st: &Structured, one_wave_lds: bool) -> Vec<bool> {
+fn candidate_blocks(
+    p: &Program,
+    st: &Structured,
+    one_wave_lds: bool,
+    local: &super::super::own_bits::OwnBits,
+) -> Vec<bool> {
     let mut needs = vec![false; p.blocks.len()];
     let mut mask_def: Map<Value, (usize, Option<usize>)> = Map::default();
     for (b, block) in p.blocks.iter().enumerate() {
@@ -348,7 +354,15 @@ fn candidate_blocks(p: &Program, st: &Structured, one_wave_lds: bool) -> Vec<boo
 
     let mut mask_worklist: Vec<Value> = Vec::new();
     for (b, block) in p.blocks.iter().enumerate() {
-        for inst in &block.insts {
+        // An own-bit loop has no operations that require lockstep. Keep
+        // following mask data users elsewhere back to their definitions.
+        if local.local_blocks.contains(&b) {
+            continue;
+        }
+        for (i, inst) in block.insts.iter().enumerate() {
+            if local.local_sections.contains(&(b, i)) {
+                continue;
+            }
             let name = inst.name();
             if matches!(
                 name,

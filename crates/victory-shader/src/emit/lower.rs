@@ -141,6 +141,9 @@ pub(crate) struct Lowered {
     /// the exchanges between 32-lane halves.
     #[cfg(test)]
     pub barriers: usize,
+    /// Whether the shader allocated the cross-half LDS exchange array.
+    #[cfg(test)]
+    pub half_exchange: bool,
     /// The `WaveSize` the program declares.
     #[cfg(test)]
     pub wave_size: Option<u32>,
@@ -474,6 +477,7 @@ struct Lower<'a> {
     console_lanes: bool,
     /// A console wave64 program in host waves of 32 lanes (`halves`).
     halves: bool,
+    own_bits: super::own_bits::OwnBits,
     /// Why such a program cannot run in halves.
     halves_refused: Option<Why>,
     /// Selective acyclic divergent-branch predication plan (`predicate`).
@@ -636,7 +640,7 @@ const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
-fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
+pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let ops: Vec<&Operand> = match &i.fields {
         // A mask operation (its result a mask) is no data use.
@@ -795,6 +799,7 @@ impl<'a> Lower<'a> {
         let (mut halves, mut halves_refused) = (false, None);
         let mut split_barriers = Set::default();
         let mut pred = predicate::PredicatePlan::empty(Vec::new());
+        let mut own_bits = super::own_bits::OwnBits::default();
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -839,6 +844,14 @@ impl<'a> Lower<'a> {
             let wave = if x.native.wave64 { 64 } else { 32 };
             let group = cs.threads.iter().product::<u32>();
             let one_wave = group <= wave;
+            if x.native.wave64
+                && x.host_wave32
+                && group > 32
+                && s.lds_dwords == 0
+                && meet_plan.is_empty()
+            {
+                own_bits = Self::local_own_bits(x);
+            }
             let one_wave_lds = (x.narrow_waves || x.st.literal) && one_wave && group > 32 && s.lds_dwords > 0;
             let step_plan = if x.st.literal {
                 // Whole-wave control flow keeps its own branches.
@@ -848,8 +861,7 @@ impl<'a> Lower<'a> {
                 && (x.host_wave32 || one_wave_lds)
                 && !predication_off()
             {
-                let base_step = in_step(p, x.st);
-                predicate::PredicatePlan::build(p, x.st, base_step, one_wave_lds, x.host_wave32)
+                Self::half_predication(x, one_wave_lds, &mut own_bits)
             } else {
                 predicate::PredicatePlan::empty(Vec::new())
             };
@@ -1000,6 +1012,7 @@ impl<'a> Lower<'a> {
             src0: None,
             console_lanes,
             halves,
+            own_bits,
             halves_refused,
             step: if !halves {
                 Vec::new()
@@ -1470,7 +1483,7 @@ impl<'a> Lower<'a> {
         for &(_, w) in &inst.writes {
             let val = if self.section_out.contains(&w) {
                 let shape = self.sections[&b][&start].shapes.get(&w).copied();
-                match shape.ok_or(UNKNOWN).and_then(|sh| self.shape(sh)) {
+                match shape.ok_or(UNKNOWN).and_then(|sh| self.shape(sh, w)) {
                     Ok(x) => Val::I32(x),
                     Err(why) => Val::Missing(why),
                 }
@@ -1485,7 +1498,7 @@ impl<'a> Lower<'a> {
     /// host's active lanes: the console's result with console lanes; on
     /// another wave size, what the HLSL wave operation the console compiler
     /// expanded gives on that wave.
-    fn shape(&mut self, shape: super::wave::Shape) -> Result<V, Why> {
+    fn shape(&mut self, shape: super::wave::Shape, output: Value) -> Result<V, Why> {
         use super::wave::{Op, Shape};
         use halves::REDUCTION_ACROSS as ACROSS;
         let (op, src, mask, ident, prefix) = match shape {
@@ -1526,7 +1539,8 @@ impl<'a> Lower<'a> {
         // If the group fits one host wave, the absent upper half contributes
         // only identities and the host wave holds the console wave's lanes in
         // order. Otherwise the halves pass each other their results.
-        let across = self.halves && !self.one_host_wave();
+        let across =
+            self.halves && !self.one_host_wave() && !self.own_bits.totals.contains(&output);
         if across && !self.across_here() {
             return Err(ACROSS);
         }
@@ -1845,6 +1859,8 @@ impl<'a> Lower<'a> {
             split_barriers: self.split_barriers.len(),
             #[cfg(test)]
             barriers: self.s.m.written_calls("dx.op.barrier"),
+            #[cfg(test)]
+            half_exchange: self.half_words.is_some(),
             #[cfg(test)]
             wave_size: self.s.wave_size,
             #[cfg(test)]
@@ -7658,6 +7674,16 @@ impl<'a> Lower<'a> {
                     .is_some_and(|w| self.waterfall_reads.contains(&w.1)) =>
             {
                 // A waterfall loop's read of a descriptor dword: the lane's own.
+                let a = s(self, 0)?;
+                int(self, a)
+            }
+            "v_readfirstlane_b32"
+                if inst
+                    .writes
+                    .iter()
+                    .any(|w| self.own_bits.first_reads.contains(&w.1)) =>
+            {
+                // Each participating lane already has its half's remaining bits.
                 let a = s(self, 0)?;
                 int(self, a)
             }
