@@ -14,6 +14,18 @@ static SUBMITTED: AtomicU64 = AtomicU64::new(0);
 
 struct Held(Vec<D3D12_RESOURCE_BARRIER>);
 
+impl Held {
+    fn extend(&mut self, barriers: &[D3D12_RESOURCE_BARRIER]) {
+        for barrier in barriers {
+            if is_global_uav(barrier) && self.0.last().is_some_and(is_global_uav) {
+                continue;
+            }
+            // SAFETY: the ManuallyDrop fields borrow the original pointers.
+            self.0.push(unsafe { std::ptr::read(barrier) });
+        }
+    }
+}
+
 // SAFETY: the barrier records borrow pointers to free-threaded resources
 // held by the command list until execution finishes.
 unsafe impl Send for Held {}
@@ -23,6 +35,7 @@ pub(crate) struct Rec {
     join: bool,
     pending: AtomicBool,
     held: Mutex<Held>,
+    indirect: Mutex<Option<crate::indirect::BatchOutput>>,
 }
 
 impl Rec {
@@ -33,6 +46,7 @@ impl Rec {
             join: *JOIN.get_or_init(|| crate::switch::on("VICTORY_JOIN_BARRIERS")),
             pending: false.into(),
             held: Mutex::new(Held(Vec::new())),
+            indirect: Mutex::new(None),
         }
     }
 
@@ -69,11 +83,26 @@ impl Rec {
         if held.0.len() + barriers.len() > MAX_HELD || repeats_transition() {
             self.submit_held(&mut held);
         }
-        held.0.extend(barriers.iter().map(|b| {
-            // SAFETY: the ManuallyDrop fields borrow the original pointers.
-            unsafe { std::ptr::read(b) }
-        }));
+        held.extend(barriers);
         self.pending.store(true, Relaxed);
+    }
+
+    /// Same contract as the native command. The caller has waited for all
+    /// submissions of this recording. A successful reset discards it.
+    #[allow(non_snake_case)]
+    pub(crate) unsafe fn Reset(
+        &self,
+        allocator: &ID3D12CommandAllocator,
+        pipeline: Option<&ID3D12PipelineState>,
+    ) -> windows::core::Result<()> {
+        self.flush();
+        // SAFETY: the caller's.
+        unsafe { self.list.Reset(allocator, pipeline)? };
+        self.indirect
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        Ok(())
     }
 
     fn submit_held(&self, held: &mut Held) {
@@ -95,6 +124,17 @@ impl Rec {
 }
 
 impl HostList {
+    pub(crate) fn indirect_batch_output(&self) -> Option<ID3D12Resource> {
+        let mut output = self.list.indirect.lock().unwrap_or_else(|e| e.into_inner());
+        if output.is_none() {
+            let lease = crate::indirect::BatchOutput::take()?;
+            // Count the buffer against the in-flight storage budget.
+            self.deferred().uploads.push(lease.buffer().clone());
+            *output = Some(lease);
+        }
+        output.as_ref().map(|lease| lease.buffer().clone())
+    }
+
     /// The tail state of a texture already transitioned on this list.
     pub(crate) fn recorded_texture_state(&self, texture: &Arc<HostTexture>) -> Option<u32> {
         self.states
@@ -146,6 +186,13 @@ fn transitioned(barrier: &D3D12_RESOURCE_BARRIER) -> Option<usize> {
         .map(|resource| resource.as_raw() as usize)
 }
 
+fn is_global_uav(barrier: &D3D12_RESOURCE_BARRIER) -> bool {
+    barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV
+        && barrier.Flags == D3D12_RESOURCE_BARRIER_FLAG_NONE
+        // SAFETY: Type identifies this union member.
+        && unsafe { barrier.Anonymous.UAV.pResource.is_none() }
+}
+
 impl std::ops::Deref for Rec {
     type Target = ID3D12GraphicsCommandList;
 
@@ -173,5 +220,45 @@ pub(super) fn report(frames: f64) {
             calls as f64 / frames,
             made as f64 / frames
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::HostGpu;
+    use crate::host::{host, uav_barrier};
+
+    #[test]
+    fn joins_only_adjacent_global_uav_barriers() {
+        let mut held = Held(Vec::new());
+        let alias = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+            ..Default::default()
+        };
+        held.extend(&[uav_barrier()]);
+        held.extend(&[uav_barrier(), alias, uav_barrier(), uav_barrier()]);
+        assert_eq!(held.0.len(), 3);
+        assert!(is_global_uav(&held.0[0]));
+        assert_eq!(held.0[1].Type, D3D12_RESOURCE_BARRIER_TYPE_ALIASING);
+        assert!(is_global_uav(&held.0[2]));
+    }
+
+    #[test]
+    fn an_indirect_batch_buffer_stays_leased_until_reset() {
+        let Some(host) = host() else { return };
+        let first = host.new_list().unwrap();
+        let first_output = first.indirect_batch_output().unwrap();
+        assert_eq!(first.indirect_batch_output().unwrap(), first_output);
+        first.close();
+
+        let second = host.new_list().unwrap();
+        let second_output = second.indirect_batch_output().unwrap();
+        assert_ne!(second_output, first_output);
+        first.reset();
+        assert!(first.list.indirect.lock().unwrap().is_none());
+        assert_ne!(first.indirect_batch_output().unwrap(), second_output);
+        first.close();
+        second.close();
     }
 }

@@ -200,6 +200,10 @@ pub(crate) struct State {
     depth: usize,
     /// Last render target and depth keys set on the host list.
     host_targets: Option<(Vec<TargetKey>, Option<TargetKey>)>,
+    /// Exact native views. Title addresses can resolve to a different backing.
+    host_vertex: [D3D12_VERTEX_BUFFER_VIEW; 32],
+    host_vertex_slots: usize,
+    host_index: Option<D3D12_INDEX_BUFFER_VIEW>,
     /// None leaves the host list's default bounds (0..1) in place.
     depth_bounds: Option<(f32, f32)>,
     /// The title's primitive topology (the host's may differ).
@@ -580,6 +584,8 @@ impl State {
         // No title heaps (0) differ from what the host list has, too.
         (self.host_pipeline, self.host_roots, self.host_heaps) = (0, [0; 2], [usize::MAX; 2]);
         self.host_targets = None;
+        self.host_vertex_slots = 0;
+        self.host_index = None;
         self.indirect = None;
     }
 
@@ -863,6 +869,7 @@ impl State {
             return false;
         }
         let l = &list.list;
+        let cache = bind_cache_enabled();
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
         let mut count = 0;
@@ -886,8 +893,14 @@ impl State {
         }
         // SAFETY: an open list; the views name live host buffers.
         unsafe {
-            if count > 0 {
+            if count > 0
+                && (!cache
+                    || count > self.host_vertex_slots
+                    || views[..count] != self.host_vertex[..count])
+            {
                 l.IASetVertexBuffers(0, Some(&views[..count]));
+                self.host_vertex[..count].copy_from_slice(&views[..count]);
+                self.host_vertex_slots = self.host_vertex_slots.max(count);
             }
         }
         if indexed {
@@ -902,8 +915,11 @@ impl State {
                 SizeInBytes: v.size,
                 Format: DXGI_FORMAT(v.format as i32),
             };
-            // SAFETY: an open list; the view names a live host buffer.
-            unsafe { l.IASetIndexBuffer(Some(&view)) };
+            if !cache || self.host_index != Some(view) {
+                // SAFETY: an open list; the view names a live host buffer.
+                unsafe { l.IASetIndexBuffer(Some(&view)) };
+                self.host_index = Some(view);
+            }
         }
         const RENDER_TARGET: u32 = 0x4;
         const DEPTH_WRITE: u32 = 0x10;
@@ -1546,13 +1562,6 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
-        if self
-            .indirect
-            .as_ref()
-            .is_some_and(|b| !b.compute || b.aliased || crate::indirect::batch_mode() != 2)
-        {
-            self.indirect = None;
-        }
         let builder = crate::pipeline::is_builder(self.pipeline as This);
         if builder && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1589,6 +1598,16 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "dispatch");
             return;
+        }
+        if x != 0
+            && y != 0
+            && z != 0
+            && self.indirect.as_ref().is_some_and(|batch| {
+                (!batch.compute || batch.aliased || crate::indirect::batch_mode() != 2)
+                    && may_write_buffers(p)
+            })
+        {
+            self.indirect = None;
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
@@ -2331,7 +2350,7 @@ impl State {
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first
     /// + count` as triangles, made when the list is submitted.
-    fn rectangles(&self, list: &HostList, count: u32, first: u32) -> bool {
+    fn rectangles(&mut self, list: &HostList, count: u32, first: u32) -> bool {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return false;
         };
@@ -2380,6 +2399,7 @@ impl State {
             };
             // SAFETY: an open list; the view names live scratch memory.
             unsafe { list.list.IASetVertexBuffers(slot, Some(&[view])) };
+            self.host_vertex_slots = 0;
         }
         true
     }
@@ -2441,7 +2461,11 @@ impl State {
         let compute = kind == 2;
         if let Some(batch) = &mut self.indirect
             && batch.epoch == epoch
-            && batch.compute == compute
+            // A live graphics batch has crossed no buffer writer. A
+            // compute batch can already contain a writer, so a subsequent
+            // graphics call still needs its own clamp.
+            && (batch.compute == compute
+                || compute && !window && crate::indirect::batch_mode() == 2)
             && batch.aliased == aliased
         {
             let step = offset.saturating_sub(batch.last);
@@ -2451,6 +2475,7 @@ impl State {
             if (!window || fits_window)
                 && let Some(record) = batch.jobs.place(source, offset, kind)
             {
+                batch.compute = compute;
                 batch.last = offset;
                 batch.step = Some(step);
                 return Some(record);
@@ -2965,7 +2990,7 @@ mod tests {
         const RESERVATION: usize = (512 << 20) + PAGE;
         const SLOTS: u64 = 256;
         assert!(crate::alias::physical_tiles_enabled());
-        assert!(crate::indirect::batching());
+        assert_eq!(crate::indirect::batch_mode(), 2);
         let host = crate::host::host().expect("D3D12 device");
         // SAFETY: reserve a private, inaccessible range for the title alias.
         let base =
@@ -3050,6 +3075,12 @@ void main() { record.Store(0, 17); }
         let (out, offset) = place(&mut state);
         assert_eq!(offset, 0, "the boundary starts a new pass after the writer");
         copy(&out, offset, 24);
+        let (_, compute_offset) = state
+            .batched_indirect(&list, (2, 12), window, false, true)
+            .unwrap();
+        assert_eq!(compute_offset, 32, "compute can follow a read-only draw");
+        let (_, graphics_offset) = place(&mut state);
+        assert_eq!(graphics_offset, 0, "compute may have written the source");
         list.close();
         host.execute(&[&list]);
         // SAFETY: the readback is mapped and execution has finished.

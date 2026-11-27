@@ -25,9 +25,10 @@ use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
+use crate::backend::HostMemory;
 use crate::host::{HostList, host, transition, uav_barrier};
 
 const SOURCE: &str = include_str!("indirect-clamp.hlsl");
@@ -67,6 +68,51 @@ pub(crate) fn batching() -> bool {
 const JOBS: u32 = 256;
 const JOB_BYTES: u64 = 16;
 const SLOT_BYTES: u64 = 32;
+
+// Reuse the clamp's small output buffer across list recordings, as in
+// Belobug/VIctory-Belobug-AMD (GPL-3.0). Keep at most 2 MiB of idle heap
+// allocations even on devices with 64 KiB resource alignment.
+const SPARE_BATCHES: usize = 32;
+static SPARE_OUTPUTS: Mutex<Vec<BatchOutput>> = Mutex::new(Vec::new());
+
+/// Owned by the command recording until reset or retirement. Close
+/// restores the buffer to COMMON and in-flight submits keep the list alive.
+pub(crate) struct BatchOutput(Option<ID3D12Resource>);
+
+// SAFETY: D3D12 resources are free-threaded; a resource is leased to one
+// active recording and obtained from the same singleton host device.
+unsafe impl Send for BatchOutput {}
+
+impl BatchOutput {
+    pub(crate) fn take() -> Option<Self> {
+        let pooled = SPARE_OUTPUTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop();
+        match pooled {
+            Some(output) => Some(output),
+            None => {
+                let (buffer, _) = host()?.shared_buffer(u64::from(JOBS) * SLOT_BYTES)?;
+                Some(Self(Some(buffer)))
+            }
+        }
+    }
+
+    pub(crate) fn buffer(&self) -> &ID3D12Resource {
+        self.0.as_ref().expect("active batch output lease")
+    }
+}
+
+impl Drop for BatchOutput {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.0.take() {
+            let mut spare = SPARE_OUTPUTS.lock().unwrap_or_else(|e| e.into_inner());
+            if spare.len() < SPARE_BATCHES {
+                spare.push(Self(Some(buffer)));
+            }
+        }
+    }
+}
 
 static BATCH_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 static EXECUTIONS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
@@ -131,7 +177,7 @@ impl Batch {
             .as_ref()?;
         let budget = list.budget()?;
         let (table, jobs) = list.scratch((u64::from(JOBS) + 1) * JOB_BYTES)?;
-        let output = list.arguments(u64::from(JOBS) * SLOT_BYTES)?;
+        let output = list.indirect_batch_output()?;
         let before = list.indirect_output_state(&output);
         let l = &list.list;
         // SAFETY: the list owns the table, budget and output. The caller
