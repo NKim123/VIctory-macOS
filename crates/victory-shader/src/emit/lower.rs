@@ -44,6 +44,9 @@ use super::bitcode::Rmw;
 use packed::packed_half;
 use round_mode::{round16, round16_after};
 
+#[path = "packed_mask.rs"]
+mod packed_mask;
+
 type Why = &'static str;
 
 #[cfg(test)]
@@ -422,6 +425,7 @@ struct Lower<'a> {
     /// Phis that code reads. Left a std set: [`Lower::live_edges`] starts
     /// its walk in this set's iteration order, and few phis are read.
     read_phis: HashSet<Value>,
+    packed_phis: HashSet<Value>,
     params: Map<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
@@ -978,6 +982,7 @@ impl<'a> Lower<'a> {
             mask_phis: Map::default(),
             pending_masks: Vec::new(),
             data_phis: Vec::new(),
+            packed_phis: HashSet::new(),
             read_phis: HashSet::new(),
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
@@ -2168,7 +2173,10 @@ impl<'a> Lower<'a> {
             return self.boolean(vote, at).map(Val::Bit);
         }
         if self.mask_ok && (self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v)) {
-            return self.mask_dword(v).map(Val::I32);
+            return self
+                .mask_dword(v)
+                .map(Val::I32)
+                .or_else(|why| self.packed_mask_word(v).map(Val::I32).ok_or(why));
         }
         if let Some(Val::Missing(w)) = found {
             return Err(w);
@@ -11485,7 +11493,11 @@ impl<'a> Lower<'a> {
                 }
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
-                let read = live.contains(&(phi.value, n));
+                let read = if self.packed_phis.contains(&phi.value) {
+                    !self.impossible_forward_edge(q, b)
+                } else {
+                    live.contains(&(phi.value, n))
+                };
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
                     // No lane from this edge reads it, or no lane comes

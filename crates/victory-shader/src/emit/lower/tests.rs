@@ -255,6 +255,52 @@ fn lowers_division_helpers_and_binary64_conversion_without_doubles() {
 }
 
 #[test]
+fn packed_scalar_words_survive_a_reused_mask_at_a_join() {
+    let words = [
+        0xBE84_0300,
+        0xBE85_0380, // s[4:5] = output table
+        0xF408_0402,
+        0xFA00_0000, // s[16:19] = output UAV
+        0xBE8A_037E, // s10 = initial exec
+        0xBE8C_3C0A, // s_and_saveexec_b32 s12, s10
+        0xBF88_0001, // s_cbranch_execz merge (never taken)
+        0xBE8A_0301, // s10 = packed scalar input
+        0xBEFE_030C, // restore exec
+        0xD4C2_0006,
+        0x0002_0080, // v_cmp_eq_u32 s6, 0, v0
+        0xBE8E_3C06,
+        0xBF88_0007, // only lane zero uses the packed word
+        0x870B_FF0A,
+        0x001F_FFFF, // s11 = lower 21 bits
+        0x880D_FF0B,
+        0xDAE0_0000, // s13 = upper field | s11
+        0x7E02_020D, // v1 = s13
+        0xE070_1000,
+        0x8004_0100, // buffer_store_dword v1, v0, s[16:19]
+        0xBEFE_030E, // restore exec
+        S_ENDPGM,
+    ];
+    let layout = vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)];
+    let output = UsedResource {
+        kind: ResourceType::Uav,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 4,
+        user_data: 0,
+        slot: 0,
+    };
+    let shader = lower_with(&words, layout, vec![output]).unwrap();
+    assert!(
+        shader
+            .user_data
+            .iter()
+            .any(|u| u.root == RootType::Constants && u.slot == 1)
+    );
+}
+
+#[test]
 fn vop3_conversion_modifiers_affect_the_lowering() {
     for (op, first, second, modifier) in [
         (0x0Au32, 1 << 15, 0, "clamp"),

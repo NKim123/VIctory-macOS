@@ -278,6 +278,10 @@ pub fn build_bounded(
     }
     split_irreducible(&mut blocks)?;
 
+    Ok(rename(blocks, wave64))
+}
+
+fn rename(mut blocks: Vec<Block>, wave64: bool) -> Program {
     let order = reverse_postorder(&blocks);
     let (live_in, live_out) = liveness(&blocks, &order);
     let mut values = 0u32;
@@ -336,11 +340,45 @@ pub fn build_bounded(
         }
     }
     remove_trivial_phis_steps(&mut blocks, values);
-    Ok(Program {
+    Program {
         wave64,
         blocks,
         inputs,
-    })
+    }
+}
+
+/// Duplicate a join for each proven (predecessor, join, destination) edge.
+/// The instructions still execute on that path and define fresh SSA values.
+pub(crate) fn thread_edges(
+    p: &Program,
+    edges: &[(usize, usize, usize)],
+) -> Result<Program, ShaderError> {
+    let mut blocks = p.blocks.clone();
+    for block in &mut blocks {
+        block.phis.clear();
+    }
+    for &(pred, join, dest) in edges {
+        let mut copy = p.blocks[join].clone();
+        copy.phis.clear();
+        copy.exit = Exit::Jump(dest);
+        let target = blocks.len();
+        match &mut blocks[pred].exit {
+            Exit::Jump(t) if *t == join => *t = target,
+            Exit::Branch { taken, not_taken } => {
+                if *taken == join {
+                    *taken = target;
+                }
+                if *not_taken == join {
+                    *not_taken = target;
+                }
+            }
+            _ => unreachable!("threading an incoming edge"),
+        }
+        blocks.push(copy);
+    }
+    link(&mut blocks);
+    split_irreducible(&mut blocks)?;
+    Ok(rename(blocks, p.wave64))
 }
 
 /// Placeholder before renaming.

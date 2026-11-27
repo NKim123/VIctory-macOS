@@ -285,6 +285,7 @@ pub mod validator;
 mod valu_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
+mod threading;
 mod wave;
 
 use crate::dxbc::{Container, FourCC};
@@ -814,7 +815,17 @@ fn prepare(container: &[u8]) -> Result<Prepared<'_>, ShaderError> {
         })?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
-    let (p, st) = crate::range::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    let (mut p, mut st) = crate::range::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    if let Ok(structured) = &st {
+        let edges = threading::constant_edges(&p, structured);
+        if !edges.is_empty()
+            && let Ok(threaded) = crate::ir::thread_edges(&p, &edges)
+            && let Ok(next) = structure::structure(&threaded)
+        {
+            p = threaded;
+            st = Ok(next);
+        }
+    }
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
