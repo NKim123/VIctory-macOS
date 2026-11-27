@@ -648,3 +648,66 @@ Under Wine the passes' shader keeps to what Wine's compiler takes. Besides what 
 Per frame it adds two small dispatches after `CS_CacheScreenSpaceRadiance` (2,304 and 1 threads), three after each resolve (2,304 threads, 14,400 threads that each walk the 2,304 cells, and one thread per texel of the light image), and one per texel of the reflection image. The constant stand-in adds one per resolve and one for the reflections.
 
 To find what the estimate costs on the GPU in a scene, `VICTORY_AMBIENT_PROBE=<n>` leaves its passes out in turn, each step for `n` frame lines: nothing, the gather, the creases' shade, the reflections' hold, the keeping, the raising, every pass. The estimate's line ends with the step the frame line above it was measured with (`probe (VICTORY_AMBIENT_PROBE) step 1 of 7: these frames were recorded without the gather ...`), so one run gives the frame line's GPU time with and without each part. The picture changes with the steps. Each pass is also named among its list's pipelines (`[ambient estimate: gather]` and so on), so a `slow host submission` or `slow host list` line says when a slow list holds one. In a diagnostics build with `VICTORY_GPU_TIMING=1` and `VICTORY_D3D12_DRED=1`, a slow list also logs `slow list commands by kind`, since GPU timestamps read 0 under D3DMetal.
+
+## Recommended Apple Silicon playable profile
+
+Combining the macOS/D3DMetal fixes with ports from `avatarmanz/VIctory-7900XTX` and `Belobug/VIctory-Belobug-AMD` (GPL-3.0) brings the title from ~0.4 FPS to interactive gameplay on Apple Silicon.
+
+1. **Build ThinLTO release binaries** (`[profile.release]` enables `lto = "thin"` and `codegen-units = 1`):
+   - Native ARM64 CLI for offline shader baking: `cargo build --release --locked --bin victory`
+   - Windows x86_64 runtime for Wine: `cargo build --release --locked --target x86_64-pc-windows-gnullvm --bin victory`
+2. **Pre-bake the shader cache natively on ARM64** using the exact lowering flags you plan to run with (`translate --cache --wine-defaults` selects the same wave32 and D3DMetal lowering options as Wine, including bypassing selective acyclic predication on 32-lane D3DMetal hosts, which avoids a 43–57 ms/frame GPU slowdown and multi-second intro stalls):
+   ```sh
+   VICTORY_RAW_STRUCTURED_VIEWS=1 \
+   VICTORY_WIDE_SCALAR_LOADS=1 \
+   VICTORY_SHADER_OPT=63 \
+   VICTORY_PORT_CBV=1 \
+   VICTORY_ATOMIC_UMAX=1 \
+   VICTORY_UAV_SIZE_LEVEL0=07f451a14b13fecb \
+     target/release/victory translate --cache --wine-defaults --jobs 6 <title-dir>
+   ```
+   On an Apple M5 Pro this translates 25,714 of 25,985 containers in ~86 s and eliminates runtime shader-cache misses.
+3. **Launch under patched CrossOver Wine + D3DMetal** with the full optimized profile:
+   ```sh
+   # 720p playable profile (for max FPS, set VICTORY_RENDER_SCALE=0.5 and VICTORY_TEXTURE_MAX=512)
+   VICTORY_OUTPUT=1280x720 \
+   VICTORY_RENDER_SCALE=1 \
+   VICTORY_TEXTURE_MAX=1024 \
+   VICTORY_PHYSICAL_TILES=1 \
+   VICTORY_RAW_STRUCTURED_VIEWS=1 \
+   VICTORY_WIDE_SCALAR_LOADS=1 \
+   VICTORY_SHADER_OPT=63 \
+   VICTORY_UAV_SIZE_LEVEL0=07f451a14b13fecb \
+   VICTORY_PORT_CBV=1 \
+   VICTORY_PORT_GUARD=1 \
+   VICTORY_PORT_JOURNAL=1 \
+   VICTORY_PORT_DESCRIPTORS=1 \
+   VICTORY_ATOMIC_UMAX=1 \
+   VICTORY_BIND_CACHE=1 \
+   VICTORY_INDIRECT_BATCH=2 \
+   VICTORY_INDIRECT_BATCH_ALIASED=1 \
+   VICTORY_JOIN_BARRIERS=1 \
+   VICTORY_SCOPED_BARRIERS=1 \
+   VICTORY_THIN=1 \
+   VICTORY_INFLIGHT=1 \
+   VICTORY_TABLE_MEMO=1 \
+   VICTORY_RAY_SKIP=1 \
+   VICTORY_AMBIENT=estimate \
+   VICTORY_PATCH_CLZERO=1 \
+   VICTORY_PATCH_WAITS=1 \
+   VICTORY_XMA_REFILL=1 \
+   VICTORY_KBM_GTA=1 \
+     <wine> target/x86_64-pc-windows-gnullvm/release/victory.exe run --execute --console series-x <title-exe>
+   ```
+   `VICTORY_KBM_GTA=1` enables PC-style mouse-look with `F2`/`~` cursor capture toggle, and `VICTORY_XMA_REFILL=1` keeps audio playback fed under slow frames.
+
+### Measured Apple M5 Pro progression
+
+Measured on an Apple M5 Pro (18 CPU / 20 GPU cores, 64 GB unified memory, macOS 27.2.1, patched CrossOver Wine + D3DMetal 4.0b3) with pre-baked shaders (0 runtime shader misses) and warmed pipelines:
+
+| Milestone / Route | Mean FPS | Host GPU ms/frame | Host prep ms/frame | Notes |
+| --- | ---: | ---: | ---: | --- |
+| Baseline Prologue (720p) | 0.42 | 243.38 | 663.52 | 2,398 ms/frame, 100% clipped whiteout |
+| Integrated Tutorial (720p, `1.0×` / `1024`) | 7.27 | 37.74 | 80.63 | 5,334 draws/frame, ~81% GPU overlap, live `W`/`S`/`J`/`L` controls |
+| Integrated Tutorial (`0.5×` / `512`) | 7.55 | 33.47 | 76.28 | 5,084 draws/frame, intact enclosure, GPU at 30 FPS budget |
+| Integrated Prologue (`0.5×` / `512`) | 8.91 | 37.02 | 52.69 | 21.2× over baseline; Wave 12 peak 30-frame window reached 16.68 FPS |
