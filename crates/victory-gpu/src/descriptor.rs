@@ -257,6 +257,8 @@ struct HeapWrites {
     at: usize,
     sync_id: u64,
     ranges: crate::watch::Runs,
+    #[cfg(target_arch = "x86_64")]
+    marks: Option<Vec<(u32, u32)>>,
 }
 
 #[cfg(windows)]
@@ -336,49 +338,36 @@ fn take_heap_writes(mut budget: usize, _audit: bool) -> Vec<HeapWrites> {
             continue;
         }
         #[cfg(target_arch = "x86_64")]
-        if let Some(marks) = crate::port_descriptors::take(at) {
-            let mut ranges = if _audit {
+        if let Some(marks) = crate::port_descriptors::take(at, _audit) {
+            if _audit {
                 #[cfg(feature = "diagnostics")]
                 let _timed =
                     crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncAuditUs);
-                crate::port_descriptors::audit(start_address, end, || {
+                let ranges = crate::port_descriptors::audit(start_address, end, || {
                     heap.written
                         .as_ref()
                         .map(|written| watch_heap(written, start_address, end))
-                })
-            } else {
-                Vec::new()
-            };
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(
-                crate::copystat::C::SyncAuditSlots,
-                ranges
-                    .iter()
-                    .map(|&(a, b)| (b - a).div_ceil(step as usize) as u64)
-                    .sum(),
-            );
-            let count = host.count() as usize;
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(
-                crate::copystat::C::SyncMarkedSlots,
-                marks
-                    .iter()
-                    .map(|&(a, b)| (b.min(count).saturating_sub(a)) as u64)
-                    .sum(),
-            );
-            ranges.extend(marks.into_iter().filter(|&(first, _)| first < count).map(
-                |(first, last)| {
-                    let addr = |index| start_address + index * step as usize;
-                    (addr(first), addr(last.min(count)))
-                },
-            ));
-            if !ranges.is_empty() {
-                work.push(HeapWrites {
-                    start,
-                    at,
-                    sync_id: heap.sync_id,
-                    ranges,
                 });
+                let count = host.count() as usize;
+                let marks: Vec<_> = marks
+                    .into_iter()
+                    .filter(|&(first, _)| first < count)
+                    .map(|(first, last)| (first as u32, last.min(count) as u32))
+                    .collect();
+                if !ranges.is_empty() || !marks.is_empty() {
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(
+                        crate::copystat::C::SyncMarkedSlots,
+                        marks.iter().map(|&(a, b)| u64::from(b - a)).sum(),
+                    );
+                    work.push(HeapWrites {
+                        start,
+                        at,
+                        sync_id: heap.sync_id,
+                        ranges,
+                        marks: Some(marks),
+                    });
+                }
             }
             continue;
         }
@@ -395,6 +384,8 @@ fn take_heap_writes(mut budget: usize, _audit: bool) -> Vec<HeapWrites> {
                 at,
                 sync_id: heap.sync_id,
                 ranges,
+                #[cfg(target_arch = "x86_64")]
+                marks: None,
             });
         }
         let pages = limit.div_ceil(crate::watch::PAGE) - start_address / crate::watch::PAGE;
@@ -429,7 +420,7 @@ pub(crate) fn sync_heaps() {
 fn publish_heap_writes(work: Vec<HeapWrites>) {
     let mut work = work;
     work.sort_unstable_by_key(|w| (w.at, w.sync_id));
-    for items in work.chunk_by(|a, b| (a.at, a.sync_id) == (b.at, b.sync_id)) {
+    for items in work.chunk_by_mut(|a, b| (a.at, a.sync_id) == (b.at, b.sync_id)) {
         let HeapWrites {
             start, at, sync_id, ..
         } = items[0];
@@ -458,22 +449,145 @@ fn publish_heap_writes(work: Vec<HeapWrites>) {
             })
             .filter(|(first, last)| first < last)
             .collect::<Vec<_>>();
-        ranges.sort_unstable();
-        // Marks and the audit can cover the same slots, as can the early
-        // and submit-time rounds. Read each slot once after both rounds.
-        let mut end = 0;
-        for i in 0..ranges.len() {
-            let (first, last) = ranges[i];
-            if end > 0 && first <= ranges[end - 1].1 {
-                ranges[end - 1].1 = ranges[end - 1].1.max(last);
-            } else {
-                ranges[end] = (first, last);
-                end += 1;
+        #[cfg(target_arch = "x86_64")]
+        if let Some(marks) = items.iter_mut().find_map(|item| item.marks.take()) {
+            let plan = plan_parts(marks, ranges);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::SyncAuditSlots, plan.audit_only_slots());
+            let audit = |index| {
+                use crate::port_descriptors::{pending_mark, record_miss};
+                if plan.missed(index, pending_mark) {
+                    record_miss(index);
+                }
+            };
+            host.sync_ranges(
+                &plan.ranges,
+                start,
+                step,
+                plan.has_audit().then_some(&audit),
+            );
+            continue;
+        }
+        merge_runs(&mut ranges);
+        host.sync_ranges(&ranges, start, step, None);
+    }
+}
+
+#[cfg(any(windows, test))]
+fn merge_runs(ranges: &mut Vec<(u32, u32)>) {
+    ranges.sort_unstable();
+    let mut end = 0;
+    for i in 0..ranges.len() {
+        let (first, last) = ranges[i];
+        if end > 0 && first <= ranges[end - 1].1 {
+            ranges[end - 1].1 = ranges[end - 1].1.max(last);
+        } else {
+            ranges[end] = (first, last);
+            end += 1;
+        }
+    }
+    ranges.truncate(end);
+}
+
+#[cfg(any(all(windows, target_arch = "x86_64"), test))]
+type SlotRuns = Vec<(u32, u32)>;
+
+#[cfg(any(all(windows, target_arch = "x86_64"), test))]
+struct SyncPlan {
+    ranges: SlotRuns,
+    taken_in_check: SlotRuns,
+    audit: SlotRuns,
+}
+
+/// Give the audit sole ownership of overlapping slots. Keep the overlap
+/// for accounting, then coalesce adjacent scan parts for block verification.
+#[cfg(any(all(windows, target_arch = "x86_64"), test))]
+fn plan_parts(mut marks: SlotRuns, mut audit: SlotRuns) -> SyncPlan {
+    merge_runs(&mut marks);
+    merge_runs(&mut audit);
+    let mut ranges = audit.clone();
+    let mut taken_in_check = Vec::new();
+    let mut checks = audit.iter().copied().peekable();
+    for (mut first, last) in marks {
+        while let Some((lo, hi)) = checks.peek().copied() {
+            if hi <= first {
+                checks.next();
+                continue;
+            }
+            if lo >= last {
+                break;
+            }
+            if first < lo {
+                ranges.push((first, lo));
+            }
+            taken_in_check.push((first.max(lo), last.min(hi)));
+            first = last.min(hi);
+            if first == last {
+                break;
             }
         }
-        ranges.truncate(end);
-        host.sync_ranges(&ranges, start, step);
+        if first < last {
+            ranges.push((first, last));
+        }
     }
+    merge_runs(&mut ranges);
+    SyncPlan {
+        ranges,
+        taken_in_check,
+        audit,
+    }
+}
+
+#[cfg(any(all(windows, target_arch = "x86_64"), test))]
+fn was_taken_in_check(runs: &[(u32, u32)], index: u32) -> bool {
+    let at = runs.partition_point(|&(first, _)| first <= index);
+    at > 0 && index < runs[at - 1].1
+}
+
+#[cfg(any(all(windows, target_arch = "x86_64"), test))]
+impl SyncPlan {
+    #[cfg(windows)]
+    fn has_audit(&self) -> bool {
+        !self.audit.is_empty()
+    }
+
+    fn missed(&self, index: u32, marked: impl FnOnce(u32) -> bool) -> bool {
+        was_taken_in_check(&self.audit, index)
+            && !was_taken_in_check(&self.taken_in_check, index)
+            && !marked(index)
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn audit_only_slots(&self) -> u64 {
+        let slots = |runs: &[(u32, u32)]| runs.iter().map(|&(a, b)| u64::from(b - a)).sum::<u64>();
+        slots(&self.audit) - slots(&self.taken_in_check)
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn plan_parts_scans_overlaps_once_and_preserves_taken_marks() {
+    let plan = plan_parts(
+        vec![(18, 25), (1, 8), (6, 14)],
+        vec![(16, 20), (3, 5), (4, 10)],
+    );
+    assert_eq!(plan.ranges, [(1, 14), (16, 25)]);
+    assert_eq!(plan.taken_in_check, [(3, 10), (18, 20)]);
+    assert_eq!(
+        (0..26)
+            .filter(|&index| plan.missed(index, |_| false))
+            .collect::<Vec<_>>(),
+        [16, 17],
+    );
+    assert!(!plan.missed(17, |index| index == 17));
+    #[cfg(feature = "diagnostics")]
+    assert_eq!(plan.audit_only_slots(), 2);
+    let plan = plan_parts(vec![(3, 5), (7, 9)], vec![(0, 32)]);
+    assert_eq!(plan.ranges, [(0, 32)]);
+    assert!(!plan.missed(3, |_| false));
+    assert!(plan.missed(5, |_| false));
+    assert!(!plan.missed(8, |_| false));
+    assert!(!plan.missed(32, |_| false));
 }
 
 #[cfg(windows)]
@@ -1819,11 +1933,15 @@ pub(crate) mod tests {
             at: h as usize,
             sync_id: heap(h).sync_id,
             ranges: early,
+            #[cfg(target_arch = "x86_64")]
+            marks: None,
         }];
         let late = written.take(base, end);
         assert!(late.iter().any(|&(a, b)| (a..b).contains(&(base + 16 * 6))));
         work.push(HeapWrites {
             ranges: late,
+            #[cfg(target_arch = "x86_64")]
+            marks: None,
             ..work[0]
         });
         register_heap(

@@ -1716,7 +1716,13 @@ impl HostHeap {
     /// Capture disjoint dirty spans, using workers for large reads.
     /// Large miss batches can use workers regardless of the capture path.
     /// Only the submission thread publishes into the shared heap.
-    pub(super) fn sync_ranges(&self, ranges: &[(u32, u32)], start: u64, step: u64) {
+    pub(super) fn sync_ranges(
+        &self,
+        ranges: &[(u32, u32)],
+        start: u64,
+        step: u64,
+        audit: Option<&dyn Fn(u32)>,
+    ) {
         const SLOTS_PER_SPAN: u32 = 2048;
         let spans: Vec<_> = ranges
             .iter()
@@ -1772,24 +1778,32 @@ impl HostHeap {
             if let Some(scan) = scan {
                 pending.push((lo, hi, scan));
             } else {
-                self.publish_scans(start, step, std::mem::take(&mut pending));
-                self.sync_slots_serial(lo, hi, start, step, &mut bytes);
+                self.publish_scans(start, step, std::mem::take(&mut pending), audit);
+                self.sync_slots_serial(lo, hi, start, step, &mut bytes, audit);
             }
         }
-        self.publish_scans(start, step, pending);
+        self.publish_scans(start, step, pending, audit);
     }
 
     #[cfg(test)]
     fn sync_slots(&self, first: u32, last: u32, start: u64, step: u64, bytes: &mut Vec<u8>) {
         let last = last.min(self.count);
         if first < last {
-            self.sync_slots_serial(first, last, start, step, bytes);
+            self.sync_slots_serial(first, last, start, step, bytes, None);
         }
     }
 
-    fn sync_slots_serial(&self, first: u32, last: u32, start: u64, step: u64, bytes: &mut Vec<u8>) {
+    fn sync_slots_serial(
+        &self,
+        first: u32,
+        last: u32,
+        start: u64,
+        step: u64,
+        bytes: &mut Vec<u8>,
+        audit: Option<&dyn Fn(u32)>,
+    ) {
         if let Some(scan) = self.capture_slots(first, last, start, step, bytes) {
-            self.publish_scans(start, step, vec![(first, last, scan)]);
+            self.publish_scans(start, step, vec![(first, last, scan)], audit);
         } else {
             // A failed read can cover multiple Windows pages. Retry
             // smaller ranges so a hole does not hide readable neighbors.
@@ -1798,8 +1812,8 @@ impl HostHeap {
             let end = start + u64::from(last - 1) * step + 12;
             if last - first > 1 && address / WINDOWS_PAGE != (end - 1) / WINDOWS_PAGE {
                 let middle = first + (last - first) / 2;
-                self.sync_slots_serial(first, middle, start, step, bytes);
-                self.sync_slots_serial(middle, last, start, step, bytes);
+                self.sync_slots_serial(first, middle, start, step, bytes, audit);
+                self.sync_slots_serial(middle, last, start, step, bytes, audit);
             }
         }
     }
@@ -1862,7 +1876,13 @@ impl HostHeap {
         Some(SlotScan { candidates, forgot })
     }
 
-    fn publish_scans(&self, start: u64, step: u64, mut scans: Vec<(u32, u32, SlotScan)>) {
+    fn publish_scans(
+        &self,
+        start: u64,
+        step: u64,
+        mut scans: Vec<(u32, u32, SlotScan)>,
+        audit: Option<&dyn Fn(u32)>,
+    ) {
         if scans.is_empty() {
             return;
         }
@@ -1883,6 +1903,11 @@ impl HostHeap {
             };
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::SyncChanged, records.len() as u64);
+            if let Some(record_check) = audit {
+                for record in &records {
+                    record_check(record.index);
+                }
+            }
             self.publish_records(&records, start, step);
         }
 
@@ -5630,7 +5655,7 @@ mod tests {
             }
             std::hint::black_box(&slots);
             let now = std::time::Instant::now();
-            heap.sync_ranges(&[(0, SLOTS as u32)], start, 32);
+            heap.sync_ranges(&[(0, SLOTS as u32)], start, 32, None);
             let elapsed = now.elapsed().as_secs_f64() * 1000.0;
             if round < 2 {
                 cold[round] = elapsed;
