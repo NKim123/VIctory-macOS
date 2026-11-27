@@ -427,10 +427,10 @@ impl Host {
                 .rev()
                 .find(|(write, may_alias)| *may_alias || write.overlaps(address, bytes))
             {
-                if !flight.shared_writes
-                    && !younger_title_writes
-                    && let Some(value) = write.value_for_wait(address, bytes)
-                {
+                if !younger_title_writes && let Some(value) = write.value_for_wait(address, bytes) {
+                    // A shared label still lands before native execution,
+                    // via order_shared_bottom_writes. This only lets the
+                    // held queue start preparing its consumer.
                     BOTTOM_FIFO_READS.fetch_add(1, Ordering::Relaxed);
                     return Some(value);
                 }

@@ -901,7 +901,17 @@ fn a_native_copy_sees_an_earlier_label_through_a_zero_copy_buffer() {
     first.defer_write(src, crate::queue::Written::Value(91), 4);
     assert_eq!(first.inflight_barrier(), None);
     assert!(host.execute_title(&[first]));
+    assert_eq!(host.queued_wait_value(src as usize, 4), Some(91));
+    // SAFETY: the producer is still gated and the label is still CPU-visible.
+    assert_eq!(unsafe { src.cast::<u32>().read() }, 0);
     let next = host.new_list().unwrap();
+    next.defer_wait(crate::hold::ValueWait {
+        address: src as u64,
+        bytes: 4,
+        comparison: 3,
+        reference: 91,
+        mask: u64::from(u32::MAX),
+    });
     // SAFETY: both buffers are retained through the submission's fence.
     unsafe { next.list.CopyBufferRegion(&out, 4, &source, 0, 4) };
     next.close();
@@ -909,7 +919,7 @@ fn a_native_copy_sees_an_earlier_label_through_a_zero_copy_buffer() {
         std::thread::sleep(Duration::from_millis(20));
         drop(gate);
     });
-    host.execute_title(&[Arc::new(next)]);
+    crate::queue::submit_test_segments(2, [Arc::new(next)]);
     release.join().unwrap();
     host.present_boundary();
     crate::shadow::unregister_aliased(src as u64);
