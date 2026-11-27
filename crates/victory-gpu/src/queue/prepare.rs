@@ -245,7 +245,7 @@ mod tests {
                 }
                 host.execute_host_parts(parts);
             },
-            move |list| crate::list::recycle_into(list, &worker_spare),
+            move |list| crate::host::with_bury_lag(0, || crate::list::recycle_into(list, &worker_spare)),
             1,
         )
         .unwrap();

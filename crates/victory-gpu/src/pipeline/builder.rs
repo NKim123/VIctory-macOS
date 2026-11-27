@@ -207,6 +207,7 @@ mod tests {
     #[test]
     fn quarantine_overrides_an_open_decision_within_the_current_frame() {
         let _lock = test_lock();
+        let _allow = allow_for_test();
         *DECIDED.lock().unwrap() = (crate::frame::current(), true);
         assert!(runs());
         quarantine("test recording failure");

@@ -7941,7 +7941,7 @@ void main() {
             let list = host.new_list().unwrap();
             list.close();
             let wait_for_retirement = || {
-                host.execute(&[&list]);
+                crate::host::with_bury_lag(0, || host.execute(&[&list]));
                 let since = std::time::Instant::now();
                 while references(&buffer) > 1 && since.elapsed() < std::time::Duration::from_secs(5)
                 {

@@ -8486,7 +8486,7 @@ void main(uint3 id : SV_DispatchThreadID) { o[id.xy] = 13.5; }",
             assert!(retired.upgrade().is_some(), "retirement still owns the copy");
         });
         list.close();
-        host.execute(&[&list]);
+        crate::host::with_bury_lag(0, || host.execute(&[&list]));
         let since = std::time::Instant::now();
         while shown.upgrade().is_some() && since.elapsed() < std::time::Duration::from_secs(5) {
             std::thread::yield_now();
