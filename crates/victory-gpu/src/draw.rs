@@ -1181,6 +1181,7 @@ impl State {
                                 None => return false,
                             }
                         }
+                        None if compute && crate::dispatch_x::uses_root_word(u.root) => 0,
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
@@ -1531,6 +1532,10 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        self.dispatch_x(list, [x, y, z], None);
+    }
+
+    pub(crate) fn dispatch_x(&mut self, list: &HostList, [x, y, z]: [u32; 3], flags: Option<u32>) {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1552,13 +1557,17 @@ impl State {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| {
                 format!(
-                    "LEFT OUT dispatch {x}x{y}x{z} (VICTORY_RAY_SKIP) {}",
+                    "LEFT OUT dispatch {x}x{y}x{z} (ray pass) {}",
                     crate::pipeline::shaders_of(self.pipeline as This)
                 )
             });
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            crate::pipeline::builder_failed(
+                self.pipeline as This,
+                "a dispatch lost its host pipeline",
+            );
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
@@ -1573,6 +1582,7 @@ impl State {
             return;
         }
         if !self.bind(list, p, true) {
+            crate::pipeline::builder_failed(self.pipeline as This, "a dispatch could not be bound");
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "dispatch");
@@ -1582,8 +1592,26 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
         self.probe_small(list, true);
-        // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        if let Some(flags) = flags {
+            if !crate::dispatch_x::record(&list.list, p, [x, y, z], flags) {
+                crate::pipeline::builder_failed(
+                    self.pipeline as This,
+                    "invalid DispatchX dimensions",
+                );
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+                once!(
+                    x,
+                    y,
+                    z,
+                    flags,
+                    "DispatchX dimensions cannot be represented on the host"
+                );
+                return;
+            }
+        } else {
+            // SAFETY: an open list with everything set.
+            unsafe { list.list.Dispatch(x, y, z) };
+        }
         self.probe_hdr_compute(list);
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
@@ -2583,10 +2611,7 @@ impl State {
             list.note_op(|| format!("DROPPED indirect kind {kind} (skipped) {}", crate::pipeline::shaders_of(self.pipeline as This)));
             return false;
         }
-        const DRAW: u32 = 0;
-        const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
-        const MESH: u32 = 10;
         #[cfg(feature = "diagnostics")]
         let pipeline = self.pipeline as This;
         #[cfg(feature = "diagnostics")]
@@ -2614,12 +2639,33 @@ impl State {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| {
                 format!(
-                    "LEFT OUT indirect kind {kind} max {max} (VICTORY_RAY_SKIP) {}",
+                    "LEFT OUT indirect kind {kind} max {max} (ray pass) {}",
                     crate::pipeline::shaders_of(pipeline)
                 )
             });
             return true;
         }
+        let ran = self.execute_indirect_bound(list, (kind, stride, max), arguments, count, why);
+        if kind == DISPATCH && !ran {
+            crate::pipeline::builder_failed(self.pipeline as This, "an indirect dispatch failed");
+        }
+        ran
+    }
+
+    fn execute_indirect_bound(
+        &mut self,
+        list: &HostList,
+        (kind, stride, max): (u32, u32, u32),
+        arguments: u64,
+        count: Option<u64>,
+        why: impl Fn(&str),
+    ) -> bool {
+        const DRAW: u32 = 0;
+        const INDEXED: u32 = 1;
+        const DISPATCH: u32 = 2;
+        const MESH: u32 = 10;
+        #[cfg(feature = "diagnostics")]
+        let pipeline = self.pipeline as This;
         if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);

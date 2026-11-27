@@ -83,6 +83,7 @@ fn store_shader() -> Arc<Shader> {
         stage: "compute",
         hash: blake3::hash(&native.code).to_hex()[..16].to_owned(),
         full_hash: *blake3::hash(&native.code).as_bytes(),
+        ray_work: super::ray_tracing::Work::Other,
         size: container.len(),
         container: std::sync::Mutex::new(container),
         spilled: OnceLock::new(),

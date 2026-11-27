@@ -67,6 +67,8 @@ pub(crate) struct Shader {
     pub(crate) hash: String,
     #[cfg(windows)]
     full_hash: [u8; 32],
+    #[cfg(windows)]
+    ray_work: ray_tracing::Work,
     /// The container's length, as logged once its bytes are gone.
     size: usize,
     /// Released after translation unless an experimental mesh/pixel pair may need it.
@@ -114,7 +116,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     };
     // Written outside the lock every pipeline creation takes.
     #[cfg(windows)]
-    if created {
+    if created && ray_tracing::policy().omission(shader.ray_work).is_none() {
         spill(&shader, full.as_bytes());
     }
     #[cfg(not(windows))]
@@ -175,14 +177,28 @@ impl Shader {
     }
 
     fn with_hash(stage: &'static str, bytes: &[u8], digest: blake3::Hash) -> Shader {
+        #[cfg(windows)]
+        let policy = ray_tracing::policy();
+        #[cfg(windows)]
+        let ray_work = ray_tracing::classify(stage, bytes, policy);
+        #[cfg(windows)]
+        let container = if policy.omission(ray_work).is_some() {
+            Vec::new()
+        } else {
+            bytes.to_vec()
+        };
+        #[cfg(all(test, not(windows)))]
+        let container = bytes.to_vec();
         Shader {
             stage,
             hash: digest.to_hex()[..16].to_owned(),
             #[cfg(windows)]
             full_hash: *digest.as_bytes(),
+            #[cfg(windows)]
+            ray_work,
             size: bytes.len(),
             #[cfg(any(windows, test))]
-            container: Mutex::new(bytes.to_vec()),
+            container: Mutex::new(container),
             #[cfg(windows)]
             spilled: OnceLock::new(),
             #[cfg(windows)]
@@ -560,6 +576,7 @@ impl Shader {
             stage: self.stage,
             hash: self.hash.clone(),
             full_hash: self.full_hash,
+            ray_work: self.ray_work,
             size: self.size,
             container: Mutex::new(Vec::new()),
             spilled: OnceLock::new(),
@@ -788,6 +805,23 @@ pub(crate) fn host_pipeline_for<'a>(
     make::ready(p)
 }
 
+#[cfg(windows)]
+fn ray_omission(shaders: &[Arc<Shader>], builder: bool) -> Option<&'static str> {
+    let policy = ray_tracing::policy();
+    if builder && let Some(reason) = policy.omission(ray_tracing::Work::Builder) {
+        return Some(reason);
+    }
+    shaders.iter().find_map(|s| policy.omission(s.ray_work))
+}
+
+/// Disable the builder after a stage fails to record.
+#[cfg(windows)]
+pub(crate) fn builder_failed(this: This, reason: &'static str) {
+    if !this.is_null() && pipeline(this).builder {
+        builder::quarantine(reason);
+    }
+}
+
 /// Whether a dispatch with the title pipeline is held back: it is the
 /// acceleration-structure builder's, which does not run this frame
 /// ([`builder::runs`]).
@@ -796,17 +830,18 @@ pub(crate) fn held_back(this: This) -> bool {
     !this.is_null() && pipeline(this).builder && !builder::runs()
 }
 
-/// Whether a dispatch with the title pipeline is left out: it is one of
-/// the ray passes `VICTORY_RAY_SKIP` names (`crate::ray_skip`), and the
-/// acceleration-structure builder does not run this frame
-/// ([`builder::runs`]), so there is nothing to trace against. Counted
-/// there when it is.
+/// Whether a dispatch is omitted by the master RT policy or by the
+/// frame-dependent `VICTORY_RAY_SKIP` setting.
 #[cfg(windows)]
 pub(crate) fn ray_pass_left_out(this: This) -> bool {
     if this.is_null() {
         return false;
     }
-    let kind = pipeline(this).ray_pass;
+    let p = pipeline(this);
+    if p.host.omitted.is_some() {
+        return true;
+    }
+    let kind = p.ray_pass;
     if kind == 0 || builder::runs() {
         return false;
     }
@@ -957,16 +992,20 @@ fn hand_out(
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
-    let builder = !code.is_empty() && builder::created_by_builder(code);
+    let builder = (!code.is_empty() && builder::created_by_builder(code))
+        || shaders
+            .iter()
+            .any(|s| s.ray_work == ray_tracing::Work::Builder);
     #[cfg(not(windows))]
     let _ = code;
     #[cfg(windows)]
-    let host = Arc::new(make::Pending::new(
+    let host = make::Pending::shared(
         shaders.clone(),
         graphics,
+        ray_omission(&shaders, builder),
         #[cfg(feature = "diagnostics")]
         skip_hashes(),
-    ));
+    );
     #[cfg(windows)]
     make::early(&host);
     #[cfg(windows)]
@@ -1193,6 +1232,8 @@ pub(crate) mod host;
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(any(windows, test))]
+mod ray_tracing;
 // Also built for tests, which run where `host` cannot.
 #[cfg(any(windows, test))]
 mod schedule;
@@ -1275,6 +1316,9 @@ impl Prebuild {
     /// Makes the host pipeline, or finds it in the library; why not if it
     /// gets none.
     pub fn make(&self) -> Result<(), String> {
+        if let Some(reason) = ray_omission(&self.shaders, false) {
+            return Err(reason.into());
+        }
         let key = self.key();
         library::keep_early_list();
         // Without the run's log lines per shader and pipeline: tens of

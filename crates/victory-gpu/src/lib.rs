@@ -46,6 +46,8 @@ pub mod console;
 mod copystat;
 pub mod descriptor;
 pub mod device;
+#[cfg(any(windows, test))]
+mod dispatch_x;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;

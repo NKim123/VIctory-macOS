@@ -83,11 +83,23 @@ static PIPELINES: Mutex<Vec<Weak<Pending>>> = Mutex::new(Vec::new());
 /// The builder created pipeline `p`: it counts towards [`runs`], and is
 /// made at once (no frame's wait budget holds it back).
 pub(crate) fn note(p: &Arc<Pending>) {
-    PIPELINES
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push(Arc::downgrade(p));
+    let weak = Arc::downgrade(p);
+    let mut pipelines = PIPELINES.lock().unwrap_or_else(|e| e.into_inner());
+    if !pipelines.iter().any(|p| p.ptr_eq(&weak)) {
+        pipelines.push(weak);
+    }
+    drop(pipelines);
     make::begin(p);
+}
+
+static QUARANTINED: AtomicBool = AtomicBool::new(false);
+
+/// A builder stage failed during recording. Later stages must not consume
+/// the incomplete structure, including stages recorded in the same frame.
+pub(super) fn quarantine(reason: &'static str) {
+    if !QUARANTINED.swap(true, Ordering::AcqRel) {
+        tracing::warn!(reason, "BVH builder quarantined");
+    }
 }
 
 /// The frame [`runs`] last decided for, and its decision.
@@ -99,6 +111,9 @@ pub(crate) fn runs() -> bool {
     static SAID: AtomicBool = AtomicBool::new(false);
     let frame = crate::frame::current();
     let mut decided = DECIDED.lock().unwrap_or_else(|e| e.into_inner());
+    if QUARANTINED.load(Ordering::Acquire) {
+        return false;
+    }
     if decided.0 == frame {
         return decided.1;
     }
@@ -146,6 +161,7 @@ fn all_made(states: &[Option<bool>]) -> bool {
 pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
     let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    QUARANTINED.store(false, Ordering::Release);
     *DECIDED.lock().unwrap_or_else(|e| e.into_inner()) = (u64::MAX, true);
     guard
 }
@@ -153,6 +169,16 @@ pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quarantine_overrides_an_open_decision_within_the_current_frame() {
+        let _lock = test_lock();
+        *DECIDED.lock().unwrap() = (crate::frame::current(), true);
+        assert!(runs());
+        quarantine("test recording failure");
+        assert!(!runs());
+        QUARANTINED.store(false, Ordering::Release);
+    }
 
     /// The builder runs only when every one of its pipelines is made: one
     /// refused or still being made holds all of them back.

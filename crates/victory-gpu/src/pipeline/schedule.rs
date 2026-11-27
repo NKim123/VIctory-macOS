@@ -57,15 +57,21 @@ pub(crate) enum Lane {
     /// Graphics pipelines (or non-prioritized compute) a live draw waits for.
     Graphics = 1,
     /// Early pre-warm pipelines started at creation from a prior run's list.
-    Early = 2,
+    EarlyDepth = 2,
+    /// Other speculative pre-warms.
+    Early = 3,
 }
 
 /// Selects the worker lane for a pipeline: early pre-warms go to
 /// [`Lane::Early`]; requested pipelines go to [`Lane::Compute`] when compute
 /// synchronization is enabled for them, else [`Lane::Graphics`].
-pub(crate) fn lane_for(now: bool, sync_compute: bool) -> Lane {
+pub(crate) fn lane_for(now: bool, sync_compute: bool, depth_only: bool) -> Lane {
     if !now {
-        Lane::Early
+        if depth_only {
+            Lane::EarlyDepth
+        } else {
+            Lane::Early
+        }
     } else if sync_compute {
         Lane::Compute
     } else {
@@ -73,16 +79,15 @@ pub(crate) fn lane_for(now: bool, sync_compute: bool) -> Lane {
     }
 }
 
-/// Three-lane FIFO queue draining [`Lane::Compute`], then [`Lane::Graphics`],
-/// then [`Lane::Early`].
+/// FIFO queue within each lane, draining lanes in priority order.
 pub(crate) struct PriorityQueue<T> {
-    lanes: [VecDeque<T>; 3],
+    lanes: [VecDeque<T>; 4],
 }
 
 impl<T> PriorityQueue<T> {
     pub(crate) const fn new() -> Self {
         Self {
-            lanes: [VecDeque::new(), VecDeque::new(), VecDeque::new()],
+            lanes: [const { VecDeque::new() }; 4],
         }
     }
 
@@ -143,7 +148,7 @@ impl WaitBudgets {
         }
     }
 
-    /// Waits on `done` until `is_ready()` becomes true or the applicable
+    /// Waits on `done` until its completion flag is set or the applicable
     /// budget expires.
     ///
     /// When `sync_compute` is true and `making_elapsed()` is below
@@ -155,8 +160,7 @@ impl WaitBudgets {
         frame: u64,
         sync_compute: bool,
         making_elapsed: impl Fn() -> Duration,
-        is_ready: impl Fn() -> bool,
-        done: &(Mutex<()>, Condvar),
+        done: &(Mutex<bool>, Condvar),
     ) -> WaitOutcome {
         let making_before = making_elapsed();
         let use_compute = sync_compute && making_before < self.compute_budget;
@@ -176,7 +180,7 @@ impl WaitBudgets {
         };
 
         if left.is_zero() {
-            let ready = is_ready();
+            let ready = *done.0.lock().unwrap_or_else(|e| e.into_inner());
             return WaitOutcome {
                 waited: Duration::ZERO,
                 ready,
@@ -189,7 +193,7 @@ impl WaitBudgets {
         let started = Instant::now();
         let (lock, cond) = done;
         let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
-        while !is_ready() {
+        while !*held {
             let rest = left.saturating_sub(started.elapsed());
             if rest.is_zero() {
                 break;
@@ -199,10 +203,10 @@ impl WaitBudgets {
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
         }
+        let ready = *held;
         drop(held);
 
         let waited = started.elapsed();
-        let ready = is_ready();
         if !use_compute {
             let mut spent = self.graphics.lock().unwrap_or_else(|e| e.into_inner());
             if spent.0 == frame {
@@ -223,7 +227,6 @@ impl WaitBudgets {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn switch_defaults_on_and_disables_on_zero() {
@@ -236,13 +239,15 @@ mod tests {
     #[test]
     fn requested_compute_jumps_ahead_of_graphics_and_early() {
         let mut q = PriorityQueue::new();
-        q.push(lane_for(false, false), "early-gfx");
-        q.push(lane_for(false, true), "early-compute");
-        q.push(lane_for(true, false), "req-gfx");
-        q.push(lane_for(true, true), "req-compute");
+        q.push(lane_for(false, false, false), "early-gfx");
+        q.push(lane_for(false, true, false), "early-compute");
+        q.push(lane_for(true, false, false), "req-gfx");
+        q.push(lane_for(true, true, false), "req-compute");
 
+        q.push(lane_for(false, false, true), "early-depth");
         assert_eq!(q.pop(), Some("req-compute"));
         assert_eq!(q.pop(), Some("req-gfx"));
+        assert_eq!(q.pop(), Some("early-depth"));
         assert_eq!(q.pop(), Some("early-gfx"));
         assert_eq!(q.pop(), Some("early-compute"));
         assert_eq!(q.pop(), None);
@@ -275,38 +280,30 @@ mod tests {
     /// asynchronous and drop immediately.
     #[test]
     fn cold_compute_waits_after_graphics_budget_is_exhausted() {
-        let budgets = WaitBudgets::with_budgets(Duration::from_millis(30), Duration::from_millis(600));
-        let done = Arc::new((Mutex::new(()), Condvar::new()));
+        let budgets =
+            WaitBudgets::with_budgets(Duration::from_millis(30), Duration::from_millis(600));
+        let done = Arc::new((Mutex::new(false), Condvar::new()));
 
         // Exhaust frame 1's graphics budget with a slow graphics pipeline.
-        let gfx1 = budgets.wait_for(1, false, || Duration::ZERO, || false, &done);
+        let gfx1 = budgets.wait_for(1, false, || Duration::ZERO, &done);
         assert!(!gfx1.ready);
         assert!(!gfx1.used_compute_budget);
 
         // A second cold graphics pipeline on the same frame drops immediately.
-        let gfx2 = budgets.wait_for(1, false, || Duration::ZERO, || false, &done);
+        let gfx2 = budgets.wait_for(1, false, || Duration::ZERO, &done);
         assert!(!gfx2.ready);
         assert_eq!(gfx2.waited, Duration::ZERO);
 
         // A cold compute pipeline whose worker finishes in 70 ms (> 30 ms
         // graphics budget) completes instead of dropping.
-        let ready = Arc::new(AtomicBool::new(false));
-        let ready_worker = ready.clone();
         let done_worker = done.clone();
         let worker = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(70));
-            ready_worker.store(true, Ordering::Release);
-            let _held = done_worker.0.lock().unwrap();
+            *done_worker.0.lock().unwrap() = true;
             done_worker.1.notify_all();
         });
 
-        let cs = budgets.wait_for(
-            1,
-            true,
-            || Duration::ZERO,
-            || ready.load(Ordering::Acquire),
-            &done,
-        );
+        let cs = budgets.wait_for(1, true, || Duration::ZERO, &done);
         worker.join().unwrap();
         assert!(cs.ready, "cold compute dispatch must wait for its pipeline");
         assert!(cs.used_compute_budget);
@@ -318,12 +315,13 @@ mod tests {
     /// shares the graphics budget and drops once it is spent.
     #[test]
     fn disabled_compute_wait_uses_graphics_budget() {
-        let budgets = WaitBudgets::with_budgets(Duration::from_millis(20), Duration::from_millis(500));
-        let done = (Mutex::new(()), Condvar::new());
+        let budgets =
+            WaitBudgets::with_budgets(Duration::from_millis(20), Duration::from_millis(500));
+        let done = (Mutex::new(false), Condvar::new());
 
-        let first = budgets.wait_for(1, false, || Duration::ZERO, || false, &done);
+        let first = budgets.wait_for(1, false, || Duration::ZERO, &done);
         assert!(!first.ready);
-        let second = budgets.wait_for(1, false, || Duration::ZERO, || false, &done);
+        let second = budgets.wait_for(1, false, || Duration::ZERO, &done);
         assert!(!second.ready);
         assert!(!second.used_compute_budget);
         assert_eq!(second.waited, Duration::ZERO);
@@ -334,12 +332,13 @@ mod tests {
     /// compute waits share one wall-clock frame window.
     #[test]
     fn compute_waits_stop_after_pipeline_and_frame_caps() {
-        let budgets = WaitBudgets::with_budgets(Duration::from_millis(20), Duration::from_millis(120));
-        let done = (Mutex::new(()), Condvar::new());
+        let budgets =
+            WaitBudgets::with_budgets(Duration::from_millis(20), Duration::from_millis(120));
+        let done = (Mutex::new(false), Condvar::new());
 
         // Pipeline has already been compiling for 80 ms of a 120 ms cap.
         let started_making = Instant::now() - Duration::from_millis(80);
-        let first = budgets.wait_for(1, true, || started_making.elapsed(), || false, &done);
+        let first = budgets.wait_for(1, true, || started_making.elapsed(), &done);
         assert!(!first.ready);
         assert!(first.used_compute_budget);
         assert!(first.compute_timed_out);
@@ -348,16 +347,16 @@ mod tests {
 
         // On the next frame, the same stalled pipeline falls back to the short
         // graphics budget rather than burning another compute window.
-        let next_frame = budgets.wait_for(2, true, || started_making.elapsed(), || false, &done);
+        let next_frame = budgets.wait_for(2, true, || started_making.elapsed(), &done);
         assert!(!next_frame.ready);
         assert!(!next_frame.used_compute_budget);
         assert!(next_frame.waited < Duration::from_millis(80));
 
         // Frame 3: once the wall-clock compute window expires, another compute
         // dispatch on the same frame drops immediately without waiting again.
-        let frame3_a = budgets.wait_for(3, true, || Duration::ZERO, || false, &done);
+        let frame3_a = budgets.wait_for(3, true, || Duration::ZERO, &done);
         assert!(frame3_a.compute_timed_out);
-        let frame3_b = budgets.wait_for(3, true, || Duration::ZERO, || false, &done);
+        let frame3_b = budgets.wait_for(3, true, || Duration::ZERO, &done);
         assert!(frame3_b.compute_timed_out);
         assert_eq!(frame3_b.waited, Duration::ZERO);
     }

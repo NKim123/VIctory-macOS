@@ -192,6 +192,10 @@ fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D1
 }
 
 impl GraphicsState {
+    pub(super) fn writes_depth_only(&self, has_pixel_shader: bool) -> bool {
+        !has_pixel_shader || self.targets.NumRenderTargets == 0
+    }
+
     /// The formats the state declares ([`TargetFormats`]): nothing past its
     /// count of render targets.
     pub(crate) fn formats(&self) -> TargetFormats {

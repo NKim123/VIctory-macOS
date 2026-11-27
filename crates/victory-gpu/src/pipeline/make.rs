@@ -18,8 +18,9 @@
 //! guess; a pass the title runs only once and whose pipeline takes longer
 //! is lost.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use super::Shader;
@@ -45,6 +46,8 @@ pub(crate) struct Pending {
     now: AtomicBool,
     taken: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
+    finished: (Mutex<bool>, Condvar),
+    pub(super) omitted: Option<&'static str>,
     #[cfg(feature = "diagnostics")]
     refusal: OnceLock<(&'static str, Option<i32>)>,
     #[cfg(feature = "diagnostics")]
@@ -69,12 +72,44 @@ unsafe impl Send for Pending {}
 unsafe impl Sync for Pending {}
 
 impl Pending {
-    pub(crate) fn new(
+    /// Title objects for identical pipelines share an in-flight compile and its result.
+    pub(super) fn shared(
         shaders: Vec<Arc<Shader>>,
         graphics: Option<Box<GraphicsState>>,
+        omitted: Option<&'static str>,
+        #[cfg(feature = "diagnostics")] skip_hashes: &[String],
+    ) -> Arc<Self> {
+        type Registry = HashMap<(String, Option<&'static str>), Weak<Pending>>;
+        static KNOWN: std::sync::LazyLock<Mutex<Registry>> =
+            std::sync::LazyLock::new(Mutex::default);
+        let key = (key(&shaders, graphics.as_deref()), omitted);
+        let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(p) = known.get(&key).and_then(Weak::upgrade) {
+            return p;
+        }
+        // Retire dead keys periodically, even when subsequent pipelines are unique.
+        if known.len().is_multiple_of(1024) {
+            known.retain(|_, p| p.strong_count() != 0);
+        }
+        let p = Arc::new(Self::new(
+            shaders,
+            graphics,
+            key.0.clone(),
+            omitted,
+            #[cfg(feature = "diagnostics")]
+            skip_hashes,
+        ));
+        known.insert(key, Arc::downgrade(&p));
+        p
+    }
+
+    fn new(
+        shaders: Vec<Arc<Shader>>,
+        graphics: Option<Box<GraphicsState>>,
+        key: String,
+        omitted: Option<&'static str>,
         #[cfg(feature = "diagnostics")] skip_hashes: &[String],
     ) -> Pending {
-        let key = key(&shaders, graphics.as_deref());
         #[cfg(feature = "diagnostics")]
         log("created", &key, || {
             let state = graphics.as_ref().map(|g| g.describe()).unwrap_or_default();
@@ -83,9 +118,10 @@ impl Pending {
         #[cfg(feature = "diagnostics")]
         let skipped_shader = super::skipped_shader(&shaders, skip_hashes).map(str::to_owned);
         let made = OnceLock::new();
-        // Publish the completed result before the pipeline can be queued.
+        let finished = omitted.is_some();
         #[cfg(feature = "diagnostics")]
-        if skipped_shader.is_some() {
+        let finished = finished || skipped_shader.is_some();
+        if finished {
             let _ = made.set(None);
         }
         let compute = graphics.is_none()
@@ -105,6 +141,8 @@ impl Pending {
             now: AtomicBool::new(false),
             taken: AtomicBool::new(false),
             made,
+            finished: (Mutex::new(finished), Condvar::new()),
+            omitted,
             #[cfg(feature = "diagnostics")]
             refusal: OnceLock::new(),
             #[cfg(feature = "diagnostics")]
@@ -133,8 +171,8 @@ impl Pending {
             );
             made
         });
-        let (lock, done) = &DONE;
-        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let (lock, done) = &self.finished;
+        *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
         done.notify_all();
     }
 }
@@ -156,6 +194,9 @@ pub(crate) fn key(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> 
 /// the shaders that failed to translate. `None` if it has one.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
+    if let Some(reason) = p.omitted {
+        return Some(reason.into());
+    }
     if let Some(hash) = p.skipped_shader.as_deref() {
         return Some(format!("skipped shader {hash}"));
     }
@@ -217,9 +258,6 @@ fn log(what: &str, key: &str, rest: impl FnOnce() -> String) {
         let _ = writeln!(file, "{what}\t{key}\t{}", rest());
     }
 }
-
-/// Signalled whenever a worker has made a pipeline.
-static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
 /// Per-frame graphics and compute wait budgets.
 static BUDGETS: WaitBudgets = WaitBudgets::new();
@@ -288,9 +326,13 @@ fn variant<'a>(p: &'a Arc<Pending>, g: &GraphicsState, bound: &TargetFormats) ->
                 so_far,
                 "a pipeline is made again for the render target formats bound at its draw (VICTORY_TARGET_VARIANTS=0 disables)"
             );
+            let graphics = Box::new(g.with_formats(bound));
+            let key = key(&p.shaders, Some(&graphics));
             Arc::new(Pending::new(
                 p.shaders.clone(),
-                Some(Box::new(g.with_formats(bound))),
+                Some(graphics),
+                key,
+                p.omitted,
                 #[cfg(feature = "diagnostics")]
                 &[],
             ))
@@ -305,7 +347,7 @@ fn variant<'a>(p: &'a Arc<Pending>, g: &GraphicsState, bound: &TargetFormats) ->
 
 /// Starts making `p` now, without waiting for it.
 pub(crate) fn begin(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() {
+    if p.made.get().is_none() && !p.shaders.is_empty() {
         start(p, false);
     }
 }
@@ -319,9 +361,7 @@ pub(crate) fn state(p: &Pending) -> Option<bool> {
 /// Queues `p` for the workers: once, and once more ahead of the early
 /// starts if a draw or dispatch waits for it (`now`) while it is still queued.
 fn start(p: &Arc<Pending>, now: bool) {
-    if let Some(lane) = enqueue(p, now) {
-        queue(p.clone(), lane);
-    }
+    queue(p, now);
 }
 
 /// Which lane `p` goes into now, if any.
@@ -331,7 +371,13 @@ fn enqueue(p: &Pending, now: bool) -> Option<Lane> {
         PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
     }
     let ahead = now && !p.now.swap(true, Ordering::Relaxed);
-    (first || ahead && !p.taken.load(Ordering::Relaxed)).then(|| lane_for(ahead, p.compute))
+    (first || ahead && !p.taken.load(Ordering::Relaxed)).then(|| {
+        let depth = p
+            .graphics
+            .as_ref()
+            .is_some_and(|g| g.writes_depth_only(p.shaders.iter().any(|s| s.stage == "pixel")));
+        lane_for(now, p.compute, depth)
+    })
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier
@@ -352,9 +398,12 @@ fn wait(p: &Pending, frame: u64) {
     let outcome = BUDGETS.wait_for(
         frame,
         p.compute,
-        || p.making_since.get().map_or(Duration::ZERO, Instant::elapsed),
-        || p.made.get().is_some(),
-        &DONE,
+        || {
+            p.making_since
+                .get()
+                .map_or(Duration::ZERO, Instant::elapsed)
+        },
+        &p.finished,
     );
     if outcome.compute_timed_out && !p.compute_dropped.swap(true, Ordering::Relaxed) {
         tracing::info!(
@@ -375,13 +424,13 @@ fn wait(p: &Pending, frame: u64) {
 }
 
 /// Pipelines for the workers: requested compute first, then requested
-/// graphics, then early pre-warms.
+/// graphics, then early depth and other pre-warms.
 static QUEUES: (Mutex<PriorityQueue<Arc<Pending>>>, Condvar) =
     (Mutex::new(PriorityQueue::new()), Condvar::new());
 
 /// Hands `p` to the workers (half the logical processors, 2 to 8), started
 /// on first use.
-fn queue(p: Arc<Pending>, lane: Lane) {
+fn queue(p: &Arc<Pending>, now: bool) {
     static WORKERS: OnceLock<usize> = OnceLock::new();
     let workers = *WORKERS.get_or_init(|| {
         let n = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
@@ -397,7 +446,11 @@ fn queue(p: Arc<Pending>, lane: Lane) {
             })
             .count()
     });
+    let (lock, work) = &QUEUES;
+    let mut queues = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(lane) = enqueue(p, now) else { return };
     if workers == 0 {
+        drop(queues);
         // No worker: made here instead.
         if !p.taken.swap(true, Ordering::Relaxed) {
             p.make();
@@ -405,8 +458,7 @@ fn queue(p: Arc<Pending>, lane: Lane) {
         }
         return;
     }
-    let (lock, work) = &QUEUES;
-    lock.lock().unwrap_or_else(|e| e.into_inner()).push(lane, p);
+    queues.push(lane, p.clone());
     work.notify_one();
 }
 
@@ -472,12 +524,58 @@ fn drained() {
 mod tests {
     use super::*;
 
+    #[test]
+    fn identical_requests_share_one_pending_until_the_last_owner_drops_it() {
+        let request = || {
+            Pending::shared(
+                vec![Arc::new(Shader::new("compute", b"dedup test"))],
+                None,
+                None,
+                #[cfg(feature = "diagnostics")]
+                &[],
+            )
+        };
+        let first = request();
+        let second = std::thread::spawn(request).join().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        let weak = Arc::downgrade(&first);
+        drop((first, second));
+        assert!(weak.upgrade().is_none());
+        assert!(!Weak::ptr_eq(&weak, &Arc::downgrade(&request())));
+    }
+
+    #[test]
+    fn early_depth_detection_accepts_no_pixel_shader_or_no_render_targets() {
+        assert!(GraphicsState::default().writes_depth_only(true));
+        assert!(GraphicsState::declaring(24).writes_depth_only(false));
+        assert!(!GraphicsState::declaring(24).writes_depth_only(true));
+    }
+
+    #[test]
+    fn omitted_pipeline_never_translates_or_queues() {
+        let shader = Arc::new(Shader::new("compute", b"omission test"));
+        let pending = Pending::shared(
+            vec![shader.clone()],
+            None,
+            Some("ray tracing disabled"),
+            #[cfg(feature = "diagnostics")]
+            &[],
+        );
+        early(&pending);
+        begin(&pending);
+        assert!(ready(&pending).is_none());
+        assert!(!pending.queued.load(Ordering::Relaxed));
+        assert!(shader.translated.get().is_none());
+    }
+
     /// An early start is queued once; a draw or compute dispatch waiting for
     /// it puts it ahead in its lane, once, unless a worker has taken it.
     #[test]
     fn draws_go_ahead_of_early_starts() {
         let p = Pending::new(
             Vec::new(),
+            None,
+            String::new(),
             None,
             #[cfg(feature = "diagnostics")]
             &[],
@@ -489,6 +587,8 @@ mod tests {
         let q = Pending::new(
             Vec::new(),
             None,
+            String::new(),
+            None,
             #[cfg(feature = "diagnostics")]
             &[],
         );
@@ -498,6 +598,8 @@ mod tests {
         let r = Pending::new(
             Vec::new(),
             None,
+            String::new(),
+            None,
             #[cfg(feature = "diagnostics")]
             &[],
         );
@@ -505,6 +607,8 @@ mod tests {
         assert_eq!(enqueue(&r, false), None);
         let mut cs = Pending::new(
             Vec::new(),
+            None,
+            String::new(),
             None,
             #[cfg(feature = "diagnostics")]
             &[],
@@ -523,6 +627,8 @@ mod tests {
     fn first_use_is_made_by_a_worker() {
         let p = Arc::new(Pending::new(
             Vec::new(),
+            None,
+            String::new(),
             None,
             #[cfg(feature = "diagnostics")]
             &[],
@@ -545,6 +651,7 @@ mod tests {
             stage: "compute",
             hash: "abcdef0123456789".into(),
             full_hash: [0; 32],
+            ray_work: super::super::ray_tracing::Work::Other,
             size: 4,
             container: std::sync::Mutex::new(vec![1, 2, 3, 4]),
             translated: OnceLock::new(),
@@ -552,7 +659,7 @@ mod tests {
         });
 
         // 1. Driver refusal keeps HRESULT (hex) and shader identity.
-        let driver = Pending::new(vec![shader.clone()], None, &[]);
+        let driver = Pending::new(vec![shader.clone()], None, String::new(), None, &[]);
         driver
             .refusal
             .set(("compute pipeline refused", Some(0x80070057u32 as i32)))
@@ -565,7 +672,7 @@ mod tests {
         );
 
         // 2. Static refusal with shaders includes reason and shader list; without shaders keeps bare reason.
-        let static_with = Pending::new(vec![shader.clone()], None, &[]);
+        let static_with = Pending::new(vec![shader.clone()], None, String::new(), None, &[]);
         static_with
             .refusal
             .set(("the host GPU has no 64-bit atomics on typed heap resources", None))
@@ -576,7 +683,7 @@ mod tests {
             Some("the host GPU has no 64-bit atomics on typed heap resources [compute abcdef0123456789]")
         );
 
-        let static_empty = Pending::new(Vec::new(), None, &[]);
+        let static_empty = Pending::new(Vec::new(), None, String::new(), None, &[]);
         static_empty
             .refusal
             .set(("no vertex or mesh shader", None))
@@ -589,7 +696,7 @@ mod tests {
 
         // 3. Skipped shader keeps its dedicated label.
         let hashes = crate::pipeline::parse_skip_hashes("ABCDEF0123456789");
-        let skipped = Pending::new(vec![shader], None, &hashes);
+        let skipped = Pending::new(vec![shader], None, String::new(), None, &hashes);
         assert_eq!(
             missing(&skipped).as_deref(),
             Some("skipped shader abcdef0123456789")
@@ -601,6 +708,8 @@ mod tests {
         let p = Arc::new(Pending::new(
             Vec::new(),
             Some(Box::new(GraphicsState::declaring(24))),
+            String::new(),
+            None,
             #[cfg(feature = "diagnostics")]
             &[],
         ));
@@ -629,13 +738,26 @@ mod tests {
             stage: "compute",
             hash: "0123456789abcdef".into(),
             full_hash: [0; 32],
+            ray_work: super::super::ray_tracing::Work::Other,
             size: 0,
             container: std::sync::Mutex::new(Vec::new()),
             translated: OnceLock::new(),
             spilled: OnceLock::new(),
         });
-        let cold = Arc::new(Pending::new(vec![shader.clone()], None, &hashes));
-        let warm = Arc::new(Pending::new(vec![shader.clone()], None, &hashes));
+        let cold = Arc::new(Pending::new(
+            vec![shader.clone()],
+            None,
+            String::new(),
+            None,
+            &hashes,
+        ));
+        let warm = Arc::new(Pending::new(
+            vec![shader.clone()],
+            None,
+            String::new(),
+            None,
+            &hashes,
+        ));
         assert!(ready(&cold).is_none());
         crate::pipeline::library::note_used(&warm.key);
         early(&warm);
