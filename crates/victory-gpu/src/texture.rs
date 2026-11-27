@@ -895,6 +895,7 @@ fn copies(
 ) {
     for (i, band) in subresources {
         let i = *i as usize;
+        let index = i as u32 + staging.first;
         let mut footprint = staging.footprints[i];
         footprint.Offset += at;
         #[cfg(feature = "diagnostics")]
@@ -929,7 +930,7 @@ fn copies(
             pResource: unsafe { std::mem::transmute_copy(texture) },
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                SubresourceIndex: i as u32 + staging.first,
+                SubresourceIndex: index,
             },
         };
         let regions = if preserved.is_empty() {
@@ -937,14 +938,13 @@ fn copies(
         } else {
             // SAFETY: the destination is a live texture.
             let desc = unsafe { texture.GetDesc() };
-            let index = i as u32 + staging.first;
             let full = Bounds {
                 lo: [0; 3],
                 hi: subresource_extent(&desc, index),
             };
             let block = crate::resource::element(footprint.Footprint.Format.0 as u32)
                 .map_or(1, |(_, block)| block as u32);
-            let regions = upload_regions(full, block, i as u32, preserved);
+            let regions = upload_regions(full, block, index, preserved);
             if regions.is_some() && block > 1 {
                 // This placed footprint has room for whole blocks in its
                 // existing row pitch and allocation, even at a mip edge.
@@ -2031,7 +2031,7 @@ pub(crate) fn eligible_for_gating(resource: This, copy: &HostTexture) -> bool {
             if total == 0 {
                 return None;
             }
-            total.max(bytes).checked_next_multiple_of(512)
+            staging_charge(total, bytes)
         })
         .is_some()
 }
@@ -2053,11 +2053,11 @@ pub(crate) fn staging(resource: This, copy: &HostTexture) -> Option<Arc<Staging>
 /// Size charged to a batch that stages pending texture slots. The console
 /// snapshot or detile scratch can exceed the host copy footprint.
 pub(crate) fn staging_bytes(staging: &Staging) -> u64 {
-    staging
-        .size
-        .max(staging.layout.size)
-        .checked_next_multiple_of(512)
-        .unwrap_or(u64::MAX)
+    staging_charge(staging.size, staging.layout.bytes_from(staging.first)).unwrap_or(u64::MAX)
+}
+
+fn staging_charge(footprint: u64, console_bytes: u64) -> Option<u64> {
+    footprint.max(console_bytes).checked_next_multiple_of(512)
 }
 
 pub(crate) fn staging_for(

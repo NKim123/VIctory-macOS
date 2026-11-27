@@ -3807,13 +3807,12 @@ impl HostHeap {
     fn worker_texture(&self, view: &View) -> bool {
         !self.sampler
             && crate::heap_worker::on()
-            && !show_after()
             && matches!(view, View::Shader(..) | View::Placed(false, ..))
             && is_texture(view)
     }
 
     fn enqueue_texture(&self, index: u32) {
-        if !self.sampler && crate::heap_worker::on() && !show_after() {
+        if !self.sampler && crate::heap_worker::on() {
             let mut uploads = self.uploads.lock().unwrap_or_else(|e| e.into_inner());
             uploads.written(index, crate::queue::presented());
         }

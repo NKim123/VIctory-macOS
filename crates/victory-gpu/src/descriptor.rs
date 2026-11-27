@@ -751,7 +751,7 @@ fn with_current_record(handle: u64, record: [u32; 3], f: impl FnOnce()) -> bool 
 /// they view as used (`crate::resource::evict`).
 #[cfg(windows)]
 pub(crate) fn make_read(slots: &[u32]) {
-    if crate::heap_worker::on() && !host::show_after() {
+    if crate::heap_worker::on() {
         let frame = crate::queue::presented();
         let mut kick_heaps: Vec<usize> = Vec::new();
         let mut sync_uavs: Vec<(usize, u32)> = Vec::new();

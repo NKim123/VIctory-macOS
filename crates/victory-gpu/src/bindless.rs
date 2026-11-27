@@ -565,7 +565,7 @@ pub(crate) fn uploads_for(
             work.push((staging.clone(), copy.clone()));
         }
     }
-    let worker_on = crate::heap_worker::on() && !crate::descriptor::host::show_after();
+    let worker_on = crate::heap_worker::on();
     let ready = worker_on.then(crate::heap_worker::take_ready);
     let mut done = std::collections::HashSet::new();
     let is_large_first_fill = |copy: &crate::resource::HostTexture| {

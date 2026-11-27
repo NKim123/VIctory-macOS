@@ -601,6 +601,27 @@ fn placed_srv_uploads_only_its_backed_mips() {
     assert!(coarse_staging.size_bytes() < fine_staging.size_bytes());
     assert!(fine_staging.size_bytes() < full_staging.size_bytes());
     let list = host.new_list().unwrap();
+    let first = coarse.first_mip();
+    let written = Transfer::new(&rig, &coarse.texture, first, 0xa7);
+    // Model the mip a host copy has filled before the title-memory seed.
+    coarse
+        .tiles
+        .as_ref()
+        .unwrap()
+        .prepare_upload(&list.list, &coarse.texture);
+    if let Some(barrier) = list.move_texture(&coarse, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32) {
+        // SAFETY: the list is open and owns the resource.
+        unsafe { list.list.ResourceBarrier(&[barrier]) };
+    }
+    written.copy(&list.list, true);
+    crate::texture::Fill::HostCopy(
+        coarse.clone(),
+        crate::texture::CopyCoverage::SubresourceRange {
+            first,
+            end: first + 1,
+        },
+    )
+    .completed();
     let mut reads = Vec::new();
     for (copy, staging) in [(&coarse, &coarse_staging), (&fine, &fine_staging)] {
         let crate::texture::WorkerRefresh::Uploaded { upload, .. } =
@@ -625,9 +646,13 @@ fn placed_srv_uploads_only_its_backed_mips() {
             // SAFETY: the list is open and owns the resource.
             unsafe { list.list.ResourceBarrier(&[barrier]) };
         }
-        for mip in [copy.first_mip(), 9] {
+        for mip in [copy.first_mip(), first * 2, 9] {
             let mut transfer = Transfer::new(&rig, &copy.texture, mip, 0);
-            transfer.pattern.fill(0x59);
+            if std::sync::Arc::ptr_eq(copy, &coarse) && mip == first {
+                transfer.pattern.copy_from_slice(&written.pattern);
+            } else {
+                transfer.pattern.fill(0x59);
+            }
             transfer.copy(&list.list, false);
             reads.push(transfer);
         }

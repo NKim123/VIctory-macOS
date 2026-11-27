@@ -45,8 +45,12 @@ thread_local! {
 }
 
 /// Whether background heap-indexed texture uploads are enabled
-/// (`VICTORY_HEAP_WORKER=1`).
+/// (`VICTORY_HEAP_WORKER=1`). Show-after owns staging and publication in
+/// the submission, which does not drain the worker's staged uploads.
 pub(crate) fn on() -> bool {
+    if crate::descriptor::host::show_after() {
+        return false;
+    }
     #[cfg(test)]
     if let Some(v) = TEST_ON.get() {
         return v;

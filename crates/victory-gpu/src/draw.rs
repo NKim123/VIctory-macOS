@@ -6771,6 +6771,23 @@ void main() { t[uint2(0, 0)] = float4(192.0 / 255.0, 0, 0, 1); }",
     #[test]
     #[ignore = "run with VICTORY_SHOW_AFTER=1 on a D3D12 host"]
     fn shared_texture_slot_uploads_bc_edge_and_tail_mips() {
+        shared_bc_texture_slot(28, 20, 5, 0, false);
+    }
+
+    #[test]
+    #[ignore = "run with VICTORY_SHOW_AFTER=1 and VICTORY_LEVELS_ON_DEMAND=1 on a tier-2 host"]
+    fn shared_texture_slot_uploads_a_reserved_bc_suffix() {
+        assert!(crate::tiles::enabled());
+        shared_bc_texture_slot(512, 512, 10, 1, false);
+    }
+
+    #[test]
+    #[ignore = "run with VICTORY_SHOW_AFTER=1 on a D3D12 host"]
+    fn shared_texture_slot_refreshes_bc_with_worker_requested() {
+        shared_bc_texture_slot(28, 20, 5, 0, true);
+    }
+
+    fn shared_bc_texture_slot(width: u32, height: u32, mips: u32, first: u32, refresh: bool) {
         assert!(crate::descriptor::host::show_after());
         let host = crate::host::host().expect("D3D12 host");
         let null = std::ptr::null();
@@ -6788,10 +6805,27 @@ void main() { t[uint2(0, 0)] = float4(192.0 / 255.0, 0, 0, 1); }",
         let title = crate::descriptor::heap(heap);
         let h = title.host().unwrap();
         let slots = Slots(h.heap.clone(), 0);
-        let address = title_memory(1 << 16);
-        let mut words = texture_words(28, 20, 71, 1, 0);
-        words[7] = 1 | 5 << 16;
-        let texture = texture_at_address(address, &words);
+        let address = title_memory(if first == 0 { 1 << 16 } else { 1 << 19 });
+        let swizzle = if first == 0 { 1 } else { 0x109 };
+        let mut words = texture_words(width, height, 71, swizzle, 0);
+        words[7] = 1 | mips << 16;
+        let View::Placed(_, _, mut srv) = placed_view(address, words) else {
+            unreachable!();
+        };
+        srv[4] = first;
+        srv[5] = mips - first;
+        let texture = if first == 0 {
+            texture_at_address(address, &words)
+        } else {
+            let view = View::Placed(false, words, srv);
+            let Some(View::Shader(texture, _)) = crate::descriptor::host::placed_texture(&view)
+            else {
+                panic!("expected a placed BC1 texture");
+            };
+            texture as This
+        };
+        let copy = crate::resource::host_copy(texture).unwrap();
+        assert_eq!(copy.first_mip(), first);
         let (_, desc) = crate::resource::texture_memory(texture).unwrap();
         let layout = crate::resource::texture_layout(&desc)
             .unwrap()
@@ -6801,7 +6835,7 @@ void main() { t[uint2(0, 0)] = float4(192.0 / 255.0, 0, 0, 1); }",
         // SAFETY: the layout fits into the title allocation.
         let memory =
             unsafe { std::slice::from_raw_parts_mut(address as *mut u8, layout.size as usize) };
-        for (mip, color) in [(2, 0xf800u16), (4, 0x001f)] {
+        let mut tile_color = |mip, color: u16| {
             let level = &layout.mips[mip as usize];
             let row = level.width as usize * 8;
             let mut blocks = vec![0; row * level.height as usize];
@@ -6811,14 +6845,23 @@ void main() { t[uint2(0, 0)] = float4(192.0 / 255.0, 0, 0, 1); }",
             layout
                 .tile(memory, mip, 0, &blocks, row, blocks.len())
                 .unwrap();
+        };
+        tile_color(first + 2, 0xf800);
+        tile_color(mips - 1, 0x001f);
+        if first == 0 {
+            let srv: &[u32; 10] = srv[..10].try_into().unwrap();
+            crate::descriptor::create_srv(null, texture, srv, title.start);
+        } else {
+            crate::descriptor::create_placed_srv(null, &words, &srv, title.start);
         }
-        let srv = [71, 4, 0x1688, 0, 0, 5, 0, 0, 0, 0];
-        crate::descriptor::create_srv(null, texture, &srv, title.start);
         let (out, data) = host.shared_buffer(16).unwrap();
         let read = compile_cs(
-            "Texture2D<float4> t : register(t0); RWByteAddressBuffer o : register(u1);
+            &format!(
+                "Texture2D<float4> t : register(t0); RWByteAddressBuffer o : register(u1);
 [numthreads(1, 1, 1)]
-void main() { o.Store(0, asuint(t.Load(int3(6, 4, 2)).r)); o.Store(4, asuint(t.Load(int3(0, 0, 4)).b)); }",
+void main() {{ o.Store(0, asuint(t.Load(int3(6, 4, 2)).r)); o.Store(4, asuint(t.Load(int3(0, 0, {})).b)); }}",
+                mips - first - 1
+            ),
             READS,
         );
         let mut state = State::default();
@@ -6829,13 +6872,25 @@ void main() { o.Store(0, asuint(t.Load(int3(6, 4, 2)).r)); o.Store(4, asuint(t.L
         run(&list, &slots, &read, 0, Some(&out), (1, 1));
         list.close();
         host.execute(&[&list]);
-        assert!(h.kept(0));
+        assert!(h.kept(0), "the completed BC1 seed publishes the slot");
         host.execute(&[&list]);
         // SAFETY: both words are inside the mapped dispatch output.
         assert_eq!(unsafe { (data as *const [f32; 2]).read() }, [1.0; 2]);
-        assert_eq!(crate::texture::copied(texture), 5);
-        for object in [heap, texture] {
-            assert_eq!(crate::object::release_ref(object), 0);
+        assert_eq!(crate::texture::copied(texture), u64::from(mips - first));
+        if refresh {
+            let worker = crate::heap_worker::EnableForTest::new();
+            tile_color(first + 2, 0x001f);
+            // Give the background pass its turn before the next submission.
+            if crate::heap_worker::on() {
+                worker.step_heap(title);
+            }
+            host.execute(&[&list]);
+            // SAFETY: execute waited for the dispatch writing these two words.
+            assert_eq!(unsafe { (data as *const [f32; 2]).read() }, [0.0, 1.0]);
+        }
+        assert_eq!(crate::object::release_ref(heap), 0);
+        if first == 0 {
+            assert_eq!(crate::object::release_ref(texture), 0);
         }
     }
 
