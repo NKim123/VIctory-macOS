@@ -2323,7 +2323,9 @@ impl Host {
     ) -> bool {
         // A last title pin can destroy a resource. Drop it outside the lock.
         let mut pending_pins = Vec::new();
+        let lock = crate::queue::CpuTimer::new(crate::queue::CpuPhase::SubmitLock);
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        drop(lock);
         let holding = Holding::enter();
         let capture = self.execute_part(
             runs,
@@ -2519,7 +2521,9 @@ impl Host {
             self.note_sync(submission, why);
             None
         } else {
+            let retire = crate::queue::CpuTimer::new(crate::queue::CpuPhase::SubmitRetire);
             self.retire_inflight(submission);
+            drop(retire);
             if runs.iter().any(|list| submission.uses(list)) {
                 self.drain_inflight(submission, Boundary::ReusedList);
             }

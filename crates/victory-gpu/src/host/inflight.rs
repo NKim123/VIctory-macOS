@@ -508,6 +508,7 @@ impl Host {
             let mut f = s.flights.pop_front().expect("completed flight");
             let mut feedback_ran = true;
             if let Some(feedback) = f.feedback {
+                let _timed = crate::queue::CpuTimer::new(crate::queue::CpuPhase::FlightFeedback);
                 feedback_ran = feedback.mark.saw(f.value);
                 if feedback_ran {
                     feedback.notify();
@@ -872,9 +873,15 @@ impl Host {
                     while receiver.recv().is_ok() {
                         loop {
                             let (published, next) = {
+                                let lock =
+                                    crate::queue::CpuTimer::new(crate::queue::CpuPhase::ReaperLock);
                                 let mut s =
                                     self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+                                drop(lock);
                                 let _holding = Holding::enter();
+                                let _retire = crate::queue::CpuTimer::new(
+                                    crate::queue::CpuPhase::ReaperRetire,
+                                );
                                 let published = self.retire_inflight(&mut s);
                                 (published, s.flights.front().map(|f| f.value))
                             };

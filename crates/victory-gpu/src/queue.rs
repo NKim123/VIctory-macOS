@@ -357,11 +357,16 @@ pub(crate) enum CpuPhase {
     ListLifecycle,
     QueueSetup,
     PresentSetup,
+    SubmitLock,
+    ReaperLock,
+    SubmitRetire,
+    ReaperRetire,
+    FlightFeedback,
 }
 
 #[cfg(windows)]
-static CPU_PHASE_NS: [AtomicU64; CpuPhase::PresentSetup as usize + 1] =
-    [const { AtomicU64::new(0) }; CpuPhase::PresentSetup as usize + 1];
+static CPU_PHASE_NS: [AtomicU64; CpuPhase::FlightFeedback as usize + 1] =
+    [const { AtomicU64::new(0) }; CpuPhase::FlightFeedback as usize + 1];
 
 #[cfg(windows)]
 pub(crate) struct CpuTimer(Option<(CpuPhase, std::time::Instant)>);
@@ -404,6 +409,11 @@ pub(crate) fn log_cpu_phases(frames: f64) {
         lifecycle_ms = ms(CpuPhase::ListLifecycle),
         queue_setup_ms = ms(CpuPhase::QueueSetup),
         present_setup_ms = ms(CpuPhase::PresentSetup),
+        submit_lock_ms = ms(CpuPhase::SubmitLock),
+        reaper_lock_ms = ms(CpuPhase::ReaperLock),
+        submit_retire_ms = ms(CpuPhase::SubmitRetire),
+        reaper_retire_ms = ms(CpuPhase::ReaperRetire),
+        flight_feedback_ms = ms(CpuPhase::FlightFeedback),
         "title CPU calls per frame"
     );
 }
