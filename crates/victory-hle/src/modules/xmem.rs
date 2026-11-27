@@ -642,7 +642,7 @@ pub(crate) fn release_virtual(address: *mut c_void, size: usize, kind: u32) -> B
         }
         released
     };
-    victory_gpu::with_physical_mapping(|| true, release)
+    victory_gpu::with_physical_mapping(|_| true, release)
 }
 
 impl Slice {
@@ -1168,7 +1168,7 @@ pub extern "system" fn XMemMapPhysicalPages(
     // SAFETY: the title passes a null pointer or `n` page numbers.
     let pages = (!pages.is_null()).then(|| unsafe { std::slice::from_raw_parts(pages, n) });
     victory_gpu::with_physical_mapping(
-        || {
+        |labels| {
             let physical = physical();
             match pages {
                 None => overlaps_view(&physical, base, len),
@@ -1183,7 +1183,7 @@ pub extern "system" fn XMemMapPhysicalPages(
                             .pages
                             .get(page)
                             .is_none_or(|s| s.section.shared.is_none())
-                    })
+                    }) || mapping_touches_labels(&physical, base, len, labels)
                 }
             }
         },
@@ -1303,17 +1303,44 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         return false;
     }
     victory_gpu::with_physical_mapping(
-        || {
+        |labels| {
             let physical = physical();
             if from == 0 {
                 return overlaps_view(&physical, to, len);
             }
-            (from..from + len).step_by(PAGE).any(|at| {
+            if (from..from + len).step_by(PAGE).any(|at| {
                 slice_at(&physical, at).is_none_or(|slice| slice.section.shared.is_none())
-            }) || overlaps_view(&physical, to, len) && !same_alias_pages(&physical, to, from, len)
+            }) {
+                return true;
+            }
+            if overlaps_view(&physical, to, len) {
+                !same_alias_pages(&physical, to, from, len)
+            } else {
+                mapping_touches_labels(&physical, to, len, labels)
+            }
         },
         || alias_pages(&mut physical(), to, from, len),
     )
+}
+
+/// An additive edit can make a pending write visible through a new alias.
+/// If a label is already in any physical view, keep the publication fence
+/// before changing the aliases, even when the destination is disjoint.
+fn mapping_touches_labels(
+    physical: &Physical,
+    base: usize,
+    len: usize,
+    labels: &mut dyn Iterator<Item = (usize, usize)>,
+) -> bool {
+    for (at, bytes) in labels {
+        if at
+            .checked_add(bytes)
+            .is_none_or(|end| (at < base + len && base < end) || overlaps_view(physical, at, bytes))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn overlaps_view(physical: &Physical, base: usize, len: usize) -> bool {
@@ -1941,6 +1968,38 @@ mod tests {
     thread_local! {
         /// Views this thread mapped for the title (`map`).
         pub(super) static MAPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn additive_mapping_preserves_label_addresses_and_physical_aliases() {
+        let pages = allocate(1);
+        let base = reserve_pages(2);
+        assert_eq!(XMemMapPhysicalPages(base, 1, pages.as_ptr()), base);
+        let destination = base as usize + PAGE;
+        let unrelated = 0u32;
+        {
+            let physical = physical();
+            let touches = |address| {
+                mapping_touches_labels(
+                    &physical,
+                    destination,
+                    PAGE,
+                    &mut [(address, 4)].into_iter(),
+                )
+            };
+            assert!(!touches(&unrelated as *const u32 as usize));
+            assert!(
+                touches(destination + 4),
+                "the edit changes the label's address"
+            );
+            assert!(
+                touches(base as usize + 4),
+                "the mapped source may gain another alias"
+            );
+        }
+        assert_eq!(XMemMapPhysicalPages(base, 1, std::ptr::null()), base);
+        release_placeholders(base, 2);
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
     }
 
     #[test]

@@ -12,6 +12,25 @@ fn depth_defaults_and_caps_at_eight() {
     assert_eq!(parse_limit("broken"), 0);
 }
 
+#[test]
+fn clearing_forgotten_reads_preserves_uncollected_feedback() {
+    let Some(host) = host_for_ring() else { return };
+    host.present_boundary();
+    let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+    let forgotten = victory_shader::emit::HEAP_VIEWS - 7;
+    let unread = forgotten + 1;
+    crate::shadow::tests::mark_read(false, forgotten);
+    assert!(crate::shadow::take_reads().contains(&forgotten));
+    crate::shadow::forget_read(forgotten);
+    crate::shadow::tests::mark_read(true, unread);
+    crate::shadow::clear_forgotten_reads();
+    let next = crate::shadow::take_reads();
+    assert!(!next.contains(&forgotten));
+    assert!(next.contains(&unread));
+    crate::shadow::tests::mark_read(false, forgotten);
+    assert!(crate::shadow::take_reads().contains(&forgotten));
+}
+
 /// A native queue wait holds the GPU while CPU submission proceeds.
 /// A watchdog opens it on a regression so the test fails without a hang.
 struct Gate {
@@ -383,15 +402,22 @@ fn texture_fill_is_published_only_after_its_fence() {
 }
 
 #[test]
-fn additive_mapping_can_proceed_while_a_destructive_edit_waits() {
+fn mapping_waits_for_labels_its_edit_can_affect() {
     let Some(host) = host_for_ring() else { return };
     host.present_boundary();
     let (out, data) = host.mapped_buffer(8, true).unwrap();
     let before = DRAINS[Boundary::Mapping as usize].load(Ordering::Relaxed);
+    let label = AtomicU32::new(0);
     let mut gate = Gate::new(host);
-    assert!(host.execute_title(&[record_copy(host, &out, 4, 0x1234)]));
+    let list = record_copy(host, &out, 4, 0x1234);
+    list.defer_write(label.as_ptr().cast(), crate::queue::Written::Value(1), 4);
+    assert!(host.execute_title(&[list]));
     crate::tiled::with_physical_mapping(
-        || false,
+        |labels| {
+            assert_eq!(labels.next(), Some((label.as_ptr() as usize, 4)));
+            assert_eq!(labels.next(), None);
+            false
+        },
         || {
             assert_eq!(
                 DRAINS[Boundary::Mapping as usize].load(Ordering::Relaxed),
@@ -405,10 +431,11 @@ fn additive_mapping_can_proceed_while_a_destructive_edit_waits() {
         gate.open();
     });
     crate::tiled::with_physical_mapping(
-        || true,
+        |labels| labels.next() == Some((label.as_ptr() as usize, 4)),
         || {
-            // SAFETY: the destructive boundary has fenced the GPU write.
+            // SAFETY: the mapping boundary has fenced the GPU write.
             assert_eq!(unsafe { data.cast::<u32>().add(1).read() }, 0x1234);
+            assert_eq!(label.load(Ordering::Acquire), 1);
         },
     );
     release.join().unwrap();
@@ -700,6 +727,94 @@ fn bottom_of_pipe_labels_and_title_signals_retire_without_another_submit() {
 }
 
 #[test]
+fn fifo_queue_waits_use_the_latest_label_before_the_cpu_can_read_it() {
+    let Some(host) = host_for_ring() else { return };
+    host.present_boundary();
+    let (out, data) = host.mapped_buffer(16, true).unwrap();
+    // SAFETY: a new readback allocation, with no GPU work using it.
+    unsafe { data.write_bytes(0, 16) };
+    let label = AtomicU32::new(4);
+    let mut gate = Gate::new(host);
+    for value in [0x104, 0x105] {
+        let producer = record_copy(host, &out, 4, 1);
+        producer.defer_write(
+            label.as_ptr().cast(),
+            crate::queue::Written::Value(value),
+            4,
+        );
+        crate::queue::submit_test_segments(0, [producer]);
+    }
+    let waiter = |offset, reference| {
+        let list = record_copy(host, &out, offset, 73);
+        list.defer_wait(crate::hold::ValueWait {
+            address: label.as_ptr() as u64,
+            bytes: 4,
+            comparison: 3,
+            reference,
+            mask: 0xff,
+        });
+        list
+    };
+    // Queue 2 must wait, even though the current CPU value and the older
+    // submitted write both satisfy it. Queue 3 can run after the newer write.
+    crate::queue::submit_test_segments(2, [waiter(8, 4)]);
+    crate::queue::submit_test_segments(3, [waiter(12, 5)]);
+    assert_eq!(label.load(Ordering::Acquire), 4);
+    assert_eq!(host.submitted.lock().unwrap().flights.len(), 3);
+    gate.open();
+    host.present_boundary();
+    assert_eq!(label.load(Ordering::Acquire), 0x105);
+    // SAFETY: all submitted GPU work has finished.
+    assert_eq!(unsafe { data.cast::<[u32; 4]>().read() }, [73, 1, 0, 73]);
+    label.store(4, Ordering::Release);
+    crate::queue::pump_held(crate::queue::Why::Fence);
+    host.present_boundary();
+    // SAFETY: the CPU write released the wait and the GPU work has finished.
+    assert_eq!(unsafe { data.cast::<u32>().add(2).read() }, 73);
+}
+
+#[test]
+fn fifo_queue_waits_see_earlier_segments_in_the_same_piece() {
+    let Some(host) = host_for_ring() else { return };
+    host.present_boundary();
+    let (out, data) = host.mapped_buffer(12, true).unwrap();
+    // SAFETY: a new readback allocation, with no GPU work using it.
+    unsafe { data.write_bytes(0, 12) };
+    let label = AtomicU64::new(0);
+    let mut gate = Gate::new(host);
+    let producer = |value| {
+        let list = record_copy(host, &out, 4, 1);
+        list.defer_write(
+            label.as_ptr().cast(),
+            crate::queue::Written::Value(value),
+            8,
+        );
+        list
+    };
+    crate::queue::submit_test_segments(0, [producer(7)]);
+    let waiter = record_copy(host, &out, 8, 73);
+    waiter.defer_wait(crate::hold::ValueWait {
+        address: label.as_ptr() as u64,
+        bytes: 8,
+        comparison: 3,
+        reference: 7,
+        mask: u64::MAX,
+    });
+    crate::queue::submit_test_segments(2, [producer(8), waiter]);
+    assert_eq!(host.submitted.lock().unwrap().flights.len(), 2);
+    gate.open();
+    host.present_boundary();
+    assert_eq!(label.load(Ordering::Acquire), 8);
+    // SAFETY: the wait is still held and the other GPU work has finished.
+    assert_eq!(unsafe { data.cast::<u32>().add(2).read() }, 0);
+    label.store(7, Ordering::Release);
+    crate::queue::pump_held(crate::queue::Why::Fence);
+    host.present_boundary();
+    // SAFETY: the CPU write released the wait and the GPU work has finished.
+    assert_eq!(unsafe { data.cast::<u32>().add(2).read() }, 73);
+}
+
+#[test]
 fn a_deferred_upload_reads_the_earlier_label() {
     let Some(host) = host_for_ring() else { return };
     host.present_boundary();
@@ -786,7 +901,17 @@ fn a_native_copy_sees_an_earlier_label_through_a_zero_copy_buffer() {
     first.defer_write(src, crate::queue::Written::Value(91), 4);
     assert_eq!(first.inflight_barrier(), None);
     assert!(host.execute_title(&[first]));
+    assert_eq!(host.queued_wait_value(src as usize, 4), Some(91));
+    // SAFETY: the producer is still gated and the label is still CPU-visible.
+    assert_eq!(unsafe { src.cast::<u32>().read() }, 0);
     let next = host.new_list().unwrap();
+    next.defer_wait(crate::hold::ValueWait {
+        address: src as u64,
+        bytes: 4,
+        comparison: 3,
+        reference: 91,
+        mask: u64::from(u32::MAX),
+    });
     // SAFETY: both buffers are retained through the submission's fence.
     unsafe { next.list.CopyBufferRegion(&out, 4, &source, 0, 4) };
     next.close();
@@ -794,7 +919,7 @@ fn a_native_copy_sees_an_earlier_label_through_a_zero_copy_buffer() {
         std::thread::sleep(Duration::from_millis(20));
         drop(gate);
     });
-    host.execute_title(&[Arc::new(next)]);
+    crate::queue::submit_test_segments(2, [Arc::new(next)]);
     release.join().unwrap();
     host.present_boundary();
     crate::shadow::unregister_aliased(src as u64);

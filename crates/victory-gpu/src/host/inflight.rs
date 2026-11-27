@@ -187,6 +187,20 @@ impl BottomWrite {
             self.address.saturating_add(self.bytes) as u64,
         )
     }
+
+    fn value_for_wait(&self, address: usize, bytes: usize) -> Option<u64> {
+        if self.address == address
+            && self.bytes == bytes
+            && let crate::queue::Written::Value(value) = self.value
+        {
+            return match bytes {
+                4 => Some(u64::from(value as u32)),
+                8 => Some(value),
+                _ => None,
+            };
+        }
+        None
+    }
 }
 
 struct TitleSignal {
@@ -227,6 +241,7 @@ static QUEUED: AtomicU64 = AtomicU64::new(0);
 static QUEUED_COMPUTED: AtomicU64 = AtomicU64::new(0);
 static OVERLAPPED: AtomicU64 = AtomicU64::new(0);
 static QUEUED_OVERLAPPED: AtomicU64 = AtomicU64::new(0);
+static BOTTOM_FIFO_READS: AtomicU64 = AtomicU64::new(0);
 static FALLBACKS: [AtomicU64; Boundary::Fence as usize + 1] =
     [const { AtomicU64::new(0) }; Boundary::Fence as usize + 1];
 static ORDERED: [AtomicU64; Boundary::Fence as usize + 1] =
@@ -282,6 +297,7 @@ pub(super) fn log(frames: f64) {
         bottom_cpu,
         bottom_native,
         bottom_read,
+        bottom_fifo_reads = BOTTOM_FIFO_READS.swap(0, Ordering::Relaxed),
         diagnostics = count(Boundary::Diagnostics),
         cpu_access = count(Boundary::CpuAccess),
         descriptors = count(Boundary::Descriptors),
@@ -300,8 +316,21 @@ impl Submission {
         !self.flights.is_empty()
     }
 
+    pub(super) fn first_flight(&self) -> Option<u64> {
+        self.flights.front().map(|flight| flight.value)
+    }
+
     pub(super) fn has_bottom_writes(&self) -> bool {
         self.flights.iter().any(|f| !f.writes.is_empty())
+    }
+
+    pub(super) fn bottom_write_ranges(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.flights.iter().flat_map(|flight| {
+            flight
+                .writes
+                .iter()
+                .map(|(write, _)| (write.address, write.bytes))
+        })
     }
 
     pub(super) fn uses(&self, list: &HostList) -> bool {
@@ -385,17 +414,42 @@ impl Host {
         }
     }
 
-    /// An emulated queue wait must not compare a stale label that still
-    /// satisfies its predicate before the previous flight overwrites it.
-    pub(crate) fn order_bottom_read(&self, address: usize, bytes: usize) {
+    /// Evaluate a held GPU queue's wait against a label already ordered
+    /// before it on our single native queue. The held scheduler will still
+    /// apply the mask and comparison, and CPU publication stays fenced.
+    pub(crate) fn queued_wait_value(&self, address: usize, bytes: usize) -> Option<u64> {
         if limit() == 0 || HOLDS_SUBMISSIONS.with(std::cell::Cell::get) {
-            return;
+            return None;
         }
         let mut s = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let _holding = Holding::enter();
-        self.wait_bottom_writes(&mut s, Boundary::BottomOfPipeRead, |write, may_alias| {
-            may_alias || write.overlaps(address, bytes)
-        });
+        let mut younger_title_writes = false;
+        for flight in s.flights.iter().rev() {
+            if let Some((write, _)) = flight
+                .writes
+                .iter()
+                .rev()
+                .find(|(write, may_alias)| *may_alias || write.overlaps(address, bytes))
+            {
+                if !younger_title_writes && let Some(value) = write.value_for_wait(address, bytes) {
+                    // A shared label still lands before native execution,
+                    // via order_shared_bottom_writes. This only lets the
+                    // held queue start preparing its consumer.
+                    BOTTOM_FIFO_READS.fetch_add(1, Ordering::Relaxed);
+                    return Some(value);
+                }
+                // Timestamps, partial overlaps and possible physical
+                // aliases still require reading the published bytes.
+                let value = flight.value;
+                self.wait_inflight(&mut s, value, Boundary::BottomOfPipeRead);
+                break;
+            }
+            younger_title_writes |= flight
+                .ordered
+                .as_ref()
+                .is_some_and(|work| work.title_memory);
+        }
+        None
     }
 
     fn wait_inflight(&self, s: &mut Submission, value: u64, why: Boundary) {
@@ -453,10 +507,12 @@ impl Host {
         }
         let mut recovery_mark = None;
         let mut completions = Vec::new();
+        let mut finished_feedback = false;
         while s.flights.front().is_some_and(|f| f.value <= completed) {
             let mut f = s.flights.pop_front().expect("completed flight");
             let mut feedback_ran = true;
             if let Some(feedback) = f.feedback {
+                let _timed = crate::queue::CpuTimer::new(crate::queue::CpuPhase::FlightFeedback);
                 feedback_ran = feedback.mark.saw(f.value);
                 if feedback_ran {
                     feedback.notify();
@@ -515,6 +571,7 @@ impl Host {
                     },
                     &mut f._pins,
                 );
+                finished_feedback = true;
             } else {
                 let missed = f.computed.as_ref().is_some_and(|baselines| {
                     f.lists.iter().any(|list| list.deferred().missed(baselines))
@@ -558,14 +615,19 @@ impl Host {
             s.marks.push(marks);
         }
         if !s.busy() {
-            // Flights cannot produce copy-back through this shared bitmap.
-            // Consume read feedback and clear the alias marks only while
-            // there is no writer, independently of which flight produced it.
-            crate::shadow::copy_back_aliased_marks();
-            log_gave_up();
-            let read = crate::shadow::take_reads();
-            if !read.is_empty() {
-                crate::descriptor::make_read(&read);
+            if finished_feedback {
+                // The ordered completion consumed all GPU feedback. A
+                // descriptor published during it can still reset a slot.
+                crate::shadow::clear_forgotten_reads();
+            } else {
+                // Ordinary flights leave shared read feedback and alias
+                // marks for this idle boundary.
+                crate::shadow::copy_back_aliased_marks();
+                log_gave_up();
+                let read = crate::shadow::take_reads();
+                if !read.is_empty() {
+                    crate::descriptor::make_read(&read);
+                }
             }
             release_retired();
             self.log_messages();
@@ -772,7 +834,7 @@ impl Host {
                 fence: fence as usize,
                 value,
             });
-            self.wake_reaper();
+            self.wake_reaper(s.first_flight().expect("pending title signal"));
         } else {
             crate::fence::set(fence, value);
         }
@@ -803,37 +865,44 @@ impl Host {
         false
     }
 
-    pub(super) fn wake_reaper(&'static self) {
+    pub(super) fn wake_reaper(&'static self, first: u64) {
         let sender = self.reaper.get_or_init(|| {
-            let (sender, receiver) = std::sync::mpsc::sync_channel::<()>(1);
+            let (sender, receiver) = std::sync::mpsc::sync_channel::<u64>(1);
             let worker = std::thread::Builder::new().name("victory GPU completion".into());
             worker
                 .spawn(move || {
                     // SAFETY: an auto-reset event private to this process-lifetime
                     // worker. Synchronous waits use the host's separate event.
                     let event = unsafe { CreateEventW(None, false, false, None) };
-                    while receiver.recv().is_ok() {
+                    while let Ok(mut next) = receiver.recv() {
                         loop {
-                            let (published, next) = {
-                                let mut s =
-                                    self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-                                let _holding = Holding::enter();
-                                let published = self.retire_inflight(&mut s);
-                                (published, s.flights.front().map(|f| f.value))
-                            };
-                            if published {
-                                crate::queue::pump_held_if_free(crate::queue::Why::Fence);
-                            }
-                            let Some(next) = next else {
-                                break;
-                            };
-                            // Never wait for the native fence with the submission lock.
-                            // Retirement checks for removal after the wait.
+                            // Past hints are harmless. The fence is monotonic
+                            // and retirement always checks the current front.
                             if let Ok(event) = event {
                                 self.wait_for_submission_event(next, event);
                             } else {
                                 poll_fence(&self.fence, next);
                             }
+                            let (published, front) = {
+                                let lock =
+                                    crate::queue::CpuTimer::new(crate::queue::CpuPhase::ReaperLock);
+                                let mut s =
+                                    self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+                                drop(lock);
+                                let _holding = Holding::enter();
+                                let _retire = crate::queue::CpuTimer::new(
+                                    crate::queue::CpuPhase::ReaperRetire,
+                                );
+                                let published = self.retire_inflight(&mut s);
+                                (published, s.first_flight())
+                            };
+                            if published {
+                                crate::queue::pump_held_if_free(crate::queue::Why::Fence);
+                            }
+                            let Some(front) = front else {
+                                break;
+                            };
+                            next = front;
                         }
                     }
                 })
@@ -844,14 +913,14 @@ impl Host {
                 });
             sender
         });
-        if let Err(TrySendError::Disconnected(())) = sender.try_send(()) {
+        if let Err(TrySendError::Disconnected(_)) = sender.try_send(first) {
             fail(format_args!("GPU completion worker stopped"));
         }
     }
 }
 
 /// The completion worker is unique to the process host.
-pub(super) type Reaper = OnceLock<SyncSender<()>>;
+pub(super) type Reaper = OnceLock<SyncSender<u64>>;
 
 #[cfg(test)]
 mod tests;

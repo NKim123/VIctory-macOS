@@ -24,17 +24,20 @@ const MAX_BUFFERS: usize = 128;
 static BUFFERS: Mutex<Vec<Weak<TiledBuffer>>> = Mutex::new(Vec::new());
 
 /// Orders XMem's CPU view changes and GPU tile edits against preparation,
-/// execution and copy-back. The classification and edit both run under
-/// the submission lock. Acquire the XMem lock within each and release it
-/// before waiting for flights. Additive edits reach the GPU in the next
-/// queue-ordered tile update.
-pub fn with_physical_mapping<T>(destructive: impl FnOnce() -> bool, edit: impl FnOnce() -> T) -> T {
+/// execution and copy-back. The fence predicate receives the address and
+/// length of each pending label. It and the edit run under the submission
+/// lock. Acquire the XMem lock within each and release it before waiting
+/// for flights. Additive edits reach the GPU in the next tile update.
+pub fn with_physical_mapping<T>(
+    wait: impl FnOnce(&mut dyn Iterator<Item = (usize, usize)>) -> bool,
+    edit: impl FnOnce() -> T,
+) -> T {
     if !crate::host::inflight_enabled() && physical_tiles_enabled() {
         let _quiet = host().and_then(|h| h.quiet());
         return edit();
     }
     let _quiet = crate::host::inflight_enabled()
-        .then(|| host()?.quiet_mapping_if(destructive))
+        .then(|| host()?.quiet_mapping_if(wait))
         .flatten();
     edit()
 }

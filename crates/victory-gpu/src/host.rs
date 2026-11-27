@@ -2252,24 +2252,33 @@ impl Host {
     }
 
     pub(crate) fn quiet_mapping(&self) -> Option<Quiet<'_>> {
-        self.quiet_mapping_if(|| true)
+        self.quiet_for(Boundary::Mapping)
     }
 
-    pub(crate) fn quiet_mapping_if(&self, destructive: impl FnOnce() -> bool) -> Option<Quiet<'_>> {
-        self.quiet_for_if(Boundary::Mapping, destructive)
+    pub(crate) fn quiet_mapping_if(
+        &self,
+        wait: impl FnOnce(&mut dyn Iterator<Item = (usize, usize)>) -> bool,
+    ) -> Option<Quiet<'_>> {
+        self.quiet_for_if(Boundary::Mapping, |held| {
+            wait(&mut held.bottom_write_ranges())
+        })
     }
 
     fn quiet_for(&self, why: Boundary) -> Option<Quiet<'_>> {
-        self.quiet_for_if(why, || true)
+        self.quiet_for_if(why, |_| true)
     }
 
-    fn quiet_for_if(&self, why: Boundary, wait: impl FnOnce() -> bool) -> Option<Quiet<'_>> {
+    fn quiet_for_if(
+        &self,
+        why: Boundary,
+        wait: impl FnOnce(&Submission) -> bool,
+    ) -> Option<Quiet<'_>> {
         if HOLDS_SUBMISSIONS.with(std::cell::Cell::get) {
             return None;
         }
         let mut held = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let holding = Holding::enter();
-        if held.busy() && (held.has_bottom_writes() || wait()) {
+        if held.busy() && wait(&held) {
             self.drain_inflight(&mut held, why);
         }
         Some(Quiet {
@@ -2300,10 +2309,10 @@ impl Host {
             inflight_enabled().then_some(owned),
             Boundary::Synchronous,
         );
-        if queued {
-            self.wake_reaper();
+        if let Some(first) = queued {
+            self.wake_reaper(first);
         }
-        queued
+        queued.is_some()
     }
 
     fn execute_lists(
@@ -2311,10 +2320,12 @@ impl Host {
         runs: &[&HostList],
         owned: Option<&[Arc<HostList>]>,
         boundary: Boundary,
-    ) -> bool {
+    ) -> Option<u64> {
         // A last title pin can destroy a resource. Drop it outside the lock.
         let mut pending_pins = Vec::new();
+        let lock = crate::queue::CpuTimer::new(crate::queue::CpuPhase::SubmitLock);
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        drop(lock);
         let holding = Holding::enter();
         let capture = self.execute_part(
             runs,
@@ -2324,14 +2335,14 @@ impl Host {
             owned,
             boundary,
         );
-        let busy = submitted.busy();
+        let first = submitted.first_flight();
         drop((holding, submitted));
         #[cfg(feature = "diagnostics")]
         if let Some((sub, targets)) = capture {
             crate::capture::dump_submission(sub, &targets);
         }
         let _ = capture;
-        busy
+        first
     }
 
     /// Runs consecutive self-contained parts under one submission lock.
@@ -2510,7 +2521,9 @@ impl Host {
             self.note_sync(submission, why);
             None
         } else {
+            let retire = crate::queue::CpuTimer::new(crate::queue::CpuPhase::SubmitRetire);
             self.retire_inflight(submission);
+            drop(retire);
             if runs.iter().any(|list| submission.uses(list)) {
                 self.drain_inflight(submission, Boundary::ReusedList);
             }

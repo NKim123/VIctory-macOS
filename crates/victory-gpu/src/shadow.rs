@@ -1762,6 +1762,16 @@ static READS: Mutex<(Vec<u32>, Vec<u32>)> = Mutex::new((Vec::new(), Vec::new()))
 /// at (`victory_shader::emit`, "Read marks"), each once until
 /// [`forget_read`]. Clears the slots forgotten since first.
 pub(crate) fn take_reads() -> Vec<u32> {
+    finish_reads(true)
+}
+
+/// Clears slots invalidated after the previous read scan, while the GPU
+/// is still idle.
+pub(crate) fn clear_forgotten_reads() {
+    let _ = finish_reads(false);
+}
+
+fn finish_reads(collect: bool) -> Vec<u32> {
     let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
     let first = (victory_shader::emit::VIEW_READS / 32) as usize;
     // Both bitmaps: shaders that use title memory mark their reads in theirs.
@@ -1784,6 +1794,9 @@ pub(crate) fn take_reads() -> Vec<u32> {
             maps.iter_mut().for_each(|bits| bits[w] &= !bit);
             seen[w] &= !bit;
         }
+    }
+    if !collect {
+        return Vec::new();
     }
     let mut new = Vec::new();
     for (w, s) in seen.iter_mut().enumerate() {
