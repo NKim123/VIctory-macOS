@@ -386,8 +386,15 @@ struct Job {
 // SAFETY: as for `Lane`.
 unsafe impl Send for Job {}
 
-/// The scheduler, with its workers started on first use; `None` if not
-/// even one worker could start.
+/// Explicit overrides accept 1 to 256 workers, including oversubscription.
+fn worker_count(override_value: Option<&str>, processors: usize) -> usize {
+    override_value
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|&workers| (1..=256).contains(&workers))
+        .unwrap_or(processors)
+}
+
+/// The scheduler, with its workers started on first use.
 fn scheduler() -> Option<&'static Scheduler> {
     static SCHEDULER: OnceLock<Option<Scheduler>> = OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
@@ -416,13 +423,12 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        // `VICTORY_DSTORAGE_WORKERS`: more reads in flight for storage
-        // with a long wait per read (a network share), else one per core.
-        let workers = std::env::var("VICTORY_DSTORAGE_WORKERS")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|&n| (1..=256).contains(&n))
-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+        // Explicitly size the shared read/decompression pool when streaming
+        // needs CPU headroom or storage needs more reads in flight.
+        let workers = worker_count(
+            std::env::var("VICTORY_DSTORAGE_WORKERS").ok().as_deref(),
+            std::thread::available_parallelism().map_or(4, |n| n.get()),
+        );
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
@@ -1141,6 +1147,17 @@ mod tests {
 
     use super::*;
     use crate::modules::xgameruntime::method;
+
+    #[test]
+    fn a_worker_override_can_leave_cores_free_or_allow_more_in_flight_reads() {
+        assert_eq!(worker_count(None, 18), 18);
+        assert_eq!(worker_count(Some(" 4 "), 18), 4);
+        assert_eq!(worker_count(Some("1"), 8), 1);
+        assert_eq!(worker_count(Some("256"), 8), 256);
+        for invalid in ["", "0", "257", "-1", "many"] {
+            assert_eq!(worker_count(Some(invalid), 8), 8);
+        }
+    }
 
     fn call<F: Copy>(object: *mut c_void, slot: usize) -> F {
         // SAFETY: every object here starts with the runtime header.
