@@ -21,6 +21,51 @@ use crate::resource::PAGEABLE_IIDS;
 #[cfg(windows)]
 mod thin;
 
+#[cfg(any(windows, test))]
+use std::hash::Hasher;
+
+/// Fast hashing for internal addresses, slot numbers and descriptor records.
+#[cfg(any(windows, test))]
+#[derive(Default)]
+pub(crate) struct AddressHash(u64);
+
+#[cfg(any(windows, test))]
+impl Hasher for AddressHash {
+    fn finish(&self) -> u64 {
+        // Fold the high bits down so aligned addresses vary in the table's
+        // bucket bits as well as its fingerprints.
+        self.0 ^ (self.0 >> 32)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let (words, tail) = bytes.as_chunks::<8>();
+        for &word in words {
+            self.write_u64(u64::from_ne_bytes(word));
+        }
+        if !tail.is_empty() {
+            let mut word = [0; 8];
+            word[..tail.len()].copy_from_slice(tail);
+            self.write_u64(u64::from_ne_bytes(word));
+        }
+    }
+
+    fn write_u64(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    fn write_usize(&mut self, word: usize) {
+        self.write_u64(word as u64);
+    }
+
+    fn write_u32(&mut self, word: u32) {
+        self.write_u64(word.into());
+    }
+
+    fn write_u8(&mut self, word: u8) {
+        self.write_u64(word.into());
+    }
+}
+
 const ALLOCATOR_IIDS: [Iid; 4] = [
     guid(
         0x6102dee4,
@@ -2854,6 +2899,16 @@ mod tests {
 
     /// Transitions between two read-only states are told from those that
     /// write, from common, and from other barrier kinds.
+    #[test]
+    fn aligned_addresses_vary_in_the_hash_bucket_bits() {
+        use std::hash::{BuildHasher, BuildHasherDefault};
+        let hasher = BuildHasherDefault::<AddressHash>::default();
+        let buckets: std::collections::HashSet<_> = (0..256u64)
+            .map(|page| hasher.hash_one(0x1_0000_0000 + (page << 16)) & 255)
+            .collect();
+        assert!(buckets.len() > 128);
+    }
+
     #[test]
     fn read_only_transitions_need_both_states_read_only() {
         const COMMON: u32 = 0;
