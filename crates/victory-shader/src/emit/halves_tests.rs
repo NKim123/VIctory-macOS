@@ -178,7 +178,7 @@ fn lower_halves(
     if literal && matches!(&native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64) {
         lower::lower_literal(&parts, None, false)
     } else {
-        lower::lower_pruned(&parts, None, false, literal)
+        lower::lower_pruned(&parts, None, false, literal, false)
     }
 }
 

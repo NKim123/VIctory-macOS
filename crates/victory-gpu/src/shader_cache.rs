@@ -201,6 +201,8 @@ fn options_for(wine: bool, wave32: bool) -> Options {
         host_wave32: wave32,
         narrow_waves: flag("VICTORY_NARROW_WAVES", wine),
         disable_literal_halves: !flag("VICTORY_LITERAL_HALVES", true),
+        // Predicated wave64 compute regions substantially slow D3DMetal.
+        disable_selective_predication: wine && wave32,
         per_vertex_center: false,
         uav_size_level0: uav_size_level0(),
     }
@@ -304,10 +306,19 @@ pub(crate) fn translation_build(options: Options) -> &'static [u8; 32] {
     let no_literal = options.host_wave32 && options.disable_literal_halves;
     let level0 = options.uav_size_level0;
     let center = options.per_vertex_center;
-    if !locks && !bias && !narrow && !no_marks && !no_literal && !level0 && !center {
+    let no_predication = options.disable_selective_predication;
+    if !locks
+        && !bias
+        && !narrow
+        && !no_marks
+        && !no_literal
+        && !level0
+        && !center
+        && !no_predication
+    {
         return build(options.host_wave32);
     }
-    static BUILDS: [OnceLock<[u8; 32]>; 2048] = [const { OnceLock::new() }; 2048];
+    static BUILDS: [OnceLock<[u8; 32]>; 4096] = [const { OnceLock::new() }; 4096];
     let n = usize::from(locks)
         | usize::from(bias) << 1
         | usize::from(narrow) << 2
@@ -318,7 +329,8 @@ pub(crate) fn translation_build(options: Options) -> &'static [u8; 32] {
         | usize::from(no_marks) << 7
         | usize::from(no_literal) << 8
         | usize::from(level0) << 9
-        | usize::from(center) << 10;
+        | usize::from(center) << 10
+        | usize::from(no_predication) << 11;
     BUILDS[n].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build(options.host_wave32));
@@ -736,6 +748,19 @@ mod tests {
             ..options
         });
         assert_ne!(on, off);
+    }
+
+    #[test]
+    fn wine_wave32_bypasses_selective_predication_with_its_own_cache_key() {
+        let wine = options_for(true, true);
+        assert!(wine.disable_selective_predication);
+        assert!(!options_for(true, false).disable_selective_predication);
+        assert!(!options_for(false, true).disable_selective_predication);
+        let predicated = Options {
+            disable_selective_predication: false,
+            ..wine
+        };
+        assert_ne!(translation_build(wine), translation_build(predicated));
     }
 
     fn shader() -> HostShader {

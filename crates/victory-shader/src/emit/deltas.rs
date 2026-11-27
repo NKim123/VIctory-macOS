@@ -287,6 +287,7 @@ mod tests {
             None,
             per_vertex_center,
             false,
+            false,
         )
         .unwrap()
         .dxil

@@ -1448,6 +1448,15 @@ fn lowered_result(
     lanes: u32,
     narrow_waves: bool,
 ) -> Result<super::Lowered, crate::ShaderError> {
+    lowered_result_with_predication(words, lanes, narrow_waves, false)
+}
+
+fn lowered_result_with_predication(
+    words: &[u32],
+    lanes: u32,
+    narrow_waves: bool,
+    disable_selective_predication: bool,
+) -> Result<super::Lowered, crate::ShaderError> {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -1465,7 +1474,7 @@ fn lowered_result(
     let st = structure::structure(&p).unwrap();
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
     let io = io::raise(&p, &native).unwrap();
-    lower(&Parts {
+    let parts = Parts {
         native: &native,
         p: &p,
         st: &st,
@@ -1484,7 +1493,8 @@ fn lowered_result(
         uav_size_level0: false,
         host_wave32: false,
         view_marks: false,
-    })
+    };
+    super::lower_pruned(&parts, None, false, false, disable_selective_predication)
 }
 
 #[test]
@@ -1548,6 +1558,8 @@ fn no_barrier_in_divergent_code() {
     w.push(S_ENDPGM);
     assert!(barriers_at(&wave64(&w)).is_none());
     assert_eq!(split_barriers(&w, 64, true), 1);
+    let per_lane = lowered_result_with_predication(&w, 64, true, true).unwrap();
+    assert_eq!(per_lane.split_barriers, 0);
 }
 
 const S_MOV_S20_0: u32 = 0xBE94_0380; // s_mov_b32 s20, 0

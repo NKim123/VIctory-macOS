@@ -214,7 +214,7 @@ enum Stop {
 
 #[cfg(any(test, all(windows, feature = "host")))]
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
-    lower_pruned(parts, None, false, false)
+    lower_pruned(parts, None, false, false, false)
 }
 
 pub(crate) fn lower_pruned(
@@ -222,9 +222,15 @@ pub(crate) fn lower_pruned(
     keep: Option<&KeptOutputs>,
     per_vertex_center: bool,
     literal_halves: bool,
+    disable_selective_predication: bool,
 ) -> Result<Lowered, ShaderError> {
     // Retry refusals from the legacy cross-half gates with whole-wave control flow.
-    let original = lower_with_structure(parts, keep, per_vertex_center);
+    let original = lower_with_structure(
+        parts,
+        keep,
+        per_vertex_center,
+        disable_selective_predication,
+    );
     if !literal_halves
         || !parts.host_wave32
         || !parts.native.wave64
@@ -279,6 +285,7 @@ pub(crate) fn lower_literal(
         },
         keep,
         per_vertex_center,
+        true,
     )
 }
 
@@ -286,10 +293,19 @@ fn lower_with_structure(
     parts: &Parts,
     keep: Option<&KeptOutputs>,
     per_vertex_center: bool,
+    disable_selective_predication: bool,
 ) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad, keep, per_vertex_center).run() {
+        match Lower::new(
+            parts,
+            &bad,
+            keep,
+            per_vertex_center,
+            disable_selective_predication,
+        )
+        .run()
+        {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -861,6 +877,7 @@ impl<'a> Lower<'a> {
         bad: &'a HashMap<Value, Why>,
         keep: Option<&KeptOutputs>,
         per_vertex_center: bool,
+        disable_selective_predication: bool,
     ) -> Self {
         let p = x.p;
         let loop_caps = LoopCaps::new(p, x.st);
@@ -948,7 +965,7 @@ impl<'a> Lower<'a> {
                 ))
             } else if x.native.wave64 && group > 32 && (x.host_wave32 || one_wave_lds) {
                 let base_step = in_step(p, x.st, &x.res.waterfall.reads, &loop_caps);
-                if predication_off() {
+                if disable_selective_predication || predication_off() {
                     predicate::PredicatePlan::empty(base_step)
                 } else {
                     predicate::PredicatePlan::build(x, &loop_caps, base_step, one_wave_lds)
