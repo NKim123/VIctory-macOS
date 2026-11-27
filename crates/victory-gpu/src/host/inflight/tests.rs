@@ -975,12 +975,7 @@ fn ambient_versions_stay_frozen_through_the_native_fence() {
     host.present_boundary();
 }
 
-#[cfg(feature = "diagnostics")]
-#[test]
-fn consecutive_uploads_keep_their_own_staging_contents() {
-    let Some(host) = host_for_ring() else { return };
-    host.present_boundary();
-    let memory = crate::watch::tests::pool(1);
+fn upload_test_texture(memory: usize) -> This {
     let words = [
         3u32,
         0,
@@ -1010,6 +1005,75 @@ fn consecutive_uploads_keep_their_own_staging_contents() {
         ),
         S_OK
     );
+    texture
+}
+
+#[test]
+fn texture_upload_waits_only_for_an_overlapping_label() {
+    let Some(host) = host_for_ring() else { return };
+    host.present_boundary();
+    let memory = crate::watch::tests::pool(1);
+    let texture = upload_test_texture(memory);
+    let copy = crate::resource::host_copy(texture).unwrap();
+    let (out, _) = host.mapped_buffer(8, true).unwrap();
+    let other_label = AtomicU64::new(0);
+    let mut uploads = crate::texture::uploads(texture);
+    for overlap in [false, true] {
+        let gate = Gate::new(host);
+        let before = DRAINS[Boundary::TextureUploadLabel as usize].load(Ordering::Relaxed);
+        let producer = record_copy(host, &out, 4, 1);
+        let label = if overlap {
+            memory as *mut u8
+        } else {
+            other_label.as_ptr().cast()
+        };
+        producer.defer_write(label, crate::queue::Written::Value(0x44332211), 8);
+        assert!(host.execute_title(&[producer]));
+        let consumer = host.new_list().unwrap();
+        crate::texture::upload(&consumer, texture, &copy.texture);
+        consumer.close();
+        let consumer = Arc::new(consumer);
+        if overlap {
+            let release = std::thread::spawn(move || {
+                let until = Instant::now() + Duration::from_secs(4);
+                while DRAINS[Boundary::TextureUploadLabel as usize].load(Ordering::Relaxed)
+                    == before
+                    && Instant::now() < until
+                {
+                    std::thread::yield_now();
+                }
+                drop(gate);
+            });
+            assert!(host.execute_title(&[consumer]));
+            release.join().unwrap();
+            assert_eq!(
+                DRAINS[Boundary::TextureUploadLabel as usize].load(Ordering::Relaxed),
+                before + 1
+            );
+            // SAFETY: the submission waited for the label in our live pool.
+            assert_eq!(unsafe { (memory as *const u64).read() }, 0x44332211);
+        } else {
+            assert!(host.execute_title(&[consumer]));
+            assert_eq!(other_label.load(Ordering::Acquire), 0);
+            assert_eq!(host.submitted.lock().unwrap().flights.len(), 2);
+            drop(gate);
+        }
+        uploads += 1;
+        assert_eq!(crate::texture::uploads(texture), uploads);
+        host.present_boundary();
+    }
+    crate::object::release_ref(texture);
+    drop(copy);
+    crate::watch::tests::free(memory);
+}
+
+#[cfg(feature = "diagnostics")]
+#[test]
+fn consecutive_uploads_keep_their_own_staging_contents() {
+    let Some(host) = host_for_ring() else { return };
+    host.present_boundary();
+    let memory = crate::watch::tests::pool(1);
+    let texture = upload_test_texture(memory);
     let copy = crate::resource::host_copy(texture).unwrap();
     let fill = |value: u8| {
         let _write = crate::watch::writing(memory, crate::watch::PAGE);

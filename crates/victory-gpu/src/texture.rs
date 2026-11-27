@@ -877,10 +877,10 @@ impl Staging {
         self.retry.store(true, std::sync::atomic::Ordering::Release);
     }
 
-    pub(crate) fn may_read_alias(&self) -> bool {
-        let start = self.memory as u64;
-        crate::shadow::has_aliased_overlap(start, start.saturating_add(self.layout.size))
-            || crate::watch::aliased(start as usize, self.layout.size as usize)
+    /// The console layout read by a full refresh. A tracked refresh can
+    /// read just some subresources, selected after older writes land.
+    pub(crate) fn source_range(&self) -> (usize, usize) {
+        (self.memory as usize, self.layout.size as usize)
     }
 
     /// Whether its memory may have changed since it was last detiled (an

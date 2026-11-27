@@ -56,6 +56,8 @@ pub(super) struct InFlight {
     ordered: Option<OrderedCompletion>,
     bytes: u64,
     writes: Vec<(BottomWrite, bool)>,
+    gpu_writes: crate::ranges::Ranges,
+    indirect_gpu_writes: bool,
     shared_writes: bool,
     signals: Vec<TitleSignal>,
 }
@@ -227,6 +229,8 @@ pub(super) enum Boundary {
     NativeBottomOfPipe,
     BottomOfPipeRead,
     CpuAccess,
+    TextureUploadLabel,
+    TextureUploadGpuWrite,
     Descriptors,
     Quiet,
     Present,
@@ -264,7 +268,9 @@ pub(super) fn log(frames: f64) {
     ];
     let [texture_back, computed_back, marked_back, shadow_back] = back.map(sync);
     let (mark_copies, mark_widened) = crate::shadow::mark_landing_owners();
-    let bottom_cpu = count(Boundary::BottomOfPipe);
+    let texture_upload_label = count(Boundary::TextureUploadLabel);
+    let texture_upload_gpu_write = count(Boundary::TextureUploadGpuWrite);
+    let bottom_cpu = count(Boundary::BottomOfPipe) + texture_upload_label;
     let bottom_native = count(Boundary::NativeBottomOfPipe);
     let bottom_read = count(Boundary::BottomOfPipeRead);
     tracing::info!(
@@ -299,7 +305,9 @@ pub(super) fn log(frames: f64) {
         bottom_read,
         bottom_fifo_reads = BOTTOM_FIFO_READS.swap(0, Ordering::Relaxed),
         diagnostics = count(Boundary::Diagnostics),
-        cpu_access = count(Boundary::CpuAccess),
+        cpu_access = count(Boundary::CpuAccess) + texture_upload_gpu_write,
+        texture_upload_label,
+        texture_upload_gpu_write,
         descriptors = count(Boundary::Descriptors),
         quiet = count(Boundary::Quiet),
         present = count(Boundary::Present),
@@ -402,6 +410,59 @@ impl Host {
             return true;
         }
         false
+    }
+
+    pub(super) fn wait_texture_upload_sources(
+        &self,
+        s: &mut Submission,
+        sources: &[crate::texture::UploadSource],
+    ) {
+        if sources.is_empty() || !s.busy() {
+            return;
+        }
+        let ranges = || {
+            sources
+                .iter()
+                .map(|(staging, _)| staging.source_range())
+                .filter(|&(_, len)| len != 0)
+        };
+        let mut physical_alias = None;
+        let mut gpu_mapping = None;
+        let mut has_physical_alias = || {
+            *physical_alias
+                .get_or_insert_with(|| ranges().any(|(at, len)| crate::watch::aliased(at, len)))
+        };
+        let mut touches_gpu_mapping = || {
+            *gpu_mapping.get_or_insert_with(|| {
+                ranges().any(|(at, len)| {
+                    crate::shadow::has_aliased_overlap(at as u64, at.saturating_add(len) as u64)
+                })
+            })
+        };
+        let pending = s.flights.iter().rev().find_map(|flight| {
+            // Copied title-memory outputs are ordered before preparation.
+            // Bindless and computed writes can target a mapped GPU buffer
+            // at an address only the shader knows until it completes.
+            if flight.indirect_gpu_writes && (touches_gpu_mapping() || has_physical_alias())
+                || flight.gpu_writes.iter().any(|(from, to)| {
+                    ranges().any(|(at, len)| at < to && from < at.saturating_add(len))
+                        || has_physical_alias() && crate::watch::aliased(from, to - from)
+                })
+            {
+                return Some((flight.value, Boundary::TextureUploadGpuWrite));
+            }
+            flight
+                .writes
+                .iter()
+                .any(|(write, aliased)| {
+                    ranges().any(|(at, len)| write.overlaps(at, len))
+                        || *aliased && has_physical_alias()
+                })
+                .then_some((flight.value, Boundary::TextureUploadLabel))
+        });
+        if let Some((value, why)) = pending {
+            self.wait_inflight(s, value, why);
+        }
     }
 
     /// A native GPU list can access a CPU label through a directly mapped
@@ -713,13 +774,25 @@ impl Host {
             }
         }
         let mut writes = Vec::new();
+        let mut gpu_writes = crate::ranges::Ranges::default();
+        let mut indirect_gpu_writes = false;
         for list in lists {
+            let deferred = list.deferred();
             writes.extend(
-                list.deferred()
+                deferred
                     .writes
                     .iter()
                     .map(|&write| (write, crate::watch::aliased(write.address, write.bytes))),
             );
+            indirect_gpu_writes |=
+                list.view_writes.load(Ordering::Relaxed) || deferred.has_computed_feedback();
+            for step in &deferred.copies {
+                if let Step::GpuWrite(copy, from, len, ..) = step
+                    && copy.is_aliased()
+                {
+                    gpu_writes.insert(*from, from.saturating_add(*len), 0);
+                }
+            }
         }
         let shared_writes = writes
             .iter()
@@ -786,6 +859,8 @@ impl Host {
             ordered,
             bytes,
             writes,
+            gpu_writes,
+            indirect_gpu_writes,
             shared_writes,
             signals: Vec::new(),
         });
