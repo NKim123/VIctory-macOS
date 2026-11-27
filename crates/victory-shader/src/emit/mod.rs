@@ -436,7 +436,8 @@ thread_local! {
     static TEST_RAW_ROOT_CBVS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
-/// Whether to lower eligible root constant buffers to bounded raw views.
+/// Whether to lower eligible root constants to bounded raw views and group
+/// dword loads from the raw views used for table constants.
 pub fn raw_root_cbvs() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_RAW_ROOT_CBVS.get() {
@@ -3029,6 +3030,125 @@ mod tests {
                     data.get(offset as usize / 4 + i).copied().unwrap_or(0)
                 });
                 assert_eq!(out[0], expected, "byte offset {offset}");
+            }
+        }
+    }
+
+    #[test]
+    fn table_cbv_grouping_preserves_scalar_and_vector_raw_reads() {
+        use crate::native::{ComputeIo, ResourceType, RootParam, StageIo, UsedResource};
+        use crate::{HwStage, RootType, io, ir, resource, structure};
+
+        let words = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0 (CBV)
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 32 (UAV)
+            0xBF8C_0000,
+            0xF428_0404,
+            0x0000_0000, // s_buffer_load_dwordx4 s[16:19], s[8:11], s0
+            0x7E00_0200, // v_mov_b32 v0, s0
+            0xE038_1000,
+            0x8002_0100, // buffer_load_dwordx4 v[1:4], v0, s[8:11], 0 offen
+            0xBF8C_0000,
+            0x7E0A_0210, // v_mov_b32 v5, s16
+            0x7E0C_0211,
+            0x7E0E_0212,
+            0x7E10_0213, // v_mov_b32 v8, s19
+            0xE078_0000,
+            0x8003_0100, // buffer_store_dwordx4 v[1:4], off, s[12:15], 0
+            0xE078_0010,
+            0x8003_0500, // buffer_store_dwordx4 v[5:8], off, s[12:15], 0 offset:16
+            0xBF81_0000u32,
+        ];
+        let table = |kind, at| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: at,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let native = super::NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 12,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![table(ResourceType::Cbv, 0), table(ResourceType::Uav, 8)],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
+        };
+        let bytes = crate::dxbc::build(&[]);
+        let container = super::Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.code, false, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let translate = |port| {
+            let before = super::TEST_RAW_ROOT_CBVS.replace(Some(port));
+            let result = super::emit(&container, &native, &p, &st, &io, &res);
+            super::TEST_RAW_ROOT_CBVS.set(before);
+            result.unwrap()
+        };
+        let narrow = translate(false);
+        let grouped = translate(true);
+        assert_ne!(narrow.dxil, grouped.dxil);
+        assert!(narrow.root_cbvs.is_empty() && grouped.root_cbvs.is_empty());
+
+        #[cfg(windows)]
+        {
+            use super::host::{Dispatch, Host, Root, Stride, View};
+            let host = Host::new(!super::host::under_wine()).expect("a D3D12 device");
+            let data = [17, 23, 31, 41, 53, 67];
+            for shader in [narrow, grouped] {
+                let (root, pso) = host.compute_pipeline(&shader).unwrap();
+                for offset in [0, 4, 12, 16, 20, 24] {
+                    let out = host
+                        .dispatch(
+                            &root,
+                            &pso,
+                            &Dispatch {
+                                roots: vec![(0, Root::Constants(vec![offset, 0, 0, 0, 0]))],
+                                views: &[
+                                    View::Buffer {
+                                        data: &data,
+                                        stride: Stride::Raw,
+                                    },
+                                    View::RawUav(8),
+                                ],
+                                samplers: &[],
+                                groups: [1, 1, 1],
+                            },
+                        )
+                        .unwrap();
+                    let expected = std::array::from_fn::<_, 8, _>(|i| {
+                        data.get(offset as usize / 4 + i % 4).copied().unwrap_or(0)
+                    });
+                    assert_eq!(out[0], expected, "byte offset {offset}");
+                }
             }
         }
     }

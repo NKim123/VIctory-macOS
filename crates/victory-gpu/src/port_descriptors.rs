@@ -141,11 +141,35 @@ pub(crate) fn retire(id: usize) {
 }
 
 /// Taken with the descriptor registry held, which serializes retirement.
-pub(crate) fn take(id: usize) -> Option<Vec<(usize, usize)>> {
+pub(crate) fn take(id: usize, submit: bool) -> Option<Vec<(usize, usize)>> {
     if MARKS.len.load(Acquire) == 0 || *HEAP.read().unwrap_or_else(|e| e.into_inner()) != Some(id) {
         return None;
     }
-    Some(SLOTS.get().unwrap().take())
+    // The early watch worker must leave the marks for the same round that
+    // takes the audit. A mark that races that round stays pending.
+    Some(if submit {
+        SLOTS.get().unwrap().take()
+    } else {
+        Vec::new()
+    })
+}
+
+/// A mark published after the sync took its first batch still belongs to
+/// the next batch. The fallback can see its record before then.
+pub(crate) fn pending_mark(index: u32) -> bool {
+    SLOTS
+        .get()
+        .and_then(|slots| slots.slots.get(index as usize))
+        .is_some_and(|mark| mark.load(Acquire) != 0)
+}
+
+/// Count fallback changes only after excluding taken and pending marks.
+pub(crate) fn record_miss(index: u32) {
+    static MISSED: AtomicU64 = AtomicU64::new(0);
+    let total = MISSED.fetch_add(1, Relaxed) + 1;
+    if total <= 20 || total.is_power_of_two() {
+        tracing::debug!(index, total, "descriptor fallback found an unmarked change");
+    }
 }
 
 // Use the dirty parts returned by the watch. One console page can contain

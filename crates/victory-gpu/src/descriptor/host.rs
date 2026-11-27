@@ -1716,7 +1716,13 @@ impl HostHeap {
     /// Capture disjoint dirty spans, using workers for large reads.
     /// Large miss batches can use workers regardless of the capture path.
     /// Only the submission thread publishes into the shared heap.
-    pub(super) fn sync_ranges(&self, ranges: &[(u32, u32)], start: u64, step: u64) {
+    pub(super) fn sync_ranges(
+        &self,
+        ranges: &[(u32, u32)],
+        start: u64,
+        step: u64,
+        audit: Option<&dyn Fn(u32)>,
+    ) {
         const SLOTS_PER_SPAN: u32 = 2048;
         let spans: Vec<_> = ranges
             .iter()
@@ -1772,24 +1778,32 @@ impl HostHeap {
             if let Some(scan) = scan {
                 pending.push((lo, hi, scan));
             } else {
-                self.publish_scans(start, step, std::mem::take(&mut pending));
-                self.sync_slots_serial(lo, hi, start, step, &mut bytes);
+                self.publish_scans(start, step, std::mem::take(&mut pending), audit);
+                self.sync_slots_serial(lo, hi, start, step, &mut bytes, audit);
             }
         }
-        self.publish_scans(start, step, pending);
+        self.publish_scans(start, step, pending, audit);
     }
 
     #[cfg(test)]
     fn sync_slots(&self, first: u32, last: u32, start: u64, step: u64, bytes: &mut Vec<u8>) {
         let last = last.min(self.count);
         if first < last {
-            self.sync_slots_serial(first, last, start, step, bytes);
+            self.sync_slots_serial(first, last, start, step, bytes, None);
         }
     }
 
-    fn sync_slots_serial(&self, first: u32, last: u32, start: u64, step: u64, bytes: &mut Vec<u8>) {
+    fn sync_slots_serial(
+        &self,
+        first: u32,
+        last: u32,
+        start: u64,
+        step: u64,
+        bytes: &mut Vec<u8>,
+        audit: Option<&dyn Fn(u32)>,
+    ) {
         if let Some(scan) = self.capture_slots(first, last, start, step, bytes) {
-            self.publish_scans(start, step, vec![(first, last, scan)]);
+            self.publish_scans(start, step, vec![(first, last, scan)], audit);
         } else {
             // A failed read can cover multiple Windows pages. Retry
             // smaller ranges so a hole does not hide readable neighbors.
@@ -1798,8 +1812,8 @@ impl HostHeap {
             let end = start + u64::from(last - 1) * step + 12;
             if last - first > 1 && address / WINDOWS_PAGE != (end - 1) / WINDOWS_PAGE {
                 let middle = first + (last - first) / 2;
-                self.sync_slots_serial(first, middle, start, step, bytes);
-                self.sync_slots_serial(middle, last, start, step, bytes);
+                self.sync_slots_serial(first, middle, start, step, bytes, audit);
+                self.sync_slots_serial(middle, last, start, step, bytes, audit);
             }
         }
     }
@@ -1862,7 +1876,13 @@ impl HostHeap {
         Some(SlotScan { candidates, forgot })
     }
 
-    fn publish_scans(&self, start: u64, step: u64, mut scans: Vec<(u32, u32, SlotScan)>) {
+    fn publish_scans(
+        &self,
+        start: u64,
+        step: u64,
+        mut scans: Vec<(u32, u32, SlotScan)>,
+        audit: Option<&dyn Fn(u32)>,
+    ) {
         if scans.is_empty() {
             return;
         }
@@ -1883,6 +1903,11 @@ impl HostHeap {
             };
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::SyncChanged, records.len() as u64);
+            if let Some(record_check) = audit {
+                for record in &records {
+                    record_check(record.index);
+                }
+            }
             self.publish_records(&records, start, step);
         }
 
@@ -3768,6 +3793,13 @@ fn texture_srv_desc(
     {
         desc.Format = DXGI_FORMAT(format as i32);
     }
+    if copy.base_level != 0
+        && let Some(desc) = desc.as_mut()
+    {
+        // SAFETY: a live host copy, with the retained mip count.
+        let own_mips = u32::from(unsafe { copy.texture.GetDesc() }.MipLevels);
+        from_base(desc, copy.base_level, own_mips);
+    }
     fits(
         &copy.texture,
         &copy.castable,
@@ -3775,6 +3807,58 @@ fn texture_srv_desc(
         false,
     )
     .then_some(desc)
+}
+
+fn from_base(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32, own_mips: u32) {
+    if own_mips == 0 {
+        return;
+    }
+    let clamp = |most: &mut u32, levels: &mut u32, lod: &mut f32| {
+        let lost = base.saturating_sub(*most);
+        *most = most.saturating_sub(base).min(own_mips - 1);
+        if *levels != u32::MAX {
+            *levels = levels.saturating_sub(lost).clamp(1, own_mips - *most);
+        }
+        *lod = (*lod - base as f32).max(0.0);
+    };
+    // SAFETY: each arm selects the union member named by the dimension.
+    unsafe {
+        match desc.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE2D => {
+                let t = &mut desc.Anonymous.Texture2D;
+                clamp(
+                    &mut t.MostDetailedMip,
+                    &mut t.MipLevels,
+                    &mut t.ResourceMinLODClamp,
+                );
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                let t = &mut desc.Anonymous.Texture2DArray;
+                clamp(
+                    &mut t.MostDetailedMip,
+                    &mut t.MipLevels,
+                    &mut t.ResourceMinLODClamp,
+                );
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBE => {
+                let t = &mut desc.Anonymous.TextureCube;
+                clamp(
+                    &mut t.MostDetailedMip,
+                    &mut t.MipLevels,
+                    &mut t.ResourceMinLODClamp,
+                );
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+                let t = &mut desc.Anonymous.TextureCubeArray;
+                clamp(
+                    &mut t.MostDetailedMip,
+                    &mut t.MipLevels,
+                    &mut t.ResourceMinLODClamp,
+                );
+            }
+            _ => {}
+        }
+    }
 }
 
 fn write_texture_srv(
@@ -3934,18 +4018,34 @@ fn make_with_texture_cache(
                 .cloned()
                 .or_else(|| crate::shadow::find(address, u64::from(size)))?;
             let bytes = u64::from(size).min(shadow.left(address));
+            let offset = shadow.offset(address);
+            let direct = victory_shader::emit::raw_root_cbvs()
+                && (shadow.is_aliased() || shadow.is_tiled())
+                && offset.is_multiple_of(u64::from(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT))
+                && bytes >= 4;
             let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
                 Format: DXGI_FORMAT_R32_TYPELESS,
                 ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
                 Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
                 Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                     Buffer: D3D12_BUFFER_SRV {
+                        FirstElement: if direct { offset / 4 } else { 0 },
                         NumElements: (bytes / 4) as u32,
                         Flags: D3D12_BUFFER_SRV_FLAG_RAW,
                         ..Default::default()
                     },
                 },
             };
+            if direct {
+                // The entire view was resolved in a single alias, including
+                // the mapped tile coverage for a reserved buffer.
+                // SAFETY: a live buffer and a slot of our heap.
+                unsafe { device.CreateShaderResourceView(&shadow.buffer, Some(&desc), at) };
+                return Some(Some((
+                    shadow.buffer.clone(),
+                    Some(HeldSource::Shadow(shadow)),
+                )));
+            }
             buffer_srv(address, bytes, desc, at, backing)
         }
         View::Shader(resource, desc) => {
@@ -4056,7 +4156,7 @@ fn prepare(view: &View) -> Option<BufferView> {
         &View::Constant(address, size) => {
             let owner = crate::shadow::find(address, u64::from(size))?;
             let bytes = u64::from(size).min(owner.left(address));
-            let (shadow, _) = crate::shadow::for_view(address, bytes / 4 * 4, 4)?;
+            let (shadow, _) = crate::shadow::view_in(owner, address, bytes / 4 * 4, 4)?;
             Some((shadow, address, bytes))
         }
         View::Placed(..) if is_placed_texture(view) => {
@@ -4351,6 +4451,115 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capped_texture_array_views_clamp_mips_and_keep_slices() {
+        let mut desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                    MostDetailedMip: 1,
+                    MipLevels: 8,
+                    FirstArraySlice: 2,
+                    ArraySize: 3,
+                    ResourceMinLODClamp: 4.0,
+                    ..Default::default()
+                },
+            },
+            ..Default::default()
+        };
+        from_base(&mut desc, 3, 4);
+        // SAFETY: this is the same union member initialized above.
+        let t = unsafe { desc.Anonymous.Texture2DArray };
+        assert_eq!(
+            (t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp),
+            (0, 4, 1.0)
+        );
+        assert_eq!((t.FirstArraySlice, t.ArraySize), (2, 3));
+
+        desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV {
+            MostDetailedMip: 99,
+            MipLevels: u32::MAX,
+            ..t
+        };
+        from_base(&mut desc, 3, 4);
+        // SAFETY: the view dimension stayed the same.
+        let t = unsafe { desc.Anonymous.Texture2DArray };
+        assert_eq!((t.MostDetailedMip, t.MipLevels), (3, u32::MAX));
+    }
+
+    #[test]
+    fn table_cbv_reads_a_bounded_raw_view_of_a_live_alias() {
+        use crate::compute::{Param, srv, uav};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        if !crate::watch::rosetta() {
+            eprintln!("skipping the mach_vm_remap test outside Rosetta");
+            return;
+        }
+        let host = host().expect("a D3DMetal device");
+        let len = crate::watch::PAGE;
+        // SAFETY: a private allocation with the alignment required for aliasing.
+        let data = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                len,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        }
+        .cast::<u8>();
+        assert!(!data.is_null());
+        assert!(crate::alias::alias_region(data as usize, len, false));
+        let base = data as u64;
+        let alias = crate::shadow::find(base, len as u64).unwrap();
+        assert!(alias.is_aliased());
+        // SAFETY: a live title mapping with space for the test values.
+        unsafe {
+            data.cast::<[u32; 8]>()
+                .write([100, 200, 300, 400, 10, 20, 30, 40])
+        };
+        let heap = HostHeap::new(false, 2).unwrap();
+        let view = View::Constant(base + 16, 12);
+        heap.make_at(0, &view);
+        if victory_shader::emit::raw_root_cbvs() {
+            assert!(Arc::ptr_eq(&heap.table_backing(0).unwrap(), &alias));
+        }
+        let (result, ptr) = host.shared_buffer(65536).unwrap();
+        heap.raw_view_at(1, Some(&result), 0, 16, true);
+        let (root, pso) = crate::compute::pipeline(
+            "ByteAddressBuffer src : register(t0);
+             RWByteAddressBuffer dst : register(u0);
+             [numthreads(1, 1, 1)] void main() {
+                 dst.Store4(0, uint4(src.Load(0), src.Load(4), src.Load(8), src.Load(12)));
+             }",
+            windows::core::s!("bounded aliased table CBV"),
+            0,
+            &[Param::Table(&[srv(0, 1)]), Param::Table(&[uav(0, 1)])],
+        )
+        .unwrap();
+        let list = host.new_list().unwrap();
+        // SAFETY: the host views are live; the title writes after the view
+        // is created and supplies no upload or refresh before the read.
+        unsafe {
+            data.add(16).cast::<u32>().write(77);
+            list.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetComputeRootDescriptorTable(0, heap.gpu(0));
+            list.list.SetComputeRootDescriptorTable(1, heap.gpu(1));
+            list.list.SetPipelineState(&pso);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: a mapped destination after the fence.
+        assert_eq!(unsafe { ptr.cast::<[u32; 4]>().read() }, [77, 20, 30, 0]);
+        drop((list, heap, alias));
+        assert!(crate::alias::unalias_region(base as usize));
+        // SAFETY: this test owns the allocation; the GPU read finished.
+        assert_ne!(unsafe { VirtualFree(data.cast(), 0, MEM_RELEASE) }, 0);
+    }
 
     /// Typed buffer views of integer formats carry their kind in the
     /// view-stride table; float, normalized, raw and structured ones none.
@@ -5630,7 +5839,7 @@ mod tests {
             }
             std::hint::black_box(&slots);
             let now = std::time::Instant::now();
-            heap.sync_ranges(&[(0, SLOTS as u32)], start, 32);
+            heap.sync_ranges(&[(0, SLOTS as u32)], start, 32, None);
             let elapsed = now.elapsed().as_secs_f64() * 1000.0;
             if round < 2 {
                 cold[round] = elapsed;

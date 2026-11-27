@@ -22,6 +22,7 @@
 //! 0 is uploaded (every mip and array slice), depth and stencil planes are
 //! not.
 
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
@@ -32,6 +33,74 @@ use crate::host::{HostList, host};
 use crate::object::This;
 use crate::resource::HostTexture;
 use windows::core::Interface;
+
+#[derive(Clone, Copy)]
+enum StreamCap {
+    Fixed(u64),
+    Auto,
+}
+
+fn stream_cap(value: &str) -> StreamCap {
+    let value = value.trim();
+    if value == "auto" {
+        StreamCap::Auto
+    } else {
+        StreamCap::Fixed(value.parse().unwrap_or(0))
+    }
+}
+
+fn budget_cap(percent: u64) -> u64 {
+    match percent {
+        0..92 => 1024,
+        92..97 => 512,
+        _ => 256,
+    }
+}
+
+fn video_memory_percent() -> u64 {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    static SAMPLE: AtomicU64 = AtomicU64::new(0);
+    let tick = (START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis()
+        / 100) as u64
+        + 1;
+    let sample = SAMPLE.load(Relaxed);
+    if sample >> 8 == tick {
+        return sample & 255;
+    }
+    let percent = crate::host::video_memory().map_or(0, |[(used, budget), _]| {
+        let budget = crate::resource::budget_mb(budget);
+        if budget > 0.0 {
+            (100.0 * used / budget).min(255.0) as u64
+        } else {
+            0
+        }
+    });
+    SAMPLE.store(tick << 8 | percent, Relaxed);
+    percent
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_TEXTURE_MAX: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Largest title mip to keep with VICTORY_TEXTURE_MAX (0 or unset: full
+/// quality; positive integer: fixed maximum side; auto: budget-based cap).
+pub(crate) fn over_cap(width: u64, height: u32, mips: u32) -> u32 {
+    static CAP: OnceLock<StreamCap> = OnceLock::new();
+    let cap =
+        *CAP.get_or_init(|| stream_cap(&std::env::var("VICTORY_TEXTURE_MAX").unwrap_or_default()));
+    let max = match cap {
+        StreamCap::Fixed(max) => max,
+        StreamCap::Auto => budget_cap(video_memory_percent()),
+    };
+    #[cfg(test)]
+    let max = TEST_TEXTURE_MAX.get().unwrap_or(max);
+    crate::resource::skip_mips(width.max(u64::from(height)), mips, max)
+}
 
 macro_rules! once {
     ($($arg:tt)*) => {{
@@ -54,6 +123,9 @@ pub(crate) struct Staging {
     layout: victory_formats::texture::Layout,
     /// Mips per array slice.
     mips: u32,
+    base: u32,
+    /// Console bytes needed by the retained mips. Empty for full uploads.
+    retained: Vec<(usize, usize)>,
     memory: *const u8,
     /// The memory's pages changed since detiled (none: not the runtime's
     /// memory, compared instead).
@@ -103,13 +175,18 @@ struct Last {
 /// Per subresource of `layout` (`mips` per array slice; a 3D texture's
 /// are its mips), the bytes of the texture's memory it lies in, rounded out
 /// to the layout's blocks; empty if the layout cannot say.
-fn spans(layout: &victory_formats::texture::Layout, count: u32, mips: u32) -> Vec<(usize, usize)> {
+fn spans(
+    layout: &victory_formats::texture::Layout,
+    count: u32,
+    mips: u32,
+    base: u32,
+) -> Vec<(usize, usize)> {
     use victory_formats::texture::Dimension;
     let d = &layout.desc;
     let block = layout.alignment.max(256);
     (0..count)
         .map(|i| {
-            let (mip, slice) = (i % mips, i / mips);
+            let (mip, slice) = (base + i % mips, i / mips);
             let m = layout.mips.get(mip as usize)?;
             let (z0, z1) = if d.dimension == Dimension::Tex3d { (0, m.depth.max(1) - 1) } else { (slice, slice) };
             let first = layout.offset(mip, 0, 0, z0).ok()?;
@@ -119,6 +196,22 @@ fn spans(layout: &victory_formats::texture::Layout, count: u32, mips: u32) -> Ve
         })
         .collect::<Option<Vec<_>>>()
         .unwrap_or_default()
+}
+
+fn retained_spans(spans: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut sorted = spans.to_vec();
+    sorted.sort_unstable();
+    let mut retained: Vec<(usize, usize)> = Vec::new();
+    for (lo, hi) in sorted {
+        if let Some(last) = retained.last_mut()
+            && lo <= last.1
+        {
+            last.1 = last.1.max(hi);
+        } else {
+            retained.push((lo, hi));
+        }
+    }
+    retained
 }
 
 /// Staging buffers for detiles to reuse, by size: the menu movie rewrites
@@ -543,15 +636,37 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     };
     let (fa, ra, total) = footprints(&da, count(&da));
     let (fb, rb, _) = footprints(&db, count(&db));
+    let base = crate::resource::made_copy(to).map_or(0, |copy| copy.base_level);
+    let source_index = |i: usize| {
+        if base == 0 {
+            return Some(i);
+        }
+        let (src_mips, dst_mips) = (usize::from(da.MipLevels), usize::from(db.MipLevels));
+        let (mip, slice) = (base as usize + i % dst_mips, i / dst_mips);
+        (mip < src_mips).then_some(slice * src_mips + mip)
+    };
     // Subresources in order while both have the same bytes there (mips of
     // a block-compressed texture past its last whole block do not).
-    let n = (0..fa.len().min(fb.len()))
-        .take_while(|&i| {
-            let (x, y) = (fa[i], fb[i]);
-            x.Offset == y.Offset && x.Footprint.RowPitch == y.Footprint.RowPitch && ra[i] == rb[i] && x.Footprint.Depth == y.Footprint.Depth
+    let pairs: Vec<_> = (0..fb.len())
+        .map_while(|i| {
+            let j = source_index(i)?;
+            let (x, y) = (*fa.get(j)?, fb[i]);
+            ((base != 0 || x.Offset == y.Offset)
+                && x.Footprint.RowPitch == y.Footprint.RowPitch
+                && ra[j] == rb[i]
+                && x.Footprint.Depth == y.Footprint.Depth)
+                .then_some((
+                    j as u32,
+                    x,
+                    D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: x.Offset,
+                        ..y
+                    },
+                ))
         })
-        .count() as u32;
-    if n == 0 {
+        .collect();
+    let n = pairs.len() as u32;
+    if pairs.is_empty() {
         once!(?da, ?db, "an aliased texture not copied: its layouts differ on the host");
         return;
     }
@@ -575,16 +690,16 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     let l = &list.list;
     // SAFETY: an open list; live resources in the states named.
     unsafe {
-        for i in 0..n {
-            l.CopyTextureRegion(&place(&buffer, fa[i as usize]), 0, 0, 0, &sub(&a, i), None);
+        for &(i, f, _) in &pairs {
+            l.CopyTextureRegion(&place(&buffer, f), 0, 0, 0, &sub(&a, i), None);
         }
         l.ResourceBarrier(&[crate::host::transition(
             &buffer,
             D3D12_RESOURCE_STATE_COPY_DEST,
             D3D12_RESOURCE_STATE_COPY_SOURCE,
         )]);
-        for i in 0..n {
-            l.CopyTextureRegion(&sub(&b, i), 0, 0, 0, &place(&buffer, fb[i as usize]), None);
+        for (i, &(_, _, f)) in pairs.iter().enumerate() {
+            l.CopyTextureRegion(&sub(&b, i as u32), 0, 0, 0, &place(&buffer, f), None);
         }
     }
     ALIAS_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1021,11 +1136,32 @@ impl Staging {
             return (0, None);
         }
         let memory = self.memory.expose_provenance();
-        let read = move |at: usize, to: &mut [u8]| {
+        let read_memory = move |at: usize, to: &mut [u8]| {
             crate::host::read_into(
                 std::ptr::with_exposed_provenance(memory.wrapping_add(at)),
                 to,
             )
+        };
+        let read = |at: usize, to: &mut [u8]| {
+            if self.retained.is_empty() {
+                return read_memory(at, to);
+            }
+            let end = at + to.len();
+            let first = self.retained.partition_point(|&(_, hi)| hi <= at);
+            let mut from = at;
+            for &(lo, hi) in self.retained[first..]
+                .iter()
+                .take_while(|&&(lo, _)| lo < end)
+            {
+                let (lo, hi) = (lo.max(at), hi.min(end));
+                to[from - at..lo - at].fill(0);
+                if !read_memory(lo, &mut to[lo - at..hi - at]) {
+                    return false;
+                }
+                from = hi;
+            }
+            to[from - at..].fill(0);
+            true
         };
         // A large memory on the workers, a part each: one thread reads and
         // compares at about 14 GB/s under Wine on Rosetta, so a 90 MiB
@@ -1063,10 +1199,15 @@ impl Staging {
             last.uploaded = buffer.is_some();
             return (0, buffer.map(|(b, at)| (b, at, every)));
         };
+        let bytes = if self.retained.is_empty() {
+            size
+        } else {
+            self.retained.iter().map(|&(lo, hi)| hi - lo).sum()
+        };
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+        crate::copystat::add(crate::copystat::C::TexHashed, bytes as u64);
         if runs.is_empty() && !initial {
-            return (size, None);
+            return (bytes, None);
         }
         // Only the subresources the changed runs touch, as the tracked path
         // above does from the tracker's pages: the others would detile and
@@ -1096,8 +1237,8 @@ impl Staging {
             last.valid = false;
         }
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
-        (size, buffer.map(|(b, at)| (b, at, fresh)))
+        crate::copystat::add(crate::copystat::C::TexChanged, bytes as u64);
+        (bytes, buffer.map(|(b, at)| (b, at, fresh)))
     }
 
     /// Detiles `subresources` of `tiled` (the texture's memory) into a
@@ -1134,7 +1275,7 @@ impl Staging {
         }
         for &i in subresources {
             let (footprint, rows) = (&self.footprints[i as usize], self.rows[i as usize]);
-            let (mip, slice) = (i % self.mips, i / self.mips);
+            let (mip, slice) = (self.base + i % self.mips, i / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let len = subresource_len(footprint.Offset, pitch, rows, f.Depth, self.size);
@@ -1516,13 +1657,20 @@ pub(crate) fn staging_for(
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     let layout_size = layout.size as usize;
     memory.checked_add(layout_size)?;
-    let spans = spans(&layout, count, u32::from(d.MipLevels));
+    let spans = spans(&layout, count, u32::from(d.MipLevels), copy.base_level);
+    let retained = if copy.base_level > 0 {
+        retained_spans(&spans)
+    } else {
+        Vec::new()
+    };
     let s = Arc::new(Staging {
         size: total,
         footprints,
         rows,
         layout,
         mips: u32::from(d.MipLevels),
+        base: copy.base_level,
+        retained,
         memory: memory as *const u8,
         tracked: if count == 1 {
             crate::watch::track_texture(memory, layout_size)
@@ -1565,6 +1713,69 @@ fn skip_same_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn texture_max_parses_fixed_and_auto_caps() {
+        assert!(matches!(stream_cap(""), StreamCap::Fixed(0)));
+        assert!(matches!(stream_cap("512"), StreamCap::Fixed(512)));
+        assert!(matches!(stream_cap("auto"), StreamCap::Auto));
+        assert_eq!([91, 92, 96, 97].map(budget_cap), [1024, 512, 512, 256]);
+    }
+
+    #[test]
+    fn capped_texture_upload_uses_the_retained_mip_of_each_array_slice() {
+        let words = [3, 0, 0, 0, 32, 0, 16, 2 | 3 << 16, 28, 1, 0, 1, 0, 0];
+        // SAFETY: the console description is laid out as fourteen words.
+        let desc = unsafe {
+            words
+                .as_ptr()
+                .cast::<crate::resource::ResourceDesc>()
+                .read_unaligned()
+        };
+        let layout = crate::resource::texture_layout(&desc).unwrap();
+        let plane = &layout.planes[0].layout;
+        let mut title = vec![0; plane.size as usize];
+        for (slice, byte) in [(0, 17), (1, 93)] {
+            let linear = [byte; 8 * 4 * 4];
+            plane.tile(&mut title, 2, slice, &linear, 32, 128).unwrap();
+        }
+        let address = title.as_mut_ptr() as u64;
+        let placed = TEST_TEXTURE_MAX.with(|max| {
+            max.set(Some(8));
+            let r = crate::resource::texture_at(address, &words);
+            max.set(None);
+            r.unwrap()
+        });
+        let copy = crate::resource::made_copy(placed).unwrap();
+        assert_eq!(copy.base_level, 2);
+        // SAFETY: the copy owns the live D3D12 resource.
+        let host = unsafe { copy.texture.GetDesc() };
+        assert_eq!(
+            (
+                host.Width,
+                host.Height,
+                host.DepthOrArraySize,
+                host.MipLevels
+            ),
+            (8, 4, 2, 1)
+        );
+        let staging = staging(placed, &copy).unwrap();
+        let (bytes, upload) = staging.refresh_now(false, None);
+        assert!(bytes < title.len());
+        let (buffer, offset, indices) = upload.unwrap();
+        assert_eq!(indices, [0, 1]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: this test examines the upload buffer's retained mip data.
+        unsafe {
+            buffer.Map(0, None, Some(&mut mapped)).unwrap();
+            let data = mapped.cast::<u8>().add(offset as usize);
+            for (footprint, byte) in staging.footprints.iter().zip([17, 93]) {
+                let first = data.add(footprint.Offset as usize);
+                assert_eq!(std::slice::from_raw_parts(first, 32), [byte; 32]);
+            }
+            buffer.Unmap(0, None);
+        }
+    }
 
     #[test]
     fn bc_upload_regions_use_whole_copies_or_complete_blocks() {

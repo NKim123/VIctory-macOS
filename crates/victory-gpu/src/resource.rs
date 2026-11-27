@@ -773,7 +773,11 @@ enum Backing {
         offset: u64,
     },
     /// Memory the title mapped itself, at this address.
-    Address(*mut u8),
+    Address {
+        ptr: *mut u8,
+        #[cfg(windows)]
+        streamed: bool,
+    },
 }
 
 impl Drop for Backing {
@@ -814,6 +818,8 @@ struct Resource {
 #[cfg(windows)]
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    /// Title mip bound as host mip zero for a capped streamed texture.
+    pub(crate) base_level: u32,
     pub(crate) state: std::sync::atomic::AtomicU32,
     /// Formats views may take besides the texture's own family: the host
     /// took them as castable formats when it made the texture.
@@ -892,6 +898,7 @@ impl HostTexture {
         TEXTURE_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         HostTexture {
             texture,
+            base_level: 0,
             state: state.into(),
             castable,
             host_written: false.into(),
@@ -1315,6 +1322,7 @@ fn shared_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
+    streamed: bool,
 ) -> Option<std::sync::Arc<HostTexture>> {
     let d = host_desc(desc)?;
     let key = memory_key(address, desc);
@@ -1324,6 +1332,7 @@ fn shared_texture(
         .and_then(|k| map.get(&k)?.upgrade())
         .filter(|copy| !copy.evicted.load(std::sync::atomic::Ordering::Acquire));
     if let Some(t) = &live
+        && (t.base_level == 0 || streamed)
         && takes(t, &d)
     {
         SHARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1340,9 +1349,11 @@ fn shared_texture(
     // Host textures are made on first use, in any order: the new one takes
     // the uses of every title texture of the memory, so none replaces it.
     let mut d = d;
+    let mut can_cap = streamed && d.flags == 0 && clear.is_null();
     if let Some(k) = key {
         let at = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
         for r in at.get(&address).into_iter().flatten().map(|&r| resource(r as This)) {
+            can_cap &= matches!(r.backing, Backing::Address { streamed: true, .. });
             if memory_key(address, &r.desc) == Some(k) {
                 d.flags |= host_desc(&r.desc).map_or(0, |h| h.flags & USES);
             }
@@ -1351,7 +1362,15 @@ fn shared_texture(
     // shortcut: title textures of a replaced host texture keep it (placed
     // views move to the new one, `texture_at`); copies (`alias_source`)
     // bridge the two where the shapes allow.
-    let mut t = make_texture(&d, state, clear)?;
+    let capped = (can_cap && d.flags == 0)
+        .then(|| capped_desc(desc, d))
+        .flatten()
+        .and_then(|(capped, base)| {
+            let mut copy = make_texture(&capped, state, clear)?;
+            copy.base_level = base;
+            Some(copy)
+        });
+    let mut t = capped.or_else(|| make_texture(&d, state, clear))?;
     t.key = key;
     let t = std::sync::Arc::new(t);
     if let Some(k) = key {
@@ -1366,6 +1385,70 @@ fn shared_texture(
         map.insert(k, std::sync::Arc::downgrade(&t));
     }
     Some(t)
+}
+
+#[cfg(windows)]
+fn capped_desc(desc: &ResourceDesc, mut host: ResourceDesc) -> Option<(ResourceDesc, u32)> {
+    const TEXTURE_2D: u32 = 3;
+    if desc.dimension != TEXTURE_2D || desc.sample_count > 1 {
+        return None;
+    }
+    let mips = mip_count(desc);
+    let base = crate::texture::over_cap(desc.width, desc.height, mips);
+    if base == 0 {
+        return None;
+    }
+    let layout = texture_layout(desc)?;
+    let [plane] = &layout.planes[..] else {
+        return None;
+    };
+    if !plane.layout.addressable() {
+        return None;
+    }
+    let base = base_level(desc.width, desc.height, base, plane.layout.desc.block);
+    if base == 0 {
+        return None;
+    }
+    host.width = (host.width >> base).max(1);
+    host.height = (host.height >> base).max(1);
+    host.mip_levels = (mips - base) as u16;
+    Some((host, base))
+}
+
+#[cfg(any(windows, test))]
+pub(crate) fn skip_mips(side: u64, mips: u32, max: u64) -> u32 {
+    if max == 0 {
+        return 0;
+    }
+    // Shifting by N floors the ratio, so 2049 >> 1 still fits 1024.
+    let needed = (side / (max.saturating_add(1)))
+        .checked_ilog2()
+        .map_or(0, |n| n + 1);
+    needed.min(mips.saturating_sub(1))
+}
+
+/// D3D12 requires mip zero of a BC texture to start on whole blocks.
+#[cfg(any(windows, test))]
+fn base_level(width: u64, height: u32, mut base: u32, block: u32) -> u32 {
+    let block = u64::from(block.max(1));
+    let whole = |side: u64| side.is_multiple_of(block);
+    while base > 0 && !(whole((width >> base).max(1)) && whole((u64::from(height) >> base).max(1)))
+    {
+        base -= 1;
+    }
+    base
+}
+
+#[cfg(test)]
+#[test]
+fn texture_max_clamps_to_the_available_whole_block_mips() {
+    assert_eq!(skip_mips(2049, 10, 0), 0);
+    assert_eq!(skip_mips(2049, 10, 1024), 1);
+    assert_eq!(skip_mips(2050, 10, 1024), 2);
+    assert_eq!(skip_mips(4096, 2, 512), 1);
+    assert_eq!(skip_mips(4096, 1, 512), 0);
+    assert_eq!(base_level(1024, 16, 4, 4), 2);
+    assert_eq!(base_level(1024, 1, 4, 1), 4);
 }
 
 /// Whether host texture `t` takes a title texture of host description
@@ -1606,7 +1689,8 @@ impl Resource {
         // maps, which `evict` holds while it takes this lock).
         let (state, clear) = self.made_with;
         let clear = clear.as_ref().map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast());
-        let made = shared_texture(self.data() as u64, &self.desc, state, clear);
+        let streamed = matches!(self.backing, Backing::Address { streamed: true, .. });
+        let made = shared_texture(self.data() as u64, &self.desc, state, clear, streamed);
         // A texture made meanwhile by another thread is the memory's too.
         let mut cached = self.host.lock().unwrap_or_else(|e| e.into_inner());
         if cached.as_ref().is_some_and(evicted) {
@@ -1626,7 +1710,7 @@ impl Resource {
                     .as_ptr()
                     .add(offset as usize)
             },
-            Backing::Address(at) => at,
+            Backing::Address { ptr, .. } => ptr,
         }
     }
 }
@@ -2304,24 +2388,29 @@ pub(crate) extern "system" fn create_at_address(
         "resource at an address"
     );
     const COMMON: u32 = 0;
-    const DEFAULT: HeapProperties = HeapProperties {
-        kind: 1,
-        cpu_pages: 0,
-        pool: 0,
-        creation_nodes: 1,
-        visible_nodes: 1,
-    };
     hand_out_resource(
         desc,
-        DEFAULT,
+        ADDRESS_HEAP,
         0,
-        Backing::Address(address as *mut u8),
+        Backing::Address {
+            ptr: address as *mut u8,
+            #[cfg(windows)]
+            streamed: false,
+        },
         COMMON,
         clear,
         iid,
         out,
     )
 }
+
+const ADDRESS_HEAP: HeapProperties = HeapProperties {
+    kind: 1,
+    cpu_pages: 0,
+    pool: 0,
+    creation_nodes: 1,
+    visible_nodes: 1,
+};
 
 /// Textures the title placed in its own memory and views without a
 /// resource object (device 0x230, Grand Theft Auto VI's streamed and
@@ -2367,14 +2456,18 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     }
     // SAFETY: 56 bytes in the description's layout.
     let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
-    if d.dimension == BUFFER {
+    if d.dimension == BUFFER || address == 0 {
         return None;
     }
     let mut out = std::ptr::null();
-    let made = create_at_address(
-        std::ptr::null(),
-        address,
-        &d,
+    let made = hand_out_resource(
+        d,
+        ADDRESS_HEAP,
+        0,
+        Backing::Address {
+            ptr: address as *mut u8,
+            streamed: true,
+        },
         0,
         std::ptr::null(),
         &RESOURCE_IIDS[0],
@@ -2512,7 +2605,7 @@ extern "system" fn gpu_address(this: This) -> u64 {
         let backing = match r.backing {
             Backing::Committed(ref m) => format!("committed, attributes {:?}", m.attributes),
             Backing::Placed { offset, .. } => format!("placed in a heap at {offset:#x}"),
-            Backing::Address(_) => "at a title address".into(),
+            Backing::Address { .. } => "at a title address".into(),
         };
         ONCE[usize::from(r.desc.dimension == BUFFER)].call_once(|| {
             tracing::warn!(address = format_args!("{at:#x}"), backing, desc = ?r.desc, "a GPU address above 40 bits")
