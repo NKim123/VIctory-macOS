@@ -2619,14 +2619,7 @@ impl Host {
             .then(|| {
                 let private = owned.and_then(|_| submission.upload_list(self));
                 crate::bindless::uploads_for(&heaps, &textures, private, |sources| {
-                    if !sources.is_empty() {
-                        self.wait_bottom_writes(submission, Boundary::BottomOfPipe, |_, _| true);
-                    }
-                    if submission.busy()
-                        && sources.iter().any(|(staging, _)| staging.may_read_alias())
-                    {
-                        self.drain_inflight(submission, Boundary::CpuAccess);
-                    }
+                    self.wait_texture_upload_sources(submission, sources);
                 })
             })
             .flatten();

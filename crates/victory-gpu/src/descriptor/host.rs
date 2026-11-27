@@ -94,7 +94,7 @@ struct Mirrored {
     /// Unpublished texture SRVs, guarded by the same lock as the records.
     pending: BTreeMap<u32, PendingTexture>,
     templates: [OnceLock<Option<Templates>>; TEMPLATE_SHARDS],
-    textures: OnceLock<Option<TextureTemplates>>,
+    textures: [OnceLock<Option<TextureTemplates>>; TEMPLATE_SHARDS],
 }
 
 impl Mirrored {
@@ -104,7 +104,13 @@ impl Mirrored {
             .filter_map(OnceLock::get)
             .find_map(Option::as_ref)
             .map(Templates::null)
-            .or_else(|| self.textures.get()?.as_ref().map(TextureTemplates::null))
+            .or_else(|| {
+                self.textures
+                    .iter()
+                    .filter_map(OnceLock::get)
+                    .find_map(Option::as_ref)
+                    .map(TextureTemplates::null)
+            })
     }
 }
 
@@ -129,7 +135,10 @@ enum Publication {
 enum Binding {
     Buffer(BufferView, bool),
     Texture(Option<usize>),
-    DeferredTexture((usize, u64, u64)),
+    Left {
+        kind: (usize, u64, u64),
+        deferred: bool,
+    },
     Sampler,
 }
 
@@ -141,7 +150,7 @@ thread_local! {
 }
 
 const STAGING_SLOTS: usize = 4096;
-const MIN_STAGED_RECORDS: usize = 128;
+const MIN_STAGED_RECORDS: usize = 64;
 
 /// Scratch descriptors live until every destination has copied them. A
 /// worker owns its CPU-only heap and template cache for the entire round.
@@ -294,6 +303,7 @@ struct StagedView {
 
 impl StagedView {
     fn hit(&self, epoch: u64) -> Option<TemplateHit> {
+        let mut texture = None;
         let binding = match &self.source {
             StagedSource::Buffer(created, backing) if *created == epoch => {
                 Binding::Buffer(backing.clone(), is_widened(&self.held))
@@ -309,9 +319,13 @@ impl StagedView {
                 ) {
                     return None;
                 }
+                texture = Some((copy.clone(), *srv));
                 Binding::Texture((*srv && copy.title_written()).then_some(resource))
             }
-            StagedSource::DeferredTexture(kind) => Binding::DeferredTexture(*kind),
+            StagedSource::DeferredTexture(kind) => Binding::Left {
+                kind: *kind,
+                deferred: true,
+            },
             _ => return None,
         };
         Some(TemplateHit {
@@ -319,20 +333,8 @@ impl StagedView {
             mark: self.mark,
             held: self.held.clone(),
             binding,
+            texture,
         })
-    }
-
-    fn published(&self) {
-        if let StagedSource::Texture(copy, srv) = &self.source {
-            copy.viewed.store(true, Ordering::Relaxed);
-            if !srv {
-                if crate::resource::evict_heap_uav() {
-                    copy.note_heap_writable();
-                } else {
-                    copy.note_state(0x8);
-                }
-            }
-        }
     }
 }
 
@@ -483,7 +485,7 @@ struct TextureTemplate {
 }
 
 impl TextureTemplates {
-    const COUNT: u32 = 8192;
+    const COUNT: u32 = 8192 / TEMPLATE_SHARDS as u32;
 
     fn new() -> Option<Self> {
         let device = &host()?.device;
@@ -558,6 +560,7 @@ struct TemplateHit {
     held: Kept,
     mark: Option<(u32, u32)>,
     binding: Binding,
+    texture: Option<(Arc<HostTexture>, bool)>,
 }
 
 impl TextureTemplate {
@@ -582,6 +585,7 @@ impl TextureTemplate {
             held: Some((copy.texture.clone(), source)),
             mark: None,
             binding: Binding::Texture((srv && copy.title_written()).then_some(resource)),
+            texture: Some((copy, srv)),
         })
     }
 }
@@ -930,7 +934,7 @@ impl HostHeap {
                 keys: vec![0; count as usize],
                 pending: BTreeMap::new(),
                 templates: std::array::from_fn(|_| OnceLock::new()),
-                textures: OnceLock::new(),
+                textures: std::array::from_fn(|_| OnceLock::new()),
             }),
             made_nonzero: (0..(count as usize).div_ceil(64))
                 .map(|_| AtomicU64::new(0))
@@ -1907,9 +1911,9 @@ impl HostHeap {
                     // A worker temporarily owns this heap's template shard.
                     // Later frames can hit the cache without another worker
                     // round, while scratch sources stay live through the copy.
-                    self.swap_buffer_templates(workers);
+                    self.swap_templates(workers);
                     let staged = stage_views(workers, &misses);
-                    self.swap_buffer_templates(workers);
+                    self.swap_templates(workers);
                     let mut remaining = Vec::new();
                     self.publish_templates(
                         &misses,
@@ -1936,14 +1940,16 @@ impl HostHeap {
         }
     }
 
-    fn swap_buffer_templates(&self, workers: &StagingWorkers) {
+    fn swap_templates(&self, workers: &StagingWorkers) {
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        for (templates, worker) in made.templates.iter_mut().zip(workers) {
+        for (i, worker) in workers.iter().enumerate() {
+            let mut worker = worker.lock().unwrap_or_else(|e| e.into_inner());
+            let templates = &mut made.templates[i];
             templates.get_or_init(|| Templates::new(false));
             if let Some(templates) = templates.get_mut().and_then(Option::as_mut) {
-                let mut worker = worker.lock().unwrap_or_else(|e| e.into_inner());
                 std::mem::swap(templates, &mut worker.templates);
             }
+            std::mem::swap(&mut made.textures[i], &mut worker.textures);
         }
     }
 
@@ -2004,7 +2010,6 @@ impl HostHeap {
                 && let Some(hit) = staged.hit(epoch)
             {
                 if self.snapshot_matches(index, address, record) {
-                    staged.published();
                     self.queue_publication(&mut made, index, &staged.view, hit, copies, published);
                 }
                 continue;
@@ -2014,14 +2019,14 @@ impl HostHeap {
                 .and_then(Option::as_ref)
                 .and_then(|templates| templates.get(key, epoch));
             let texture = if buffer.is_none() {
-                made.textures
+                made.textures[template_shard(key)]
                     .get()
                     .and_then(Option::as_ref)
                     .and_then(|templates| templates.entry(key))
             } else {
                 None
             };
-            if buffer.is_none() && texture.is_none() {
+            if buffer.is_none() && texture.is_none() && (self.sampler || staged.is_some()) {
                 misses.push(change);
                 continue;
             }
@@ -2047,9 +2052,26 @@ impl HostHeap {
                     held: hit.held,
                     mark: hit.mark,
                     binding,
+                    texture: None,
                 })
+            } else if let Some(texture) = texture {
+                texture.hit(view)
             } else {
-                texture.and_then(|entry| entry.hit(view))
+                let deferred = is_placed_texture(view);
+                if deferred || matches!(**view, View::Shader(0, _) | View::Unordered(0, _, _)) {
+                    null_template_for(view).map(|at| TemplateHit {
+                        at,
+                        held: None,
+                        mark: None,
+                        binding: Binding::Left {
+                            kind: crate::bindless::left_kind(view),
+                            deferred,
+                        },
+                        texture: None,
+                    })
+                } else {
+                    None
+                }
             };
             if let Some(hit) = hit {
                 if self.snapshot_matches(index, address, record) {
@@ -2090,9 +2112,11 @@ impl HostHeap {
                             bindings.buffer(*index, backing, *uav, widened);
                         }
                         Binding::Texture(resource) => bindings.texture(*index, resource),
-                        Binding::DeferredTexture(kind) => {
+                        Binding::Left { kind, deferred } => {
                             bindings.left(*index, kind);
-                            ready = 0;
+                            if deferred {
+                                ready = 0;
+                            }
                         }
                         Binding::Sampler => {}
                     }
@@ -2121,8 +2145,18 @@ impl HostHeap {
         copies: &mut DescriptorCopies,
         published: &mut Vec<Publication>,
     ) {
+        if let Some((copy, srv)) = hit.texture {
+            copy.viewed.store(true, Ordering::Relaxed);
+            if !srv {
+                if crate::resource::evict_heap_uav() {
+                    copy.note_heap_writable();
+                } else {
+                    copy.note_state(0x8);
+                }
+            }
+        }
         self.begin_record(made, index, view.key, view);
-        if matches!(hit.binding, Binding::DeferredTexture(_)) {
+        if matches!(hit.binding, Binding::Left { deferred: true, .. }) {
             crate::shadow::forget_read(index);
         }
         made.pending.remove(&index);
@@ -3819,8 +3853,9 @@ fn typed_store(format: u32) -> bool {
 type TextureCache<'a> = Option<(&'a mut TextureTemplates, u64)>;
 
 fn texture_cache(made: &mut Mirrored, key: u64) -> TextureCache<'_> {
-    made.textures.get_or_init(TextureTemplates::new);
-    made.textures.get_mut()?.as_mut().map(|cache| (cache, key))
+    let templates = &mut made.textures[template_shard(key)];
+    templates.get_or_init(TextureTemplates::new);
+    templates.get_mut()?.as_mut().map(|cache| (cache, key))
 }
 
 fn write_texture_view(
@@ -4069,65 +4104,136 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
 /// cannot make: unordered access (to a buffer or a 2D texture) or a shader
 /// view. Writes to it are dropped, reads give zeros.
 fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
-    let Some(host) = host() else { return };
+    null_shape(view).write(at);
+}
+
+/// Null descriptors depend only on the host view kind and dimension.
+#[derive(Clone, Copy)]
+enum NullShape {
+    Srv(u8),
+    TextureUav(u8),
+    TypedBufferUav,
+    RawBufferUav,
+}
+
+impl NullShape {
+    fn slot(self) -> usize {
+        match self {
+            Self::Srv(dimension) => usize::from(dimension),
+            Self::TextureUav(dimension) => 11 + usize::from(dimension),
+            Self::TypedBufferUav => 20,
+            Self::RawBufferUav => 21,
+        }
+    }
+
+    fn write(self, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+        let desc = match self {
+            Self::Srv(1) => return null_buffer_view(at),
+            Self::Srv(dimension) => {
+                return null_texture(u32::from(dimension), DXGI_FORMAT_R8G8B8A8_UNORM, at);
+            }
+            Self::TextureUav(dimension) => null_uav_desc(Some(u32::from(dimension))),
+            Self::TypedBufferUav => D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_UINT,
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                ..Default::default()
+            },
+            Self::RawBufferUav => D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_UAV {
+                        NumElements: 1,
+                        Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                        ..Default::default()
+                    },
+                },
+            },
+        };
+        let Some(host) = host() else { return };
+        // SAFETY: a slot of our heap; a null resource is allowed with a desc.
+        unsafe {
+            host.device.CreateUnorderedAccessView(
+                None::<&ID3D12Resource>,
+                None::<&ID3D12Resource>,
+                Some(&desc),
+                at,
+            )
+        };
+    }
+}
+
+fn null_shape(view: &View) -> NullShape {
     let is_buffer = |r: &usize| crate::resource::buffer_bytes(*r as crate::object::This).is_some();
-    // Unordered views: whether a buffer, and the title's view dimension.
+    let srv = |dimension| {
+        NullShape::Srv(if (2..=10).contains(&dimension) {
+            dimension as u8
+        } else {
+            0
+        })
+    };
     let (buffer, dimension) = match view {
         View::Unordered(r, _, desc) => (
             is_buffer(r) || desc.is_some_and(|d| d[1] == 1),
             desc.map(|d| d[1]),
         ),
         View::Placed(true, resource, desc) => (resource[0] == 1, Some(desc[1])),
-        // Shader views of buffers read nothing through a null buffer view:
-        // a null 2D view where the shader expects a buffer is a mismatch
-        // the hardware does not survive in general (GPU-based validation
-        // reports it).
         View::Shader(r, desc) if is_buffer(r) || desc.is_some_and(|d| d[1] == 1) => {
-            return null_buffer_view(at);
+            return NullShape::Srv(1);
         }
-        View::Placed(false, resource, _) if resource[0] == 1 => return null_buffer_view(at),
-        // Textures: a null view of the title's dimension (1D, arrays, 3D,
-        // cubes), not always 2D.
-        View::Shader(_, Some(desc)) => return null_like(desc, at),
-        View::Placed(false, _, desc) => {
-            return null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
-        }
-        // Read as raw buffers, as made (`make`).
-        View::Constant(..) => return null_buffer_view(at),
-        _ => return null_view(at),
+        View::Placed(false, resource, _) if resource[0] == 1 => return NullShape::Srv(1),
+        View::Shader(_, Some(desc)) => return srv(desc[1]),
+        View::Placed(false, _, desc) => return srv(desc[1]),
+        View::Constant(..) => return NullShape::Srv(1),
+        _ => return NullShape::Srv(0),
     };
-    let desc = if buffer_layout(view)
-        .is_some_and(|(format, stride, _)| structured_as_raw(format, stride))
-    {
-        D3D12_UNORDERED_ACCESS_VIEW_DESC {
-            Format: DXGI_FORMAT_R32_TYPELESS,
-            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
-            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
-                Buffer: D3D12_BUFFER_UAV {
-                    NumElements: 1,
-                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
-                    ..Default::default()
-                },
-            },
-        }
+    if buffer_layout(view).is_some_and(|(format, stride, _)| structured_as_raw(format, stride)) {
+        NullShape::RawBufferUav
     } else if buffer {
-        D3D12_UNORDERED_ACCESS_VIEW_DESC {
-            Format: DXGI_FORMAT_R32_UINT,
-            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
-            ..Default::default()
-        }
+        NullShape::TypedBufferUav
     } else {
-        null_uav_desc(dimension)
-    };
-    // SAFETY: a slot of our heap; a null resource is allowed with a desc.
-    unsafe {
-        host.device.CreateUnorderedAccessView(
-            None::<&ID3D12Resource>,
-            None::<&ID3D12Resource>,
-            Some(&desc),
-            at,
-        )
-    };
+        let dimension = match dimension {
+            Some(n @ (2 | 3 | 5 | 8)) => n as u8,
+            _ => 4,
+        };
+        NullShape::TextureUav(dimension)
+    }
+}
+
+fn null_template_for(view: &View) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+    static NULLS: OnceLock<Option<(ID3D12DescriptorHeap, usize, usize)>> = OnceLock::new();
+    let (_, base, step) = NULLS
+        .get_or_init(|| {
+            let device = &host()?.device;
+            let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+            // SAFETY: a CPU-only heap with storage for every null shape.
+            let (heap, base, step) = unsafe {
+                let heap: ID3D12DescriptorHeap = device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: kind,
+                        NumDescriptors: 22,
+                        ..Default::default()
+                    })
+                    .ok()?;
+                let base = heap.GetCPUDescriptorHandleForHeapStart().ptr;
+                let step = device.GetDescriptorHandleIncrementSize(kind) as usize;
+                (heap, base, step)
+            };
+            let shapes = (0..=10)
+                .map(NullShape::Srv)
+                .chain([2, 3, 4, 5, 8].map(NullShape::TextureUav))
+                .chain([NullShape::TypedBufferUav, NullShape::RawBufferUav]);
+            for shape in shapes {
+                shape.write(D3D12_CPU_DESCRIPTOR_HANDLE {
+                    ptr: base + shape.slot() * step,
+                });
+            }
+            Some((heap, base, step))
+        })
+        .as_ref()?;
+    Some(D3D12_CPU_DESCRIPTOR_HANDLE {
+        ptr: base + null_shape(view).slot() * step,
+    })
 }
 
 /// A null texture UAV of the title's view dimension (1D, 1D or 2D arrays,
@@ -4191,12 +4297,6 @@ fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         host.device
             .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
     };
-}
-
-/// A texture view that reads zeros with the dimension (and mip and array
-/// counts) of the title's description `words`; 2D if it names none.
-fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
-    null_texture(words[1], DXGI_FORMAT_R8G8B8A8_UNORM, at);
 }
 
 fn null_texture(dimension: u32, format: DXGI_FORMAT, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
@@ -5190,7 +5290,7 @@ mod tests {
     }
 
     #[test]
-    fn staged_placed_texture_slots_remain_lazy() {
+    fn batched_placed_texture_slots_remain_lazy() {
         if !templates::enabled() {
             return;
         }
@@ -5217,7 +5317,7 @@ mod tests {
 
         let before = STAGED_BATCHES.with(std::cell::Cell::get);
         heap.sync_slots(0, count, start, 32, &mut Vec::new());
-        assert_eq!(STAGED_BATCHES.with(std::cell::Cell::get) - before, 1);
+        assert_eq!(STAGED_BATCHES.with(std::cell::Cell::get) - before, 0);
         for index in 0..count {
             assert!(heap.unmade_placed(index).is_some());
             assert_eq!(heap.ready[index as usize].load(Ordering::Acquire), 0);
@@ -5274,12 +5374,20 @@ mod tests {
         let old = crate::resource::made_copy(first).unwrap();
         {
             let made = heap.made.lock().unwrap();
-            let cache = made.textures.get().unwrap().as_ref().unwrap();
-            assert!(cache.entry(srv_key).is_some());
-            assert!(cache.entry(uav_key).is_some());
+            let entry = |key| {
+                made.textures[template_shard(key)]
+                    .get()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .entry(key)
+                    .unwrap()
+            };
+            let cached_srv = entry(srv_key);
+            assert_eq!(entry(uav_key).key, uav_key);
             let pin = view_at(srv_record[1], srv_record[2]).unwrap();
             old.evicted.store(true, Ordering::Release);
-            assert!(cache.entry(srv_key).unwrap().hit(&pin).is_none());
+            assert!(cached_srv.hit(&pin).is_none());
             old.evicted.store(false, Ordering::Release);
         }
 

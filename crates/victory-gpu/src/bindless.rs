@@ -30,7 +30,8 @@ enum Seen {
     /// A view left without a host view (textures the title placed itself),
     /// by kind (diagnostics: `KINDS`), with a placed texture's address and
     /// console bytes.
-    Left(#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))] (usize, u64, u64)),
+    #[cfg(feature = "diagnostics")]
+    Left((usize, u64, u64)),
 }
 
 impl Seen {
@@ -42,6 +43,7 @@ impl Seen {
             #[cfg(feature = "diagnostics")]
             (Self::DirectBuffer, Self::DirectBuffer) => true,
             (Self::Texture(a), Self::Texture(b)) => a == b,
+            #[cfg(feature = "diagnostics")]
             (Self::Left(a), Self::Left(b)) => a == b,
             _ => false,
         }
@@ -202,6 +204,7 @@ impl Inner {
             }
             #[cfg(feature = "diagnostics")]
             Seen::DirectBuffer => {}
+            #[cfg(feature = "diagnostics")]
             Seen::Left(_) => {}
         }
     }
@@ -251,7 +254,11 @@ impl Viewed {
             if made {
                 seen(v, backing, widened)
             } else {
-                Some(Seen::Left(left_kind(v)))
+                #[cfg(feature = "diagnostics")]
+                let absent = Some(Seen::Left(left_kind(v)));
+                #[cfg(not(feature = "diagnostics"))]
+                let absent = None;
+                absent
             }
         });
         self.updates().set(index, seen);
@@ -315,7 +322,13 @@ impl Updates<'_> {
     }
 
     pub(crate) fn left(&mut self, index: u32, kind: (usize, u64, u64)) {
+        #[cfg(feature = "diagnostics")]
         self.set(index, Some(Seen::Left(kind)));
+        #[cfg(not(feature = "diagnostics"))]
+        {
+            let _ = kind;
+            self.clear(index);
+        }
     }
 
     fn set(&mut self, index: u32, seen: Option<Seen>) {
@@ -394,6 +407,12 @@ fn seen_buffer((shadow, address, len): BufferView, uav: bool, widened: bool) -> 
 }
 
 pub(crate) fn left_kind(view: &View) -> (usize, u64, u64) {
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        let _ = view;
+        (0, 0, 0)
+    }
+    #[cfg(feature = "diagnostics")]
     match view {
         View::Placed(_, resource, desc) if resource[0] != 1 => {
             let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
