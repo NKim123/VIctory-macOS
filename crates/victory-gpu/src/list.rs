@@ -5,9 +5,9 @@
 //! lists keep the pointer and every limit at zero, so every command reaches
 //! the table as a call.
 //!
-//! Each list records onto a host command list as its methods are called
-//! (decision 0007); draw state lives in `crate::draw`. Methods not
-//! written yet log once with their caller, so a run lists what to do next.
+//! Lists record onto a host command list (decision 0007). `VICTORY_THIN=1`
+//! moves that work to recording workers. Draw state lives in `crate::draw`.
+//! Unimplemented methods log once with their caller.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::mem::offset_of;
@@ -23,6 +23,9 @@ mod thin;
 
 #[cfg(any(windows, test))]
 use std::hash::Hasher;
+
+#[cfg(windows)]
+type AddressSet<K> = std::collections::HashSet<K, std::hash::BuildHasherDefault<AddressHash>>;
 
 /// Fast hashing for internal addresses, slot numbers and descriptor records.
 #[cfg(any(windows, test))]
@@ -173,9 +176,9 @@ struct List {
     #[cfg(windows)]
     segment: std::sync::atomic::AtomicUsize,
     #[cfg(windows)]
-    state: std::sync::Arc<std::sync::Mutex<crate::draw::State>>,
+    state: std::sync::Mutex<crate::draw::State>,
     #[cfg(windows)]
-    thin: std::sync::Mutex<thin::Front>,
+    thin: Option<std::sync::Mutex<thin::Front>>,
 }
 const _: () = assert!(offset_of!(List, put) == 0x18);
 const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
@@ -185,7 +188,9 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 #[cfg(windows)]
 pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let _timer = crate::queue::CpuTimer::new(crate::queue::CpuPhase::State);
-    let Some(list) = host_list(this) else { return };
+    let Some(list) = recording_host(this) else {
+        return;
+    };
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
@@ -196,9 +201,15 @@ pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut
 #[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     let list = title_list(this)?;
-    let current = current_host(list)?;
-    thin::flush(list, Some(current));
-    Some(current)
+    thin::use_calling_thread(this, list);
+    current_host(list)
+}
+
+#[cfg(windows)]
+fn recording_host<'a>(this: This) -> Option<&'a crate::host::HostList> {
+    let list = title_list(this)?;
+    thin::flush(this, list);
+    current_host(list)
 }
 
 #[cfg(windows)]
@@ -224,9 +235,8 @@ pub(crate) fn segments(this: This) -> Vec<std::sync::Arc<crate::host::HostList>>
     let Some(list) = title_list(this) else {
         return Vec::new();
     };
-    // Close may be finishing on the recording worker. Never publish a
-    // partially translated list to the submission lane.
-    thin::wait(list);
+    // The title closes the list before submitting it. Close drains replay,
+    // so every returned segment is ready for the submission lane.
     let k = list.segment.load(std::sync::atomic::Ordering::Relaxed);
     let hosts = list.hosts.lock().unwrap_or_else(|e| e.into_inner());
     hosts.iter().take(k + 1).cloned().collect()
@@ -236,7 +246,6 @@ pub(crate) fn segments(this: This) -> Vec<std::sync::Arc<crate::host::HostList>>
 #[cfg(windows)]
 pub(crate) fn owns_submission_storage(this: This) -> bool {
     title_list(this).is_some_and(|list| {
-        thin::wait(list);
         !list
             .uploads
             .lock()
@@ -282,7 +291,9 @@ pub(crate) extern "system" fn wait64(this: This, address: u64, comparison: u32, 
 fn wait(this: This, wait: crate::hold::ValueWait) {
     #[cfg(windows)]
     {
-        let Some(current) = host_list(this) else { return };
+        let Some(current) = recording_host(this) else {
+            return;
+        };
         if !current.is_empty() {
             let Some(next) = next_segment(this) else { return };
             CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -395,16 +406,28 @@ pub(crate) fn recycle_into(
 /// descriptor slots and title-memory page table. Freed once that host list
 /// (the list's last held one, so the last to run) is gone.
 #[cfg(windows)]
-fn leave(to: Option<std::sync::Arc<crate::host::HostList>>, uploads: Vec<Upload>, state: crate::draw::State) {
-    if uploads.is_empty() && !state.owns_submission_storage() {
+fn leave(
+    to: Option<std::sync::Arc<crate::host::HostList>>,
+    uploads: Vec<Upload>,
+    state: crate::draw::State,
+    pins: thin::Pins,
+) {
+    if uploads.is_empty() && !state.owns_submission_storage() && pins.is_empty() {
         return;
     }
-    struct Kept(#[allow(dead_code)] Vec<Upload>, #[allow(dead_code)] crate::draw::State);
-    // SAFETY: only dropped, with the host list, after it has run.
-    unsafe impl Send for Kept {}
+    struct Kept {
+        _uploads: Vec<Upload>,
+        _state: crate::draw::State,
+        _pins: thin::Pins,
+    }
+    let bytes = uploads.iter().map(|upload| upload.len as u64).sum();
+    let storage = Kept {
+        _uploads: uploads,
+        _state: state,
+        _pins: pins,
+    };
     if let Some(held) = to {
-        let bytes = uploads.iter().map(|upload| upload.len as u64).sum();
-        held.keep_recording_storage(Kept(uploads, state), bytes);
+        held.keep_recording_storage(storage, bytes);
     }
 }
 
@@ -472,12 +495,41 @@ fn new_list(
         return E_INVALIDARG;
     }
     tracing::debug!(kind, "command list");
-    let list = Box::new(List {
-        object: if crate::device::newer() {
-            Object::new(&NEWER_LIST_FUNCTIONS)
+    let newer = crate::device::newer();
+    let functions = if newer {
+        &NEWER_LIST_FUNCTIONS
+    } else {
+        &LIST_FUNCTIONS
+    };
+    #[cfg(windows)]
+    let hosts = crate::host::host()
+        .and_then(|host| match host.new_list() {
+            Ok(list) => Some(std::sync::Arc::new(list)),
+            Err(error) => {
+                tracing::warn!(%error, "no host command list");
+                None
+            }
+        })
+        .into_iter()
+        .collect::<Vec<_>>();
+    #[cfg(windows)]
+    let thin = (!hosts.is_empty() && thin::enabled()).then(|| {
+        let mut front = thin::Front::default();
+        front.pins.pin(pipeline);
+        std::sync::Mutex::new(front)
+    });
+    #[cfg(windows)]
+    let functions = if thin.is_some() {
+        if newer {
+            &THIN_NEWER_LIST_FUNCTIONS
         } else {
-            Object::new(&LIST_FUNCTIONS)
-        },
+            &THIN_LIST_FUNCTIONS
+        }
+    } else {
+        functions
+    };
+    let list = Box::new(List {
+        object: Object::new(functions),
         kind,
         put: [0; 5],
         reserved: [0; 64],
@@ -487,28 +539,17 @@ fn new_list(
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        hosts: std::sync::Mutex::new(
-            crate::host::host()
-                .and_then(|h| match h.new_list() {
-                    Ok(list) => Some(std::sync::Arc::new(list)),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "no host command list");
-                        None
-                    }
-                })
-                .into_iter()
-                .collect(),
-        ),
+        hosts: std::sync::Mutex::new(hosts),
         #[cfg(windows)]
         segment: Default::default(),
         #[cfg(windows)]
         state: {
             let mut state = crate::draw::State::default();
             state.set_pipeline(pipeline);
-            std::sync::Arc::new(std::sync::Mutex::new(state))
+            std::sync::Mutex::new(state)
         },
         #[cfg(windows)]
-        thin: Default::default(),
+        thin,
     });
     let hr = object::hand_out(LIST, list, iid, &LIST_IIDS, out);
     if hr == S_OK {
@@ -539,14 +580,24 @@ extern "system" fn list_release(this: This) -> u32 {
     if !this.is_null() && object::refs(this) == 1 {
         // SAFETY: the title passes one of our lists.
         let list = unsafe { &*this.cast::<List>() };
-        thin::flush(list, None);
-        let held = list.hosts.lock().unwrap_or_else(|e| e.into_inner()).iter().rfind(|h| std::sync::Arc::strong_count(h) > 1).cloned();
+        let pins = thin::discard(list);
+        let held = list
+            .hosts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .rfind(|h| std::sync::Arc::strong_count(h) > 1)
+            .cloned();
         if held.is_some() {
             EARLY_RESETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::debug!("a list released while a queue still holds part of it: that part runs on its own");
             let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
             let state = std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner()));
-            leave(held, uploads, state);
+            leave(held, uploads, state, pins);
+        } else {
+            let refs = object::release_boxed::<List>(this);
+            drop(pins);
+            return refs;
         }
     }
     object::release_boxed::<List>(this)
@@ -559,10 +610,8 @@ extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
     let _timer = crate::queue::CpuTimer::new(crate::queue::CpuPhase::ListLifecycle);
     #[cfg(windows)]
-    if let Some(list) = title_list(this)
-        && let Some(host) = current_host(list)
-    {
-        thin::close(list, host);
+    if let Some(list) = title_list(this) {
+        thin::close(this, list);
     }
     S_OK
 }
@@ -583,13 +632,20 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
             Ok(held) => held,
             Err(error) => return error,
         };
-        thin::flush(list, None);
+        let pins = thin::discard(list);
+        if let Some(front) = &list.thin {
+            front
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pins
+                .pin(pipeline);
+        }
         let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
         let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
         let old = std::mem::take(&mut *state);
         state.reset(pipeline);
         drop(state);
-        leave(held, uploads, old);
+        leave(held, uploads, old, pins);
     }
     #[cfg(not(windows))]
     list.uploads
@@ -708,7 +764,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     #[cfg(windows)]
     let _timer = crate::queue::CpuTimer::new(crate::queue::CpuPhase::Barriers);
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
+    if let Some(list) = recording_host(this)
         && !barriers.is_null()
     {
         list.indirect_boundary();
@@ -805,7 +861,7 @@ extern "system" fn copy_buffer_region(
     len: u64,
 ) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
+    if let Some(list) = recording_host(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
@@ -818,7 +874,7 @@ extern "system" fn copy_buffer_region(
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
-        let Some(list) = host_list(this) else {
+        let Some(list) = recording_host(this) else {
             return;
         };
         if let (Some(to), Some(from)) = (
@@ -879,7 +935,7 @@ extern "system" fn copy_texture_region(
         const FOOTPRINT: u32 = 1;
         // SAFETY: the title passes both locations (null is tolerated).
         let (Some(list), Some(&dst), Some(&src)) =
-            (host_list(this), unsafe { dst.as_ref() }, unsafe {
+            (recording_host(this), unsafe { dst.as_ref() }, unsafe {
                 src.as_ref()
             })
         else {
@@ -1156,7 +1212,7 @@ extern "system" fn resolve(
     format: u32,
 ) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
+    if let Some(list) = recording_host(this)
         && let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
@@ -1223,6 +1279,7 @@ extern "system" fn resolve(
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub(crate) struct Rect {
     left: i32,
     top: i32,
@@ -1250,7 +1307,32 @@ extern "system" fn clear_rtv(
         let Some(&color) = (unsafe { color.as_ref() }) else {
             return;
         };
-        thin::clear_color(this, record.resource, record.desc(), color, count, rects);
+        let (Some(list), Some(texture), Some(host)) = (
+            recording_host(this),
+            crate::resource::host_copy(record.resource),
+            crate::host::host(),
+        ) else {
+            return;
+        };
+        const RENDER_TARGET: u32 = 0x4;
+        let rects = (count != 0 && !rects.is_null()).then(|| {
+            // SAFETY: the title passes `count` rectangles in the host layout.
+            unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
+        });
+        if let Some((resource, before)) = list.transition_copy(&texture, RENDER_TARGET) {
+            use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES;
+            let barrier = crate::host::transition(
+                &resource,
+                D3D12_RESOURCE_STATES(before as i32),
+                D3D12_RESOURCE_STATES(RENDER_TARGET as i32),
+            );
+            // SAFETY: an open list and a texture retained by its state entry.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+        }
+        host.with_clear_rtv(&texture.texture, record.desc().as_ref(), |view| {
+            // SAFETY: an open list, with the CPU descriptor held for this call.
+            unsafe { list.list.ClearRenderTargetView(view, &color, rects) };
+        });
     }
     #[cfg(not(windows))]
     let _ = (this, handle, color, count, rects);
@@ -1270,7 +1352,8 @@ extern "system" fn clear_dsv(
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
-        let (Some(list), Some(record)) = (host_list(this), crate::descriptor::dsv_record(handle))
+        let (Some(list), Some(record)) =
+            (recording_host(this), crate::descriptor::dsv_record(handle))
         else {
             return;
         };
@@ -1308,7 +1391,7 @@ extern "system" fn clear_dsv(
 /// `memmove` when both ranges are committed.
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
+    if let Some(list) = recording_host(this)
         && dst != 0
         && src != 0
     {
@@ -1565,14 +1648,13 @@ extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
 mod state {
-    use super::{This, thin, with_state};
+    use super::{This, with_state};
     use crate::draw::{IndexView, VertexView};
-    use thin::Command;
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
 
     /// `count` items at `items`, or none.
-    fn items<'a, T>(items: *const T, count: u32) -> &'a [T] {
+    pub(super) fn items<'a, T>(items: *const T, count: u32) -> &'a [T] {
         if items.is_null() || count == 0 {
             return &[];
         }
@@ -1581,42 +1663,25 @@ mod state {
     }
 
     pub(super) extern "system" fn topology(this: This, topology: u32) {
-        thin::record(this, Command::Topology(topology));
+        with_state(this, |list, state| state.set_topology(list, topology));
     }
     pub(super) extern "system" fn viewports(
         this: This,
         count: u32,
         viewports: *const D3D12_VIEWPORT,
     ) {
-        if thin::enabled() && !this.is_null() && count <= 16 {
-            thin::record(this, Command::Viewports(items(viewports, count).to_vec()));
-        } else {
-            with_state(this, |list, s| s.viewports(list, items(viewports, count)));
-        }
+        with_state(this, |list, s| s.viewports(list, items(viewports, count)));
     }
     pub(super) extern "system" fn scissors(this: This, count: u32, rects: *const RECT) {
-        if thin::enabled() && !this.is_null() && count <= 16 {
-            thin::record(this, Command::Scissors(items(rects, count).to_vec()));
-        } else {
-            with_state(this, |list, s| s.scissors(list, items(rects, count)));
-        }
+        with_state(this, |list, s| s.scissors(list, items(rects, count)));
     }
     pub(super) extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
-        if thin::enabled() && !this.is_null() {
-            // SAFETY: the title passes four floats or null.
-            thin::record(
-                this,
-                Command::BlendFactor(unsafe { factor.as_ref() }.copied()),
-            );
-        } else {
-            with_state(this, |list, s| {
-                // SAFETY: the title passes four floats or null.
-                s.blend_factor(list, unsafe { factor.as_ref() })
-            });
-        }
+        with_state(this, |list, s| {
+            s.blend_factor(list, items(factor, 1).first())
+        });
     }
     pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
-        thin::record(this, Command::StencilRef(reference));
+        with_state(this, |list, s| s.stencil_ref(list, reference));
     }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
         with_state(this, |_, s| s.set_heaps(items(heaps, count)));
@@ -1656,13 +1721,13 @@ mod state {
         });
     }
     pub(super) extern "system" fn compute_table(this: This, slot: u32, handle: u64) {
-        thin::record(this, Command::Table(true, slot, handle));
+        with_state(this, |_, s| s.set_table(true, slot, handle));
     }
     pub(super) extern "system" fn graphics_table(this: This, slot: u32, handle: u64) {
-        thin::record(this, Command::Table(false, slot, handle));
+        with_state(this, |_, s| s.set_table(false, slot, handle));
     }
     pub(super) extern "system" fn compute_constant(this: This, slot: u32, value: u32, offset: u32) {
-        thin::record(this, Command::Constant(true, slot, value, offset));
+        with_state(this, |_, s| s.set_constants(true, slot, &[value], offset));
     }
     pub(super) extern "system" fn graphics_constant(
         this: This,
@@ -1670,7 +1735,7 @@ mod state {
         value: u32,
         offset: u32,
     ) {
-        thin::record(this, Command::Constant(false, slot, value, offset));
+        with_state(this, |_, s| s.set_constants(false, slot, &[value], offset));
     }
     pub(super) extern "system" fn compute_constants(
         this: This,
@@ -1698,24 +1763,17 @@ mod state {
         values: *const u32,
         offset: u32,
     ) {
-        if thin::enabled() && !this.is_null() && count <= 64 {
-            thin::record(
-                this,
-                Command::Constants(compute, slot, items(values, count).to_vec(), offset),
-            );
-        } else {
-            with_state(this, |_, s| {
-                s.set_constants(compute, slot, items(values, count), offset)
-            });
-        }
+        with_state(this, |_, s| {
+            s.set_constants(compute, slot, items(values, count), offset)
+        });
     }
 
     /// Root constant buffer, shader resource and unordered access views.
     pub(super) extern "system" fn compute_view(this: This, slot: u32, address: u64) {
-        thin::record(this, Command::View(true, slot, address));
+        with_state(this, |_, s| s.set_view(true, slot, address));
     }
     pub(super) extern "system" fn graphics_view(this: This, slot: u32, address: u64) {
-        thin::record(this, Command::View(false, slot, address));
+        with_state(this, |_, s| s.set_view(false, slot, address));
     }
     pub(super) extern "system" fn index_buffer(this: This, view: *const IndexView) {
         // SAFETY: the title passes a view or null.
@@ -1744,16 +1802,29 @@ mod state {
         one_range: i32,
         depth: *const u64,
     ) {
-        let handles: Vec<u64> = if one_range != 0 && !handles.is_null() {
-            // SAFETY: the title passes the first handle.
-            let first = unsafe { *handles };
-            (0..u64::from(count)).map(|i| first + 128 * i).collect()
-        } else {
-            items(handles, count).to_vec()
-        };
-        // SAFETY: the title passes a handle or null.
-        let depth = unsafe { depth.as_ref() }.copied().unwrap_or(0);
+        let handles: Vec<_> = target_handles(count, handles, one_range).collect();
+        let depth = items(depth, 1).first().copied().unwrap_or(0);
         with_state(this, |list, s| s.set_targets(list, &handles, depth));
+    }
+    pub(super) fn target_handles(
+        count: u32,
+        handles: *const u64,
+        one_range: i32,
+    ) -> impl ExactSizeIterator<Item = u64> {
+        let ranged = one_range != 0;
+        let handles = items(handles, if ranged { 1 } else { count });
+        let count = if handles.is_empty() {
+            0
+        } else {
+            count as usize
+        };
+        (0..count).map(move |index| {
+            if ranged {
+                handles[0] + 128 * index as u64
+            } else {
+                handles[index]
+            }
+        })
     }
     pub(super) extern "system" fn draw(
         this: This,
@@ -1958,6 +2029,7 @@ mod enhanced {
     }
 
     #[repr(C)]
+    #[derive(Clone, Copy)]
     pub(super) struct Buffer {
         pub(super) scope: D3D12_GLOBAL_BARRIER,
         pub(super) resource: This,
@@ -1966,6 +2038,7 @@ mod enhanced {
     }
 
     #[repr(C)]
+    #[derive(Clone, Copy)]
     pub(super) struct Texture {
         pub(super) scope: D3D12_GLOBAL_BARRIER,
         pub(super) before: D3D12_BARRIER_LAYOUT,
@@ -2491,7 +2564,7 @@ extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
     let _timer = crate::queue::CpuTimer::new(crate::queue::CpuPhase::Barriers);
     #[cfg(windows)]
     if count > 0
-        && let Some(list) = host_list(this)
+        && let Some(list) = recording_host(this)
     {
         let groups = if groups.is_null() {
             None
@@ -2565,7 +2638,7 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
         return;
     }
     #[cfg(windows)]
-    if let Some(list) = host_list(this) {
+    if let Some(list) = recording_host(this) {
         list.defer_write(address as *mut u8, what, bytes);
         return;
     }
@@ -2696,13 +2769,17 @@ const fn list_table(newer: bool) -> [*const (); 160] {
 /// titles add.
 static LIST_FUNCTIONS: Table<160> = Table(list_table(false));
 static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
+#[cfg(windows)]
+static THIN_LIST_FUNCTIONS: Table<160> = Table(thin::table(false));
+#[cfg(windows)]
+static THIN_NEWER_LIST_FUNCTIONS: Table<160> = Table(thin::table(true));
 
 #[cfg(all(test, windows))]
 pub(crate) fn has_newer_table(list: This) -> bool {
     // SAFETY: one of our lists; its first field is the table. The device
     // tests can switch layouts, so use this list's table.
     let table = unsafe { *list.cast::<*const *const ()>() };
-    table == NEWER_LIST_FUNCTIONS.0.as_ptr()
+    table == NEWER_LIST_FUNCTIONS.0.as_ptr() || table == THIN_NEWER_LIST_FUNCTIONS.0.as_ptr()
 }
 
 #[cfg(test)]

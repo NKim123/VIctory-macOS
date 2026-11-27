@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, Weak};
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::ambient::{self, CheckedViews, Role};
-use crate::descriptor::View;
+use crate::descriptor::{RtvRecord, View};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -284,10 +284,23 @@ struct Fixed {
     scissors: Option<Vec<RECT>>,
     blend_factor: Option<Option<[f32; 4]>>,
     stencil_ref: Option<u32>,
-    /// Render target and depth view handles.
-    targets: Option<(Vec<u64>, u64)>,
+    targets: Option<TargetBindings>,
     topology: bool,
 }
+
+enum TargetBindings {
+    Handles(Vec<u64>, u64),
+    Records(RecordedTargets),
+}
+
+struct RecordedTargets {
+    colors: Vec<(u64, Option<RtvRecord>)>,
+    depth: Option<RtvRecord>,
+}
+
+// SAFETY: these are immutable view snapshots. Thin recording pins the
+// title resource on each record through replay and each segment cut.
+unsafe impl Send for RecordedTargets {}
 
 impl FreshTable {
     fn record_writes(&self, list: &HostList, group: &TableGroup) {
@@ -543,8 +556,14 @@ impl State {
         if let Some(s) = fixed.stencil_ref {
             self.stencil_ref(list, s);
         }
-        if let Some((targets, depth)) = &fixed.targets {
-            self.set_targets(list, targets, *depth);
+        match fixed.targets {
+            Some(TargetBindings::Handles(handles, depth)) => {
+                self.set_targets(list, &handles, depth)
+            }
+            Some(TargetBindings::Records(records)) => {
+                self.set_target_records(list, &records.colors, records.depth)
+            }
+            None => {}
         }
     }
 
@@ -637,15 +656,40 @@ impl State {
 
     /// Render targets and depth, set on the host list at once.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
-        self.fixed.targets = Some((handles.to_vec(), depth));
+        self.fixed.targets = Some(TargetBindings::Handles(handles.to_vec(), depth));
+        let records = handles
+            .iter()
+            .map(|&handle| (handle, crate::descriptor::rtv_record(handle)));
+        self.apply_targets(list, records, crate::descriptor::dsv_record(depth));
+    }
+
+    pub(crate) fn set_target_records(
+        &mut self,
+        list: &HostList,
+        colors: &[(u64, Option<RtvRecord>)],
+        depth: Option<RtvRecord>,
+    ) {
+        self.fixed.targets = Some(TargetBindings::Records(RecordedTargets {
+            colors: colors.to_vec(),
+            depth,
+        }));
+        self.apply_targets(list, colors.iter().copied(), depth);
+    }
+
+    fn apply_targets(
+        &mut self,
+        list: &HostList,
+        colors: impl ExactSizeIterator<Item = (u64, Option<RtvRecord>)>,
+        depth: Option<RtvRecord>,
+    ) {
         let Some(host) = crate::host::host() else {
             return;
         };
         self.targets.clear();
-        let mut rtv_views = Vec::with_capacity(handles.len());
-        let mut rtv_keys = Vec::with_capacity(handles.len());
-        for &h in handles {
-            let Some(record) = crate::descriptor::rtv_record(h) else {
+        let mut rtv_views = Vec::with_capacity(colors.len());
+        let mut rtv_keys = Vec::with_capacity(colors.len());
+        for (h, record) in colors {
+            let Some(record) = record else {
                 once!(
                     handle = format_args!("{h:#x}"),
                     "render target without a recorded view"
@@ -664,7 +708,7 @@ impl State {
         self.depth = 0;
         let mut dsv_view = None;
         let mut dsv_key = None;
-        if let Some(record) = crate::descriptor::dsv_record(depth)
+        if let Some(record) = depth
             && let Some(texture) = crate::resource::host_copy(record.resource)
         {
             self.depth = record.resource as usize;
@@ -1414,8 +1458,25 @@ impl State {
         float: bool,
         rects: &[RECT],
     ) {
+        self.clear_unordered_view(
+            list,
+            crate::descriptor::view(cpu).as_deref(),
+            values,
+            float,
+            rects,
+        );
+    }
+
+    pub(crate) fn clear_unordered_view(
+        &mut self,
+        list: &HostList,
+        view: Option<&View>,
+        values: [u32; 4],
+        float: bool,
+        rects: &[RECT],
+    ) {
         self.indirect = None;
-        let Some(view) = crate::descriptor::view(cpu) else {
+        let Some(view) = view else {
             once!("an unordered access clear of a slot without a view");
             return;
         };
@@ -1430,9 +1491,9 @@ impl State {
         };
         self.dynamic
             .push((std::ptr::from_ref(heap) as usize, slot, 1));
-        visible.make_at(slot, &view);
+        visible.make_at(slot, view);
         let at = host.cpu_view();
-        let Some(resource) = crate::descriptor::host::make_view(&view, at) else {
+        let Some(resource) = crate::descriptor::host::make_view(view, at) else {
             once!("an unordered access clear of a view the host cannot make");
             return;
         };
@@ -1446,7 +1507,7 @@ impl State {
             user_data: 0,
             slot: 0,
         };
-        readable(list, &written, &view, false);
+        readable(list, &written, view, false);
         self.bind_heaps(list, false);
         list.keep(&resource);
         let gpu = visible.gpu(slot);
