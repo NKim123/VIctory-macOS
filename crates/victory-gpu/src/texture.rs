@@ -59,6 +59,8 @@ pub(crate) struct Staging {
     layout: victory_formats::texture::Layout,
     /// Mips per array slice.
     mips: u32,
+    /// First native subresource in the staging buffer.
+    first: u32,
     memory: *const u8,
     /// The memory's pages changed since detiled (none: not the runtime's
     /// memory, compared instead).
@@ -125,11 +127,15 @@ struct Last {
 /// Per subresource of `layout` (`mips` per array slice; a 3D texture's
 /// are its mips), the bytes of the texture's memory it lies in, rounded out
 /// to the layout's blocks; empty if the layout cannot say.
-fn spans(layout: &victory_formats::texture::Layout, count: u32, mips: u32) -> Vec<(usize, usize)> {
+fn spans(
+    layout: &victory_formats::texture::Layout,
+    range: std::ops::Range<u32>,
+    mips: u32,
+) -> Vec<(usize, usize)> {
     use victory_formats::texture::Dimension;
     let d = &layout.desc;
     let block = layout.alignment.max(256);
-    (0..count)
+    range
         .map(|i| {
             let (mip, slice) = (i % mips, i / mips);
             let m = layout.mips.get(mip as usize)?;
@@ -342,18 +348,19 @@ pub(crate) static ALIAS_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic
 pub(crate) fn alias_copy(list: &HostList, from: This, to: This) -> bool {
     const COPY_DEST: u32 = 0x400;
     const COPY_SOURCE: u32 = 0x800;
-    let (Some(a), Some(b), Some(host)) = (
+    let (Some(a), Some(copy), Some(host)) = (
         crate::resource::host_resource(from),
-        crate::resource::host_resource(to),
+        crate::resource::host_copy(to),
         host(),
     ) else {
         return false;
     };
+    let b = &copy.texture;
     // An upload from title memory can have already used this view; only a
     // copy from the same GPU source with no intervening state change on the
     // source can satisfy this read.
     list.first_use(to as usize | 1);
-    let new_source = list.alias_source_changed(&b, &a);
+    let new_source = list.alias_source_changed(b, &a);
     let before = list.transition(from, COPY_SOURCE).map(|(texture, before)| {
         let state = crate::host::legal_state(&texture, COPY_SOURCE);
         let barrier = crate::host::transition(
@@ -398,12 +405,16 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) -> bool {
             x.Offset == y.Offset && x.Footprint.RowPitch == y.Footprint.RowPitch && ra[i] == rb[i] && x.Footprint.Depth == y.Footprint.Depth
         })
         .count() as u32;
-    if n == 0 {
+    let first = copy.first_mip();
+    if n <= first {
         once!(?da, ?db, "an aliased texture not copied: its layouts differ on the host");
         return false;
     }
     let Some(buffer) = host.default_buffer(total) else { return false };
     list.keep(&buffer);
+    if let Some(tiles) = &copy.tiles {
+        tiles.prepare_upload(&list.list, b);
+    }
     crate::texture::host_writes(list, to);
     crate::list::ensure_state(list, to, COPY_DEST);
     let place = |r: &ID3D12Resource, f: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
@@ -421,7 +432,7 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) -> bool {
     let l = &list.list;
     // SAFETY: an open list; live resources in the states named.
     unsafe {
-        for i in 0..n {
+        for i in first..n {
             l.CopyTextureRegion(&place(&buffer, fa[i as usize]), 0, 0, 0, &sub(&a, i), None);
         }
         l.ResourceBarrier(&[crate::host::transition(
@@ -429,8 +440,8 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) -> bool {
             D3D12_RESOURCE_STATE_COPY_DEST,
             D3D12_RESOURCE_STATE_COPY_SOURCE,
         )]);
-        for i in 0..n {
-            l.CopyTextureRegion(&sub(&b, i), 0, 0, 0, &place(&buffer, fb[i as usize]), None);
+        for i in first..n {
+            l.CopyTextureRegion(&sub(b, i), 0, 0, 0, &place(&buffer, fb[i as usize]), None);
         }
     }
     ALIAS_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -493,6 +504,9 @@ pub(crate) fn record_upload(
 ) -> Option<D3D12_RESOURCE_BARRIER> {
     const COPY_DEST: u32 = 0x400;
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+    if let Some(tiles) = &copy.tiles {
+        tiles.prepare_upload(&list.list, &copy.texture);
+    }
     if let Some(b) = list.move_texture(copy, COPY_DEST) {
         // SAFETY: an open list; the barrier names a live texture.
         unsafe { list.list.ResourceBarrier(&[b]) };
@@ -567,7 +581,7 @@ fn copies(
             pResource: unsafe { std::mem::transmute_copy(texture) },
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                SubresourceIndex: i as u32,
+                SubresourceIndex: i as u32 + staging.first,
             },
         };
         let from = D3D12_TEXTURE_COPY_LOCATION {
@@ -745,7 +759,7 @@ impl Staging {
         &self,
         alloc: &mut dyn FnMut(u64) -> Option<(ID3D12Resource, u64, *mut u8)>,
     ) -> WorkerRefresh {
-        let size = self.layout.size as usize;
+        let size = self.layout.bytes_from(self.first) as usize;
         let start = self.memory as usize;
         let mut guard = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let forced = self
@@ -921,7 +935,7 @@ impl Staging {
                 .map(|i| (i, None))
                 .collect::<Vec<Sub>>()
         };
-        let size = self.layout.size as usize;
+        let size = self.layout.bytes_from(self.first) as usize;
         let start = self.memory as usize;
         let mut guard = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let forced = self
@@ -1020,7 +1034,7 @@ impl Staging {
             let plan: Vec<(usize, Band)> = touched
                 .into_iter()
                 .map(|i| {
-                    let s = i as u32;
+                    let s = i as u32 + self.first;
                     let band = if use_rows && own(i) {
                         self.layout
                             .touched_rows(s % self.mips, s / self.mips, &changed)
@@ -1246,7 +1260,8 @@ impl Staging {
         for (i, band) in subresources {
             let i = *i;
             let (footprint, rows) = (&self.footprints[i as usize], self.rows[i as usize]);
-            let (mip, slice) = (i % self.mips, i / self.mips);
+            let subresource = i + self.first;
+            let (mip, slice) = (subresource % self.mips, subresource / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let len = subresource_len(footprint.Offset, pitch, rows, f.Depth, self.size);
@@ -1625,15 +1640,17 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
     } else {
         u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize)
     };
-    let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
-    let mut rows = vec![0u32; count as usize];
+    let first = copy.first_mip();
+    let mut footprints =
+        vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); (count - first) as usize];
+    let mut rows = vec![0u32; (count - first) as usize];
     let mut total = 0;
     // SAFETY: outputs for `count` subresources.
     unsafe {
         host.device.GetCopyableFootprints(
             &d,
-            0,
-            count,
+            first,
+            count - first,
             0,
             Some(footprints.as_mut_ptr()),
             Some(rows.as_mut_ptr()),
@@ -1642,14 +1659,15 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
         );
     }
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
-    let layout_size = layout.size as usize;
-    let spans = spans(&layout, count, u32::from(d.MipLevels));
+    let layout_size = layout.bytes_from(first) as usize;
+    let spans = spans(&layout, first..count, u32::from(d.MipLevels));
     let s = Arc::new(Staging {
         size: total,
         footprints,
         rows,
         layout,
         mips: u32::from(d.MipLevels),
+        first,
         memory,
         tracked: crate::watch::track(memory as usize, layout_size, true),
         uploaded_once: std::sync::atomic::AtomicBool::new(false),

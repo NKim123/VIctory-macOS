@@ -3335,7 +3335,18 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
         return None;
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-    let texture = crate::resource::texture_at(address, resource)?;
+    // Only an explicitly typed 2D SRV can restrict which mips are backed.
+    // Its MostDetailedMip already clamps shader reads to that suffix.
+    let first_mip = if !unordered
+        && desc[1] == D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32
+        && desc[5] != 0
+        && crate::resource::pc_format(desc[0]) == crate::resource::pc_format(resource[8])
+    {
+        desc[4]
+    } else {
+        0
+    };
+    let texture = crate::resource::texture_at_mip(address, resource, first_mip)?;
     let view_desc = desc[..10].try_into().ok();
     Some(if *unordered {
         View::Unordered(texture as usize, 0, view_desc)

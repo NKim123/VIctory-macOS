@@ -2579,7 +2579,7 @@ impl Host {
     }
 
     /// The queue submissions go to now.
-    fn queue(&self) -> ID3D12CommandQueue {
+    pub(crate) fn queue(&self) -> ID3D12CommandQueue {
         self.queue.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 

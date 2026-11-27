@@ -208,6 +208,22 @@ On an M1 Max with CrossOver Wine 11.17 and D3DMetal 4.0 beta 3, a reserved buffe
 
 Run the probe under the D3DMetal Wine runner with `tools/macos/test-wine.sh -p victory-gpu --lib inplace_probe_6_remap_cpu_visible_tiles -- --ignored --test-threads=1`.
 
+## Small placed textures and reserved mip chains
+
+Measured on an Apple M5 Pro with patched CrossOver Wine (reported as `wine-11.0`) and D3DMetal `4.0b3`. The default allocation for both 32×32 RGBA8 and BC7 was 65,536 bytes at 65,536-byte alignment. Requesting 4,096-byte alignment returned 8,192 bytes for RGBA8 and 4,096 bytes for BC7. Three of each occupied 36,864 bytes of one 64 KiB heap and preserved distinct patterns on readback. The production enhanced creation path reported the same sizes and alignment with its castable format lists. A 512×512 RGBA8 texture used the 64 KiB alignment path.
+
+The device advertised tiled resources tier 2. Each 512×512, 10-mip reserved texture used a one-tile packed tail. The probe mapped and copied the tail first, then mapped and copied the next finer mip on the same direct queue. Byte readback matched the upload for every mapped mip, and shader reads through SRVs with the requested `MostDetailedMip` matched the corresponding committed textures. [D3D12 packed mip info](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ns-d3d12-d3d12_packed_mip_info)
+
+| Format | Standard tile shape | Total tiles | First packed mip | Next finer mip verified |
+| --- | --- | ---: | ---: | ---: |
+| BC7_UNORM | 256×256 | 6 | 2 | 1 |
+| BC1_UNORM | 512×256 | 3 | 1 | 0 |
+| R8G8B8A8_UNORM | 128×128 | 22 | 3 | 2 |
+
+The tile pool uses a 256 MiB cap, including unused space in its heaps. It backs shader-visible mip suffixes of single-layer 2D textures in the tested formats. A finer view can allocate a wider suffix while previously recorded views keep their backing. The normal texture path handles full-chain views, unsupported tilings, and pool exhaustion. `VICTORY_LEVELS_ON_DEMAND=0` disables the sparse path. The default enables it under Rosetta with tier 2, and `VICTORY_LEVELS_ON_DEMAND=1` opts in on other tier-2 hosts.
+
+Run the two D3DMetal probes with `tools/macos/test-wine.sh -p victory-gpu --lib inplace_probe::textures -- --nocapture` under the patched Wine runtime with `WINEDLLOVERRIDES="d3d12,d3d12core,dxgi=b"`. The same filter also exercises the production upload path.
+
 ## Plain 256-bit stores into protected pages stop Rosetta too
 
 The masked-store patch is not enough on its own once fault tracking is on. Measured under CrossOver Wine on an M5 Max (macOS 26): a plain `vmovups`, `vmovdqu` or `vmovaps` of 32 bytes that begins in a writable page and faults in the next one stops Rosetta with the same "unexpectedly need to EmulateForward on a synchronous exception", before any handler runs. The same store wholly inside one page resumes. 128-bit stores, `vextractf128` to memory and smaller stores resume in every layout, and an AVX masked store of 128 bits stops it like one of 256. Series 1.0.2.1 has 119,296 plain 256-bit stores; #144 hit eight of them, which `VICTORY_PATCH_MASKED` now lists by hand.

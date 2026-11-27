@@ -652,6 +652,27 @@ impl Layout {
         )
     }
 
+    /// Size of the prefix containing mip `first_mip` and all coarser
+    /// mips. Thin single-slice chains store their smallest mips first.
+    /// Keep the whole allocation for interleaved or out-of-range chains.
+    pub fn bytes_from(&self, first_mip: u32) -> u64 {
+        if first_mip == 0
+            || first_mip >= self.desc.mips
+            || self.slices != 1
+            || self.desc.dimension == Dimension::Tex3d
+            || self.desc.samples != 1
+        {
+            return self.size;
+        }
+        let mip = &self.mips[first_mip as usize];
+        if mip.tail.is_some() {
+            self.alignment.min(self.size)
+        } else {
+            mip.offset
+                + u64::from(mip.pitch) * u64::from(mip.rows) * u64::from(self.desc.element_bytes)
+        }
+    }
+
     /// The rows (in elements, the same for every depth slice) of mip `mip`
     /// of array slice `slice` (3D: 0) whose tiled bytes overlap `ranges`
     /// (byte offsets into the texture's memory, sorted and disjoint), and
@@ -787,11 +808,11 @@ impl Layout {
             .checked_mul(depth_pitch)
             .and_then(|offset| offset.checked_add(slice_bytes))
             .ok_or(Error::TooSmall)?;
-        let (tiled_len, linear_len) = match &copy {
-            Buffers::Tile { tiled, linear } => (tiled.len(), linear.len()),
-            Buffers::Detile { tiled, linear } => (tiled.len(), linear.len()),
+        let (tiled_len, tiled_need, linear_len) = match &copy {
+            Buffers::Tile { tiled, linear } => (tiled.len(), self.size, linear.len()),
+            Buffers::Detile { tiled, linear } => (tiled.len(), self.bytes_from(mip), linear.len()),
         };
-        if tiled_len < self.size as usize || linear_len < need || row_pitch < bytes {
+        if tiled_len < tiled_need as usize || linear_len < need || row_pitch < bytes {
             return Err(Error::TooSmall);
         }
         let row_range = match rows {
@@ -1682,6 +1703,18 @@ mod tests {
         assert_eq!(l.first_tail_mip, 1);
         assert_eq!(l.size, 2 * 65536);
         assert_eq!(l.mips[0].offset, 65536);
+        assert_eq!(l.bytes_from(0), l.size);
+        assert_eq!(l.bytes_from(1), 65536);
+        assert_eq!(l.bytes_from(8), 65536);
+        assert_eq!(l.bytes_from(9), l.size);
+        let mut linear = [0; 16];
+        let prefix = vec![7; l.bytes_from(8) as usize];
+        assert!(l.detile(&prefix, 8, 0, &mut linear, 16, 16).is_ok());
+        assert_eq!(linear, [7; 16]);
+        assert_eq!(
+            l.detile(&prefix[..prefix.len() - 1], 8, 0, &mut linear, 16, 16),
+            Err(Error::TooSmall)
+        );
         assert_eq!(
             l.mips[1].tail,
             Some(Tail {
@@ -1695,6 +1728,7 @@ mod tests {
         let l = Layout::new(&desc(64, 64, 9, 16, Swizzle::SW_4KB_S)).unwrap();
         assert_eq!(l.first_tail_mip, 3);
         assert_eq!(l.mips[2].offset, 4096);
+        assert_eq!(l.bytes_from(2), 8192);
         assert_eq!(l.mips[1].offset, 8192);
         assert_eq!(l.mips[0].offset, 8192 + 16384);
     }

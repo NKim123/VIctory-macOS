@@ -187,13 +187,19 @@ impl Drop for Rig {
 
 impl Rig {
     fn new(device: &ID3D12Device) -> windows::core::Result<Rig> {
+        // SAFETY: a plain request for a direct queue.
+        let queue = unsafe {
+            device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                ..Default::default()
+            })
+        }?;
+        Self::with_queue(device, queue)
+    }
+
+    fn with_queue(device: &ID3D12Device, queue: ID3D12CommandQueue) -> windows::core::Result<Rig> {
         // SAFETY: plain creation of objects of our own.
         unsafe {
-            let queue: ID3D12CommandQueue =
-                device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    ..Default::default()
-                })?;
             let allocator: ID3D12CommandAllocator =
                 device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
             let list: ID3D12GraphicsCommandList =
@@ -910,3 +916,5 @@ fn inplace_probe_6_remap_cpu_visible_tiles() {
         }
     }
 }
+
+mod textures;

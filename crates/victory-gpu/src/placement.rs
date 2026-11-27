@@ -54,7 +54,7 @@ static HEAPS: Mutex<Option<Heaps>> = Mutex::new(None);
 
 /// The first range of `free` that fits `size` bytes at `align`: its
 /// offset, taken out of `free`.
-fn take(free: &mut BTreeMap<u64, u64>, size: u64, align: u64) -> Option<u64> {
+pub(crate) fn take(free: &mut BTreeMap<u64, u64>, size: u64, align: u64) -> Option<u64> {
     let (&start, &len, at) = free.iter().find_map(|(s, l)| {
         let at = s.next_multiple_of(align);
         (at + size <= s + l).then_some((s, l, at))
@@ -71,7 +71,7 @@ fn take(free: &mut BTreeMap<u64, u64>, size: u64, align: u64) -> Option<u64> {
 
 /// Gives `[offset, offset + size)` back to `free`, joined with its
 /// neighbours.
-fn give(free: &mut BTreeMap<u64, u64>, offset: u64, size: u64) {
+pub(crate) fn give(free: &mut BTreeMap<u64, u64>, offset: u64, size: u64) {
     let (mut start, mut end) = (offset, offset + size);
     if let Some((&s, &l)) = free.range(..start).next_back()
         && s + l == start
@@ -87,7 +87,7 @@ fn give(free: &mut BTreeMap<u64, u64>, offset: u64, size: u64) {
 }
 
 /// Whether a resource has no holder but the one passed.
-fn last_holder(resource: &ID3D12Resource) -> bool {
+pub(crate) fn last_holder(resource: &ID3D12Resource) -> bool {
     // SAFETY: a live COM object; one reference taken and given back.
     unsafe {
         let raw = resource.as_raw();
@@ -158,31 +158,52 @@ impl Heaps {
     }
 }
 
-/// Whether a texture of `desc` goes into a heap: no render-target, depth or
-/// unordered-access use, and at most a quarter of a heap.
-pub(crate) fn fits(device: &ID3D12Device, desc: &D3D12_RESOURCE_DESC) -> bool {
+/// Whether a resource can use the non-RT/DS texture pool.
+pub(crate) fn eligible(desc: &D3D12_RESOURCE_DESC) -> bool {
     const USES: i32 = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0
         | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0
         | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0
         | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS.0;
-    if desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER || desc.Flags.0 & USES != 0 || desc.SampleDesc.Count > 1 {
-        return false;
-    }
-    // SAFETY: a plain query.
-    let info = unsafe { device.GetResourceAllocationInfo(0, &[*desc]) };
-    info.SizeInBytes != u64::MAX && info.SizeInBytes <= HEAP / 4 && info.Alignment <= ALIGN
+    desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
+        && desc.Flags.0 & USES == 0
+        && desc.SampleDesc.Count == 1
 }
 
-/// Room for a texture of `desc` in a heap ([`fits`] first): the heap and
-/// the placement, which the texture gives back with [`free`].
-pub(crate) fn place(device: &ID3D12Device, desc: &D3D12_RESOURCE_DESC) -> Option<(ID3D12Heap, Placement)> {
-    // SAFETY: a plain query.
-    let info = unsafe { device.GetResourceAllocationInfo(0, &[*desc]) };
-    let size = info.SizeInBytes.next_multiple_of(ALIGN);
+pub(crate) const SMALL: u64 = D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT as u64;
+
+/// Let the driver decide small alignment for ordinary 2D texture layouts.
+pub(crate) fn small_candidate(desc: &D3D12_RESOURCE_DESC) -> bool {
+    eligible(desc)
+        && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN
+        && desc.DepthOrArraySize == 1
+        && victory_formats::texture::format(desc.Format.0 as u32).is_some_and(|format| {
+            let block = u64::from(format.block);
+            let row = desc
+                .Width
+                .div_ceil(block)
+                .saturating_mul(u64::from(format.bytes));
+            !format.stencil && row.saturating_mul(u64::from(desc.Height).div_ceil(block)) <= ALIGN
+        })
+}
+
+/// Reserve the driver's allocation size at the required alignment.
+pub(crate) fn place(
+    device: &ID3D12Device,
+    info: D3D12_RESOURCE_ALLOCATION_INFO,
+    align: u64,
+) -> Option<(ID3D12Heap, Placement)> {
+    let max_size = if align == SMALL { ALIGN } else { HEAP / 4 };
+    if info.Alignment != align
+        || !(align..=max_size).contains(&info.SizeInBytes)
+        || !info.SizeInBytes.is_multiple_of(align)
+    {
+        return None;
+    }
     let mut heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     let heaps = heaps.get_or_insert_with(Heaps::default);
     heaps.reap();
-    heaps.allocate(device, size, info.Alignment.max(ALIGN))
+    heaps.allocate(device, info.SizeInBytes, align)
 }
 
 /// A range [`place`] gave whose texture could not be made there.
@@ -251,7 +272,7 @@ mod tests {
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             ..Default::default()
         };
-        assert!(fits(&host.device, &desc));
+        assert!(eligible(&desc));
         let mut heaps = Heaps::default();
         let (heap, a) = heaps.allocate(&host.device, ALIGN, ALIGN).unwrap();
         let mut texture: Option<ID3D12Resource> = None;

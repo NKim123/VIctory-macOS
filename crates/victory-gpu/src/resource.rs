@@ -900,6 +900,9 @@ struct Resource {
     /// The creation's initial state and clear value, for the host texture.
     #[cfg(windows)]
     made_with: (u32, Option<[u32; 5]>),
+    /// Finest mip the placed SRV that created this resource may read.
+    #[cfg(windows)]
+    first_mip: u32,
 }
 
 /// A title texture's host copy and the state it is in. The title's barriers
@@ -953,6 +956,8 @@ pub(crate) struct HostTexture {
     /// Its range in a heap of textures (`crate::placement`), given back
     /// when it goes; `None` for a committed texture.
     placement: Option<crate::placement::Placement>,
+    /// Budgeted physical backing, for a reserved mip suffix.
+    pub(crate) tiles: Option<crate::tiles::Tiled>,
     /// When the title last used it: presented frame and milliseconds since
     /// the first stamp ([`HostTexture::stamp`]).
     last: [std::sync::atomic::AtomicU64; 2],
@@ -966,12 +971,25 @@ impl HostTexture {
         state: u32,
         castable: Vec<u32>,
     ) -> Self {
+        Self::with_tiles(texture, state, castable, None)
+    }
+
+    fn with_tiles(
+        texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        state: u32,
+        castable: Vec<u32>,
+        tiles: Option<crate::tiles::Tiled>,
+    ) -> Self {
         // SAFETY: a plain query on a live resource.
         let desc = unsafe { texture.GetDesc() };
-        let bytes = crate::host::host().map_or(0, |h| {
-            // SAFETY: a plain query.
-            unsafe { h.device.GetResourceAllocationInfo(0, &[desc]) }.SizeInBytes
-        });
+        let bytes = if let Some(tiles) = &tiles {
+            tiles.bytes()
+        } else {
+            crate::host::host().map_or(0, |h| {
+                // SAFETY: a plain query.
+                unsafe { h.device.GetResourceAllocationInfo(0, &[desc]) }.SizeInBytes
+            })
+        };
         TEXTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         TEXTURE_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         HostTexture {
@@ -990,8 +1008,13 @@ impl HostTexture {
             viewed: false.into(),
             key: None,
             placement: None,
+            tiles,
             last: [crate::queue::presented().into(), now_ms().into()],
         }
+    }
+
+    pub(crate) fn first_mip(&self) -> u32 {
+        self.tiles.as_ref().map_or(0, |tiles| tiles.first_mip)
     }
 
     /// Whether its contents come from title memory: the host GPU does not
@@ -1121,6 +1144,9 @@ impl Drop for HostTexture {
     fn drop(&mut self) {
         if let Some(p) = self.placement.take() {
             crate::placement::free(self.texture.clone(), p);
+        }
+        if let Some(tiles) = self.tiles.take() {
+            tiles.retire(self.texture.clone());
         }
         TEXTURES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         TEXTURE_BYTES.fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
@@ -1472,6 +1498,7 @@ fn shared_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
+    first_mip: u32,
 ) -> Option<std::sync::Arc<HostTexture>> {
     let d = host_desc(desc)?;
     let title_format = pc_format(desc.format);
@@ -1480,17 +1507,11 @@ fn shared_texture(
     let map = map.get_or_insert_with(Default::default);
     let live = key.and_then(|k| map.get(&k)?.upgrade());
     if let Some(t) = &live
+        && t.first_mip() <= first_mip
         && takes(t, &d, title_format)
     {
         SHARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if let Some(host) = crate::host::host() {
-            // The live texture's own description: `d` may ask for uses its
-            // format does not take on this host (unordered access on
-            // B5G5R5A1 on NVIDIA), which the query rejects by removing the
-            // device. SAFETY: plain queries on a live resource.
-            let info = unsafe { host.device.GetResourceAllocationInfo(0, &[t.texture.GetDesc()]) };
-            SAVED.fetch_add(info.SizeInBytes, std::sync::atomic::Ordering::Relaxed);
-        }
+        SAVED.fetch_add(t.bytes, std::sync::atomic::Ordering::Relaxed);
         return live;
     }
     // Host textures are made on first use, in any order: the new one takes
@@ -1513,7 +1534,7 @@ fn shared_texture(
     if PACKED_16.contains(&title_format) && d.flags & (RENDER_TARGET | UNORDERED) != 0 {
         d.format = target_format(title_format);
     }
-    let mut t = make_texture(&d, state, clear)?;
+    let mut t = make_texture(&d, state, clear, first_mip)?;
     if PACKED_16.contains(&title_format) && d.format == RGBA8_UNORM {
         t.promoted_from = Some(title_format);
     }
@@ -1541,6 +1562,9 @@ fn takes(t: &HostTexture, d: &ResourceDesc, title_format: u32) -> bool {
     // SAFETY: a live resource.
     let td = unsafe { t.texture.GetDesc() };
     let (flags, own) = (td.Flags.0 as u32, td.Format.0 as u32);
+    if t.tiles.is_some() && own != d.format {
+        return false;
+    }
     if d.flags & USES & !flags != 0 {
         return false;
     }
@@ -1571,7 +1595,12 @@ fn current(this: This) -> bool {
 /// [`castable`]'s formats (colour textures, through the enhanced-barrier
 /// creation; it starts in the common state) where the host takes that.
 #[cfg(windows)]
-fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<HostTexture> {
+fn make_texture(
+    d: &ResourceDesc,
+    state: u32,
+    clear: *const c_void,
+    first_mip: u32,
+) -> Option<HostTexture> {
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
     use windows::core::Interface;
@@ -1602,46 +1631,107 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         () => castable(d.format),
     };
     let mut initial = crate::host::legal_for(d.flags, crate::host::texture_state(state));
-    // In a heap of textures if it fits there (`crate::placement`).
     // SAFETY: the description has the host layout (checked size).
     let plain = unsafe { std::ptr::from_ref(d).cast::<D3D12_RESOURCE_DESC>().read_unaligned() };
-    let mut placement = None;
-    if clear_value.is_none()
-        && crate::placement::fits(&host.device, &plain)
-        && let Some((heap, p)) = crate::placement::place(&host.device, &plain)
+    if initial == 0
+        && clear_value.is_none()
+        && let Some((texture, tiles)) = crate::tiles::Tiled::create(&host.device, plain, first_mip)
     {
-        let formats: Vec<DXGI_FORMAT> = castable_formats.iter().map(|&f| DXGI_FORMAT(f as i32)).collect();
-        let made = match host.device.cast::<ID3D12Device10>() {
-            Ok(device) if !formats.is_empty() => {
-                let desc1 = desc1_of(&plain);
-                // SAFETY: a range of the heap for this description; the
-                // list of formats lives through the call.
+        crate::host::name(&texture, || {
+            format!(
+                "reserved texture {}x{} f{} from mip {first_mip}",
+                d.width, d.height, d.format
+            )
+        });
+        return Some(HostTexture::with_tiles(
+            texture,
+            initial,
+            Vec::new(),
+            Some(tiles),
+        ));
+    }
+    // In a heap of textures if it fits there (`crate::placement`).
+    let mut placement = None;
+    if clear_value.is_none() && crate::placement::eligible(&plain) {
+        let formats: Vec<DXGI_FORMAT> = castable_formats
+            .iter()
+            .map(|&f| DXGI_FORMAT(f as i32))
+            .collect();
+        let enhanced = (!formats.is_empty())
+            .then(|| host.device.cast::<ID3D12Device10>().ok())
+            .flatten();
+        let small = crate::placement::SMALL;
+        for alignment in [small, 0] {
+            let is_small = alignment == small;
+            let desc = D3D12_RESOURCE_DESC {
+                Alignment: alignment,
+                ..plain
+            };
+            if is_small && !crate::placement::small_candidate(&desc) {
+                continue;
+            }
+            let desc1 = desc1_of(&desc);
+            // Match the creation's cast list when sizing a sub-64 KiB placement.
+            let info = if is_small && enhanced.is_some() {
+                let Ok(device) = host.device.cast::<ID3D12Device12>() else {
+                    continue;
+                };
+                // SAFETY: one description, count and pointer for its cast list.
                 unsafe {
+                    device.GetResourceAllocationInfo3(
+                        0,
+                        1,
+                        &desc1,
+                        Some(&(formats.len() as u32)),
+                        Some(&formats.as_ptr()),
+                        None,
+                    )
+                }
+            } else {
+                // SAFETY: one description with an explicit or default alignment.
+                unsafe { host.device.GetResourceAllocationInfo(0, &[desc]) }
+            };
+            let Some((heap, p)) = crate::placement::place(
+                &host.device,
+                info,
+                if is_small {
+                    small
+                } else {
+                    u64::from(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
+                },
+            ) else {
+                continue;
+            };
+            // SAFETY: this queried range is reserved for the description and
+            // the cast list and out pointer remain live through creation.
+            let made = unsafe {
+                if let Some(device) = &enhanced {
                     device.CreatePlacedResource2(&heap, p.offset(), &desc1, D3D12_BARRIER_LAYOUT_COMMON, None, Some(&formats), &mut texture)
+                } else {
+                    host.device.CreatePlacedResource(
+                        &heap,
+                        p.offset(),
+                        &desc,
+                        D3D12_RESOURCE_STATES(initial as i32),
+                        None,
+                        &mut texture,
+                    )
                 }
-                .map(|()| 0)
-            }
-            _ => {
-                // SAFETY: as above.
-                unsafe {
-                    host.device.CreatePlacedResource(&heap, p.offset(), &plain, D3D12_RESOURCE_STATES(initial as i32), None, &mut texture)
-                }
-                .map(|()| {
+            };
+            if made.is_ok() && texture.is_some() {
+                if enhanced.is_some() {
+                    initial = 0;
+                } else {
                     castable_formats.clear();
-                    initial
-                })
-            }
-        };
-        match made {
-            Ok(state) => {
-                initial = state;
+                }
                 placement = Some(p);
+                break;
             }
-            Err(e) => {
+            texture = None;
+            crate::placement::unplace(p);
+            if !is_small && let Err(e) = made {
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| tracing::warn!(error = %e, desc = ?d, "a texture not placed in a heap: committed"));
-                crate::placement::unplace(p);
-                texture = None;
             }
         }
     }
@@ -1770,7 +1860,7 @@ impl Resource {
         // maps, which `evict` holds while it takes this lock).
         let (state, clear) = self.made_with;
         let clear = clear.as_ref().map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast());
-        let made = shared_texture(self.data() as u64, &self.desc, state, clear);
+        let made = shared_texture(self.data() as u64, &self.desc, state, clear, self.first_mip);
         // A texture made meanwhile by another thread is the memory's too.
         self.host.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(made).clone()
     }
@@ -2247,9 +2337,10 @@ fn hand_out_resource(
     clear: *const c_void,
     iid: *const Iid,
     out: *mut This,
+    first_mip: u32,
 ) -> HRESULT {
     #[cfg(not(windows))]
-    let _ = (state, clear);
+    let _ = (state, clear, first_mip);
     let resource = Box::new(Resource {
         object: Object::new(&RESOURCE_FUNCTIONS),
         desc,
@@ -2263,6 +2354,8 @@ fn hand_out_resource(
         #[cfg(windows)]
         // SAFETY: the title passes a whole clear value (or null).
         made_with: (state, (!clear.is_null()).then(|| unsafe { clear.cast::<[u32; 5]>().read_unaligned() })),
+        #[cfg(windows)]
+        first_mip,
     });
     #[cfg(windows)]
     if desc.dimension == BUFFER {
@@ -2467,6 +2560,7 @@ pub(crate) extern "system" fn create_committed(
         clear,
         iid,
         out,
+        0,
     )
 }
 
@@ -2532,6 +2626,14 @@ pub(crate) extern "system" fn unregister_page_pool(_: This, handle: usize) -> HR
     }
 }
 
+const DEFAULT_ADDRESS_HEAP: HeapProperties = HeapProperties {
+    kind: 1,
+    cpu_pages: 0,
+    pool: 0,
+    creation_nodes: 1,
+    visible_nodes: 1,
+};
+
 /// Device method 0x428, one of the `ID3D12Device9` to `ID3D12Device11`
 /// additions. From Grand Theft Auto VI's call: a resource at a virtual
 /// address the title mapped itself, `(address, desc1, initial barrier
@@ -2562,23 +2664,16 @@ pub(crate) extern "system" fn create_at_address(
         layout,
         "resource at an address"
     );
-    const COMMON: u32 = 0;
-    const DEFAULT: HeapProperties = HeapProperties {
-        kind: 1,
-        cpu_pages: 0,
-        pool: 0,
-        creation_nodes: 1,
-        visible_nodes: 1,
-    };
     hand_out_resource(
         desc,
-        DEFAULT,
+        DEFAULT_ADDRESS_HEAP,
         0,
         Backing::Address(address as *mut u8),
-        COMMON,
+        0,
         clear,
         iid,
         out,
+        0,
     )
 }
 
@@ -2609,7 +2704,17 @@ pub(crate) fn placed_size(desc: &[u32; 14]) -> Option<u64> {
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
+#[cfg(test)]
 pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+    texture_at_mip(address, desc, 0)
+}
+
+/// The native texture for a placed 2D SRV, with every mip the SRV may read.
+#[cfg(windows)]
+pub(crate) fn texture_at_mip(address: u64, desc: &[u32; 14], first_mip: u32) -> Option<This> {
+    if address == 0 {
+        return None;
+    }
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     // Words 1 and 13 are padding (stack bytes in the title's records).
     let mut desc = *desc;
@@ -2621,23 +2726,40 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     // host texture until the title rewrites them).
     if let Some(&r) = map.get(&(address, *desc))
         && current(r as This)
+        && made(resource(r as This)).map_or_else(
+            || resource(r as This).first_mip <= first_mip,
+            |copy| copy.first_mip() <= first_mip,
+        )
     {
-        return Some(r as This);
+        drop(map);
+        return resource(r as This).host().map(|_| r as This);
     }
     // SAFETY: 56 bytes in the description's layout.
     let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
     if d.dimension == BUFFER {
         return None;
     }
+    let first_mip = if first_mip != 0
+        && crate::tiles::enabled()
+        && texture_layout(&d).is_some_and(|t| {
+            let layout = &t.planes[0].layout;
+            layout.addressable() && layout.bytes_from(first_mip) < layout.size
+        }) {
+        first_mip
+    } else {
+        0
+    };
     let mut out = std::ptr::null();
-    let made = create_at_address(
-        std::ptr::null(),
-        address,
-        &d,
+    let made = hand_out_resource(
+        d,
+        DEFAULT_ADDRESS_HEAP,
+        0,
+        Backing::Address(address as *mut u8),
         0,
         std::ptr::null(),
         &RESOURCE_IIDS[0],
         &mut out,
+        first_mip,
     );
     if made != S_OK {
         return None;
@@ -2695,6 +2817,7 @@ pub(crate) extern "system" fn create_placed(
         clear,
         iid,
         out,
+        0,
     )
 }
 
@@ -3039,6 +3162,31 @@ mod tests {
             S_OK
         );
         heap
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn small_texture_packing_preserves_the_native_cast_list() {
+        if !crate::watch::rosetta() || crate::host::host().is_none() {
+            return;
+        }
+        for format in [28, 98] {
+            let copy = make_texture(&texture(32, 32, format, 1), 0, std::ptr::null(), 0).unwrap();
+            // SAFETY: this test owns a reference to the texture.
+            let desc = unsafe { copy.texture.GetDesc() };
+            eprintln!(
+                "PLACEMENT production format {format}: {} byte alignment, {} byte allocation, {} cast formats",
+                desc.Alignment,
+                copy.bytes,
+                copy.castable.len()
+            );
+            assert_eq!(desc.Alignment, crate::placement::SMALL);
+            assert!(!copy.castable.is_empty());
+        }
+        let copy = make_texture(&texture(512, 512, 28, 1), 0, std::ptr::null(), 0).unwrap();
+        // SAFETY: this test owns a reference to the texture.
+        let desc = unsafe { copy.texture.GetDesc() };
+        assert_eq!(desc.Alignment, 64 << 10);
     }
 
     /// A title texture's host texture is made when first asked for, and a
