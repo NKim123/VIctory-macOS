@@ -234,7 +234,7 @@ pub(crate) fn lower_pruned(
     literal_halves: bool,
 ) -> Result<Lowered, ShaderError> {
     // Retry refusals from the legacy cross-half gates with whole-wave control flow.
-    let original = lower_with_structure(parts, keep, per_vertex_center);
+    let original = lower_with_structure(parts, keep, per_vertex_center, false);
     if !literal_halves
         || !parts.host_wave32
         || !parts.native.wave64
@@ -290,13 +290,33 @@ pub(crate) fn lower_literal(
         },
         keep,
         per_vertex_center,
+        false,
     )
+}
+
+pub(super) fn lower_partial_dispatch(parts: &Parts<'_>) -> Result<Lowered, ShaderError> {
+    if parts.native.wave64
+        || parts.native.stage != HwStage::Cs
+        || parts
+            .p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|inst| inst.name() == "s_barrier")
+    {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "partial dispatch requires a barrier-free wave32 compute program",
+        });
+    }
+    lower_with_structure(parts, None, false, true)
 }
 
 fn lower_with_structure(
     parts: &Parts,
     keep: Option<&KeptOutputs>,
     per_vertex_center: bool,
+    partial: bool,
 ) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     // Divergent sites where the halves meet (`lower::meet`): a pass that
@@ -304,7 +324,7 @@ fn lower_with_structure(
     let mut plan: Set<MeetSite> = Set::default();
     loop {
         let found = std::cell::RefCell::new(Set::default());
-        let r = Lower::new(parts, &bad, keep, per_vertex_center, &plan, &found).run();
+        let r = Lower::new(parts, &bad, keep, per_vertex_center, &plan, &found).run(partial);
         let found = found.into_inner();
         if !found.is_empty() {
             plan.extend(found);
@@ -1640,7 +1660,42 @@ impl<'a> Lower<'a> {
         Ok(if float { self.as_int(r) } else { r })
     }
 
-    fn run(mut self) -> Result<Lowered, Stop> {
+    fn dispatch_tail(&mut self) {
+        let entry = self.s.entry;
+        let width = self.s.threads.expect("compute thread count")[0];
+        let index = self
+            .x
+            .native
+            .layout
+            .iter()
+            .map(|p| u32::from(p.user_data) + p.sgprs)
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(self.user_first());
+        let limit = self.user_at(UserData {
+            root: RootType::Other(super::USER_DISPATCH_THREADS_X),
+            slot: 0,
+            dword: width,
+            index,
+        });
+        let Val::I32(x) = self.compute_id("threadId.i32", 93, 0) else {
+            unreachable!()
+        };
+        let zero = self.s.m.i32(0);
+        let unlimited = self.s.m.cmp(entry, pred::EQ, limit, zero);
+        let inside = self.s.m.cmp(entry, pred::IULT, x, limit);
+        let active = self.s.m.bin(entry, Bin::Or, unlimited, inside);
+        let body = self.s.m.new_block();
+        let done = self.s.m.new_block();
+        self.s.m.terminate(entry, Term::CondBr(active, body, done));
+        self.s.m.terminate(done, Term::Ret);
+        self.s.entry = body;
+    }
+
+    fn run(mut self, partial: bool) -> Result<Lowered, Stop> {
+        if partial {
+            self.dispatch_tail();
+        }
         let p = self.x.p;
         self.halves_only = self.places_read_as_halves();
         let order = crate::ir::reverse_postorder(&p.blocks);
@@ -2209,11 +2264,19 @@ impl<'a> Lower<'a> {
         }
     }
 
+    fn user_first(&self) -> u32 {
+        if crate::spill::is_spilled(self.x.native) {
+            crate::spill::FIRST
+        } else {
+            0
+        }
+    }
+
     /// User-data dword `dword` of root parameter `param` as the host passes
     /// it (for a root descriptor: its GPU address, low dword first).
     fn user_dword(&mut self, param: usize, dword: u32) -> V {
         let rp = self.x.native.layout[param];
-        let index = u32::from(rp.user_data) + dword;
+        let index = u32::from(rp.user_data) + dword - self.user_first();
         self.user_at(UserData {
             index,
             slot: rp.slot,
@@ -2233,7 +2296,7 @@ impl<'a> Lower<'a> {
         let rp = self.x.native.layout[param];
         // The descriptor's two user-data dwords hold its address on the
         // console; such a program never reads them as data (`user`).
-        let index = u32::from(rp.user_data);
+        let index = u32::from(rp.user_data) - self.user_first();
         if let Some(&h) = self.root_views.get(&index) {
             return h;
         }
@@ -2262,7 +2325,7 @@ impl<'a> Lower<'a> {
             return None;
         }
         Some(self.user_at(UserData {
-            index: u32::from(rp.user_data) + 1,
+            index: u32::from(rp.user_data) + 1 - self.user_first(),
             slot: rp.slot,
             root: RootType::Descriptor,
             dword: super::ROOT_VIEW_OFFSET,

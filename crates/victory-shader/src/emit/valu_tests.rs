@@ -1684,7 +1684,7 @@ fn bfe_signed_and_unsigned_match_rdna2() {
 /// tables at s4 and s6 (slots 1 and 2); `used` lists (table user SGPR,
 /// kind, table offset in dwords, descriptor dwords).
 fn lower_cs32(words: &[u32], used: &[(u8, ResourceType, u32, u8)], validate: bool) -> HostShader {
-    lower_cs32_with(words, used, validate, false, false, false)
+    lower_cs32_with(words, used, validate, false, false, false, false)
 }
 
 /// [`lower_cs32`], with 64-bit image atomics under locks if `atomic_locks`,
@@ -1697,6 +1697,7 @@ fn lower_cs32_with(
     atomic_locks: bool,
     atomic_lock_rounds: bool,
     atomic_umax: bool,
+    partial: bool,
 ) -> HostShader {
     let param = |root, user_data, slot| RootParam {
         root,
@@ -1740,7 +1741,7 @@ fn lower_cs32_with(
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, &native).expect("io::raise");
-    let lowered = lower::lower(&lower::Parts {
+    let parts = lower::Parts {
         halves_rendezvous: false,
         native: &native,
         p: &p,
@@ -1759,8 +1760,12 @@ fn lower_cs32_with(
         narrow_waves: false,
         uav_size_level0: false,
         view_marks: false,
-    })
-    .expect("lower");
+    };
+    let lowered = if partial {
+        lower::lower_partial_dispatch(&parts)
+    } else {
+        lower::lower(&parts)
+    }.expect("lower");
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -1897,6 +1902,60 @@ fn integer_texture_loads_and_gathers_keep_exact_bits() {
         ran += 1;
     }
     assert!(ran > 0, "integer texture test needs an SM 6.6 device");
+}
+
+#[test]
+fn partial_compute_dispatch_only_runs_threads_below_the_limit() {
+    let mut words = vec![s_mov_b32(5, 128)];
+    words.extend(s_load_dwordx4(8, 4));
+    // Store 1 at byte offset 4 * v0, the thread's X within the group.
+    words.extend([
+        vop1(1, 1, 129),
+        0x1A << 25 | 2 << 17 | 130, // v_lshlrev_b32 v2, 2, v0
+        0xE070_1000,
+        0x8002_0102,
+        S_ENDPGM,
+    ]);
+    let shader = lower_cs32_with(
+        &words,
+        &[(4, ResourceType::Uav, 0, 4)],
+        true,
+        false,
+        false,
+        false,
+        true,
+    );
+    assert_eq!(shader.compute_threads(), Some([32, 1, 1]));
+    let tail = shader.dispatch_threads_x().unwrap();
+    assert_eq!(tail.dword, 32);
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for warp in [false, true] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root, pso) = host.compute_pipeline(&shader).unwrap();
+        for limit in [0, 13, 32] {
+            let mut data = vec![0; shader.user_data_dwords() as usize];
+            data[tail.index as usize] = limit;
+            let result = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(data))],
+                        views: &[View::RawUav(32)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            let want: Vec<_> = (0..32)
+                .map(|x| u32::from(limit == 0 || x < limit))
+                .collect();
+            assert_eq!(result[0], want);
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "partial dispatch test needs an SM 6.6 device");
 }
 
 #[test]
@@ -2141,7 +2200,7 @@ fn image_atomics_of_64_bits() {
     // rounds first. Texel (0, 0) puts all 32 lanes on one lock.
     for (locks, rounds) in [(false, false), (true, false), (true, true)] {
         let used = &[(4, ResourceType::Uav, 0, 8)];
-        let shader = lower_cs32_with(&words, used, true, locks, rounds, false);
+        let shader = lower_cs32_with(&words, used, true, locks, rounds, false, false);
         assert_eq!(shader.view_marks, locks, "the lock words' buffer");
         for (label, warp) in [("hardware", false), ("warp", true)] {
             let Ok(host) = Host::new(warp) else {
@@ -2209,7 +2268,7 @@ fn locked_atomics64(
     (width, height): (u32, u32),
     groups: u32,
 ) -> Option<(Vec<u64>, Vec<u32>, &'static str, std::time::Duration)> {
-    let shader = lower_cs32_with(words, &[(4, ResourceType::Uav, 0, 8)], true, true, rounds, umax);
+    let shader = lower_cs32_with(words, &[(4, ResourceType::Uav, 0, 8)], true, true, rounds, umax, false);
     let (host, label) = [("hardware", false), ("warp", true)]
         .into_iter()
         .find_map(|(label, warp)| Host::new(warp).ok().map(|h| (h, label)))?;

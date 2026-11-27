@@ -228,6 +228,90 @@ fn quad_local_dpp8_recovers_only_a_shared_quad_permutation() {
 }
 
 #[test]
+fn spilled_compute_constants_compact_before_the_dispatch_tail_word() {
+    let words = [
+        0x8703_FF01u32,
+        0x0000_00FF, // s3 = s1 & 0xff
+        0xBE82_0300, // s2 = s0
+        0xF400_0141,
+        0xFA00_0010, // s_load_dword s5, s[2:3], 0x10
+        0x7E02_0205, // v_mov_b32 v1, s5
+        0xD834_0000,
+        0x0000_0100, // ds_write_b32 v0, v1
+        S_ENDPGM,
+    ];
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 32,
+        layout: vec![RootParam {
+            sgprs: 8,
+            ..root(RootType::Constants, 16, 0)
+        }],
+        used: vec![],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 2 << 1 | 1 << 15,
+            threads: [32, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let mut p = ir::build(&native.code, false, native.vgprs).unwrap();
+    assert_eq!(crate::spill::user_data(&mut p, &native), 1);
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let parts = Parts {
+        halves_rendezvous: false,
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+        atomic_locks: false,
+        atomic_lock_rounds: false,
+        atomic_umax: false,
+        bias_as_gradients: false,
+        host_wave32: false,
+        narrow_waves: false,
+        uav_size_level0: false,
+        view_marks: false,
+    };
+    let result = super::lower_partial_dispatch(&parts).unwrap();
+    assert_eq!(
+        result.user_data,
+        [
+            super::UserData {
+                index: 4,
+                slot: 0,
+                root: RootType::Constants,
+                dword: 4
+            },
+            super::UserData {
+                index: 8,
+                slot: 0,
+                root: RootType::Other(crate::emit::USER_DISPATCH_THREADS_X),
+                dword: 32
+            },
+        ]
+    );
+    assert_eq!(lower(&parts).unwrap().user_data, result.user_data[..1]);
+
+    let mut wave64 = native.clone();
+    wave64.wave64 = true;
+    assert!(
+        super::lower_partial_dispatch(&Parts {
+            native: &wave64,
+            ..parts
+        })
+        .is_err()
+    );
+}
+
+#[test]
 fn lds_float_min_and_max_lower_to_compare_exchange() {
     for opcode in [0x12, 0x13] {
         let words = [

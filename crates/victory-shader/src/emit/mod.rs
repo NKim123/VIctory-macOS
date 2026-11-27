@@ -448,6 +448,24 @@ pub struct HostShader {
 }
 
 impl HostShader {
+    /// Host root-constant binding for a partial dispatch, when requested.
+    /// Its dword is the X dimension of the group.
+    pub fn dispatch_threads_x(&self) -> Option<UserData> {
+        self.user_data
+            .iter()
+            .copied()
+            .find(|u| u.root == RootType::Other(USER_DISPATCH_THREADS_X))
+    }
+
+    /// Compute thread-group dimensions declared in the emitted DXIL.
+    pub fn compute_threads(&self) -> Option<[u32; 3]> {
+        let c = Container::parse(&self.dxil).ok()?;
+        let psv = c.part(FourCC::PSV0)?.data;
+        let word = |at| crate::dxbc::u32_at(psv, at).ok();
+        (self.stage == HwStage::Cs && word(0)? >= 48).then_some(())?;
+        Some([word(40)?, word(44)?, word(48)?])
+    }
+
     /// Size of the user-data buffer the shader declares, in dwords (a
     /// multiple of 4; 0 when it reads none). Root constants must cover it.
     pub fn user_data_dwords(&self) -> u32 {
@@ -465,6 +483,9 @@ impl HostShader {
 /// index of the host's raw SRV of it (module notes, "Root SRVs and root
 /// UAVs"); dwords 0 and 1 are its address (programs using title memory).
 pub const ROOT_SRV_VIEW: u32 = 2;
+
+/// Host-supplied X thread count for a partial dispatch. Zero runs every lane.
+pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 /// As [`ROOT_SRV_VIEW`], for the raw UAV of a root UAV.
 pub const ROOT_UAV_VIEW: u32 = 3;
 /// [`UserData::dword`] of a root descriptor's entry that takes its
@@ -475,7 +496,7 @@ pub const ROOT_VIEW_OFFSET: u32 = 4;
 /// One dword of user data and the root parameter that fills it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UserData {
-    /// Dword in the user-data buffer (the console's user-data index).
+    /// Dword in the host user-data buffer.
     pub index: u32,
     /// Root parameter index in the title's root signature.
     pub slot: u8,
@@ -826,6 +847,9 @@ fn prepare(container: &[u8]) -> Result<Prepared<'_>, ShaderError> {
             st = Ok(next);
         }
     }
+    if crate::spill::user_data(&mut p, &native) != 0 {
+        st = structure::structure(&p);
+    }
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
@@ -882,8 +906,25 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 
 /// [`translate`] made as `options` say.
 pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, ShaderError> {
+    translate_dispatch(container, options, false)
+}
+
+/// Translates barrier-free wave32 compute for a dispatch that can end partway
+/// through its last group. The host binds the dispatch_threads_x metadata.
+pub fn translate_with_dispatch_threads_x(
+    container: &[u8],
+    options: Options,
+) -> Result<HostShader, ShaderError> {
+    translate_dispatch(container, options, true)
+}
+
+fn translate_dispatch(
+    container: &[u8],
+    options: Options,
+    partial: bool,
+) -> Result<HostShader, ShaderError> {
     let prep = prepare(container)?;
-    emit_pruned(
+    emit_pruned_dispatch(
         &EmitInput {
             c: &prep.c,
             native: &prep.native,
@@ -894,6 +935,7 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
         },
         options,
         None,
+        partial,
     )
 }
 
@@ -1023,6 +1065,15 @@ fn emit_pruned(
     options: Options,
     keep: Option<&lower::KeptOutputs>,
 ) -> Result<HostShader, ShaderError> {
+    emit_pruned_dispatch(input, options, keep, false)
+}
+
+fn emit_pruned_dispatch(
+    input: &EmitInput<'_>,
+    options: Options,
+    keep: Option<&lower::KeptOutputs>,
+    partial: bool,
+) -> Result<HostShader, ShaderError> {
     let EmitInput {
         c,
         native,
@@ -1115,16 +1166,26 @@ fn emit_pruned(
         uav_size_level0: options.uav_size_level0,
         halves_rendezvous: options.halves_rendezvous,
     };
-    let (l, heap_index_sources) = match lower::lower_pruned(&parts(st, res), keep,
-        options.per_vertex_center,
-        !options.disable_literal_halves,
-    ) {
+    let lowered = if partial {
+        lower::lower_partial_dispatch(&parts(st, res))
+    } else {
+        lower::lower_pruned(
+            &parts(st, res),
+            keep,
+            options.per_vertex_center,
+            !options.disable_literal_halves,
+        )
+    };
+    let (l, heap_index_sources) = match lowered {
         // A console wave the host splits into 32-lane halves needs both at
         // each group barrier, and lanes that left early for the end never
         // arrive; kept on to the end with EXEC off (`ir::keep_lanes_to_end`),
         // they do. A program with no such early exit stays refused.
         Err(e @ ShaderError::Unsupported { what, .. })
-            if options.host_wave32 && native.stage == HwStage::Cs && halves_refusal(what) =>
+            if !partial
+                && options.host_wave32
+                && native.stage == HwStage::Cs
+                && halves_refusal(what) =>
         {
             let Some(q) = crate::ir::keep_lanes_to_end(p) else {
                 return Err(e);
@@ -1145,7 +1206,7 @@ fn emit_pruned(
         // Discarded lanes kept on as helpers can read what no surviving
         // lane does (a register only killed lanes skipped writing); such a
         // program kills them as the console does (`structure::killing`).
-        Err(_) if !st.discards.is_empty() => {
+        Err(_) if !partial && !st.discards.is_empty() => {
             let st = structure::killing(p)?;
             let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
             let l = lower::lower_pruned(&parts(&st, &res), keep, options.per_vertex_center, false)?;
