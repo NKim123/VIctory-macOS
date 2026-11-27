@@ -2053,7 +2053,7 @@ impl State {
         }
         let view = host.mirror(index, handle, true);
         if let Some(view) = &view {
-            readable_entry(list, u, view, true, writes);
+            readable_entry(list, u, view, true, writes, Some((heap, index)));
         }
         if !samplers {
             list.defer_slot(&host.viewed, index);
@@ -2215,7 +2215,14 @@ impl State {
                     }
                     let view = crate::descriptor::view(handle);
                     if let Some(view) = &view {
-                        readable_entry(list, u, view, true, writes(u));
+                        readable_entry(
+                            list,
+                            u,
+                            view,
+                            true,
+                            writes(u),
+                            heap.index(handle).map(|i| (heap, i)),
+                        );
                     }
                     self.entry_end(list, memo, view.as_deref());
                 }
@@ -2247,7 +2254,14 @@ impl State {
                             None => host.make_at(index, view),
                         }
                         if let Some(u) = used_entry {
-                            readable_entry(list, u, view, true, writes(u));
+                            readable_entry(
+                                list,
+                                u,
+                                view,
+                                true,
+                                writes(u),
+                                heap.index(table + u64::from(k) * 32).map(|i| (heap, i)),
+                            );
                         }
                     }
                     None => {
@@ -2877,10 +2891,17 @@ fn table_uav_write_skip() -> bool {
 /// writes through the view mark their pages (every translated shader's do);
 /// the host's own (clears) do not.
 fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
-    readable_entry(list, u, view, marked, true);
+    readable_entry(list, u, view, marked, true, None);
 }
 
-fn readable_entry(list: &HostList, u: &UsedResource, view: &View, marked: bool, writes: bool) {
+fn readable_entry(
+    list: &HostList,
+    u: &UsedResource,
+    view: &View,
+    marked: bool,
+    writes: bool,
+    slot: Option<(&crate::descriptor::Heap, u32)>,
+) {
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
@@ -2931,8 +2952,14 @@ fn readable_entry(list: &HostList, u: &UsedResource, view: &View, marked: bool, 
             if !copied
                 && let Some(t) = crate::resource::host_copy(*resource as This)
                 && t.title_written()
+                && !crate::texture::upload(list, *resource as This, &t.texture)
+                && crate::heap_worker::on()
+                && let Some((heap, index)) = slot
+                && let Some(host) = heap.made_host()
+                && index < host.count()
             {
-                crate::texture::upload(list, *resource as This, &t.texture);
+                host.requeue_texture_slots(&[index], crate::queue::presented());
+                crate::heap_worker::kick(heap);
             }
             crate::list::ensure_state(list, *resource as This, SHADER_RESOURCE);
             #[cfg(feature = "diagnostics")]

@@ -1196,9 +1196,29 @@ pub fn writing(at: usize, len: usize) -> Writing {
     Writing { first, last }
 }
 
+type Intervals = std::collections::BTreeMap<usize, usize>;
+
+/// Inserts one interval, keeping disjoint, ordered runs.
+pub(crate) fn insert_interval(ranges: &mut Intervals, mut from: usize, mut to: usize) {
+    if from >= to {
+        return;
+    }
+    if let Some((&start, &end)) = ranges.range(..=from).next_back()
+        && end >= from
+    {
+        from = start;
+    }
+    while let Some((&start, &end)) = ranges.range(from..=to).next() {
+        to = to.max(end);
+        ranges.remove(&start);
+    }
+    ranges.insert(from, to);
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    crate::heap_worker::title_remapped(at, len);
     crate::texback::remapped(at, len);
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     remapped(&mut guards(), first, last);

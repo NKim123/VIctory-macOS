@@ -442,6 +442,21 @@ pub(crate) fn make_read(slots: &[u32]) {
     }
 }
 
+#[cfg(windows)]
+pub(crate) fn wake_remapped_textures(ranges: &std::collections::BTreeMap<usize, usize>) {
+    let frame = crate::queue::presented();
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live under SHADER_HEAPS.
+        let heap = unsafe { &*(at as *const Heap) };
+        if let Some(host) = heap.made_host()
+            && host.wake_remapped_textures(ranges, frame)
+        {
+            crate::heap_worker::kick(heap);
+        }
+    }
+}
+
 /// Wakes the background heap worker for any shader-visible view heap that has
 /// queued texture slots or tracked bindless textures.
 #[cfg(windows)]

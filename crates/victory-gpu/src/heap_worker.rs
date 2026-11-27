@@ -381,8 +381,22 @@ impl Drop for Batch {
 
 /// Pending heaps for the worker to sweep, plus its wakeup condvar.
 struct Job {
-    heaps: Mutex<Vec<HeldHeap>>,
+    pending: Mutex<Pending>,
     wake: Condvar,
+}
+
+#[derive(Default)]
+struct Pending {
+    heaps: Vec<HeldHeap>,
+    remaps: std::collections::BTreeMap<usize, usize>,
+}
+
+/// Called under the title's mapping lock. Only touches the worker inbox.
+pub(crate) fn title_remapped(from: usize, len: usize) {
+    let Some(job) = JOB.get() else { return };
+    let mut pending = lock(&job.pending);
+    crate::watch::insert_interval(&mut pending.remaps, from, from.saturating_add(len));
+    job.wake.notify_one();
 }
 
 static JOB: OnceLock<Job> = OnceLock::new();
@@ -404,7 +418,7 @@ pub(crate) fn kick(heap: &Heap) -> bool {
     static STARTED: OnceLock<bool> = OnceLock::new();
     let started = *STARTED.get_or_init(|| {
         JOB.get_or_init(|| Job {
-            heaps: Mutex::new(Vec::new()),
+            pending: Mutex::default(),
             wake: Condvar::new(),
         });
         match std::thread::Builder::new()
@@ -427,9 +441,9 @@ pub(crate) fn kick(heap: &Heap) -> bool {
         return false;
     };
     let this: This = std::ptr::from_ref(heap).cast();
-    let mut heaps = lock(&job.heaps);
-    if !heaps.iter().any(|h| h.ptr() == this) {
-        heaps.push(HeldHeap::new(heap));
+    let mut pending = lock(&job.pending);
+    if !pending.heaps.iter().any(|h| h.ptr() == this) {
+        pending.heaps.push(HeldHeap::new(heap));
     }
     job.wake.notify_one();
     true
@@ -475,20 +489,23 @@ fn worker() {
         return;
     };
     loop {
-        let heap = {
-            let mut heaps = lock(&job.heaps);
-            loop {
-                if let Some(next) = heaps.pop() {
-                    break next;
-                }
-                heaps = job.wake.wait(heaps).unwrap_or_else(|e| e.into_inner());
-            }
-        };
+        let mut pending = lock(&job.pending);
+        while pending.remaps.is_empty() && pending.heaps.is_empty() {
+            pending = job.wake.wait(pending).unwrap_or_else(|e| e.into_inner());
+        }
+        if !pending.remaps.is_empty() {
+            let remaps = std::mem::take(&mut pending.remaps);
+            drop(pending);
+            crate::descriptor::wake_remapped_textures(&remaps);
+            continue;
+        }
+        let heap = pending.heaps.pop().expect("pending heap");
+        drop(pending);
         if READY_BYTES.load(Relaxed) >= MAX_READY_BYTES {
             std::thread::sleep(std::time::Duration::from_millis(4));
-            let mut heaps = lock(&job.heaps);
-            if !heaps.iter().any(|h| h.ptr() == heap.ptr()) {
-                heaps.push(heap);
+            let mut pending = lock(&job.pending);
+            if !pending.heaps.iter().any(|h| h.ptr() == heap.ptr()) {
+                pending.heaps.push(heap);
             }
             continue;
         }
@@ -595,14 +612,15 @@ fn process_heap(heap: &Heap) {
             continue;
         }
         let Some(staging) = crate::texture::staging(resource, &copy.texture) else {
-            host.texture_slot_done(index, write);
+            host.texture_slot_later(index, write, frame, max_wait);
             continue;
         };
+        host.note_texture_slot_range(index, write, staging.title_range());
         let detile_start = Instant::now();
         let refreshed = staging.refresh_for_worker(&mut |sz| batch.alloc(sz));
         STATS[1].fetch_add(detile_start.elapsed().as_nanos() as u64, Relaxed);
         match refreshed {
-            WorkerRefresh::Uploaded(upload) => {
+            WorkerRefresh::Uploaded { upload, partial } => {
                 handled_resources.insert(resource as usize);
                 let sz = staging.size_bytes();
                 batch.push(
@@ -620,7 +638,11 @@ fn process_heap(heap: &Heap) {
                     },
                     sz,
                 );
-                host.texture_slot_done(index, write);
+                if partial {
+                    host.texture_slot_later(index, write, frame, max_wait);
+                } else {
+                    host.texture_slot_done(index, write);
+                }
             }
             WorkerRefresh::Unchanged => {
                 handled_resources.insert(resource as usize);
@@ -680,7 +702,7 @@ fn process_heap(heap: &Heap) {
         let detile_start = Instant::now();
         let refreshed = staging.refresh_for_worker(&mut |sz| batch.alloc(sz));
         STATS[1].fetch_add(detile_start.elapsed().as_nanos() as u64, Relaxed);
-        if let WorkerRefresh::Uploaded(upload) = refreshed {
+        if let WorkerRefresh::Uploaded { upload, .. } = refreshed {
             let sz = staging.size_bytes();
             batch.push(
                 ReadyUpload {

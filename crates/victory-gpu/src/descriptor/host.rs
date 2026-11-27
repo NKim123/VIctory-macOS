@@ -76,6 +76,7 @@ struct QueuedSlot {
     due_frame: u64,
     looks: u32,
     urgent: bool,
+    range: Option<(usize, usize)>,
 }
 
 /// Queue of shader-visible texture slots waiting for background creation and
@@ -101,6 +102,7 @@ impl UploadQueue {
                 due_frame: frame,
                 looks: 0,
                 urgent: false,
+                range: None,
             },
         );
     }
@@ -121,6 +123,7 @@ impl UploadQueue {
                             due_frame: frame,
                             looks: 0,
                             urgent: true,
+                            range: None,
                         },
                     );
                 }
@@ -128,7 +131,6 @@ impl UploadQueue {
         }
     }
 
-    #[allow(dead_code)] // hook for urgent bake-source pre-upload
     pub(crate) fn requeue(&mut self, indices: &[u32], frame: u64) {
         for &index in indices {
             if !self.slots.contains_key(&index) {
@@ -140,6 +142,7 @@ impl UploadQueue {
                         due_frame: frame,
                         looks: 0,
                         urgent: true,
+                        range: None,
                     },
                 );
             }
@@ -173,6 +176,35 @@ impl UploadQueue {
             let backoff = (1u64 << entry.looks.saturating_sub(1).min(10)).min(max_wait.max(1));
             entry.due_frame = frame.saturating_add(backoff);
         }
+    }
+
+    fn note_range(&mut self, index: u32, write: u64, range: (usize, usize)) {
+        if let Some(entry) = self.slots.get_mut(&index)
+            && entry.write == write
+        {
+            entry.range = Some(range);
+        }
+    }
+
+    fn wake_remapped(
+        &mut self,
+        ranges: &std::collections::BTreeMap<usize, usize>,
+        frame: u64,
+    ) -> bool {
+        let mut woke = false;
+        for entry in self.slots.values_mut() {
+            if let Some((from, to)) = entry.range
+                && ranges
+                    .range(..to)
+                    .next_back()
+                    .is_some_and(|(_, end)| *end > from)
+            {
+                entry.due_frame = frame;
+                entry.looks = 0;
+                woke = true;
+            }
+        }
+        woke
     }
 
     pub(crate) fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
@@ -2133,8 +2165,11 @@ impl HostHeap {
         drop(made);
         if !self.sampler && !PUBLISHING.get() && crate::heap_worker::on() {
             let mut uploads = self.uploads.lock().unwrap_or_else(|e| e.into_inner());
-            if !for_draw && is_texture_view(&view) {
-                uploads.written(index, crate::queue::presented());
+            if is_texture_view(&view) {
+                // A table use keeps any pending background upload alive.
+                if !for_draw {
+                    uploads.written(index, crate::queue::presented());
+                }
             } else {
                 uploads.remove(index);
             }
@@ -2173,6 +2208,24 @@ impl HostHeap {
         self.ready[index as usize].load(Ordering::Acquire) == key
     }
 
+    pub(crate) fn note_texture_slot_range(&self, index: u32, write: u64, range: (usize, usize)) {
+        self.uploads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .note_range(index, write, range);
+    }
+
+    pub(crate) fn wake_remapped_textures(
+        &self,
+        ranges: &std::collections::BTreeMap<usize, usize>,
+        frame: u64,
+    ) -> bool {
+        self.uploads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .wake_remapped(ranges, frame)
+    }
+
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
         self.uploads
             .lock()
@@ -2201,7 +2254,6 @@ impl HostHeap {
             .prioritize(indices, frame);
     }
 
-    #[allow(dead_code)] // hook for urgent bake-source pre-upload
     pub(crate) fn requeue_texture_slots(&self, indices: &[u32], frame: u64) {
         self.uploads
             .lock()
@@ -3651,6 +3703,28 @@ mod tests {
         crate::shadow::unregister(address, address as u64);
         drop(heap);
         crate::watch::tests::free(address);
+    }
+
+    #[test]
+    fn remapped_texture_slots_leave_backoff_only_for_overlapping_mappings() {
+        let mut queue = UploadQueue::default();
+        for (index, range) in [(0, (100, 200)), (1, (200, 300))] {
+            queue.written(index, 1);
+            let write = queue.queued(&[index])[0].1;
+            queue.note_range(index, write, range);
+            for _ in 0..7 {
+                queue.later(index, write, 1, 1024);
+            }
+        }
+        assert!(queue.due(2, 2).is_empty());
+        assert!(queue.wake_remapped(&[(190, 200)].into(), 2));
+        let due = queue.due(2, 2);
+        assert_eq!(
+            due.iter().map(|&(index, _)| index).collect::<Vec<_>>(),
+            vec![0]
+        );
+        queue.later(0, due[0].1, 2, 1024);
+        assert_eq!(queue.due(3, 2), due, "the retry starts at one frame again");
     }
 
     #[test]

@@ -4127,6 +4127,11 @@ impl HostList {
         self.deferred().textures.insert(key)
     }
 
+    /// Makes the next read try again if staging could not be prepared.
+    pub(crate) fn retry_texture(&self, key: usize) {
+        self.deferred().textures.remove(&key);
+    }
+
     pub(crate) fn alias_source_changed(
         &self,
         view: &ID3D12Resource,
