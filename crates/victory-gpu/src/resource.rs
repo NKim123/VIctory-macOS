@@ -107,6 +107,9 @@ pub(crate) struct AllocationInfo {
 
 const _: () = assert!(size_of::<HeapProperties>() == 20);
 const _: () = assert!(size_of::<HeapDesc>() == 48);
+// `descriptor::placed_resource_words` zeroes words 1 and 13 (struct padding).
+const _: () = assert!(std::mem::offset_of!(ResourceDesc, alignment) == 8);
+const _: () = assert!(std::mem::offset_of!(ResourceDesc, flags) == 48);
 const _: () = assert!(size_of::<ResourceDesc>() == 56);
 
 const BUFFER: u32 = 1;
@@ -1081,8 +1084,13 @@ impl HostTexture {
     pub(crate) fn note_state(&self, state: u32) {
         const RENDER_TARGET_UNORDERED_DEPTH_WRITE: u32 = 0x4 | 0x8 | 0x10;
         if state & RENDER_TARGET_UNORDERED_DEPTH_WRITE != 0 {
-            self.gpu_written.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.gpu_written.store(true, std::sync::atomic::Ordering::Release);
         }
+    }
+
+    /// Whether a list has moved this host texture into a GPU write state.
+    pub(crate) fn is_gpu_written(&self) -> bool {
+        self.gpu_written.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// A heap slot views it for unordered access.
@@ -2323,10 +2331,33 @@ fn hand_out_resource(
         crate::shadow::register(at, resource.data() as u64, desc.width);
     } else if host_desc(&desc).is_some() {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
+        LIVE_TEXTURES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(at);
+        let data_at = resource.data() as usize;
         let mut map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
-        map.entry(resource.data() as u64).or_default().push(at);
+        map.entry(data_at as u64).or_default().push(at);
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
+}
+
+/// Live title textures (by raw pointer), for fast [`hold`] checks from
+/// background threads before `Resource::drop` frees the allocation.
+#[cfg(windows)]
+static LIVE_TEXTURES: std::sync::Mutex<std::collections::BTreeSet<usize>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Holds title texture `this` alive for work on a background thread. Returns
+/// `None` if `this` is not a live texture or is already being released.
+#[cfg(windows)]
+pub(crate) fn hold(this: This) -> Option<Held> {
+    if this.is_null() {
+        return None;
+    }
+    // `Resource::drop` removes `this` under `LIVE_TEXTURES` before freeing it.
+    let live = LIVE_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    (live.contains(&(this as usize)) && crate::object::try_add_ref(this)).then_some(Held(this))
 }
 
 /// Title textures with a host copy, by the console memory they start at.
@@ -2342,6 +2373,11 @@ static TEXTURES_AT: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<usize>>
 /// so the title cannot free it while the caller uses it.
 #[cfg(windows)]
 pub(crate) struct Held(This);
+
+// SAFETY: owns a COM reference to a live `Resource`; only atomic refcounts and
+// locked/immutable fields are accessed across threads.
+#[cfg(windows)]
+unsafe impl Send for Held {}
 
 #[cfg(windows)]
 impl Held {
@@ -2428,11 +2464,16 @@ impl Drop for Resource {
         }
         if self.desc.dimension != BUFFER {
             crate::bindless::forget(std::ptr::from_ref::<Resource>(self) as usize);
-            crate::texback::released(std::ptr::from_ref::<Resource>(self) as usize);
+            LIVE_TEXTURES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&(std::ptr::from_ref::<Resource>(self) as usize));
+            let address = std::ptr::from_ref::<Resource>(self) as usize;
+            crate::texback::released(address);
             let mut map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
             let at = self.data() as u64;
             if let Some(list) = map.get_mut(&at) {
-                list.retain(|&r| r != std::ptr::from_ref::<Resource>(self) as usize);
+                list.retain(|&r| r != address);
                 if list.is_empty() {
                     map.remove(&at);
                 }
@@ -4407,5 +4448,189 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    /// An earlier title-memory upload in a command list must not suppress a
+    /// later alias copy from a GPU-written atlas (`R32_UINT` -> `R9G9B9E5`),
+    /// and a subsequent GPU write to the source in the same list must copy
+    /// again into the sampled view.
+    #[cfg(windows)]
+    #[test]
+    fn alias_after_title_upload_and_mid_list_gpu_write_copies_the_gpu_atlas() {
+        use crate::backend::{HostGpu, HostMemory};
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let h = heap(1 << 20);
+        let place = |desc: &ResourceDesc| {
+            let mut out = null;
+            assert_eq!(
+                create_placed(
+                    null,
+                    h,
+                    0,
+                    desc,
+                    0,
+                    null.cast(),
+                    &RESOURCE_IIDS[0],
+                    &mut out
+                ),
+                S_OK
+            );
+            out
+        };
+        // 4x4 R32G32_UINT (format 17, 8 bytes/texel) and 16x16 BC1_UNORM
+        // (format 71, 4x4 blocks of 8 bytes) cannot share a host texture
+        // across uncompressed/compressed families, so `alias_source` pairs them.
+        let source = place(&ResourceDesc {
+            flags: UNORDERED,
+            ..texture(4, 4, 17, 1)
+        });
+        let view = place(&texture(16, 16, 71, 1));
+        let written = host_resource(source).expect("written host texture");
+        let sampled = host_resource(view).expect("sampled host texture");
+        assert_eq!(alias_source(view).map(|a| a.get()), Some(source));
+
+        let (upload, data) = host.upload_buffer(2048).unwrap();
+        let first_light = 0x8c02_0100_55aa_1122_u64;
+        let second_light = 0x9d04_0200_cc33_7788_u64;
+        // SAFETY: two 1024-byte 4-row footprints inside the 2048-byte upload buffer.
+        unsafe {
+            for row in 0..4 {
+                for x in 0..4 {
+                    data.add(row * 256 + x * 8)
+                        .cast::<u64>()
+                        .write_unaligned(first_light);
+                    data.add(1024 + row * 256 + x * 8)
+                        .cast::<u64>()
+                        .write_unaligned(second_light);
+                }
+            }
+        }
+        let copy_into_source = |list: &crate::host::HostList, offset: u64| {
+            // SAFETY: borrowed COM pointers live through CopyTextureRegion.
+            unsafe {
+                let dst = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&written),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        SubresourceIndex: 0,
+                    },
+                };
+                let src = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&upload),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                            Offset: offset,
+                            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                Format: written.GetDesc().Format,
+                                Width: 4,
+                                Height: 4,
+                                Depth: 1,
+                                RowPitch: 256,
+                            },
+                        },
+                    },
+                };
+                crate::list::ensure_state(list, source, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
+                list.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+            }
+        };
+
+        let seed = host.new_list().unwrap();
+        copy_into_source(&seed, 0);
+        seed.close();
+        host.execute(&[&seed]);
+
+        let readback_heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let readback_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 1024,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut readback: Option<ID3D12Resource> = None;
+        // SAFETY: valid readback buffer description.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &readback_heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &readback_desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut readback,
+                )
+                .unwrap();
+        }
+        let readback = readback.unwrap();
+
+        let list = host.new_list().unwrap();
+        crate::texture::upload(&list, view, &sampled);
+        assert!(crate::texture::alias_copy(&list, source, view));
+        copy_into_source(&list, 1024);
+        assert!(crate::texture::alias_copy(&list, source, view));
+
+        crate::list::ensure_state(&list, view, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        // SAFETY: open list; valid readback footprint for 16x16 BC1 texture.
+        unsafe {
+            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&readback),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: sampled.GetDesc().Format,
+                            Width: 16,
+                            Height: 16,
+                            Depth: 1,
+                            RowPitch: 256,
+                        },
+                    },
+                },
+            };
+            let src = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&sampled),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: 0,
+                },
+            };
+            list.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        }
+        list.close();
+        host.execute(&[&list]);
+
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: completed GPU copy into a 1024-byte readback buffer.
+        let actual = unsafe {
+            readback.Map(0, None, Some(&mut mapped)).unwrap();
+            let texel = mapped.cast::<u64>().read_unaligned();
+            readback.Unmap(0, None);
+            texel
+        };
+        for r in [view, source, h] {
+            assert_eq!(slot::<Release>(r, 0x10)(r), 0);
+        }
+        assert_eq!(
+            actual, second_light,
+            "sampled alias view did not reflect the latest GPU-written atlas"
+        );
     }
 }

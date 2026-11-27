@@ -45,6 +45,7 @@ pub(super) struct InFlight {
     active_marks: usize,
     feedback: Option<MarkFeedback>,
     native_lists: Vec<Option<ID3D12CommandList>>,
+    barriers: Vec<BarrierList>,
     lists: Vec<Arc<HostList>>,
     upload: Option<crate::bindless::OwnedUpload>,
     _tiles: crate::tiled::Flushed,
@@ -190,7 +191,7 @@ impl BottomWrite {
         )
     }
 
-    fn value_for_wait(&self, address: usize, bytes: usize) -> Option<u64> {
+    pub(super) fn value_for_wait(&self, address: usize, bytes: usize) -> Option<u64> {
         if self.address == address
             && self.bytes == bytes
             && let crate::queue::Written::Value(value) = self.value
@@ -416,9 +417,9 @@ impl Host {
         &self,
         s: &mut Submission,
         sources: &[crate::texture::UploadSource],
-    ) {
+    ) -> bool {
         if sources.is_empty() || !s.busy() {
-            return;
+            return false;
         }
         let ranges = || {
             sources
@@ -463,6 +464,7 @@ impl Host {
         if let Some((value, why)) = pending {
             self.wait_inflight(s, value, why);
         }
+        pending.is_some()
     }
 
     /// A native GPU list can access a CPU label through a directly mapped
@@ -609,6 +611,7 @@ impl Host {
                 crate::resource::life::note(0, crate::resource::life::RAN, f.value, 0);
             }
             drop(f.native_lists);
+            self.recycle_barrier_lists(f.barriers);
             if let Some(work) = f.ordered {
                 assert!(
                     !s.busy(),
@@ -749,6 +752,7 @@ impl Host {
         s: &mut Submission,
         marks: Vec<Mark>,
         native_lists: Vec<Option<ID3D12CommandList>>,
+        barriers: Vec<BarrierList>,
         boundaries: &[usize],
         lists: &[Arc<HostList>],
         upload: Option<crate::bindless::OwnedUpload>,
@@ -848,6 +852,7 @@ impl Host {
             active_marks,
             feedback,
             native_lists: marked,
+            barriers,
             lists: lists.to_vec(),
             upload,
             _tiles: tiles,

@@ -1148,6 +1148,7 @@ fn omitted_mark_recovers_after_all_old_work_and_reuses_the_ring() {
             &mut pins,
             Some(std::slice::from_ref(&list)),
             Boundary::Synchronous,
+            &[],
         );
     }
     assert_eq!(s.flights.len(), 2);
@@ -1164,6 +1165,7 @@ fn omitted_mark_recovers_after_all_old_work_and_reuses_the_ring() {
         &mut pins,
         Some(std::slice::from_ref(&list)),
         Boundary::Synchronous,
+        &[],
     );
     assert!(s.busy());
     host.drain_inflight(&mut s, Boundary::Synchronous);

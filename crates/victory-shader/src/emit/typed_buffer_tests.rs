@@ -116,6 +116,7 @@ fn lowered() -> lower::Lowered {
         atomic_early_exit: false,
         bias_as_gradients: false,
         narrow_waves: false,
+        uav_size_level0: false,
         host_wave32: false,
         view_marks: false,
     })

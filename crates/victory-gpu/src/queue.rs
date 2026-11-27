@@ -31,6 +31,26 @@ pub(crate) struct QueueDesc {
     nodes: u32,
 }
 
+#[cfg(all(test, windows))]
+pub(crate) const QUEUE_IID: Iid = QUEUE_IIDS[0];
+
+#[cfg(all(test, windows))]
+impl QueueDesc {
+    pub(crate) fn compute() -> Self {
+        Self {
+            kind: 2,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn submit_one(queue: This, list: This) {
+    execute(queue, 1, &list);
+}
+
 /// The title reads the list type right after the header.
 #[repr(C)]
 struct Queue {
@@ -207,16 +227,11 @@ fn held() -> std::sync::MutexGuard<'static, Holding> {
     HELD.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-// A null fence cannot be signalled through the title API. Use it as a
-// flush marker so a wait cannot skip writes in an unsubmitted piece.
-#[cfg(windows)]
-const PIECE_BOUNDARY: usize = 0;
-
 #[cfg(windows)]
 fn push_segment(held: &mut Holding, queue: usize, segment: std::sync::Arc<crate::host::HostList>) {
     let waits = segment.waits();
     if !waits.is_empty() && crate::host::inflight_enabled() && held.holds_work(queue) {
-        held.push(queue, Item::Signal(PIECE_BOUNDARY, 0));
+        held.push(queue, Item::Boundary);
     }
     held.push(queue, Item::Segment(segment, waits));
 }
@@ -310,6 +325,35 @@ pub(crate) fn pump_held_if_free(why: Why) {
 #[cfg(windows)]
 const VALVE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Whether ready segments across queues and chained bottom-of-pipe waits are
+/// coalesced into one host submission (`VICTORY_COALESCE_PIECES`, on by default
+/// unless `"0"`).
+#[cfg(windows)]
+fn coalesce_pieces() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_COALESCE_PIECES").is_none_or(|v| v != "0");
+        if !on {
+            tracing::info!("queue piece coalescing disabled (VICTORY_COALESCE_PIECES=0)");
+        }
+        on
+    })
+}
+
+/// Maximum number of host command lists joined into one coalesced submission
+/// (`VICTORY_JOIN_LISTS`, default 64).
+#[cfg(windows)]
+fn join_lists() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_JOIN_LISTS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(64)
+    })
+}
+
 /// Runs what held work may run now (`why`), its time counted in
 /// [`BLOCKED_US`].
 #[cfg(windows)]
@@ -334,25 +378,47 @@ fn pump_work(held: &mut Holding, why: Why) {
         tracing::warn!(queue = kind(queue), ?waits, "held work runs without its waits after {VALVE:?} (safety valve)");
     }
     let fence = |f: usize| crate::fence::value(f as This);
+    let max_lists = join_lists();
+    let pending_write = |seg: &std::sync::Arc<crate::host::HostList>, wait: &crate::hold::ValueWait| {
+        seg.pending_write(wait)
+    };
+    let can_join = |piece: &[(std::sync::Arc<crate::host::HostList>, bool)],
+                    next: &std::sync::Arc<crate::host::HostList>| {
+        if piece.len() >= max_lists {
+            return false;
+        }
+        let existing = piece
+            .iter()
+            .fold(crate::hold::BatchFlags::default(), |acc, (s, _)| {
+                acc.merge(s.batch_flags())
+            });
+        crate::hold::can_join_batch(existing, next.batch_flags(), piece.len(), max_lists)
+    };
     let started = std::time::Instant::now();
     let mut ran = std::time::Duration::ZERO;
-    let mut run = |_: usize, segments: Vec<std::sync::Arc<crate::host::HostList>>| {
+    let mut run = |segments: Vec<(std::sync::Arc<crate::host::HostList>, bool)>| {
+        let (segments, barriers): (Vec<_>, Vec<_>) = segments.into_iter().unzip();
         let at = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::PumpExecutes, 1);
-        host.execute_title(&segments);
+        if barriers.iter().any(|&barrier| barrier) {
+            host.execute_title_with_barriers(&segments, &barriers);
+        } else {
+            host.execute_title(&segments);
+        }
         ran += at.elapsed();
         segments.into_iter().for_each(crate::list::recycle);
     };
     let mut signal = |f: usize, value: u64| {
-        if f != PIECE_BOUNDARY {
-            signal_host(f as This, value);
-            crate::fence::let_go(f as This);
-        }
+        signal_host(f as This, value);
+        crate::fence::let_go(f as This);
     };
     let pumped = held.pump(&mut crate::hold::World {
         read: &read,
         fence: &fence,
+        pending_write: &pending_write,
+        can_join: &can_join,
+        coalesce: coalesce_pieces(),
         run: &mut run,
         signal: &mut signal,
         release_wait: &mut |f| crate::fence::let_go(f as This),
@@ -363,6 +429,8 @@ fn pump_work(held: &mut Holding, why: Why) {
         a.pieces += pumped.pieces;
         a.segments += pumped.segments;
         a.unknown += pumped.unknown;
+        a.coalesced_bop_waits += pumped.coalesced_bop_waits;
+        a.hazard_splits += pumped.hazard_splits;
         for (queue, waited) in pumped.waited {
             a.released.push((kind(queue), waited, why));
         }
@@ -490,6 +558,8 @@ struct Account {
     unknown: u32,
     forced: u32,
     mappings: u32,
+    coalesced_bop_waits: u32,
+    hazard_splits: u32,
     /// Time in the pump outside host submissions.
     pump: std::time::Duration,
 }
@@ -524,13 +594,17 @@ fn account_frame(frame: u64) {
         cuts,
         early_resets = early,
         waited = a.released.len(),
+        coalesced_bop_waits = a.coalesced_bop_waits,
+        hazard_splits = a.hazard_splits,
         longest_ms = longest.as_secs_f64() * 1e3,
         pump_ms = a.pump.as_secs_f64() * 1e3,
         fence_waits,
         fence_wait_ms = fence_waited.as_secs_f64() * 1e3,
         "held work this frame (submissions; host submissions, segments; lists cut at waits; lists reset or released \
          while held, each keeping its own host list; segments that waited, released by \
-         submission/signal/wait/fence/present/timer {by:?}; time in the pump outside host submissions; events the          title waited on for fence values and their summed waits); held at the present: {}",
+         submission/signal/wait/fence/present/timer {by:?}; coalesced BoP waits and hazard splits; time in the pump \
+         outside host submissions; events the title waited on for fence values and their summed waits); held at the \
+         present: {}",
         blocked.len()
     );
     tracing::debug!(

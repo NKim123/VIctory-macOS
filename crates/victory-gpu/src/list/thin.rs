@@ -1164,6 +1164,8 @@ mod tests {
                     half_views: Vec::new(),
                 },
                 used: vec![],
+                used_written: Vec::new(),
+                write_unknown: true,
             },
         ))
     }

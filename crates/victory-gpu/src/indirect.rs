@@ -881,6 +881,8 @@ void main(uint3 group : SV_GroupID) { dst.Store(group.x * 4, 7); }
                     half_views: Vec::new(),
                 },
                 used: vec![],
+                used_written: Vec::new(),
+                write_unknown: true,
             },
         ));
         let passes = || BATCH_STATS[0].load(Ordering::Relaxed);

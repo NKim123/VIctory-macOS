@@ -32,7 +32,6 @@ pub struct ShaderCache {
     dir: PathBuf,
     cache: Cache,
     options: Options,
-    build: [u8; 32],
 }
 
 impl ShaderCache {
@@ -52,7 +51,6 @@ impl ShaderCache {
             dir,
             cache,
             options,
-            build: *translation_build(options),
         })
     }
 
@@ -61,8 +59,9 @@ impl ShaderCache {
     }
 
     pub fn host_shader(&self, container: &[u8]) -> (Result<HostShader, String>, bool) {
-        cached(&self.cache, &self.build, container, |c| {
-            translate(c, self.options)
+        let options = options_for_container(self.options, container);
+        cached(&self.cache, translation_build(options), container, |c| {
+            translate(c, options)
         })
     }
 }
@@ -136,6 +135,7 @@ struct LoweringSwitches {
     raw_structured_views: bool,
     wide_scalar_loads: bool,
     shader_opt: u32,
+    thread_ticket: bool,
 }
 
 impl LoweringSwitches {
@@ -145,6 +145,7 @@ impl LoweringSwitches {
             raw_structured_views: victory_shader::emit::raw_structured_views(),
             wide_scalar_loads: victory_shader::emit::wide_scalar_loads(),
             shader_opt: victory_shader::emit::shader_opt(),
+            thread_ticket: victory_shader::emit::thread_ticket(),
         }
     }
 }
@@ -160,7 +161,11 @@ fn key(
     h.update(translator.as_bytes());
     h.update(blake3::hash(encoding).as_bytes());
     h.update(&limit.to_le_bytes());
-    h.update(&[u8::from(wave32), u8::from(switches.port_cbv)]);
+    h.update(&[
+        u8::from(wave32),
+        u8::from(switches.port_cbv),
+        u8::from(switches.thread_ticket),
+    ]);
     if switches.port_cbv {
         // The flag changes how root CBVs are lowered and bound.
         h.update(b"bounded root CBVs");
@@ -195,6 +200,9 @@ fn options_for(wine: bool, wave32: bool) -> Options {
         bias_as_gradients: flag("VICTORY_BIAS_AS_GRADIENTS", wine),
         host_wave32: wave32,
         narrow_waves: flag("VICTORY_NARROW_WAVES", wine),
+        disable_literal_halves: !flag("VICTORY_LITERAL_HALVES", true),
+        per_vertex_center: false,
+        uav_size_level0: uav_size_level0(),
     }
 }
 
@@ -202,6 +210,64 @@ fn options_for(wine: bool, wave32: bool) -> Options {
 /// `VICTORY_ATOMIC_LOCK_ROUNDS`: on with the locks unless it is `0`.
 fn rounds_on(locks: bool, var: Option<&str>) -> bool {
     locks && var != Some("0")
+}
+
+/// Whether a size query on a writable image asks for level 0 in every
+/// program (`Options::uav_size_level0`): only with
+/// `VICTORY_UAV_SIZE_LEVEL0=1`. D3DMetal answers the undefined level DXC
+/// writes with a size of 0, so a program that computes with that size
+/// goes wrong: the title's shadow min/max program (`07f451a14b13fecb`)
+/// writes one flat value and sun shadows get 16x16-tile edges. Level 0
+/// in every program also changed the TAA disocclusion mask (speckles on
+/// skin), so a list of shader hashes instead of `1` turns it on for those
+/// programs only ([`uav_size_level0_for`]).
+fn uav_size_level0() -> bool {
+    uav_size_rule().0
+}
+
+/// Whether the program in `container` gets the level-0 size query: with
+/// `VICTORY_UAV_SIZE_LEVEL0=1`, or when the variable lists its hash (16
+/// digits, as the log prints shader hashes; several with commas).
+fn uav_size_level0_for(container: &[u8]) -> bool {
+    let (all, only) = uav_size_rule();
+    *all || (!only.is_empty() && only.contains(&blake3::hash(container).to_hex()[..16].to_owned()))
+}
+
+fn uav_size_rule() -> &'static (bool, Vec<String>) {
+    static RULE: OnceLock<(bool, Vec<String>)> = OnceLock::new();
+    RULE.get_or_init(|| {
+        let rule = uav_size(std::env::var("VICTORY_UAV_SIZE_LEVEL0").ok().as_deref());
+        if rule.0 {
+            tracing::info!("VICTORY_UAV_SIZE_LEVEL0=1: size queries on writable images ask for level 0");
+        } else if !rule.1.is_empty() {
+            tracing::info!(
+                programs = ?rule.1,
+                "VICTORY_UAV_SIZE_LEVEL0: size queries on writable images ask for level 0 in these programs only"
+            );
+        }
+        rule
+    })
+}
+
+/// `VICTORY_UAV_SIZE_LEVEL0`'s rule: `1` is every program; a list of
+/// 16-digit shader hashes is those programs; anything else is off.
+fn uav_size(value: Option<&str>) -> (bool, Vec<String>) {
+    let value = value.unwrap_or_default().trim();
+    if value == "1" {
+        return (true, Vec::new());
+    }
+    let hashes: Vec<String> = value
+        .split(',')
+        .map(|h| h.trim().to_ascii_lowercase())
+        .collect();
+    if hashes
+        .iter()
+        .all(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        (false, hashes)
+    } else {
+        (false, Vec::new())
+    }
 }
 
 /// Whether this runs under Wine (on a Mac: D3DMetal's D3D12).
@@ -235,10 +301,13 @@ pub(crate) fn translation_build(options: Options) -> &'static [u8; 32] {
     let rounds = locks && options.atomic_lock_rounds;
     let umax = rounds && options.atomic_umax;
     let early_exit = umax && options.atomic_early_exit;
-    if !locks && !bias && !narrow && !no_marks {
+    let no_literal = options.host_wave32 && options.disable_literal_halves;
+    let level0 = options.uav_size_level0;
+    let center = options.per_vertex_center;
+    if !locks && !bias && !narrow && !no_marks && !no_literal && !level0 && !center {
         return build(options.host_wave32);
     }
-    static BUILDS: [OnceLock<[u8; 32]>; 256] = [const { OnceLock::new() }; 256];
+    static BUILDS: [OnceLock<[u8; 32]>; 2048] = [const { OnceLock::new() }; 2048];
     let n = usize::from(locks)
         | usize::from(bias) << 1
         | usize::from(narrow) << 2
@@ -246,7 +315,10 @@ pub(crate) fn translation_build(options: Options) -> &'static [u8; 32] {
         | usize::from(umax) << 4
         | usize::from(early_exit) << 5
         | usize::from(options.host_wave32) << 6
-        | usize::from(no_marks) << 7;
+        | usize::from(no_marks) << 7
+        | usize::from(no_literal) << 8
+        | usize::from(level0) << 9
+        | usize::from(center) << 10;
     BUILDS[n].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build(options.host_wave32));
@@ -271,6 +343,7 @@ pub(crate) fn translation_build(options: Options) -> &'static [u8; 32] {
         if no_marks {
             h.update(b"no view marks");
         }
+        h.update(&(n as u16).to_le_bytes());
         *h.finalize().as_bytes()
     })
 }
@@ -278,6 +351,11 @@ pub(crate) fn translation_build(options: Options) -> &'static [u8; 32] {
 pub(crate) fn runtime_options() -> Options {
     static OPTIONS: OnceLock<Options> = OnceLock::new();
     *OPTIONS.get_or_init(|| options_for(under_wine(), host_wave32()))
+}
+
+fn options_for_container(mut options: Options, container: &[u8]) -> Options {
+    options.uav_size_level0 = uav_size_level0_for(container);
+    options
 }
 
 fn translate(container: &[u8], options: Options) -> Result<HostShader, String> {
@@ -288,7 +366,13 @@ fn translate(container: &[u8], options: Options) -> Result<HostShader, String> {
 pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
     match CACHE.get() {
         Some(cache) => cache.host_shader(container),
-        None => (translate(container, runtime_options()), false),
+        None => (
+            translate(
+                container,
+                options_for_container(runtime_options(), container),
+            ),
+            false,
+        ),
     }
 }
 
@@ -605,6 +689,55 @@ mod tests {
         assert!(!rounds_on(false, Some("1")), "nor when asked for");
     }
 
+    #[test]
+    fn the_size_query_switch_is_all_programs_or_a_list_of_hashes() {
+        assert_eq!(uav_size(None), (false, vec![]));
+        assert_eq!(uav_size(Some("")), (false, vec![]));
+        assert_eq!(uav_size(Some("0")), (false, vec![]));
+        assert_eq!(uav_size(Some("1")), (true, vec![]));
+        assert_eq!(uav_size(Some("yes")), (false, vec![]));
+        let two = vec!["07f451a14b13fecb".to_owned(), "11eeb27c2d15980d".to_owned()];
+        assert_eq!(
+            uav_size(Some("07F451A14B13FECB, 11eeb27c2d15980d")),
+            (false, two)
+        );
+        // A list with a wrong entry is no list: nothing is turned on.
+        assert_eq!(uav_size(Some("07f451a14b13fecb,1")), (false, vec![]));
+    }
+
+    /// Translations with the level-0 size query have cache entries of
+    /// their own.
+    #[test]
+    fn the_size_query_switch_keys_the_cache() {
+        let plain = Options {
+            view_marks: true,
+            ..Options::default()
+        };
+        let level0 = victory_shader::emit::Options {
+            uav_size_level0: true,
+            ..plain
+        };
+        assert_eq!(translation_build(plain), build(plain.host_wave32));
+        assert_ne!(translation_build(level0), build(level0.host_wave32));
+    }
+
+    #[test]
+    fn disabling_literal_halves_changes_the_translation_key() {
+        let options = victory_shader::emit::Options {
+            host_wave32: true,
+            ..runtime_options()
+        };
+        let on = translation_build(victory_shader::emit::Options {
+            disable_literal_halves: false,
+            ..options
+        });
+        let off = translation_build(victory_shader::emit::Options {
+            disable_literal_halves: true,
+            ..options
+        });
+        assert_ne!(on, off);
+    }
+
     fn shader() -> HostShader {
         HostShader {
             stage: HwStage::Ps,
@@ -729,13 +862,14 @@ mod tests {
         assert_ne!(k, key(version, encoding, limit, true, switches));
 
         let mut seen = std::collections::HashSet::new();
-        for flags in 0..8 {
+        for flags in 0..16 {
             for shader_opt in 0..128 {
                 let switches = LoweringSwitches {
                     port_cbv: flags & 1 != 0,
                     raw_structured_views: flags & 2 != 0,
                     wide_scalar_loads: flags & 4 != 0,
                     shader_opt,
+                    thread_ticket: flags & 8 != 0,
                 };
                 assert!(seen.insert(key(version, encoding, limit, false, switches)));
             }
@@ -779,6 +913,7 @@ mod tests {
                     narrow_waves: flags & 2 != 0,
                     host_wave32: flags & 4 != 0,
                     view_marks: flags & 8 != 0,
+                    ..Options::default()
                 };
                 assert!(seen.insert(translation_build(options)));
             }
