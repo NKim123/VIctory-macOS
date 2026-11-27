@@ -2641,7 +2641,7 @@ mod tests {
     #[test]
     #[ignore = "requires VICTORY_PHYSICAL_TILES=1 VICTORY_INDIRECT_BATCH=2"]
     fn aliased_indirect_batches_fill_a_window_and_stop_at_a_writer() {
-        use crate::host::{transition, uav_barrier};
+        use crate::host::transition;
         use crate::watch::PAGE;
         use windows_sys::Win32::System::Memory::{
             MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc, VirtualFree,
@@ -2662,6 +2662,7 @@ mod tests {
             std::sync::Arc::new(crate::alias::PhysicalHeap::new(&host.device, PAGE).unwrap());
         let address = base as usize + RESERVATION - PAGE;
         title.map(address, PAGE, Some((&heap, 0)));
+        let resource = buffer_at_address(address as u64, 12);
         let args = crate::shadow::find(address as u64, 12).unwrap();
         assert!(args.is_tiled());
         let gpu = args.gpu(address as u64);
@@ -2706,6 +2707,12 @@ void main() { record.Store(0, 17); }
             state.set_constants(false, 0, &[slot as u32], 0);
             let (out, offset) = place(&mut state);
             assert_eq!(offset, 32 * slot);
+            if slot == 0 {
+                assert_eq!(
+                    crate::list::test_enhanced_buffer_barrier(&list, resource, false),
+                    Some((0, 0))
+                );
+            }
             if slot == SLOTS - 1 {
                 copy(&out, offset, 0);
             }
@@ -2720,9 +2727,11 @@ void main() { record.Store(0, 17); }
             l.SetPipelineState(&writer);
             l.SetComputeRootUnorderedAccessView(0, gpu);
             l.Dispatch(1, 1, 1);
-            l.ResourceBarrier(&[uav_barrier()]);
         }
-        list.indirect_boundary();
+        assert_eq!(
+            crate::list::test_enhanced_buffer_barrier(&list, resource, true),
+            Some((0, 1))
+        );
         let (out, offset) = place(&mut state);
         assert_eq!(offset, 0, "the boundary starts a new pass after the writer");
         copy(&out, offset, 24);
@@ -2731,6 +2740,7 @@ void main() { record.Store(0, 17); }
         // SAFETY: the readback is mapped and execution has finished.
         let actual = unsafe { read.cast::<[[u32; 3]; 3]>().read() };
         assert_eq!(actual, [[7, 1, 1], [7, 1, 1], [17, 1, 1]]);
+        assert_eq!(crate::object::release_ref(resource), 0);
         drop(title);
         // SAFETY: release the reservation made by this test.
         let released = unsafe { VirtualFree(base, 0, MEM_RELEASE) };
@@ -3802,9 +3812,11 @@ void main() { dst.Store4(0, asuint(src[1])); }
             list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(0));
             list.list.SetPipelineState(&writer.1);
             list.list.Dispatch(1, 1, 1);
-            list.list.ResourceBarrier(&[crate::host::uav_barrier()]);
         }
-        list.sync_widened();
+        assert_eq!(
+            crate::list::test_enhanced_buffer_barrier(&list, src, true),
+            Some((0, 1))
+        );
         // The title makes another RGB32 view after the barrier. Its CPU copy
         // predates the UAV write, so its first read must also consume the
         // writes retained from earlier in this list.
@@ -3831,9 +3843,11 @@ void main() { dst.Store4(0, asuint(src[1])); }
             list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(0));
             list.list.SetPipelineState(&writer_again.1);
             list.list.Dispatch(1, 1, 1);
-            list.list.ResourceBarrier(&[crate::host::uav_barrier()]);
         }
-        list.sync_widened();
+        assert_eq!(
+            crate::list::test_enhanced_buffer_barrier(&list, src, true),
+            Some((0, 1))
+        );
         // SAFETY: the second widening copy finished.
         unsafe {
             list.list.SetComputeRootSignature(&reader.0);
@@ -5401,6 +5415,14 @@ void main() { o.Store(0, asuint(t.Load(int3(6, 4, 2)).r)); o.Store(4, asuint(t.L
             let copies = crate::texture::ALIAS_COPIES.load(Ordering::Relaxed);
             readable(&list, &used(ResourceType::Uav), &unordered, false);
             run(&list, &slots, &write, 0, None, (size / 8, size / 8));
+            if shared {
+                let epoch = list.indirect_epoch();
+                assert_eq!(
+                    crate::list::test_enhanced_texture_barrier(&list, object),
+                    Some((1, 0))
+                );
+                assert_eq!(list.indirect_epoch(), epoch);
+            }
             readable(&list, &used(ResourceType::Srv), &view, false);
             run(&list, &slots, &read, 1, Some(&out), (read_size / 8, read_size / 8));
             list.close();

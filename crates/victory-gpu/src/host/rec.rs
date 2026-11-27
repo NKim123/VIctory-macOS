@@ -2,9 +2,12 @@
 //! Adapted from avatarmanz/VIctory-7900XTX (GPL-3.0).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::{Win32::Graphics::Direct3D12::*, core::Interface};
+
+use super::{HostList, WidenedEvent};
+use crate::{resource::HostTexture, shadow::Shadow};
 
 static CALLS: AtomicU64 = AtomicU64::new(0);
 static SUBMITTED: AtomicU64 = AtomicU64::new(0);
@@ -91,6 +94,49 @@ impl Rec {
     }
 }
 
+impl HostList {
+    /// The tail state of a texture already transitioned on this list.
+    pub(crate) fn recorded_texture_state(&self, texture: &Arc<HostTexture>) -> Option<u32> {
+        self.states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(Arc::as_ptr(texture) as usize))
+            .map(|(_, last, _)| *last)
+    }
+
+    /// The widened copy pass samples all pending writers. A scoped UAV
+    /// barrier can precede it only if it orders every source that pass reads.
+    pub(crate) fn orders_widened_writes(&self, buffers: &[Arc<Shadow>]) -> bool {
+        self.widened_pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .all(|event| match event {
+                WidenedEvent::Write((shadow, _, _)) => {
+                    buffers.iter().any(|buffer| buffer.buffer == shadow.buffer)
+                }
+                WidenedEvent::Heap(_) => false,
+            })
+    }
+
+    /// Records a resource-specific UAV dependency. Callers retain the
+    /// resource and any title backing allocation for this recording.
+    pub(crate) fn scoped_uav(&self, resource: &ID3D12Resource) {
+        let barrier = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    // SAFETY: as in `transition`, the resource pointer is borrowed.
+                    pResource: unsafe { std::mem::transmute_copy(resource) },
+                }),
+            },
+        };
+        // SAFETY: the list is open and the caller holds the resource alive.
+        unsafe { self.list.ResourceBarrier(&[barrier]) };
+    }
+}
+
 fn transitioned(barrier: &D3D12_RESOURCE_BARRIER) -> Option<usize> {
     if barrier.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION {
         return None;
@@ -117,6 +163,8 @@ impl PartialEq<ID3D12GraphicsCommandList> for Rec {
 }
 
 pub(super) fn report(frames: f64) {
+    #[cfg(feature = "diagnostics")]
+    crate::list::report_enhanced_barriers(frames);
     let calls = CALLS.swap(0, Relaxed);
     let made = SUBMITTED.swap(0, Relaxed);
     if calls > 0 {
