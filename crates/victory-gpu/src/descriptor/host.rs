@@ -220,7 +220,11 @@ impl ViewStaging {
                             .make(at, view.key, epoch, view, Some(&backing));
                     (held?, backing, mark)
                 };
-                (held, mark, StagedSource::Buffer(epoch, backing))
+                (
+                    held,
+                    mark,
+                    StagedSource::Buffer(AtomicU64::new(epoch), backing),
+                )
             } else {
                 let (resource, srv, ambient) = match **view {
                     View::Shader(resource, _) => (resource, true, true),
@@ -290,7 +294,7 @@ impl ViewStaging {
 }
 
 enum StagedSource {
-    Buffer(u64, BufferView),
+    Buffer(AtomicU64, BufferView),
     Texture(Arc<HostTexture>, bool),
     DeferredTexture((usize, u64, u64)),
 }
@@ -304,29 +308,32 @@ struct StagedView<'a> {
 }
 
 impl StagedView<'_> {
-    fn recheck_buffer(&mut self, epoch: u64) {
-        let StagedSource::Buffer(created, (shadow, address, len)) = &mut self.source else {
-            return;
+    fn recheck_buffer(&self, epoch: u64) -> bool {
+        let StagedSource::Buffer(created, (shadow, address, len)) = &self.source else {
+            return false;
         };
         // Preparing other descriptors can add unrelated shadows and
         // invalidate the epoch before this batch reaches publication.
         // Reuse the staged descriptor if the same range still resolves
         // to the exact backing it names.
-        if *created != epoch
+        let current = created.load(Ordering::Relaxed);
+        if current != epoch
             && crate::shadow::lookup_epoch() == epoch
             && prepare(self.view).is_some_and(|(current, from, bytes)| {
                 Arc::ptr_eq(&current, shadow) && from == *address && bytes == *len
             })
             && crate::shadow::lookup_epoch() == epoch
         {
-            *created = epoch;
+            created.store(epoch, Ordering::Relaxed);
+            return true;
         }
+        false
     }
 
     fn hit(&self, epoch: u64) -> Option<TemplateHit> {
         let mut texture = None;
         let binding = match &self.source {
-            StagedSource::Buffer(created, backing) if *created == epoch => {
+            StagedSource::Buffer(created, backing) if created.load(Ordering::Relaxed) == epoch => {
                 Binding::Buffer(backing.clone(), is_widened(&self.held))
             }
             StagedSource::Texture(copy, srv) => {
@@ -363,6 +370,39 @@ impl StagedView<'_> {
 struct StagedViews<'a> {
     views: HashMap<u64, StagedView<'a>>,
     null: D3D12_CPU_DESCRIPTOR_HANDLE,
+}
+
+impl StagedViews<'_> {
+    /// The epoch can move between staging and publication even after the
+    /// initial worker recheck. Retry only the unresolved, staged mappings.
+    /// Publication still validates the current epoch and the title header.
+    fn recheck_pending(&self, records: &[ChangedRecord]) -> bool {
+        let epoch = crate::shadow::lookup_epoch();
+        let mut seen = HashSet::new();
+        let mut jobs: [_; STAGING_WORKERS] = std::array::from_fn(|_| Vec::new());
+        for record in records.iter().filter(|record| !record.clear) {
+            let key = record_key(record.record);
+            if let Some(view) = self.views.get(&key)
+                && let StagedSource::Buffer(created, _) = &view.source
+                && created.load(Ordering::Relaxed) != epoch
+                && seen.insert(key)
+            {
+                jobs[template_shard(key)].push(view);
+            }
+        }
+        let jobs: Vec<_> = jobs.iter().filter(|job| !job.is_empty()).collect();
+        let refreshed = AtomicBool::new(false);
+        crate::texture::in_parallel(jobs.len(), |i| {
+            let mut any = false;
+            for view in jobs[i] {
+                any |= view.recheck_buffer(epoch);
+            }
+            if any {
+                refreshed.store(true, Ordering::Relaxed);
+            }
+        });
+        refreshed.load(Ordering::Relaxed)
+    }
 }
 
 #[derive(Default)]
@@ -430,7 +470,7 @@ fn stage_views<'a>(
     if before != epoch {
         crate::texture::in_parallel(active.len(), |worker| {
             let i = active[worker];
-            for entry in &mut *results[i].lock().unwrap_or_else(|e| e.into_inner()) {
+            for entry in &*results[i].lock().unwrap_or_else(|e| e.into_inner()) {
                 entry.recheck_buffer(epoch);
             }
         });
@@ -2052,7 +2092,19 @@ impl HostHeap {
                         &mut batch,
                         &mut remaining,
                     );
-                    misses = remaining;
+                    if staged.recheck_pending(&remaining) {
+                        misses.clear();
+                        self.publish_templates(
+                            &remaining,
+                            start,
+                            step,
+                            (&pins, Some(&staged)),
+                            &mut batch,
+                            &mut misses,
+                        );
+                    } else {
+                        misses = remaining;
+                    }
                 }
             }
         }
@@ -5650,6 +5702,7 @@ mod tests {
         crate::shadow::register(allocation + 1, address, 4096);
         let replacement = crate::shadow::find(address, 256).unwrap();
         assert!(!Arc::ptr_eq(&original, &replacement));
+        assert!(!staged.recheck_pending(&records[2..]));
         heap.publish_templates(
             &records[2..],
             start,
@@ -5674,7 +5727,7 @@ mod tests {
             return;
         };
         let page = crate::watch::PAGE;
-        let allocation = crate::watch::tests::pool(2);
+        let allocation = crate::watch::tests::pool(3);
         let addresses = [allocation, allocation + page];
         let mut slots = [[0u64; 4]; 2];
         for (slot, address) in slots.iter_mut().zip(addresses) {
@@ -5692,10 +5745,17 @@ mod tests {
         let staged = stage_views(&workers, &records, &pins);
         let after = crate::shadow::lookup_epoch();
         assert_ne!(before, after, "staging materializes the two shadows");
-        for record in records {
+        for record in &records {
             let staged = &staged.views[&record_key(record.record)];
             assert!(staged.hit(after).is_some());
         }
+        let unrelated = allocation + 2 * page;
+        crate::shadow::register(unrelated, unrelated as u64, page as u64);
+        let newer = crate::shadow::lookup_epoch();
+        assert!(staged.views.values().all(|view| view.hit(newer).is_none()));
+        assert!(staged.recheck_pending(&records));
+        assert!(staged.views.values().all(|view| view.hit(newer).is_some()));
+        crate::shadow::unregister(unrelated, unrelated as u64);
         drop(staged);
         for address in addresses {
             crate::shadow::unregister(address, address as u64);
