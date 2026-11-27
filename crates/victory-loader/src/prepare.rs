@@ -336,6 +336,11 @@ mod tests {
         assert_ne!(prepared.info.tls.unwrap().callbacks_va, 0);
         let tls = ImageInfo::parse(&prepared.bytes).unwrap().tls.unwrap();
         assert_eq!(tls.callbacks_va, 0);
+        // directory_rva + TLS64_ADDRESS_OF_CALLBACKS overflows u32: a panic
+        // in debug builds, a wrapped RVA in release ones, before. The parse
+        // now refuses a directory outside the image, so `prepare` never
+        // gets to the addition.
+        assert!(ImageInfo::parse(&synthetic_tls_image(0xFFFF_FFF0)).is_err());
     }
 
     #[test]

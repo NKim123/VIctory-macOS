@@ -3217,17 +3217,19 @@ mod tests {
             super::TEST_RAW_ROOT_CBVS.set(before);
             result.unwrap()
         };
-        let narrow = translate(false);
-        let grouped = translate(true);
-        assert_ne!(narrow.dxil, grouped.dxil);
-        assert!(narrow.root_cbvs.is_empty() && grouped.root_cbvs.is_empty());
+        let default = translate(false);
+        let port = translate(true);
+        // Both settings now group table loads. The port still changes how
+        // root CBVs are bound, which this shader does not use.
+        assert!(default.dxil == port.dxil);
+        assert!(default.root_cbvs.is_empty() && port.root_cbvs.is_empty());
 
         #[cfg(windows)]
         {
             use super::host::{Dispatch, Host, Root, Stride, View};
             let host = Host::new(!super::host::under_wine()).expect("a D3D12 device");
             let data = [17, 23, 31, 41, 53, 67];
-            for shader in [narrow, grouped] {
+            for shader in [default, port] {
                 let (root, pso) = host.compute_pipeline(&shader).unwrap();
                 for offset in [0, 4, 12, 16, 20, 24] {
                     let out = host

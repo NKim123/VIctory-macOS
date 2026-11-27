@@ -474,18 +474,30 @@ pub(crate) fn uploads_for(
     private: Option<Box<HostList>>,
     before_refresh: impl FnOnce(&[crate::texture::UploadSource]),
 ) -> Option<Uploads> {
-    static LIST: Mutex<Option<HostList>> = Mutex::new(None);
-    let storage = if let Some(list) = private {
+    static LIST: Mutex<SharedUploadList> = Mutex::new(SharedUploadList {
+        list: None,
+        recorded: false,
+    });
+    let mut storage = if let Some(list) = private {
         UploadList::Owned(list)
     } else {
         let mut guard = LIST.lock().unwrap_or_else(|e| e.into_inner());
         crate::texture::recycle();
-        match &guard.as_ref() {
+        if heaps.is_empty() && textures.is_empty() {
+            if guard.recorded {
+                let list = guard.list.as_ref().expect("upload list was recorded");
+                list.reset();
+                list.close();
+                guard.recorded = false;
+            }
+            return None;
+        }
+        match guard.list.as_ref() {
             Some(list) => list.reset(),
             None => {
                 let list = crate::host::host()?.new_list().ok()?;
                 list.set_ours();
-                *guard = Some(list);
+                guard.list = Some(list);
             }
         }
         UploadList::Shared(guard)
@@ -600,6 +612,9 @@ pub(crate) fn uploads_for(
         unsafe { list.list.ResourceBarrier(&readable) };
     }
     list.close();
+    if let UploadList::Shared(holder) = &mut storage {
+        holder.recorded = recorded;
+    }
     Some(Uploads {
         storage,
         recorded,
@@ -607,16 +622,21 @@ pub(crate) fn uploads_for(
     })
 }
 
+struct SharedUploadList {
+    list: Option<HostList>,
+    recorded: bool,
+}
+
 enum UploadList {
     Owned(Box<HostList>),
-    Shared(std::sync::MutexGuard<'static, Option<HostList>>),
+    Shared(std::sync::MutexGuard<'static, SharedUploadList>),
 }
 
 impl UploadList {
     fn list(&self) -> &HostList {
         match self {
             Self::Owned(list) => list,
-            Self::Shared(guard) => guard.as_ref().expect("upload list was created"),
+            Self::Shared(guard) => guard.list.as_ref().expect("upload list was created"),
         }
     }
 }

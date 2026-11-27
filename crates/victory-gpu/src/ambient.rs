@@ -1,926 +1,555 @@
-//! An opt-in estimate of the indirect light, placed into the screen-probe
-//! resolve before the title lights the scene. It uses the previous radiance
-//! cache, scene depth and a slow mean to estimate light outside the view.
-//! See VIctory-7900XTX 82ca134 and 7da523a, based on beloooo's resolve hook.
+//! A least amount of indirect light: a stand-in for the title's ray-traced
+//! one, from Belobug's fork (`victory-gpu/src/ambient.rs` at 4f62c2a). Off
+//! unless `VICTORY_AMBIENT=1`.
+//!
+//! Grand Theft Auto VI's indirect diffuse light comes from probes it fills
+//! by tracing rays. Where those do not run, or run on nothing, its program
+//! that resolves them (`CS_ScreenProbes_TemporalResolve_*`) leaves next to
+//! nothing, and whatever the sun does not reach directly is black. Right
+//! after that program, its output is replaced by a constant (it used to be
+//! a floor under what the program wrote, but that is garbage: see the
+//! shader). The constant is the same everywhere: the light in these images
+//! does not go with the title's exposure (well-lit surfaces hold about the
+//! same in a shot at -5.5 EV and in one at -9.75). The title's own lighting
+//! then applies it with the surfaces' colors. Replaced, not added: the
+//! result is the next frame's history.
+//!
+//! shortcut: the same light everywhere, from everywhere; gone once rays run.
+//!
+//! What differs from the fork's file, for this line (Wine's HLSL compiler
+//! and D3DMetal; one host texture per texture memory):
+//! - Off by default, behind `VICTORY_AMBIENT=1`; the level is
+//!   `VICTORY_AMBIENT_LEVEL` (0.6 by default). Off, nothing here runs: the
+//!   title's containers are not searched for names and no pass is made.
+//! - The pass's root signature is built in code and its shader keeps to
+//!   what Wine's compiler takes (`crate::ambient_set::SOURCE`).
+//! - Programs are known per title pipeline (`crate::pipeline::ambient_role`,
+//!   from the names found when their containers are first seen), not by
+//!   flags on every shader container.
+//! - An image is taken if a 32-bit integer view can be made of its host
+//!   texture: on this line a texture memory's host texture has the format
+//!   of the first title texture there and is castable to the others, where
+//!   the fork made such textures `R32_UINT`.
+//! - Its view heap is made with other threads' submissions held off
+//!   (`Host::quiet`, VIctory-macOS issue #31).
 
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
-
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, OnceLock};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
-use windows::core::{Error, Result, s};
+use windows::core::s;
 
-use crate::compute::{self, Param};
-use crate::descriptor::host::TextureView;
-use crate::host::{HostList, host, transition};
+use crate::ambient_set as set;
+use crate::backend::HostGpu;
+use crate::host::{Host, HostList, host};
+use crate::object::This;
+use crate::resource::HostTexture;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Role {
-    Resolve,
-    Radiance,
-    Air,
+pub(crate) use set::{DEPTH, DRAWS_SKY, ENDS_REFLECTIONS, LIGHT, REFLECTIONS, RESOLVES};
+
+/// Whether the stand-in is on: `VICTORY_AMBIENT=1` (off when unset, empty,
+/// `0` or `off`). Read once.
+pub(crate) fn on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| set::is_on(var("VICTORY_AMBIENT").as_deref()))
 }
 
-impl Role {
-    pub(crate) fn detect(container: &[u8]) -> Option<Self> {
-        Self::in_container(container, settings())
-    }
+fn var(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
 
-    fn in_container(container: &[u8], settings: Settings) -> Option<Self> {
-        if settings.mode == Mode::Off {
-            return None;
-        }
-        let has = |name: &[u8]| container.windows(name.len()).any(|w| w == name);
-        if has(b"CS_ScreenProbes_TemporalResolve") {
-            Some(Self::Resolve)
-        } else if matches!(settings.mode, Mode::Estimate(_)) {
-            if has(b"CS_CacheScreenSpaceRadiance") {
-                Some(Self::Radiance)
-            } else if settings.air > 0.0 && has(b"CS_AccumulateLocalLightInscatteringVolume") {
-                Some(Self::Air)
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    }
-
-    /// Root parameter and offset in dwords of the title's output.
-    pub(crate) fn image(self) -> (u8, u32) {
-        match self {
-            Self::Resolve => (1, 176),
-            Self::Radiance => (1, 16),
-            Self::Air => (1, 32),
-        }
-    }
-
-    /// Root parameter and offset in dwords of the resolve's scene depth.
-    pub(crate) const DEPTH: (u8, u32) = (0, 464);
-
-    /// The stand-in works on full, mip-zero 2D images and a 3D volume.
-    pub(crate) fn extent(self, view: TextureView, desc: D3D12_RESOURCE_DESC) -> Option<[u32; 3]> {
-        let TextureView::Uav(view) = view else {
-            return None;
-        };
-        let volume = self == Self::Air;
-        let dimension = if volume {
-            D3D12_RESOURCE_DIMENSION_TEXTURE3D
-        } else {
-            D3D12_RESOURCE_DIMENSION_TEXTURE2D
-        };
-        let format = if self == Self::Resolve {
-            DXGI_FORMAT_R32_UINT
-        } else {
-            DXGI_FORMAT_R11G11B10_FLOAT
-        };
-        if effective_format(view.map(|d| d.Format), desc.Format) != format
-            || desc.Dimension != dimension
-            || desc.SampleDesc.Count != 1
-            || (!volume && desc.DepthOrArraySize != 1)
-        {
-            return None;
-        }
-        if let Some(view) = view {
-            if volume {
-                if view.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE3D {
-                    return None;
-                }
-                // SAFETY: the dimension selects the union member.
-                let shape = unsafe { view.Anonymous.Texture3D };
-                if shape.MipSlice != 0
-                    || shape.FirstWSlice != 0
-                    || (shape.WSize != u32::MAX && shape.WSize != u32::from(desc.DepthOrArraySize))
-                {
-                    return None;
-                }
-            } else {
-                if view.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE2D {
-                    return None;
-                }
-                // SAFETY: the dimension selects the union member.
-                let shape = unsafe { view.Anonymous.Texture2D };
-                if shape.MipSlice != 0 || shape.PlaneSlice != 0 {
-                    return None;
-                }
-            }
-        }
-        Some([
-            u32::try_from(desc.Width).ok()?,
-            desc.Height,
-            u32::from(desc.DepthOrArraySize),
-        ])
+/// Says what is on, once, when the host device is ready.
+pub(crate) fn announce() {
+    // The estimate in its place (`VICTORY_AMBIENT=estimate`).
+    if crate::ambient_estimate::on() {
+        crate::ambient_estimate::announce();
+    } else if on() {
+        tracing::info!("{}", set::start_line(level(), shade(), keep(), follow()));
     }
 }
 
-fn effective_format(view: Option<DXGI_FORMAT>, resource: DXGI_FORMAT) -> DXGI_FORMAT {
-    view.filter(|&f| f != DXGI_FORMAT_UNKNOWN)
-        .unwrap_or(resource)
+/// What the containers seen so far are to the stand-in, by their hash as
+/// logged: only those of programs it follows (a handful).
+static FOLLOWED: Mutex<Vec<(String, u8)>> = Mutex::new(Vec::new());
+
+/// The title passed shader container `container` for the first time, `hash`
+/// as logged: remembered if its program is one the stand-in follows.
+/// Nothing while the stand-in is off.
+pub(crate) fn note_program(hash: &str, container: &[u8]) {
+    if !on() {
+        return;
+    }
+    let role = set::role_of(container);
+    // The estimate's own programs (none while it is off).
+    let more = crate::ambient_estimate::role_of(container);
+    if role | more != 0 {
+        let name = if more != 0 { crate::ambient_estimate::role_name(more) } else { set::role_name(role) };
+        tracing::info!(hash, "a program the ambient light follows: it {name}");
+        FOLLOWED.lock().unwrap_or_else(|e| e.into_inner()).push((hash.to_owned(), role | more));
+    }
 }
 
-pub(crate) fn depth_matches(view: TextureView, desc: D3D12_RESOURCE_DESC, size: [u32; 3]) -> bool {
-    let TextureView::Srv(view) = view else {
-        return false;
-    };
-    if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
-        || desc.DepthOrArraySize != 1
-        || desc.SampleDesc.Count != 1
-        || [desc.Width, u64::from(desc.Height)] != [u64::from(size[0]), u64::from(size[1])]
+/// What a title pipeline of the shaders with these hashes is to the
+/// stand-in (bits of `RESOLVES` and its siblings; 0: nothing, and always
+/// while the stand-in is off).
+pub(crate) fn role<'a>(hashes: impl Iterator<Item = &'a str>) -> u8 {
+    if !on() {
+        return 0;
+    }
+    let followed = FOLLOWED.lock().unwrap_or_else(|e| e.into_inner());
+    if followed.is_empty() {
+        return 0;
+    }
+    hashes
+        .filter_map(|hash| followed.iter().find(|(h, _)| h == hash))
+        .fold(0, |role, (_, r)| role | r)
+}
+
+/// The level; 0 is no indirect diffuse light at all.
+fn level() -> f32 {
+    static LEVEL: OnceLock<f32> = OnceLock::new();
+    *LEVEL.get_or_init(|| set::level(var("VICTORY_AMBIENT_LEVEL").as_deref()))
+}
+
+/// The light's colour: warm white, or what `VICTORY_AMBIENT_TINT=r,g,b`
+/// gives. With `VICTORY_AMBIENT_FILE=<file>` (diagnostics builds) the file's
+/// `level r g b` is read again twice a second, to tune both by eye in a
+/// running game.
+fn tint() -> [f32; 3] {
+    if let Some((_, tint)) = *LIVE.lock().unwrap_or_else(|e| e.into_inner()) {
+        return tint;
+    }
+    static SET: OnceLock<[f32; 3]> = OnceLock::new();
+    *SET.get_or_init(|| set::tint(var("VICTORY_AMBIENT_TINT").as_deref()))
+}
+
+/// The level and colour last read from `VICTORY_AMBIENT_FILE`, if any.
+static LIVE: Mutex<Option<(f32, [f32; 3])>> = Mutex::new(None);
+
+/// The most a reflection may hold, as a part of the ambient light's level:
+/// `VICTORY_AMBIENT_REFLECT=<part>` (0.5 by default; 0 leaves the title's
+/// reflections alone); a ninth number in the file sets it in a running game.
+///
+/// Without rays the reflections are the sky's, unoccluded, wherever a
+/// surface is glossy: indoors a wooden floor, a counter and glass tops wore
+/// a white glaze five to ten times brighter than anything in the room (the
+/// fork's run ciel1, 2026-11-25; it did not move with the ambient level).
+/// They are held to a part of the light around, after the program that
+/// writes them for the last time in a frame (`set::REFLECTED`); the
+/// lighting programs read that image next.
+/// shortcut: stands in for what the title's traced reflections would see.
+fn keep() -> f32 {
+    if let Some(live) = *KEEP.lock().unwrap_or_else(|e| e.into_inner()) {
+        return live;
+    }
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| set::keep(var("VICTORY_AMBIENT_REFLECT").as_deref()))
+}
+
+static KEEP: Mutex<Option<f32>> = Mutex::new(None);
+
+/// The least a reflection holds, as a part of the light around: a tenth
+/// number in the file (0, the default, leaves dark reflections dark).
+/// shortcut: without rays, what should mirror the sky (still water) sees
+/// nothing and is black; this gives it a part of the ambient light instead.
+static LEAST: Mutex<f32> = Mutex::new(0.0);
+
+/// The sky dome the title's sky program (`set::SKY`) last drew into: the
+/// host copy, held, since the title's object may go at any time.
+///
+/// The program draws twice a frame, on two lists recorded at once: the dome
+/// (128x128, R16G16B16A16_FLOAT) and another image of the sky (R11G11B10).
+/// Following whichever was recorded last made the light jump between the
+/// two, three times apart, from frame to frame (the fork's run don1,
+/// 2026-11-25).
+static SKY_IMAGE: Mutex<Option<std::sync::Arc<HostTexture>>> = Mutex::new(None);
+
+/// The sky program draws into the title texture `image`.
+pub(crate) fn sky_drawn(image: usize) {
+    let Some(copy) = crate::resource::host_copy(image as This) else { return };
+    // SAFETY: a live resource.
+    let d = unsafe { copy.texture.GetDesc() };
+    if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        || !viewed_as(&copy, d.Format, DXGI_FORMAT_R16G16B16A16_FLOAT)
     {
-        return false;
+        return;
     }
-    if let Some(view) = view {
-        if view.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D
-            || view.Shader4ComponentMapping != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
-        {
-            return false;
-        }
-        // SAFETY: the dimension selects the union member.
-        let shape = unsafe { view.Anonymous.Texture2D };
-        if shape.MostDetailedMip != 0
-            || shape.MipLevels == 0
-            || shape.PlaneSlice != 0
-            || shape.ResourceMinLODClamp != 0.0
-        {
-            return false;
-        }
-    }
-    matches!(
-        effective_format(view.map(|d| d.Format), desc.Format),
-        DXGI_FORMAT_R32_FLOAT
-            | DXGI_FORMAT_R16_UNORM
-            | DXGI_FORMAT_R24_UNORM_X8_TYPELESS
-            | DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS
-    )
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Mode {
-    Off,
-    Estimate(f32),
-    Constant(f32),
-}
-
-impl Mode {
-    fn parse(value: &str) -> Self {
-        let value = value.trim();
-        match value.strip_prefix("constant:") {
-            Some(level) => positive(level).map_or(Self::Off, Self::Constant),
-            None => positive(value).map_or(Self::Off, Self::Estimate),
-        }
+    let mut held = SKY_IMAGE.lock().unwrap_or_else(|e| e.into_inner());
+    if !held.as_ref().is_some_and(|h| std::sync::Arc::ptr_eq(h, &copy)) {
+        *held = Some(copy);
     }
 }
 
-fn positive(value: &str) -> Option<f32> {
-    value
-        .trim()
-        .parse()
-        .ok()
-        .filter(|v: &f32| v.is_finite() && *v > 0.0)
+/// What the constant light is made of now, for the floor under the
+/// estimate (`crate::ambient_estimate`): its level and colour, the gain,
+/// least level and power with which it follows the sky (if it does), and
+/// the sky image the title last drew (if any).
+#[allow(clippy::type_complexity)]
+pub(crate) fn light_now() -> (f32, [f32; 3], Option<[f32; 3]>, Option<std::sync::Arc<HostTexture>>) {
+    let sky = SKY_IMAGE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    (live_level().unwrap_or_else(level), tint(), follow(), sky)
 }
 
-#[derive(Clone, Copy)]
-struct Settings {
-    mode: Mode,
-    shade: [f32; 2],
-    air: f32,
+/// The light follows the sky: its level and colour are the sky image's mean
+/// times a gain, over a least bluish level. Hand-set levels that looked
+/// right in the fork were 0.07 at night, 0.3 at dusk and 1.4 at noon (runs
+/// lum1, pr1, av1, 2026-11-25), with sky means of 0.001 at night and 0.65
+/// at dawn; one level for all hours either drowned the title's own shadows
+/// or left what the sun does not reach black. On unless
+/// `VICTORY_AMBIENT_SKY=off`, which keeps the constant; `gain,least,power`
+/// sets it; a file of two or three numbers, or six or seven with the
+/// shading's, does so in a running game.
+/// shortcut: the sky's mean stands in for the light the title's traced
+/// probes would gather; indoors it is the sky's too.
+///
+/// Gain, least level and power: the level is `gain * mean^power + least`.
+/// The power is under one because the title's exposure follows the light:
+/// the sky's mean goes from 0.001 at night to several units by day, the
+/// levels that look right only from 0.07 to 1.4.
+fn follow() -> Option<[f32; 3]> {
+    if let Some(live) = *FOLLOW.lock().unwrap_or_else(|e| e.into_inner()) {
+        return live;
+    }
+    static SET: OnceLock<Option<[f32; 3]>> = OnceLock::new();
+    *SET.get_or_init(|| set::follow(var("VICTORY_AMBIENT_SKY").as_deref()))
 }
 
-fn settings() -> Settings {
-    static SETTINGS: OnceLock<Settings> = OnceLock::new();
-    *SETTINGS.get_or_init(|| {
-        let mode = Mode::parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default());
-        let mut shade = [1.0, 0.6];
-        if mode == Mode::Off {
-            return Settings {
-                mode,
-                shade,
-                air: 0.0,
-            };
+static FOLLOW: Mutex<Option<Option<[f32; 3]>>> = Mutex::new(None);
+
+/// How much less of the light reaches creases and corners, worked out from
+/// the depth image alone (`set::shade`, `VICTORY_AMBIENT_SHADE=s,r,n,t`).
+/// The file's values after its first four replace them.
+/// shortcut: stands in for the occlusion the title's traced probes carry.
+fn shade() -> [f32; 4] {
+    if let Some(live) = *SHADE.lock().unwrap_or_else(|e| e.into_inner()) {
+        return live;
+    }
+    static SET: OnceLock<[f32; 4]> = OnceLock::new();
+    *SET.get_or_init(|| set::shade(var("VICTORY_AMBIENT_SHADE").as_deref()))
+}
+
+static SHADE: Mutex<Option<[f32; 4]>> = Mutex::new(None);
+
+/// The level from `VICTORY_AMBIENT_FILE`, if it gave one; starts the thread
+/// that reads the file (diagnostics builds).
+fn live_level() -> Option<f32> {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        if !cfg!(feature = "diagnostics") {
+            return;
         }
-        let value = std::env::var("VICTORY_AMBIENT_SHADE").unwrap_or_default();
-        for (slot, word) in shade.iter_mut().zip(value.split(',')) {
-            if let Ok(value) = word.trim().parse::<f32>()
-                && value.is_finite()
-                && value >= 0.0
-            {
-                *slot = value;
+        let Some(file) = std::env::var_os("VICTORY_AMBIENT_FILE") else { return };
+        let _ = std::thread::Builder::new().name("victory-ambient".into()).spawn(move || {
+            loop {
+                // Not `read_to_string`: it asks for the file's metadata,
+                // which can hang a thread under Wine (`crate::read_file`).
+                let text = crate::read_file(std::path::Path::new(&file)).unwrap_or_default();
+                read_live(&String::from_utf8_lossy(&text));
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        });
+    });
+    LIVE.lock().unwrap_or_else(|e| e.into_inner()).map(|(level, _)| level)
+}
+
+/// Takes what the file's text sets (`set::from_file`).
+fn read_live(text: &str) {
+    match set::from_file(text) {
+        Some(set::FromFile::Follow { follow, shade }) => {
+            if shade.is_some() {
+                *SHADE.lock().unwrap_or_else(|e| e.into_inner()) = shade;
+            }
+            let new = Some(Some(follow));
+            let mut live = FOLLOW.lock().unwrap_or_else(|e| e.into_inner());
+            if *live != new {
+                let [gain, least, power] = follow;
+                tracing::info!(gain, least, power, "ambient light follows the sky, set from the file");
+                *live = new;
             }
         }
-        Settings {
-            mode,
-            shade,
-            air: positive(&std::env::var("VICTORY_AMBIENT_AIR").unwrap_or_default()).unwrap_or(0.0),
+        Some(set::FromFile::Constant { level, tint, shade, reflections }) => {
+            *FOLLOW.lock().unwrap_or_else(|e| e.into_inner()) = Some(None);
+            if shade.is_some() {
+                *SHADE.lock().unwrap_or_else(|e| e.into_inner()) = shade;
+            }
+            if let Some([keep, least]) = reflections {
+                *KEEP.lock().unwrap_or_else(|e| e.into_inner()) = Some(keep);
+                *LEAST.lock().unwrap_or_else(|e| e.into_inner()) = least;
+            }
+            let new = Some((level, tint));
+            let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+            if *live != new {
+                let [r, g, b] = tint;
+                tracing::info!(level, r, g, b, "ambient light set from the file");
+                *live = new;
+            }
         }
-    })
-}
-
-pub(crate) fn enabled() -> bool {
-    #[cfg(test)]
-    if TEST_RECORDER.with(|r| r.borrow().is_some()) {
-        return true;
+        None => {}
     }
-    settings().mode != Mode::Off
 }
 
-const SOURCE: &str = include_str!("ambient.hlsl");
-const CELLS_BYTES: u64 = 64 * 36 * 16;
-// The last float4 indicates whether the gather had radiance to work with.
-const POINTS_X: u32 = 80;
-const POINTS_Y: u32 = 45;
-const POINTS_BYTES: u64 = (POINTS_X as u64 * POINTS_Y as u64 * 3 + 1) * 16;
-const MEAN_BYTES: u64 = 16;
+/// Views, used in turn: more than the passes of every list in flight.
+const SLOTS: u32 = 1024;
 
-const COMMON: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_COMMON;
-const READ: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-const WRITE: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-
-struct Kernel {
+struct Pass {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
+    views: ID3D12DescriptorHeap,
+    step: u32,
+    next: AtomicU32,
 }
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for Pass {}
+// SAFETY: as above.
+unsafe impl Sync for Pass {}
 
-impl Kernel {
-    fn new(part: &str, name: windows::core::PCSTR, inputs: &[Param<'_>]) -> Result<Self> {
-        let mut params = vec![Param::Constants {
-            register: 0,
-            count: 15,
-        }];
-        params.extend_from_slice(inputs);
-        let (root, pso) = compute::pipeline(
-            &format!("#define {part}\n#define PX {POINTS_X}\n#define PY {POINTS_Y}\n{SOURCE}"),
-            name,
-            0,
-            &params,
-        )?;
-        Ok(Self { root, pso })
-    }
-
-    /// Scratch buffers enter and leave in COMMON so independently recorded
-    /// lists can run in submission order on the host's single queue.
-    fn run(
-        &self,
-        list: &HostList,
-        words: &[u32; 15],
-        groups: [u32; 3],
-        views: &[D3D12_GPU_DESCRIPTOR_HANDLE],
-        scratch: (&[&ID3D12Resource], Option<&ID3D12Resource>),
-        gate: Option<&Gate>,
-    ) {
-        let (reads, output) = scratch;
-        let mut barriers = Vec::with_capacity(reads.len() + usize::from(output.is_some()));
-        barriers.extend(reads.iter().map(|r| transition(r, COMMON, READ)));
-        barriers.extend(output.map(|r| transition(r, COMMON, WRITE)));
-        let l = &list.list;
-        // SAFETY: an open list, live descriptors in its bound heap, and
-        // scratch buffers transitioned for each read or write.
-        unsafe {
-            if !barriers.is_empty() {
-                l.ResourceBarrier(&barriers);
-            }
-            l.SetComputeRootSignature(&self.root);
-            l.SetPipelineState(&self.pso);
-            l.SetComputeRoot32BitConstants(0, 15, words.as_ptr().cast(), 0);
-            let mut slot = 1;
-            for &view in views {
-                l.SetComputeRootDescriptorTable(slot, view);
-                slot += 1;
-            }
-            for r in reads {
-                l.SetComputeRootShaderResourceView(slot, r.GetGPUVirtualAddress());
-                slot += 1;
-            }
-            if let Some(output) = output {
-                l.SetComputeRootUnorderedAccessView(slot, output.GetGPUVirtualAddress());
-            }
-            if let Some(gate) = gate {
-                gate.dispatch(l, groups);
-            } else {
-                l.Dispatch(groups[0], groups[1], groups[2]);
-            }
-            barriers.clear();
-            barriers.extend(reads.iter().map(|r| transition(r, READ, COMMON)));
-            barriers.extend(output.map(|r| transition(r, WRITE, COMMON)));
-            if !barriers.is_empty() {
-                l.ResourceBarrier(&barriers);
-            }
-        }
-    }
-}
-
-struct Estimate {
-    keep: Kernel,
-    mean: Kernel,
-    publish: Kernel,
-    place: Kernel,
-    gather: Kernel,
-    raise: Kernel,
-    cells: ID3D12Resource,
-    positions: ID3D12Resource,
-    points: ID3D12Resource,
-    history: ID3D12Resource,
-    next_mean: ID3D12Resource,
-}
-
-const DEPTH_TABLE: Param<'_> = Param::Table(&[compute::srv(0, 1).volatile()]);
-const IMAGE_TABLE: Param<'_> = Param::Table(&[compute::uav(0, 1).volatile()]);
-const OUTPUT: Param<'_> = Param::Uav { register: 1 };
-
-const fn scratch_read(register: u32) -> Param<'static> {
-    Param::Srv { register, space: 0 }
-}
-
-impl Estimate {
-    fn new() -> Result<Self> {
-        let device = &host().ok_or_else(Error::empty)?.device;
-        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
-            Format: DXGI_FORMAT_R11G11B10_FLOAT,
-            ..Default::default()
-        };
-        // SAFETY: a plain query into a struct of the feature's size.
-        unsafe {
-            device.CheckFeatureSupport(
-                D3D12_FEATURE_FORMAT_SUPPORT,
-                std::ptr::from_mut(&mut support).cast(),
-                std::mem::size_of_val(&support) as u32,
-            )?;
-        }
-        if !support
-            .Support2
-            .contains(D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD)
-        {
-            return Err(Error::new(
-                windows::Win32::Foundation::E_NOTIMPL,
-                "R11G11B10_FLOAT typed UAV loads are unavailable",
-            ));
-        }
-        Ok(Self {
-            keep: Kernel::new("KEEP", s!("ambient keep"), &[IMAGE_TABLE, OUTPUT])?,
-            mean: Kernel::new(
-                "MEAN",
-                s!("ambient mean"),
-                &[scratch_read(1), scratch_read(2), OUTPUT],
-            )?,
-            publish: Kernel::new("PUBLISH", s!("ambient publish"), &[scratch_read(2), OUTPUT])?,
-            place: Kernel::new("PLACE", s!("ambient place"), &[DEPTH_TABLE, OUTPUT])?,
-            gather: Kernel::new(
-                "GATHER",
-                s!("ambient gather"),
-                &[
-                    DEPTH_TABLE,
-                    scratch_read(1),
-                    scratch_read(2),
-                    scratch_read(3),
-                    OUTPUT,
-                ],
-            )?,
-            raise: Kernel::new(
-                "RAISE",
-                s!("ambient resolve"),
-                &[DEPTH_TABLE, IMAGE_TABLE, scratch_read(2), scratch_read(4)],
-            )?,
-            cells: buffer(CELLS_BYTES, true)?,
-            positions: buffer(CELLS_BYTES, true)?,
-            points: buffer(POINTS_BYTES, true)?,
-            history: buffer(MEAN_BYTES, true)?,
-            next_mean: buffer(MEAN_BYTES, true)?,
-        })
-    }
-}
-
-fn buffer(size: u64, writable: bool) -> Result<ID3D12Resource> {
-    let device = &host().ok_or_else(Error::empty)?.device;
-    let mut buffer = None;
-    // SAFETY: plain creation. The default heap starts zeroed, so history
-    // and points are invalid until their corresponding dispatch runs.
+/// The pass: compiled with the system's compiler (Wine's under Wine), its
+/// root signature built here (`crate::compute`): the constants, then a
+/// table of the image, the depth and the sky.
+fn make(host: &Host) -> windows::core::Result<Pass> {
+    use crate::compute::{Param, srv, uav};
+    let ranges = [uav(0, 1), srv(0, 2)];
+    let params = [
+        Param::Constants { register: 0, count: set::CONSTANTS as u32 },
+        Param::Table(&ranges),
+    ];
+    let (root, pso) = crate::compute::pipeline(set::SOURCE, s!("ambient"), 0, &params)?;
+    let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    // Under Wine on D3DMetal, lists other threads submit while a view heap
+    // is made can lose their views (VIctory-macOS issue #31).
+    let _quiet = host.quiet();
+    // SAFETY: plain creations.
     unsafe {
-        device.CreateCommittedResource(
-            &D3D12_HEAP_PROPERTIES {
-                Type: D3D12_HEAP_TYPE_DEFAULT,
-                ..Default::default()
-            },
-            D3D12_HEAP_FLAG_NONE,
-            &D3D12_RESOURCE_DESC {
-                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                Width: size,
-                Height: 1,
-                DepthOrArraySize: 1,
-                MipLevels: 1,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                Flags: if writable {
-                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
-                } else {
-                    D3D12_RESOURCE_FLAG_NONE
-                },
-                ..Default::default()
-            },
-            COMMON,
-            None,
-            &mut buffer,
-        )?;
-    }
-    buffer.ok_or_else(Error::empty)
-}
-
-/// A version of one host descriptor slot. Rewrites wait for an executing
-/// pair, and invalidate the version before writing a new descriptor.
-#[derive(Clone)]
-pub(crate) struct Watch(Arc<Mutex<Version>>);
-
-pub(crate) struct Version {
-    valid: bool,
-    frozen: Weak<Frozen>,
-}
-
-/// The native fence that protects a recorded descriptor version. A
-/// descriptor writer can wait for it even while holding its slot lock.
-pub(crate) struct Frozen {
-    fence: ID3D12Fence,
-    value: u64,
-}
-
-impl Watch {
-    pub(crate) fn new() -> Self {
-        Self(Arc::new(Mutex::new(Version {
-            valid: true,
-            frozen: Weak::new(),
-        })))
-    }
-
-    pub(crate) fn invalidate(&self) {
-        let mut version = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(frozen) = version.frozen.upgrade() {
-            crate::host::poll_fence(&frozen.fence, frozen.value);
-        }
-        version.valid = false;
-    }
-
-    fn key(&self) -> usize {
-        Arc::as_ptr(&self.0) as usize
-    }
-}
-
-pub(crate) struct Binding {
-    pub(crate) resource: ID3D12Resource,
-    pub(crate) view: TextureView,
-    pub(crate) handle: D3D12_GPU_DESCRIPTOR_HANDLE,
-    pub(crate) watch: Watch,
-}
-
-pub(crate) struct CheckedViews {
-    pub(crate) image: Binding,
-    pub(crate) depth: Option<Binding>,
-    pub(crate) size: [u32; 3],
-}
-
-/// One count word and space for the indirect arguments of a complete pass.
-const DISPATCH_BYTES: u64 = 64;
-pub(crate) const MAX_PASSES: usize = 64;
-pub(crate) const UPLOAD_BYTES: u64 = DISPATCH_BYTES * MAX_PASSES as u64;
-
-#[derive(Clone)]
-pub(crate) struct Candidate {
-    image: Watch,
-    depth: Option<Watch>,
-    count: usize,
-}
-
-impl Candidate {
-    pub(crate) fn new(views: &CheckedViews, count: usize) -> Self {
-        Self {
-            image: views.image.watch.clone(),
-            depth: views.depth.as_ref().map(|depth| depth.watch.clone()),
-            count,
-        }
-    }
-
-    fn watches(&self) -> impl Iterator<Item = &Watch> {
-        std::iter::once(&self.image).chain(self.depth.iter())
-    }
-}
-
-/// Under the submission lock, after all heap sync and deferred CPU copies.
-/// Hold each version at most once, even if many passes share the same slot.
-pub(crate) fn arm(candidates: &[Candidate]) -> Vec<MutexGuard<'_, Version>> {
-    let mut watches: Vec<_> = candidates.iter().flat_map(Candidate::watches).collect();
-    watches.sort_unstable_by_key(|w| w.key());
-    watches.dedup_by_key(|w| w.key());
-    let locks: Vec<_> = watches
-        .iter()
-        .map(|w| w.0.lock().unwrap_or_else(|e| e.into_inner()))
-        .collect();
-    for pass in candidates {
-        let ready = pass.watches().all(|w| {
-            let index = watches.binary_search_by_key(&w.key(), |w| w.key()).unwrap();
-            locks[index].valid
-        });
-        // SAFETY: a mapped word owned by the closed list, with no other
-        // instance executing (submissions hold the host lock).
-        unsafe { (pass.count as *mut u32).write_volatile(u32::from(ready)) };
-    }
-    locks
-}
-
-/// Arm the gate words while these exact descriptor versions are locked,
-/// then hand the hold to the native submission fence.
-pub(crate) fn freeze(
-    candidates: &[Candidate],
-    fence: &ID3D12Fence,
-    value: u64,
-) -> Option<Arc<Frozen>> {
-    if candidates.is_empty() {
-        return None;
-    }
-    let frozen = Arc::new(Frozen {
-        fence: fence.clone(),
-        value,
-    });
-    for mut version in arm(candidates) {
-        if version.valid {
-            version.frozen = Arc::downgrade(&frozen);
-        }
-    }
-    Some(frozen)
-}
-
-pub(crate) struct Gate {
-    buffer: ID3D12Resource,
-    signature: ID3D12CommandSignature,
-    base: u64,
-    data: usize,
-    next: std::cell::Cell<u64>,
-}
-
-impl Gate {
-    pub(crate) fn new(buffer: &ID3D12Resource, data: usize, pass: usize) -> Option<Self> {
-        static SIGNATURE: OnceLock<Option<ID3D12CommandSignature>> = OnceLock::new();
-        let signature = SIGNATURE
-            .get_or_init(|| {
-                let host = host()?;
-                let arg = D3D12_INDIRECT_ARGUMENT_DESC {
-                    Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
-                    ..Default::default()
-                };
-                let desc = D3D12_COMMAND_SIGNATURE_DESC {
-                    ByteStride: 12,
-                    NumArgumentDescs: 1,
-                    pArgumentDescs: &arg,
-                    NodeMask: 0,
-                };
-                let mut signature = None;
-                // SAFETY: one dispatch argument, no root arguments.
-                unsafe {
-                    host.device.CreateCommandSignature(
-                        &desc,
-                        None::<&ID3D12RootSignature>,
-                        &mut signature,
-                    )
-                }
-                .ok()?;
-                signature
-            })
-            .as_ref()?
-            .clone();
-        let base = pass as u64 * DISPATCH_BYTES;
-        let data = data + base as usize;
-        // SAFETY: one count and its arguments per pass in the mapped upload.
-        unsafe { (data as *mut u32).write(0) };
-        Some(Self {
-            buffer: buffer.clone(),
-            signature,
-            base,
-            data,
-            next: 4.into(),
+        let views = host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: kind,
+            NumDescriptors: SLOTS * 3,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+            NodeMask: 0,
+        })?;
+        Ok(Pass {
+            root,
+            pso,
+            views,
+            step: host.device.GetDescriptorHandleIncrementSize(kind),
+            next: AtomicU32::new(0),
         })
     }
-
-    pub(crate) fn count(&self) -> usize {
-        self.data
-    }
-
-    fn dispatch(&self, list: &ID3D12GraphicsCommandList, groups: [u32; 3]) {
-        let at = self.next.get();
-        assert!(at + 12 <= DISPATCH_BYTES);
-        self.next.set(at + 12);
-        // SAFETY: distinct arguments in the mapped upload, written before
-        // submission. The same count gates every dispatch of this pass.
-        unsafe {
-            ((self.data + at as usize) as *mut [u32; 3]).write(groups);
-            list.ExecuteIndirect(
-                &self.signature,
-                1,
-                &self.buffer,
-                self.base + at,
-                Some(&self.buffer),
-                self.base,
-            );
-        }
-    }
 }
 
-pub(crate) struct Views {
-    pub(crate) resource: ID3D12Resource,
-    pub(crate) image: D3D12_GPU_DESCRIPTOR_HANDLE,
-    pub(crate) depth: Option<D3D12_GPU_DESCRIPTOR_HANDLE>,
-    pub(crate) size: [u32; 3],
+/// The pass, made on first use; `None` if the host does not take it (said
+/// once, with the compiler's messages).
+fn pass(host: &Host) -> Option<&'static Pass> {
+    static PASS: OnceLock<Option<Pass>> = OnceLock::new();
+    PASS.get_or_init(|| {
+        make(host)
+            .inspect_err(|e| tracing::warn!(error = %e, "no ambient light: its pass was not made"))
+            .ok()
+    })
+    .as_ref()
 }
 
-impl CheckedViews {
-    pub(crate) fn handles(&self) -> Views {
-        Views {
-            resource: self.image.resource.clone(),
-            image: self.image.handle,
-            depth: self.depth.as_ref().map(|depth| depth.handle),
-            size: self.size,
-        }
-    }
-}
-
-fn uav_barrier(list: &HostList, resource: &ID3D12Resource) {
+fn uav_barrier(list: &ID3D12GraphicsCommandList) {
     let barrier = D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
             UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                // SAFETY: a borrowed pointer the barrier never releases.
-                pResource: unsafe { std::mem::transmute_copy(resource) },
+                pResource: std::mem::ManuallyDrop::new(None),
             }),
         },
     };
-    // SAFETY: an open list; the barrier orders unordered accesses to the
-    // title's image without changing its state.
-    unsafe { list.list.ResourceBarrier(&[barrier]) };
+    // SAFETY: an open list; the barrier names no resource.
+    unsafe { list.ResourceBarrier(&[barrier]) };
 }
 
-/// Record after the title's dispatch with the same view heap bound.
-/// Returns whether the host pipeline and compute root have been replaced.
-pub(crate) fn after(list: &HostList, role: Role, views: &Views, gate: &Gate) -> bool {
-    #[cfg(test)]
-    if let Some(ran) = TEST_RECORDER.with(|r| {
-        r.borrow()
-            .as_ref()
-            .map(|r| r.after(list, role, views, Some(gate)))
-    }) {
-        return ran;
+/// Whether views of `wanted` can be made of the host texture `copy`, whose
+/// own format is `own`: it is that format, or the host took it as castable
+/// to it (one host texture per texture memory, in the format of the first
+/// title texture there).
+fn viewed_as(copy: &HostTexture, own: DXGI_FORMAT, wanted: DXGI_FORMAT) -> bool {
+    own == wanted || copy.castable.contains(&(wanted.0 as u32))
+}
+
+/// Replaces what `light` holds by the ambient light, in `list`, after the
+/// program that wrote it as an image. Whether it recorded anything (the
+/// list's heaps, compute root signature and pipeline are then ours).
+pub(crate) fn raise(list: &HostList, light: This, depth: Option<This>) -> bool {
+    record(list, light, depth, 0.0)
+}
+
+/// Holds the reflections in `image` to a part of the ambient light, in
+/// `list`, after the program that wrote them last. Whether it recorded
+/// anything (the list's heaps, compute root signature and pipeline are then
+/// ours).
+pub(crate) fn hold(list: &HostList, image: This) -> bool {
+    let held = keep();
+    if held <= 0.0 || !record(list, image, None, held) {
+        return false;
     }
-    static RECORDER: OnceLock<Recorder> = OnceLock::new();
-    RECORDER
-        .get_or_init(|| Recorder::new(settings()))
-        .after(list, role, views, Some(gate))
+    static HELD: std::sync::Once = std::sync::Once::new();
+    HELD.call_once(|| tracing::info!(held, "reflections held to the ambient light"));
+    true
 }
 
-#[cfg(test)]
-thread_local! {
-    static TEST_RECORDER: std::cell::RefCell<Option<Recorder>> = const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(test)]
-pub(crate) fn test_constant() {
-    TEST_RECORDER.with(|r| {
-        *r.borrow_mut() = Some(Recorder::new(Settings {
-            mode: Mode::Constant(0.25),
-            shade: [0.0, 0.6],
-            air: 0.0,
-        }))
-    });
-}
-
-/// Light history follows elapsed time, with an immediate response to a
-/// sufficiently large change in luminance.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Settle {
-    ms: f32,
-    jump: f32,
-    fresh: f32,
-}
-
-impl Settle {
-    fn parse(spec: &str) -> Option<Self> {
-        let mut parts = spec.split(',').map(|p| {
-            p.trim()
-                .parse::<f32>()
-                .ok()
-                .filter(|v| v.is_finite() && *v >= 0.0)
-        });
-        Some(Self {
-            ms: parts.next().flatten().filter(|&ms| ms > 0.0)?,
-            jump: parts.next().flatten().unwrap_or(3.0),
-            fresh: parts.next().flatten().unwrap_or(0.0),
-        })
+fn record(list: &HostList, light: This, depth: Option<This>, held: f32) -> bool {
+    if !on() {
+        return false;
     }
-
-    fn follow(self, dt_ms: f32) -> f32 {
-        -(-dt_ms / self.ms).exp_m1()
-    }
-}
-
-fn settle() -> Option<Settle> {
-    static SETTLE: OnceLock<Option<Settle>> = OnceLock::new();
-    *SETTLE.get_or_init(|| {
-        Settle::parse(&std::env::var("VICTORY_AMBIENT_SETTLE").unwrap_or_else(|_| "250,3".into()))
-    })
-}
-
-fn radiance_ms(last: Option<std::time::Instant>, now: std::time::Instant) -> f32 {
-    last.map(|prev| now.saturating_duration_since(prev).as_secs_f32() * 1000.0)
-        .filter(|&ms| ms <= 1000.0)
-        .map_or(1000.0 / 30.0, |ms| ms.max(1.0))
-}
-
-struct Recorder {
-    settings: Settings,
-    constant: OnceLock<Option<Kernel>>,
-    estimate: OnceLock<Option<Estimate>>,
-    air: OnceLock<Option<Kernel>>,
-    last_radiance: std::sync::Mutex<Option<std::time::Instant>>,
-}
-
-impl Recorder {
-    fn new(settings: Settings) -> Self {
-        Self {
-            settings,
-            constant: OnceLock::new(),
-            estimate: OnceLock::new(),
-            air: OnceLock::new(),
-            last_radiance: std::sync::Mutex::new(None),
-        }
-    }
-
-    fn after(&self, list: &HostList, role: Role, views: &Views, gate: Option<&Gate>) -> bool {
-        let tuning = settle();
-        let mut words = constants(self.settings, views.size);
-        words[13] = tuning.map_or(0.0, |s| s.fresh).to_bits();
-        let [width, height, slices] = views.size;
-        let groups = [width.div_ceil(8), height.div_ceil(8), 1];
-        match (self.settings.mode, role, views.depth) {
-            (Mode::Constant(_), Role::Resolve, Some(depth)) => {
-                let Some(kernel) = self
-                    .constant
-                    .get_or_init(|| {
-                        optional(Kernel::new(
-                            "CONSTANT",
-                            s!("ambient constant"),
-                            &[DEPTH_TABLE, IMAGE_TABLE],
-                        ))
-                    })
-                    .as_ref()
-                else {
-                    return false;
-                };
-                uav_barrier(list, &views.resource);
-                kernel.run(
-                    list,
-                    &words,
-                    groups,
-                    &[depth, views.image],
-                    (&[], None),
-                    gate,
-                );
-            }
-            (Mode::Estimate(_), _, depth) => {
-                let Some(pass) = self
-                    .estimate
-                    .get_or_init(|| optional(Estimate::new()))
-                    .as_ref()
-                else {
-                    return false;
-                };
-                match (role, depth) {
-                    (Role::Radiance, _) => {
-                        if let Some(tuning) = tuning {
-                            let mut last =
-                                self.last_radiance.lock().unwrap_or_else(|e| e.into_inner());
-                            let now = std::time::Instant::now();
-                            let dt = radiance_ms(last.replace(now), now);
-                            words[8] = tuning.follow(dt).to_bits();
-                            words[12] = tuning.jump.to_bits();
-                            words[14] = (dt / 1000.0).to_bits();
-                        }
-                        uav_barrier(list, &views.resource);
-                        pass.keep.run(
-                            list,
-                            &words,
-                            [8, 9, 1],
-                            &[views.image],
-                            (&[], Some(&pass.cells)),
-                            gate,
-                        );
-                        pass.mean.run(
-                            list,
-                            &words,
-                            [1, 1, 1],
-                            &[],
-                            (&[&pass.cells, &pass.history], Some(&pass.next_mean)),
-                            gate,
-                        );
-                        pass.publish.run(
-                            list,
-                            &words,
-                            [1, 1, 1],
-                            &[],
-                            (&[&pass.next_mean], Some(&pass.history)),
-                            gate,
-                        );
-                    }
-                    (Role::Resolve, Some(depth)) => {
-                        uav_barrier(list, &views.resource);
-                        pass.place.run(
-                            list,
-                            &words,
-                            [8, 9, 1],
-                            &[depth],
-                            (&[], Some(&pass.positions)),
-                            gate,
-                        );
-                        pass.gather.run(
-                            list,
-                            &words,
-                            [POINTS_X / 8, POINTS_Y, 1],
-                            &[depth],
-                            (
-                                &[&pass.cells, &pass.history, &pass.positions],
-                                Some(&pass.points),
-                            ),
-                            gate,
-                        );
-                        pass.raise.run(
-                            list,
-                            &words,
-                            groups,
-                            &[depth, views.image],
-                            (&[&pass.history, &pass.points], None),
-                            gate,
-                        );
-                    }
-                    (Role::Air, _) if self.settings.air > 0.0 => {
-                        let Some(air) = self
-                            .air
-                            .get_or_init(|| {
-                                optional(Kernel::new(
-                                    "AIR",
-                                    s!("ambient air"),
-                                    &[IMAGE_TABLE, scratch_read(2), scratch_read(4)],
-                                ))
-                            })
-                            .as_ref()
-                        else {
-                            return false;
-                        };
-                        uav_barrier(list, &views.resource);
-                        air.run(
-                            list,
-                            &words,
-                            [groups[0], groups[1], slices.div_ceil(2)],
-                            &[views.image],
-                            (&[&pass.history, &pass.points], None),
-                            gate,
-                        );
-                    }
-                    _ => return false,
-                }
-            }
-            _ => return false,
-        }
-        uav_barrier(list, &views.resource);
-        list.keep(&views.resource);
-        true
-    }
-}
-
-fn optional<T>(result: Result<T>) -> Option<T> {
-    result
-        .inspect_err(|e| tracing::warn!(error = %e, "could not build an indirect-light pass"))
-        .ok()
-}
-
-fn constants(settings: Settings, [width, height, slices]: [u32; 3]) -> [u32; 15] {
-    let (level, constant) = match settings.mode {
-        Mode::Estimate(level) => (level, 0.0),
-        Mode::Constant(level) => (0.0, level),
-        Mode::Off => (0.0, 0.0),
+    let Some(host) = host() else {
+        return false;
     };
-    let [strength, radius] = settings.shade;
-    [
-        level.to_bits(),
-        constant.to_bits(),
-        strength.to_bits(),
-        radius.to_bits(),
-        0.1_f32.to_bits(),
-        0.45_f32.to_bits(),
-        width,
-        height,
-        0.04_f32.to_bits(),
-        4.0_f32.to_bits(),
-        settings.air.to_bits(),
-        slices,
-        0,
-        0,
-        0,
-    ]
+    let Some(light) = crate::resource::host_copy(light) else {
+        return false;
+    };
+    let Some(pass) = pass(host) else {
+        return false;
+    };
+    // SAFETY: a live resource.
+    let d = unsafe { light.texture.GetDesc() };
+    static REFUSED: std::sync::Once = std::sync::Once::new();
+    if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        || !(d.Format == DXGI_FORMAT_R32_TYPELESS || viewed_as(&light, d.Format, DXGI_FORMAT_R32_UINT))
+    {
+        REFUSED.call_once(|| {
+            tracing::warn!(
+                format = d.Format.0,
+                dimension = d.Dimension.0,
+                "no ambient light: its image is not one a 32-bit integer view can be made of"
+            );
+        });
+        return false;
+    }
+    let level = live_level().unwrap_or_else(level);
+    static FIRST: std::sync::Once = std::sync::Once::new();
+    FIRST.call_once(|| {
+        tracing::info!(
+            level,
+            width = d.Width,
+            height = d.Height,
+            format = d.Format.0,
+            "ambient light: the first image it writes"
+        );
+    });
+    let slot = pass.next.fetch_add(1, Ordering::Relaxed) % SLOTS * 3;
+    // The sky image, if the light follows it and the title has drawn it.
+    let sky_image = SKY_IMAGE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let sky = follow().and_then(|f| {
+        let copy = sky_image.as_ref()?;
+        // SAFETY: a live resource.
+        let d = unsafe { copy.texture.GetDesc() };
+        Some((copy, f, [d.Width as u32, d.Height], d))
+    });
+    static FOLLOWS: std::sync::Once = std::sync::Once::new();
+    if let Some((copy, f, _, d)) = &sky {
+        FOLLOWS.call_once(|| {
+            tracing::info!(
+                gain = f[0],
+                least = f[1],
+                power = f[2],
+                format = d.Format.0,
+                width = d.Width,
+                height = d.Height,
+                slices = d.DepthOrArraySize,
+                "ambient light follows the sky dome"
+            );
+        });
+        list.keep(&copy.texture);
+        let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0
+            | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0;
+        if let Some(barrier) = list.move_texture(copy, read as u32) {
+            // SAFETY: an open list and a live texture the list keeps.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+        }
+    }
+    list.keep(&light.texture);
+    // The depth the resolve just read, in the state it read it in; of the
+    // light's size, or the shading is left out.
+    let depth = depth.and_then(crate::resource::host_resource).filter(|t| {
+        // SAFETY: a live resource.
+        let t = unsafe { t.GetDesc() };
+        t.Format == DXGI_FORMAT_R32G8X24_TYPELESS && (t.Width, t.Height) == (d.Width, d.Height)
+    });
+    if let Some(depth) = &depth {
+        list.keep(depth);
+    }
+    let mut shade = shade();
+    if depth.is_none() {
+        shade[0] = 0.0;
+    }
+    let constants = set::constants(&set::Pass {
+        level,
+        tint: tint(),
+        shade,
+        follow: sky.as_ref().map_or([0.0, 0.0, 1.0], |s| s.1),
+        held,
+        floor: *LEAST.lock().unwrap_or_else(|e| e.into_inner()),
+        size: [d.Width as u32, d.Height],
+        sky: sky.as_ref().map_or([0, 0], |s| s.2),
+    });
+    let l = &list.list;
+    uav_barrier(l);
+    // SAFETY: an open list; a live texture the list keeps, in the
+    // unordered-access state as the program before left it; views in slots
+    // no list in flight reads.
+    unsafe {
+        let cpu = pass.views.GetCPUDescriptorHandleForHeapStart();
+        let gpu = pass.views.GetGPUDescriptorHandleForHeapStart();
+        let at = D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: cpu.ptr + (slot * pass.step) as usize,
+        };
+        let view = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_UINT,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        host.device
+            .CreateUnorderedAccessView(&light.texture, None::<&ID3D12Resource>, Some(&view), at);
+        let seen = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() },
+            },
+        };
+        let beside = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: at.ptr + pass.step as usize };
+        host.device.CreateShaderResourceView(depth.as_ref(), Some(&seen), beside);
+        // The sky dome's first slice in the format its program draws it in;
+        // a null view while the light does not follow it.
+        let around = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_SRV { MipLevels: 1, ArraySize: 1, ..Default::default() },
+            },
+        };
+        let third = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: at.ptr + 2 * pass.step as usize };
+        host.device.CreateShaderResourceView(sky.as_ref().map(|s| &s.0.texture), Some(&around), third);
+        l.SetDescriptorHeaps(&[Some(pass.views.clone())]);
+        l.SetComputeRootSignature(&pass.root);
+        l.SetPipelineState(&pass.pso);
+        l.SetComputeRoot32BitConstants(0, constants.len() as u32, constants.as_ptr().cast(), 0);
+        l.SetComputeRootDescriptorTable(
+            1,
+            D3D12_GPU_DESCRIPTOR_HANDLE {
+                ptr: gpu.ptr + u64::from(slot * pass.step),
+            },
+        );
+        l.Dispatch((d.Width as u32).div_ceil(8), d.Height.div_ceil(8), 1);
+    }
+    uav_barrier(l);
+    true
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    /// The pass compiles with the system's compiler and the host takes it.
+    #[test]
+    fn ambient_pass_builds() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        super::make(host).expect("the ambient pass");
+    }
+}

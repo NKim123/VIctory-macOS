@@ -617,6 +617,11 @@ impl TextureTemplate {
 
 const SYNC_BLOCK_SLOTS: u32 = 128;
 
+fn sync_fast_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_FAST").as_deref() != Some(std::ffi::OsStr::new("0")))
+}
+
 /// Monotonic identity for each [`HostHeap`] so stale dynamic-slot releases
 /// targeting a released heap's recycled address never free a newer heap's slots.
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -1740,7 +1745,7 @@ impl HostHeap {
     }
 
     /// Watch the texture descriptor actually emitted into this slot.
-    pub(crate) fn ambient_view(&self, index: u32) -> Option<crate::ambient::Binding> {
+    pub(crate) fn ambient_view(&self, index: u32) -> Option<crate::ambient_wave::Binding> {
         // Title slots are mutated under made. Dynamic slots are owned by
         // this recorder until it finishes recording the list.
         let _made =
@@ -1753,10 +1758,10 @@ impl HostHeap {
         };
         let watch = view
             .watch
-            .get_or_insert_with(crate::ambient::Watch::new)
+            .get_or_insert_with(crate::ambient_wave::Watch::new)
             .clone();
         self.ambient_watched.store(true, Ordering::Release);
-        Some(crate::ambient::Binding {
+        Some(crate::ambient_wave::Binding {
             resource: resource.clone(),
             view: view.desc,
             handle: self.gpu(index),
@@ -1921,8 +1926,9 @@ impl HostHeap {
             crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncCaptureUs);
         let at = |i: u32| start + u64::from(i) * step;
         let forgot = views_forgot();
-        let blocks_verified = (first / SYNC_BLOCK_SLOTS..=(last - 1) / SYNC_BLOCK_SLOTS)
-            .all(|b| self.block_forgot[b as usize].load(Ordering::Acquire) == forgot);
+        let blocks_verified = sync_fast_enabled()
+            && (first / SYNC_BLOCK_SLOTS..=(last - 1) / SYNC_BLOCK_SLOTS)
+                .all(|b| self.block_forgot[b as usize].load(Ordering::Acquire) == forgot);
 
         #[cfg(target_arch = "x86_64")]
         if step == 32
@@ -3465,7 +3471,7 @@ fn held_backing(held: &Held) -> Option<&std::sync::Arc<crate::shadow::Shadow>> {
 #[derive(Clone)]
 pub(crate) struct AmbientTexture {
     desc: TextureView,
-    watch: Option<crate::ambient::Watch>,
+    watch: Option<crate::ambient_wave::Watch>,
 }
 
 #[derive(Clone, Copy)]
@@ -3493,7 +3499,7 @@ impl TextureView {
     }
 
     fn for_ambient(self, texture: &ID3D12Resource) -> Option<HeldSource> {
-        if !crate::ambient::enabled() {
+        if !crate::ambient_wave::enabled() {
             return None;
         }
         let default_format = || {
@@ -3892,6 +3898,14 @@ fn fits(
     }
     if view == 0 {
         return !typeless && (!unordered || typed_store(own));
+    }
+    // A packed 16-bit target made R8G8B8A8_UNORM on this GPU
+    // (`resource::target_format`): views name the format it has.
+    if view != own && crate::resource::target_format(view) == own {
+        if let Some(format) = format {
+            *format = d.Format;
+        }
+        return true;
     }
     if DEPTH_FORMATS.iter().any(|&(typed, _)| typed == view) || is_typeless(view) {
         once!(unordered, view, own, "view the host does not allow");

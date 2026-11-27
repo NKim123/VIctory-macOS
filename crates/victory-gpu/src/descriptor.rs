@@ -944,7 +944,9 @@ impl RtvRecord {
                 0,
             ]
         };
-        words[0] = crate::resource::pc_format(words[0]);
+        // Render target and depth views: a packed 16-bit target may be
+        // R8G8B8A8_UNORM on this GPU (`resource::target_format`).
+        words[0] = crate::resource::target_format(words[0]);
         // SAFETY: both host view descriptions are 24 bytes in this layout.
         Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
     }
@@ -1876,6 +1878,54 @@ pub(crate) mod tests {
         }
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         crate::watch::tests::free(memory);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sync_heaps_reads_partial_64k_pages_and_small_heaps() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        // Reserve 64 KiB with write-watch, commit only the first 4 KiB so a full
+        // heap-range read_into fails and sync_heaps must fall back to 4 KiB pages.
+        // SAFETY: fresh reservation freed at the end of the test.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                64 << 10,
+                MEM_RESERVE | crate::watch::tests::MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(base, 0);
+        // SAFETY: committing the first 4 KiB of our reservation.
+        let committed = unsafe { VirtualAlloc(base as *const _, 4 << 10, MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!committed.is_null());
+
+        let desc = HeapDesc {
+            kind: SAMPLERS,
+            count: 512, // 512 * 16 = 8 KiB: spans committed 4 KiB + uncommitted 4 KiB
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let mut h = std::ptr::null();
+        let placement = Placement {
+            address: base as u64,
+            size: 512 * 16,
+        };
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        if let Some(host) = heap(h).host() {
+            let mut elsewhere = [0u64; 2];
+            let at = elsewhere.as_mut_ptr() as u64;
+            create_sampler(std::ptr::null(), &[21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0], at);
+            let slot1 = base as u64 + 16;
+            // SAFETY: 16 bytes inside the committed first 4 KiB.
+            unsafe { std::ptr::copy_nonoverlapping(at as *const u8, slot1 as *mut u8, 16) };
+            assert!(!host.made(1));
+            sync_heaps();
+            assert!(host.made(1), "partial 64 KiB page / small heap must still sync");
+        }
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
     }
 
     #[cfg(windows)]

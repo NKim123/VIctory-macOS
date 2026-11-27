@@ -48,7 +48,7 @@ pub(super) struct InFlight {
     lists: Vec<Arc<HostList>>,
     upload: Option<crate::bindless::OwnedUpload>,
     _tiles: crate::tiled::Flushed,
-    _ambient: Option<Arc<crate::ambient::Frozen>>,
+    _ambient: Option<Arc<crate::ambient_wave::Frozen>>,
     _batch: Batch,
     _pins: Vec<crate::descriptor::ViewPin>,
     _retired: Vec<crate::descriptor::host::Held>,
@@ -801,12 +801,12 @@ impl Host {
         let value = s.value;
         let queue = self.queue();
         let tiles = crate::tiled::flush(&queue);
-        let ambient = if crate::ambient::enabled() {
+        let ambient = if crate::ambient_wave::enabled() {
             let candidates: Vec<_> = lists
                 .iter()
                 .flat_map(|list| list.deferred().ambient.clone())
                 .collect();
-            crate::ambient::freeze(&candidates, &self.fence, value)
+            crate::ambient_wave::freeze(&candidates, &self.fence, value)
         } else {
             None
         };

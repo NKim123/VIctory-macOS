@@ -282,7 +282,8 @@ mod tests {
                 .lock()
                 .unwrap()
                 .pop()
-                .expect("early-reset host list in the spare pool"),
+                .expect("early-reset host list in the spare pool")
+                .list,
         );
         assert!(recycled.list == handle);
         recycled.close();

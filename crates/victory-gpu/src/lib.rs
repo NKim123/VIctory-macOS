@@ -24,6 +24,16 @@ mod backend;
 #[cfg(windows)]
 mod ambient;
 #[cfg(windows)]
+mod ambient_estimate;
+// Plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod ambient_estimate_set;
+// Plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod ambient_set;
+#[cfg(windows)]
+mod ambient_wave;
+#[cfg(windows)]
 mod bindless;
 #[cfg(any(windows, test))]
 mod caption;
@@ -74,6 +84,8 @@ pub mod queue;
 #[cfg(any(windows, test))]
 mod ranges;
 // Plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod ray_skip;
 #[cfg(any(windows, test))]
 mod recent;
 pub mod resource;

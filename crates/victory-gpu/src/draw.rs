@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use victory_shader::{ResourceType, RootType, UsedResource};
 
-use crate::ambient::{self, CheckedViews, Role};
+use crate::ambient_wave::{self, CheckedViews, Role};
 use crate::descriptor::{RtvRecord, View};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
@@ -868,6 +868,13 @@ impl State {
         if !self.bind(list, p, false) {
             return false;
         }
+        // The sky dome the ambient light follows (`crate::ambient`).
+        if crate::ambient::on()
+            && crate::pipeline::ambient_role(self.pipeline as This) & crate::ambient::DRAWS_SKY != 0
+            && let Some(&sky) = self.targets.first()
+        {
+            crate::ambient::sky_drawn(sky);
+        }
         let l = &list.list;
         let cache = bind_cache_enabled();
         // Vertex buffers the input layout reads.
@@ -1027,6 +1034,9 @@ impl State {
         // to date at submission (`crate::bindless`).
         if p.stages.iter().any(|s| s.translated().host.heap) {
             let writes = p.stages.iter().any(|s| s.translated().host.heap_writes);
+            if writes {
+                list.note_unknown_gpu_write();
+            }
             if let Some(host) = (self.heaps[0] != 0)
                 .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
                 .flatten()
@@ -1268,6 +1278,7 @@ impl State {
                         l.SetGraphicsRootShaderResourceView(param, table);
                     }
                     if let Some(param) = stage.memory_dirty {
+                        list.note_unknown_gpu_write();
                         if compute {
                             l.SetComputeRootUnorderedAccessView(param, dirty);
                         } else {
@@ -1563,16 +1574,31 @@ impl State {
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         let builder = crate::pipeline::is_builder(self.pipeline as This);
-        if builder && !crate::pipeline::builder_runs() {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
-            crate::pipeline::note_why("BVH builder disabled".to_owned());
-            return;
-        }
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             dropped(list, self.pipeline, "dispatch");
+            return;
+        }
+        // The acceleration-structure builder runs whole or not at all
+        // (`pipeline::builder`).
+        if crate::pipeline::held_back(self.pipeline as This) {
+            once!("a dispatch of the BVH builder held back");
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            dropped(list, self.pipeline, "dispatch");
+            return;
+        }
+        // A ray pass with no structure to work on (`VICTORY_RAY_SKIP`,
+        // `crate::ray_skip`): left out, and counted there, not as dropped.
+        if crate::pipeline::ray_pass_left_out(self.pipeline as This) {
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| {
+                format!(
+                    "LEFT OUT dispatch {x}x{y}x{z} (VICTORY_RAY_SKIP) {}",
+                    crate::pipeline::shaders_of(self.pipeline as This)
+                )
+            });
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
@@ -1636,6 +1662,112 @@ impl State {
             self.host_pipeline = 0;
             self.host_roots[1] = 0;
         }
+        if x != 0 && y != 0 && z != 0 {
+            self.ambient(list);
+        }
+    }
+
+    /// After a dispatch: the stand-in for ray-traced indirect light
+    /// (`crate::ambient`, `VICTORY_AMBIENT=1`; from Belobug 0603123), if the
+    /// program is one it follows. Its pass sets a view heap, a compute root
+    /// signature and a pipeline of its own: the title's are set again by the
+    /// next draw or dispatch.
+    fn ambient(&mut self, list: &HostList) {
+        if !crate::ambient::on() {
+            return;
+        }
+        let role = crate::pipeline::ambient_role(self.pipeline as This);
+        let estimate = crate::ambient_estimate::roles();
+        if role & (crate::ambient::RESOLVES | crate::ambient::ENDS_REFLECTIONS | estimate) == 0 {
+            return;
+        }
+        let Some(stage) =
+            crate::pipeline::host_pipeline(self.pipeline as This).and_then(|p| p.stages.first())
+        else {
+            return;
+        };
+        // The texture viewed at a place of one of the program's tables, if
+        // its code uses that place as `kind`; the view stays pinned while
+        // the pass is recorded.
+        let image = |kind: ResourceType, (slot, offset): (u8, u32)| {
+            stage.translated().used.iter().find(|u| {
+                u.kind == kind
+                    && u.root == RootType::Table
+                    && (u.slot, u.table_offset_dwords) == (slot, offset)
+            })?;
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
+                return None;
+            };
+            let pin = crate::descriptor::view(table + u64::from(offset) * 4)?;
+            // A texture the title placed in memory itself: the resource made
+            // for that memory.
+            let placed = crate::descriptor::host::placed_texture(&pin);
+            let texture = match (placed.as_ref().unwrap_or(&pin), kind) {
+                (&View::Unordered(r, ..), ResourceType::Uav) => r,
+                (&View::Shader(r, _), ResourceType::Srv) => r,
+                _ => 0,
+            };
+            (texture != 0).then_some((pin, texture as This))
+        };
+        let recorded = if crate::ambient_estimate::on() {
+            // The estimate in the constant's place (`VICTORY_AMBIENT=estimate`,
+            // from avatarmanz 82ca1347).
+            use crate::ambient_estimate as estimate;
+            if role & estimate::KEEPS != 0 {
+                match &image(ResourceType::Uav, estimate::RADIANCE) {
+                    Some((_, radiance)) => estimate::keep(list, *radiance),
+                    None => {
+                        once!("no ambient estimate: the light visible surfaces send out is not at its place in the table");
+                        false
+                    }
+                }
+            } else if role & estimate::LIGHTS_AIR != 0 {
+                // (Nothing unless `VICTORY_AMBIENT_AIR` is set.)
+                match &image(ResourceType::Uav, estimate::AIR) {
+                    Some((_, scattered)) => estimate::air(list, *scattered),
+                    None => false,
+                }
+            } else if role & crate::ambient::RESOLVES != 0 {
+                let light = image(ResourceType::Uav, crate::ambient::LIGHT);
+                let depth = image(ResourceType::Srv, crate::ambient::DEPTH);
+                match &light {
+                    Some((_, light)) => estimate::raise(list, *light, depth.as_ref().map(|d| d.1)),
+                    None => {
+                        once!("no ambient estimate: the resolve's light image is not at its place in the table");
+                        false
+                    }
+                }
+            } else {
+                // The reflections, held to the light around.
+                match &image(ResourceType::Uav, crate::ambient::REFLECTIONS) {
+                    Some((_, reflections)) => estimate::hold(list, *reflections),
+                    None => false,
+                }
+            }
+        } else if role & crate::ambient::RESOLVES != 0 {
+            let light = image(ResourceType::Uav, crate::ambient::LIGHT);
+            let depth = image(ResourceType::Srv, crate::ambient::DEPTH);
+            match &light {
+                Some((_, light)) => {
+                    crate::ambient::raise(list, *light, depth.as_ref().map(|d| d.1))
+                }
+                None => {
+                    once!("no ambient light: the resolve's light image is not at its place in the table");
+                    false
+                }
+            }
+        } else {
+            // The reflections, held to the light around.
+            match &image(ResourceType::Uav, crate::ambient::REFLECTIONS) {
+                Some((_, reflections)) => crate::ambient::hold(list, *reflections),
+                None => false,
+            }
+        };
+        if recorded {
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| "the ambient light's pass (VICTORY_AMBIENT)".into());
+            self.host_state_lost();
+        }
     }
 
     /// Interpret only expected full-size views prepared by the producer.
@@ -1677,7 +1809,7 @@ impl State {
             // SAFETY: the heap made a view of this live host resource.
             let desc = unsafe { depth.resource.GetDesc() };
             if depth.resource == image.resource
-                || !ambient::depth_matches(depth.view, desc, size)
+                || !ambient_wave::depth_matches(depth.view, desc, size)
                 || !list.has_texture_state(
                     &depth.resource,
                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
@@ -2512,7 +2644,7 @@ impl State {
         count: Option<u64>,
     ) -> bool {
         let builder = crate::pipeline::is_builder(self.pipeline as This);
-        if builder && !crate::pipeline::builder_runs() {
+        if builder && crate::pipeline::held_back(self.pipeline as This) {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_why("indirect BVH builder disabled".to_owned());
             return false;
@@ -2558,6 +2690,19 @@ impl State {
         // the arguments and dispatch a compute shader for records nothing
         // reads. Same order as the `is_skipped` check above, for the same
         // reason.
+        // A ray pass with no structure to work on (`VICTORY_RAY_SKIP`,
+        // `crate::ray_skip`): left out before its arguments are refreshed
+        // and clamped, and counted there, not as a dropped execution.
+        if kind == DISPATCH && crate::pipeline::ray_pass_left_out(self.pipeline as This) {
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| {
+                format!(
+                    "LEFT OUT indirect kind {kind} max {max} (VICTORY_RAY_SKIP) {}",
+                    crate::pipeline::shaders_of(pipeline)
+                )
+            });
+            return true;
+        }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
@@ -2586,13 +2731,18 @@ impl State {
             why("no host signature");
             return false;
         };
+        let gpu = args.gpu(arguments);
+        let clamp = crate::indirect::clamp_enabled();
+        if clamp && (!gpu.is_multiple_of(4) || !stride.is_multiple_of(4)) {
+            why("indirect arguments not 4-byte aligned");
+            return false;
+        }
         args.refresh(list, arguments, len);
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
         // Bounded first: the clamp binds a compute pipeline of its own. It
         // reads the count, so that it stops where the execution does.
-        let clamp = crate::indirect::clamp_enabled();
         let mode = crate::indirect::batch_mode();
         let window = mode == 0 && crate::indirect::windows();
         let keep_readable = clamp && (mode != 0 || window);
@@ -2600,7 +2750,6 @@ impl State {
         let batch_aliased = aliased && mode != 0 && crate::indirect::batch_aliased();
         let graphics_may_write = keep_readable && kind != DISPATCH && may_write_buffers(p);
         let offset = args.offset(arguments);
-        let gpu = args.gpu(arguments);
         let source_window = if batch_aliased {
             crate::indirect::source_window(gpu, offset)
         } else {
@@ -2617,29 +2766,43 @@ impl State {
         let batched = eligible
             .then(|| self.batched_indirect(list, (kind, stride), source_window, window, aliased))
             .flatten();
-        let (argument_buffer, at) = if !clamp {
-            // The diagnostic timing path bypasses the work limits and budget.
-            (args.buffer.clone(), offset)
-        } else if let Some(record) = batched {
+        let counted = counter.as_ref().map(|(s, at)| s.gpu(*at));
+        // Inline batches take precedence when explicitly selected. The first
+        // inline clamp keeps the rest inline so the budget is charged in order.
+        // Alias and tiled mappings may reach earlier writes by another address.
+        let hoist = clamp
+            && batched.is_none()
+            && !aliased
+            && counter.as_ref().is_none_or(|(s, _)| !s.is_aliased() && !s.is_tiled())
+            && crate::indirect::batch_clamps_enabled()
+            && list.can_hoist_clamp(arguments, len, count)
+            && crate::indirect::available();
+        let inline = if !clamp {
+            Some((args.buffer.clone(), offset, false))
+        } else if let Some((buffer, at)) = batched {
+            list.note_inline_clamp();
             if aliased {
                 crate::indirect::note_batched_alias();
             }
-            record
+            Some((buffer, at, false))
+        } else if hoist {
+            self.indirect = None;
+            None
         } else {
             self.indirect = None;
-            let counted = counter.as_ref().map(|(s, at)| s.gpu(*at));
             let Some(clamped) =
                 crate::indirect::bound(list, gpu, (kind, stride, max), counted, keep_readable)
             else {
                 why("not bounded (no clamp, or arguments not 4-byte aligned)");
                 return false;
             };
+            list.note_inline_clamp();
             self.host_pipeline = 0;
             self.host_roots[1] = 0;
             if aliased && max == 1 && count.is_none() {
                 crate::indirect::note_aliased_record();
             }
-            (clamped, 0)
+            Some((clamped, 0, !keep_readable))
         };
         // The GPU controls the effective count and dimensions. Even a
         // nonzero max cannot prove any shader writes this texture.
@@ -2655,8 +2818,8 @@ impl State {
             _ => unreachable!("the signature check above admits only these kinds"),
         };
         if !ran {
-            if clamp && !keep_readable {
-                crate::indirect::done(list, &argument_buffer);
+            if let Some((buffer, _, true)) = &inline {
+                crate::indirect::done(list, buffer);
             }
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
@@ -2673,6 +2836,18 @@ impl State {
             }
             return false;
         }
+        let (argument_buffer, at, needs_done) = match inline {
+            Some(inline) => inline,
+            None => {
+                let Some((buffer, offset)) =
+                    crate::indirect::enqueue(list, gpu, (kind, stride, max), counted)
+                else {
+                    why("not bounded (no hoisted argument buffer)");
+                    return false;
+                };
+                (buffer, offset, false)
+            }
+        };
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
             self.op_text(
@@ -2717,7 +2892,7 @@ impl State {
                 );
             }
         }
-        if clamp && !keep_readable {
+        if needs_done {
             crate::indirect::done(list, &argument_buffer);
         }
         if (kind == DISPATCH && mode != 2) || graphics_may_write {
@@ -2726,6 +2901,7 @@ impl State {
         if kind == DISPATCH {
             self.probe_hdr_compute(list);
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            self.ambient(list);
         } else {
             self.note_hdr_draw();
             DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -4829,7 +5005,7 @@ void main() { dst.Store4(0, asuint(src[0])); }
         let Some(host) = crate::host::host() else {
             return;
         };
-        ambient::test_constant();
+        ambient_wave::test_constant();
         let (heap, title_heap) = title_view_heap(64);
         if capped {
             title_heap.test_cap_host_views(8);

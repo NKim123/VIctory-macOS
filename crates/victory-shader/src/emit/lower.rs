@@ -134,6 +134,13 @@ pub(crate) struct Lowered {
     /// title-memory page table, one entry per load.
     #[cfg(test)]
     pub raw_loads: [Vec<usize>; 2],
+    /// Written raw buffer loads: the byte offset (where a constant) and
+    /// the mask.
+    #[cfg(test)]
+    pub raw_load_args: Vec<(Option<i64>, Option<i64>)>,
+    /// Written constant buffer row loads (`cbufferLoadLegacy`).
+    #[cfg(test)]
+    pub cbuffer_rows: usize,
     /// The written `dx.op.unary.f32` calls: their DXIL opcodes, and whether
     /// the operand was denormal-flushed first. For structural tests.
     #[cfg(test)]
@@ -445,6 +452,8 @@ struct Lower<'a> {
     code_table: Option<(V, u32, u32)>,
     /// The null pair's view in the page table ([`Lower::memory_null`]).
     memory_null: Option<V>,
+    /// The offsets [`Lower::memory`] returned ([`Lower::raw_run`]).
+    memory_offsets: HashSet<V>,
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
@@ -987,6 +996,7 @@ impl<'a> Lower<'a> {
             section_out: Set::default(),
             code_table: None,
             memory_null: None,
+            memory_offsets: HashSet::new(),
             counters: HashMap::new(),
             abort: None,
             round16: round16(p),
@@ -1109,14 +1119,8 @@ impl<'a> Lower<'a> {
                 (Some(h), off)
             }
         };
-        if let (Some(h), None) = (h, sub)
-            && n > 1
-            && super::shader_opt() & super::bitcode::opt::WIDE != 0
-        {
-            let raw = self.raw_dword_group(h, off, n);
-            for k in 0..n {
-                let x = self.s.m.extract(self.cur, raw, k);
-                let x = self.as_int(x);
+        if let (Some(h), None) = (h, sub) {
+            for (k, x) in self.raw_run(h, off, n).into_iter().enumerate() {
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
@@ -1811,6 +1815,16 @@ impl<'a> Lower<'a> {
             early_depth_stencil: self.s.flags & flags::EARLY_DEPTH_STENCIL != 0,
             #[cfg(test)]
             raw_loads,
+            #[cfg(test)]
+            raw_load_args: self
+                .s
+                .m
+                .written_call_args("dx.op.rawBufferLoad.f32")
+                .iter()
+                .map(|a| (a[2], a[4]))
+                .collect(),
+            #[cfg(test)]
+            cbuffer_rows: self.s.m.written_calls("dx.op.cbufferLoadLegacy.i32"),
             #[cfg(test)]
             unary_f32: self.s.m.written_unary_f32_flushes(),
             dxil: self.s.finish(),
@@ -4876,29 +4890,24 @@ impl<'a> Lower<'a> {
                 if self.x.native.layout.get(address.param).is_some_and(|p| p.root == RootType::Descriptor));
         if srv || root_uav {
             let (h, addr) = self.raw_view(site, src, addr, 4 * count, (11, 0), false, None)?;
-            let c = self.cur;
-            // 7900XTX's wide scalar SRV loads. Each call stays within the
-            // same console instruction and uses its four-byte alignment.
-            let width = if srv
-                && !root_uav
-                && (super::wide_scalar_loads()
-                    || table_constants && super::raw_root_cbvs()
-                    || super::shader_opt() & super::bitcode::opt::WIDE != 0)
-            {
-                4
+            let wide = heap_constants
+                || table_constants
+                || !root_uav
+                    && (super::wide_scalar_loads()
+                        || super::shader_opt() & super::bitcode::opt::WIDE != 0);
+            let values = if wide {
+                self.raw_run(h, addr, count)
             } else {
-                1
+                (0..count)
+                    .map(|k| {
+                        let off = self.s.m.i32(4 * k);
+                        let at = self.s.m.bin(c, Bin::Add, addr, off);
+                        self.raw_dword(h, at)
+                    })
+                    .collect()
             };
-            for first in (0..count).step_by(width as usize) {
-                let dwords = (count - first).min(width);
-                let off = self.s.m.i32(4 * first);
-                let a = self.s.m.bin(c, Bin::Add, addr, off);
-                let r = self.raw_dword_group(h, a, dwords);
-                for k in 0..dwords {
-                    let x = self.s.m.extract(c, r, k);
-                    let x = self.as_int(x);
-                    self.write(inst, Reg::S(code + (first + k) as u8), x, None);
-                }
+            for (k, x) in values.into_iter().enumerate() {
+                self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
         }
@@ -4919,6 +4928,10 @@ impl<'a> Lower<'a> {
                 Some(*offset as u32)
             }
             _ => None,
+        };
+        let dynamic = match constant {
+            Some(_) => Vec::new(),
+            None => self.cbuffer_dwords(h, addr, count),
         };
         let mut rows: HashMap<u32, V> = HashMap::new();
         for k in 0..count {
@@ -4943,11 +4956,7 @@ impl<'a> Lower<'a> {
                     };
                     self.s.m.extract(c, row, (byte >> 2) & 3)
                 }
-                None => {
-                    let off = self.s.m.i32(4 * k);
-                    let a = self.s.m.bin(c, Bin::Add, addr, off);
-                    self.cbuffer_dword(h, a)
-                }
+                None => dynamic[k as usize],
             };
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
@@ -5219,10 +5228,7 @@ impl<'a> Lower<'a> {
             (lo, hi) = self.add64(lo, hi, x, negative);
         }
         let (h, off) = self.memory(lo, hi, 4 * count, false, None);
-        for k in 0..count {
-            let four = self.s.m.i32(4 * k);
-            let at = self.s.m.bin(self.cur, Bin::Add, off, four);
-            let x = self.raw_dword(h, at);
+        for (k, x) in self.raw_run(h, off, count).into_iter().enumerate() {
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
         Ok(())
@@ -5508,6 +5514,7 @@ impl<'a> Lower<'a> {
             self.mark_memory_bit(bitmap, second);
             self.end_guarded(at, &[]);
         }
+        self.memory_offsets.insert(e.offset);
         (e.handle, e.offset)
     }
 
@@ -5725,31 +5732,109 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// The dword at a computed byte address of a constant buffer.
-    fn cbuffer_dword(&mut self, h: V, a: V) -> V {
+    /// `count` dwords of a constant buffer from a computed byte address `a`
+    /// on, a row load for each row the run can touch rather than one per
+    /// dword. Dword `k` is in the row of `a + 4k`: row `j` of the run is
+    /// that of `a + 16j`, the last the row of its last dword (past the
+    /// aligned rows when `a` is not 16-byte aligned, else one read already),
+    /// so no row past the dwords is read. Rows wrap as `a + 4k` does.
+    fn cbuffer_dwords(&mut self, h: V, a: V, count: u32) -> Vec<V> {
         let c = self.cur;
-        let four = self.s.m.i32(4);
-        let ri = self.s.m.bin(c, Bin::LShr, a, four);
-        let r = self.s.op(
-            c,
-            "cbufferLoadLegacy.i32",
-            Attr::ReadOnly,
-            self.s.t.cbuf_ret,
-            59,
-            &[h, ri],
-        );
-        let two = self.s.m.i32(2);
-        let three = self.s.m.i32(3);
+        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
+        let (two, three, four) = (k(self, 2), k(self, 3), k(self, 4));
+        let last = (count + 2) / 4;
+        let rows: Vec<V> = (0..=last)
+            .map(|j| {
+                let at = match j {
+                    0 => a,
+                    _ if j == last => {
+                        let end = k(self, 4 * (count - 1));
+                        self.s.m.bin(c, Bin::Add, a, end)
+                    }
+                    _ => {
+                        let row = k(self, 16 * j);
+                        self.s.m.bin(c, Bin::Add, a, row)
+                    }
+                };
+                let ri = self.s.m.bin(c, Bin::LShr, at, four);
+                self.s.op(
+                    c,
+                    "cbufferLoadLegacy.i32",
+                    Attr::ReadOnly,
+                    self.s.t.cbuf_ret,
+                    59,
+                    &[h, ri],
+                )
+            })
+            .collect();
         let comp = self.s.m.bin(c, Bin::LShr, a, two);
         let comp = self.s.m.bin(c, Bin::And, comp, three);
-        let mut x = self.s.m.extract(c, r, 0);
-        for j in 1..4 {
-            let e = self.s.m.extract(c, r, j);
-            let jc = self.s.m.i32(j);
-            let is = self.s.m.cmp(c, pred::EQ, comp, jc);
-            x = self.s.m.select(c, is, e, x);
+        let is: Vec<V> = (1..4)
+            .map(|j| {
+                let jc = k(self, j);
+                self.s.m.cmp(c, pred::EQ, comp, jc)
+            })
+            .collect();
+        // The rows' dwords in order (those no dword takes are not written).
+        let mut parts = Vec::new();
+        for &r in &rows {
+            for j in 0..4 {
+                parts.push(self.s.m.extract(c, r, j));
+            }
         }
-        x
+        (0..count as usize)
+            .map(|i| {
+                // `comp` is the first dword's component.
+                let mut x = parts[i];
+                for j in 1..4 {
+                    x = self.s.m.select(c, is[j - 1], parts[i + j], x);
+                }
+                x
+            })
+            .collect()
+    }
+
+    /// `count` dwords of raw buffer `h` from byte `at` on, a load of up to
+    /// four at a time: raw loads need 4-byte alignment only, and D3D12
+    /// bounds them per 32-bit component (D3D11.3 `ld_raw`), so a dword out
+    /// of the view reads 0 as its own load did. In title memory an access
+    /// that starts before its copy (on the copy's first page) has an offset
+    /// just under 2^32, which wraps into the copy from one dword to the
+    /// next and not within a load: lanes whose run wraps read it a dword at
+    /// a time.
+    fn raw_run(&mut self, h: V, at: V, count: u32) -> Vec<V> {
+        let c = self.cur;
+        let mut xs = Vec::new();
+        for first in (0..count).step_by(4) {
+            let n = (count - first).min(4);
+            let a = match first {
+                0 => at,
+                _ => {
+                    let off = self.s.m.i32(4 * first);
+                    self.s.m.bin(c, Bin::Add, at, off)
+                }
+            };
+            let r = self.raw_dword_group(h, a, n);
+            for k in 0..n {
+                let x = self.s.m.extract(c, r, k);
+                xs.push(self.as_int(x));
+            }
+        }
+        if count == 1 || !self.memory_offsets.contains(&at) {
+            return xs;
+        }
+        let last = self.s.m.i32(!(4 * (count - 1)));
+        let wraps = self.s.m.cmp(c, pred::IUGT, at, last);
+        let guard = self.begin_guarded(Some(wraps));
+        let pairs: Vec<(V, V)> = (0..count)
+            .zip(xs)
+            .map(|(k, x)| {
+                let off = self.s.m.i32(4 * k);
+                let a = self.s.m.bin(self.cur, Bin::Add, at, off);
+                (self.raw_dword(h, a), x)
+            })
+            .collect();
+        self.end_guarded(guard, &pairs)
     }
 
     /// `channels` channels of the element at byte `off` of raw buffer `h`,
@@ -10637,17 +10722,8 @@ impl<'a> Lower<'a> {
                     return Err("a buffer result");
                 };
                 let (h, byte) = self.raw_view(site, src, byte, 4 * count, (11, 0), false, guard)?;
-                let width = if super::raw_root_cbvs() { 4 } else { 1 };
-                for first in (0..count).step_by(width) {
-                    let dwords = (count - first).min(width as u32);
-                    let off = self.s.m.i32(4 * first);
-                    let address = self.s.m.bin(self.cur, Bin::Add, byte, off);
-                    let row = self.raw_dword_group(h, address, dwords);
-                    for k in 0..dwords {
-                        let value = self.s.m.extract(self.cur, row, k);
-                        let value = self.as_int(value);
-                        self.write(inst, Reg::V(reg + (first + k) as u8), value, guard);
-                    }
+                for (k, x) in self.raw_run(h, byte, count).into_iter().enumerate() {
+                    self.write(inst, Reg::V(reg + k as u8), x, guard);
                 }
                 return Ok(());
             }
@@ -10659,14 +10735,18 @@ impl<'a> Lower<'a> {
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
-            for k in 0..count {
-                let four = self.s.m.i32(4 * k);
-                let a = self.s.m.bin(c, Bin::Add, byte, four);
-                let x = if raw.is_some() {
-                    self.raw_root_cbv_dword(h, a)
-                } else {
-                    self.cbuffer_dword(h, a)
-                };
+            let values = if raw.is_some() {
+                (0..count)
+                    .map(|k| {
+                        let four = self.s.m.i32(4 * k);
+                        let a = self.s.m.bin(c, Bin::Add, byte, four);
+                        self.raw_root_cbv_dword(h, a)
+                    })
+                    .collect()
+            } else {
+                self.cbuffer_dwords(h, byte, count)
+            };
+            for (k, x) in values.into_iter().enumerate() {
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());

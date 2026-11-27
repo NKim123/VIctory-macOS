@@ -929,10 +929,10 @@ fn a_native_copy_sees_an_earlier_label_through_a_zero_copy_buffer() {
 
 #[test]
 fn ambient_versions_stay_frozen_through_the_native_fence() {
-    use crate::ambient::{Binding, Candidate, CheckedViews, Watch};
+    use crate::ambient_wave::{Binding, Candidate, CheckedViews, Watch};
     use crate::descriptor::host::TextureView;
     let Some(host) = host_for_ring() else { return };
-    if !crate::ambient::enabled() {
+    if !crate::ambient_wave::enabled() {
         return;
     }
     host.present_boundary();

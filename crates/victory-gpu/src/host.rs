@@ -406,6 +406,8 @@ fn create() -> windows::core::Result<Host> {
         let cpu_view_size =
             device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         tracing::info!("host D3D12 device ready");
+        crate::ambient::announce();
+        crate::ray_skip::announce();
         // The console fuses its multiply-adds (`v_fma_f32`, `v_fmac_f32`,
         // `v_fma_mix*`); the lowering's DXIL `FMad` is fused only where the
         // host chooses (the RX 6700 XT does, WARP does not).
@@ -1195,6 +1197,21 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_shed_list_makes_its_scratch_again_from_the_first_chunk() {
+        let Some(host) = host() else { return };
+        let Ok(list) = host.new_list() else { return };
+        list.scratch(200 << 10).unwrap();
+        list.close();
+        list.reset();
+        assert!(list.scratch_bytes() > 0, "kept for the next cycle");
+        list.shed_scratch();
+        assert_eq!(list.scratch_bytes(), 0);
+        list.scratch(1).unwrap();
+        assert_eq!(list.scratch_bytes(), FIRST_SCRATCH_CHUNK);
+        list.close();
+    }
+
+    #[test]
     fn warp_adapter_accepts_only_software() {
         // This probes DXGI without creating a D3D12 device or running a title.
         // SAFETY: plain DXGI adapter queries.
@@ -1491,12 +1508,15 @@ pub(crate) struct HostList {
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
     /// Clamped indirect arguments (`crate::indirect`), reused by each
-    /// execution in turn; replaced by a bigger one when too small.
+    /// inline execution in turn; replaced by a bigger one when too small.
     arguments: Mutex<Option<ID3D12Resource>>,
     /// Scratch last left ready for indirect execution by a clamp.
     indirect_readable: Mutex<Option<ID3D12Resource>>,
     /// Title ordering boundaries that may make GPU-written arguments visible.
     indirect_epoch: AtomicU64,
+    /// Indirect clamps hoisted into `prelude`, their bump-allocated argument
+    /// buffers, and the list's GPU-write hazard tracker.
+    clamps: Mutex<HoistedClamps>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -1634,6 +1654,137 @@ unsafe impl Send for Scratch {}
 
 const SCRATCH_CHUNK: u64 = 4 << 20;
 const FIRST_SCRATCH_CHUNK: u64 = 64 << 10;
+const ARGUMENT_CHUNK_FIRST: u64 = 64 << 10;
+const ARGUMENT_CHUNK_MAX: u64 = 4 << 20;
+const MAX_HAZARD_RANGES: usize = 256;
+
+struct ArgumentChunk {
+    buffer: ID3D12Resource,
+    gpu: u64,
+    capacity: u64,
+}
+
+/// Tracks title-address ranges written on the GPU earlier in a host list so
+/// indirect argument clamps only hoist into the list's prelude when neither
+/// their argument range nor their count word could have been written earlier
+/// in the same list, and preserves sequential budget order once any inline
+/// clamp has run.
+#[derive(Default)]
+pub(crate) struct WriteHazard {
+    /// Sorted, disjoint, non-empty half-open title address ranges `[start, end)`.
+    ranges: Vec<(u64, u64)>,
+    /// Set when an earlier command can write arbitrary buffer memory (e.g.
+    /// bindless heap UAV writes or page-table memory writes).
+    unknown: bool,
+    /// Set once an inline clamp has been recorded in this list so subsequent
+    /// clamps stay inline and charge the shared budget in recorded order.
+    inline_used: bool,
+}
+
+impl WriteHazard {
+    pub(crate) fn note_write(&mut self, start: u64, len: u64) {
+        if self.unknown || len == 0 {
+            return;
+        }
+        let end = start.saturating_add(len);
+        if end <= start {
+            return;
+        }
+        if self.ranges.last() == Some(&(start, end)) {
+            return;
+        }
+        let pos = self.ranges.partition_point(|&(s, _)| s < start);
+        let mut lo = pos;
+        let mut new_start = start;
+        let mut new_end = end;
+        if lo > 0 && self.ranges[lo - 1].1 >= new_start {
+            lo -= 1;
+            new_start = self.ranges[lo].0;
+            new_end = new_end.max(self.ranges[lo].1);
+        }
+        let mut hi = pos;
+        while hi < self.ranges.len() && self.ranges[hi].0 <= new_end {
+            new_end = new_end.max(self.ranges[hi].1);
+            hi += 1;
+        }
+        self.ranges.splice(lo..hi, std::iter::once((new_start, new_end)));
+        if self.ranges.len() > MAX_HAZARD_RANGES {
+            self.unknown = true;
+            self.ranges.clear();
+        }
+    }
+
+    pub(crate) fn note_unknown(&mut self) {
+        self.unknown = true;
+        self.ranges.clear();
+    }
+
+    pub(crate) fn note_inline(&mut self) {
+        self.inline_used = true;
+    }
+
+    pub(crate) fn overlaps(&self, start: u64, len: u64) -> bool {
+        if self.unknown {
+            return true;
+        }
+        if len == 0 {
+            return false;
+        }
+        let end = start.saturating_add(len);
+        let pos = self.ranges.partition_point(|&(_, e)| e <= start);
+        pos < self.ranges.len() && self.ranges[pos].0 < end
+    }
+
+    pub(crate) fn can_hoist(&self, arguments: u64, len: u64, count: Option<u64>) -> bool {
+        if self.inline_used || self.unknown {
+            return false;
+        }
+        if self.overlaps(arguments, len) {
+            return false;
+        }
+        if let Some(at) = count
+            && self.overlaps(at, 4)
+        {
+            return false;
+        }
+        true
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.ranges.clear();
+        self.unknown = false;
+        self.inline_used = false;
+    }
+}
+
+#[derive(Default)]
+struct HoistedClamps {
+    chunks: Vec<ArgumentChunk>,
+    current: usize,
+    used: u64,
+    touched: usize,
+    oversized: Vec<ID3D12Resource>,
+    pending: Vec<crate::indirect::PendingClamp>,
+    budget_gpu: u64,
+    hazard: WriteHazard,
+}
+
+impl HoistedClamps {
+    fn retained_bytes(&self) -> u64 {
+        let chunks = self.chunks.iter().map(|chunk| chunk.capacity).sum::<u64>();
+        self.oversized.iter().fold(chunks, |total, buffer| {
+            // SAFETY: the arena holds this resource.
+            total.saturating_add(unsafe { buffer.GetDesc() }.Width)
+        })
+    }
+
+    fn touched_buffers(&self) -> Vec<ID3D12Resource> {
+        let mut out = Vec::with_capacity(self.touched + self.oversized.len());
+        out.extend(self.chunks.iter().take(self.touched).map(|c| c.buffer.clone()));
+        out.extend(self.oversized.iter().cloned());
+        out
+    }
+}
 
 struct ScratchChunk {
     buffer: ID3D12Resource,
@@ -1757,7 +1908,7 @@ struct Deferred {
     /// Uploads and root bindings transferred by an early title-list reset.
     /// They live with the old recording and need no CPU completion callback.
     recording_storage: Option<(Box<dyn Send>, u64)>,
-    ambient: Vec<crate::ambient::Candidate>,
+    ambient: Vec<crate::ambient_wave::Candidate>,
     /// Aliasing and UAV barriers, and render target bindings, can name
     /// textures without recording a state transition. Keep their allocations
     /// alive until reset and include them in the async lane's bounds.
@@ -2073,6 +2224,7 @@ impl HostGpu for Host {
                 arguments: Mutex::new(None),
                 indirect_readable: Mutex::new(None),
                 indirect_epoch: AtomicU64::new(0),
+                clamps: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -2613,6 +2765,7 @@ impl Host {
             self.wait_ordered_completion(submission, |work| work.title_memory);
             // Host textures the title has not used for a while (or past the
             // card's budget) are given up first: the last submission has run.
+            crate::list::trim_idle();
             if !submission.busy() {
                 crate::resource::evict_unused();
             }
@@ -2675,9 +2828,11 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         let uploading =
             crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
-        let mut uploads = (!heaps.is_empty() || !textures.is_empty())
+        let mut uploads = (!host_only)
             .then(|| {
-                let private = owned.and_then(|_| submission.upload_list(self));
+                let private = (!heaps.is_empty() || !textures.is_empty())
+                    .then(|| owned.and_then(|_| submission.upload_list(self)))
+                    .flatten();
                 crate::bindless::uploads_for(&heaps, &textures, private, |sources| {
                     self.wait_texture_upload_sources(submission, sources);
                 })
@@ -2960,7 +3115,7 @@ impl Host {
             }
             // Capture slot versions only after sync, refreshes and deferred
             // descriptor writes. Keep them stable until this group has run.
-            let pairings = if crate::ambient::enabled() {
+            let pairings = if crate::ambient_wave::enabled() {
                 let group_lists = if groups.len() > 1 {
                     &runs[i..i + 1]
                 } else {
@@ -2973,7 +3128,7 @@ impl Host {
             } else {
                 Vec::new()
             };
-            let frozen = crate::ambient::arm(&pairings);
+            let frozen = crate::ambient_wave::arm(&pairings);
             let queue = self.queue();
             let _tiles = crate::tiled::flush(&queue);
             // All native calls share the existing completion fence. Mark
@@ -3801,6 +3956,7 @@ impl HostList {
             }
         }
         self.widen_close();
+        self.hoisted_clamps_close();
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
             fail(format_args!(
@@ -3833,6 +3989,7 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         self.targets.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.trim_scratch();
+        self.reset_hoisted_clamps();
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -4160,7 +4317,18 @@ impl HostList {
                 copy.state.store(*last, Ordering::Relaxed);
             }
         };
-        if copies.is_empty() && states.values().all(|(first, _, copy)| copy.state.load(Ordering::Relaxed) == *first) {
+        let (clamp_budget, clamp_buffers, pending_clamps) = {
+            let clamps = self.clamps.lock().unwrap_or_else(|e| e.into_inner());
+            if clamps.pending.is_empty() {
+                (0, Vec::new(), Vec::new())
+            } else {
+                (clamps.budget_gpu, clamps.touched_buffers(), clamps.pending.clone())
+            }
+        };
+        if copies.is_empty()
+            && pending_clamps.is_empty()
+            && states.values().all(|(first, _, copy)| copy.state.load(Ordering::Relaxed) == *first)
+        {
             left();
             return None;
         }
@@ -4194,6 +4362,14 @@ impl HostList {
                 let barriers = moves();
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
+                }
+                if !pending_clamps.is_empty() {
+                    crate::indirect::record_batch(
+                        list,
+                        clamp_budget,
+                        &clamp_buffers,
+                        &pending_clamps,
+                    );
                 }
                 list.Close()
             })
@@ -4435,6 +4611,14 @@ impl HostList {
         marked: bool,
     ) {
         let memory = self.memory_writer.load(Ordering::Relaxed);
+        if crate::indirect::batch_clamps_enabled() {
+            let mut clamps = self.clamps.lock().unwrap_or_else(|e| e.into_inner());
+            if shadow.is_aliased() || shadow.is_tiled() {
+                clamps.hazard.note_unknown();
+            } else {
+                clamps.hazard.note_write(address as u64, len as u64);
+            }
+        }
         let mut deferred = self.deferred();
         let key = (
             std::sync::Arc::as_ptr(shadow) as usize,
@@ -4470,6 +4654,152 @@ impl HostList {
     /// view heap `heap` (`crate::memory::prepare` at submission).
     pub(crate) fn defer_memory(&self, heap: usize) {
         self.deferred().copies.push(Step::Memory(heap));
+    }
+
+    /// Notes that an earlier command in this list may write arbitrary title
+    /// buffers on the GPU (bindless heap UAVs or page-table memory writes).
+    pub(crate) fn note_unknown_gpu_write(&self) {
+        if !crate::indirect::batch_clamps_enabled() {
+            return;
+        }
+        self.clamps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .hazard
+            .note_unknown();
+    }
+
+    /// Notes that an inline indirect clamp was recorded in this list so later
+    /// clamps stay inline and charge the list budget in recorded order.
+    pub(crate) fn note_inline_clamp(&self) {
+        if !crate::indirect::batch_clamps_enabled() {
+            return;
+        }
+        self.clamps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .hazard
+            .note_inline();
+    }
+
+    /// Whether an indirect execution reading `[arguments, arguments + len)`
+    /// (and optional 4-byte `count`) has no earlier conflicting GPU write or
+    /// inline clamp in this list and may be clamped in `prelude`.
+    pub(crate) fn can_hoist_clamp(&self, arguments: u64, len: u64, count: Option<u64>) -> bool {
+        self.clamps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .hazard
+            .can_hoist(arguments, len, count)
+    }
+
+    /// Allocates a 16-byte-aligned slice of `bytes` in this list's hoisted
+    /// indirect argument arena and records its prelude clamp.
+    pub(crate) fn enqueue_hoisted_clamp(
+        &self,
+        bytes: u64,
+        make: impl FnOnce(u64) -> crate::indirect::PendingClamp,
+    ) -> Option<(ID3D12Resource, u64)> {
+        let budget_gpu = self.budget()?;
+        let size = bytes.max(16).checked_next_multiple_of(16)?;
+        let host = host()?;
+        let mut clamps = self.clamps.lock().unwrap_or_else(|e| e.into_inner());
+        let (buffer, offset, dst_gpu) = if size > ARGUMENT_CHUNK_MAX {
+            let (buffer, _) = host.shared_buffer(size)?;
+            name(&buffer, || format!("hoisted indirect arguments {size:#x}"));
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            clamps.oversized.push(buffer.clone());
+            (buffer, 0, gpu)
+        } else {
+            while let Some(chunk) = clamps.chunks.get(clamps.current) {
+                if size <= chunk.capacity - clamps.used {
+                    break;
+                }
+                clamps.current += 1;
+                clamps.used = 0;
+            }
+            if clamps.current == clamps.chunks.len() {
+                let next = clamps
+                    .chunks
+                    .last()
+                    .map_or(ARGUMENT_CHUNK_FIRST, |c| (2 * c.capacity).min(ARGUMENT_CHUNK_MAX));
+                let capacity = size
+                    .next_multiple_of(ARGUMENT_CHUNK_FIRST)
+                    .max(next)
+                    .min(ARGUMENT_CHUNK_MAX);
+                let (buffer, _) = host.shared_buffer(capacity)?;
+                name(&buffer, || format!("hoisted indirect arguments {capacity:#x}"));
+                // SAFETY: a live buffer.
+                let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                clamps.chunks.push(ArgumentChunk { buffer, gpu, capacity });
+                clamps.used = 0;
+            }
+            let current = clamps.current;
+            let at = clamps.used;
+            let chunk = &clamps.chunks[current];
+            let result = (chunk.buffer.clone(), at, chunk.gpu + at);
+            clamps.used = at + size;
+            clamps.touched = clamps.touched.max(current + 1);
+            result
+        };
+        clamps.budget_gpu = budget_gpu;
+        clamps.pending.push(make(dst_gpu));
+        Some((buffer, offset))
+    }
+
+    /// Transitions hoisted indirect argument buffers back to `COMMON` at the
+    /// end of `list.list` so the list can be re-submitted or reset cleanly.
+    fn hoisted_clamps_close(&self) {
+        let buffers = {
+            let clamps = self.clamps.lock().unwrap_or_else(|e| e.into_inner());
+            if clamps.pending.is_empty() {
+                return;
+            }
+            clamps.touched_buffers()
+        };
+        if buffers.is_empty() {
+            return;
+        }
+        let barriers: Vec<D3D12_RESOURCE_BARRIER> = buffers
+            .iter()
+            .map(|b| {
+                transition(
+                    b,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )
+            })
+            .collect();
+        // SAFETY: an open list and live argument buffers left in
+        // `INDIRECT_ARGUMENT` by `prelude`.
+        unsafe {
+            self.list.ResourceBarrier(&barriers);
+        }
+    }
+
+    /// Resets hoisted clamp tracking after the list finishes running, keeping
+    /// the chunks needed by the last cycle (plus one) for zero-allocation reuse.
+    fn reset_hoisted_clamps(&self) {
+        let (spent_chunks, spent_oversized) = {
+            let mut clamps = self.clamps.lock().unwrap_or_else(|e| e.into_inner());
+            clamps.pending.clear();
+            clamps.budget_gpu = 0;
+            clamps.hazard.clear();
+            let kept = (clamps.touched + 1).min(clamps.chunks.len());
+            let spent_chunks = clamps.chunks.split_off(kept);
+            let spent_oversized = std::mem::take(&mut clamps.oversized);
+            clamps.current = 0;
+            clamps.used = 0;
+            clamps.touched = 0;
+            (spent_chunks, spent_oversized)
+        };
+        if !spent_chunks.is_empty() {
+            release_later(Box::new(spent_chunks));
+        }
+        if !spent_oversized.is_empty() {
+            release_later(Box::new(spent_oversized));
+        }
     }
 
     /// After the list has run, before its writes go back: `check` says
@@ -4603,14 +4933,7 @@ impl HostList {
     }
 
     pub(crate) fn inflight_bytes(&self) -> u64 {
-        let bytes = self
-            .scratch
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .chunks
-            .iter()
-            .map(|chunk| chunk.capacity)
-            .sum::<u64>();
+        let bytes = self.scratch_bytes();
         let arguments = self.arguments.lock().unwrap_or_else(|e| e.into_inner());
         let deferred = self.deferred();
         let bytes = bytes.saturating_add(
@@ -4732,6 +5055,7 @@ impl HostList {
             && self.states.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
             && self.twins.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
             && self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+            && self.clamps.lock().unwrap_or_else(|e| e.into_inner()).pending.is_empty()
     }
 
     /// `size` bytes of mapped upload memory for a texture to copy from,
@@ -4827,6 +5151,39 @@ impl HostList {
         // Each release is a kernel call, as in [`release_later`].
         if !spent.is_empty() {
             release_later(Box::new(spent));
+        }
+    }
+
+    /// The upload memory the list keeps for its next cycle, in bytes.
+    pub(crate) fn scratch_bytes(&self) -> u64 {
+        let upload = self
+            .scratch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .chunks
+            .iter()
+            .map(|chunk| chunk.capacity)
+            .sum::<u64>();
+        let clamps = self.clamps.lock().unwrap_or_else(|e| e.into_inner());
+        upload.saturating_add(clamps.retained_bytes())
+    }
+
+    /// Gives up all the scratch of a list that is reset and that no title
+    /// list or submission uses (`list::SPARE`): the next cycle makes what it
+    /// needs again. Released as [`Self::trim_scratch`] releases its chunks.
+    pub(crate) fn shed_scratch(&self) {
+        let spent = {
+            let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+            (s.current, s.used) = (0, 0);
+            std::mem::take(&mut s.chunks)
+        };
+        let argument_chunks = {
+            let mut clamps = self.clamps.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut clamps.chunks)
+        };
+        // Release outside the spare-list pool, as in [`Self::trim_scratch`].
+        if !spent.is_empty() || !argument_chunks.is_empty() {
+            release_later(Box::new((spent, argument_chunks)));
         }
     }
 
@@ -4929,28 +5286,28 @@ impl HostList {
     /// stays zero unless submission validates the same slot versions.
     pub(crate) fn ambient_after(
         &self,
-        role: crate::ambient::Role,
-        views: &crate::ambient::CheckedViews,
+        role: crate::ambient_wave::Role,
+        views: &crate::ambient_wave::CheckedViews,
     ) -> bool {
         let pass = self.deferred().ambient.len();
-        if pass >= crate::ambient::MAX_PASSES {
+        if pass >= crate::ambient_wave::MAX_PASSES {
             return false;
         }
         let Some((buffer, data)) = self
             .ambient_upload
             .get_or_init(|| {
                 host()?
-                    .upload_buffer(crate::ambient::UPLOAD_BYTES)
+                    .upload_buffer(crate::ambient_wave::UPLOAD_BYTES)
                     .map(|(b, data)| (b, data as usize))
             })
             .as_ref()
         else {
             return false;
         };
-        let Some(gate) = crate::ambient::Gate::new(buffer, *data, pass) else {
+        let Some(gate) = crate::ambient_wave::Gate::new(buffer, *data, pass) else {
             return false;
         };
-        if !crate::ambient::after(self, role, &views.handles(), &gate) {
+        if !crate::ambient_wave::after(self, role, &views.handles(), &gate) {
             return false;
         }
         if let Some(depth) = views.depth.as_ref() {
@@ -4958,7 +5315,7 @@ impl HostList {
         }
         self.deferred()
             .ambient
-            .push(crate::ambient::Candidate::new(views, gate.count()));
+            .push(crate::ambient_wave::Candidate::new(views, gate.count()));
         true
     }
 
@@ -5282,8 +5639,39 @@ impl Batch {
             crate::copystat::add(crate::copystat::C::AliasedCopies, 1);
             return self.title_written();
         }
-        self.flush();
         let (from, to) = touched(at, at.saturating_add(len));
+        if from >= to {
+            return;
+        }
+        // Flush only pending refreshes whose ranges overlap the destination
+        // window; disjoint copies stay queued so they coalesce across lists.
+        let mut overlapping = Vec::new();
+        let mut i = 0;
+        while i < self.refreshes.len() {
+            let overlaps = {
+                let (shadow, ranges) = &self.refreshes[i];
+                let (start, slen) = shadow.range();
+                let (s_start, s_end) = (start as usize, start.saturating_add(slen) as usize);
+                s_start < to
+                    && s_end > from
+                    && ranges.iter().any(|(r_from, r_to)| r_from < to && r_to > from)
+            };
+            if overlaps {
+                let (shadow, ranges) = self.refreshes.swap_remove(i);
+                let key = std::sync::Arc::as_ptr(&shadow) as usize;
+                self.pending.remove(&key);
+                if let Some((moved, _)) = self.refreshes.get(i) {
+                    self.pending
+                        .insert(std::sync::Arc::as_ptr(moved) as usize, i);
+                }
+                overlapping.push((shadow, ranges));
+            } else {
+                i += 1;
+            }
+        }
+        if !overlapping.is_empty() {
+            self.flush_work(overlapping);
+        }
         // Only the copies whose memory the bytes can be in: the rest
         // hold nothing of the window, and what a no-op remove would
         // leave whole it leaves whole.
@@ -5296,13 +5684,22 @@ impl Batch {
 
     /// Does the refreshes; returns the bytes copied.
     fn flush(&mut self) -> usize {
-        if self.refreshes.is_empty() {
+        self.pending.clear();
+        let work = std::mem::take(&mut self.refreshes);
+        self.flush_work(work)
+    }
+
+    /// Runs `work` refreshes, recording their covered ranges into `current`
+    /// and `extents`; returns the bytes copied.
+    fn flush_work(
+        &mut self,
+        work: Vec<(std::sync::Arc<crate::shadow::Shadow>, crate::ranges::Ranges)>,
+    ) -> usize {
+        if work.is_empty() {
             return 0;
         }
         #[cfg(feature = "diagnostics")]
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
-        self.pending.clear();
-        let work = std::mem::take(&mut self.refreshes);
         let total_requested: usize = work
             .iter()
             .flat_map(|(_, ranges)| ranges.iter())
@@ -6145,15 +6542,20 @@ impl Meter {
             let root_views = crate::draw::take_root_view_slots() as f64 / report_frames;
             let [records, counted] =
                 crate::indirect::take_records().map(|n| n as f64 / report_frames);
+            let [hoisted, inline] =
+                crate::indirect::take_clamps().map(|n| n as f64 / report_frames);
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame; indirect \
-                 max records {records:.0}/frame ({counted:.0} under a count)",
+                 max records {records:.0}/frame ({counted:.0} under a count; clamps \
+                 {hoisted:.0} hoisted, {inline:.0} inline)",
                 making = crate::pipeline::making()
             );
+            crate::ray_skip::log(report_frames);
+            crate::ambient_estimate::log(report_frames);
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
             let (heaps, heap_used, heap_free) = crate::placement::stats();
             tracing::info!(
@@ -6235,6 +6637,16 @@ impl Meter {
                         n as f64 / report_frames,
                         bytes as f64 / report_frames / 1e3,
                         own as f64 / report_frames
+                    );
+                }
+                #[cfg(feature = "diagnostics")]
+                {
+                    let (lists, bytes) = crate::list::spare_scratch();
+                    let shed = crate::list::SPARE_SHED.swap(0, Ordering::Relaxed);
+                    tracing::info!(
+                        "spare host lists: {lists}, keeping {:.1} MB of scratch; {:.1} MB given up since the last line",
+                        bytes as f64 / 1e6,
+                        shed as f64 / 1e6
                     );
                 }
                 for (why, n) in drops.iter().take(40) {
@@ -7252,14 +7664,124 @@ mod batch {
         batch.add(&b, pb, 4 * PAGE);
         assert_eq!(
             batch.flush(),
-            2 * PAGE,
-            "only the overlapping copy's destination"
+            2 * PAGE + 4 * PAGE,
+            "the overlapping copy's destination plus the disjoint copy deferred until flush"
         );
         assert_eq!(a.read_host((pa + PAGE) as u64, 1)[0], 0x1212_1212);
         assert_eq!(a.read_host((pa + 2 * PAGE) as u64, 1)[0], 0x3434_3434);
         assert_eq!(b.read_host(pb as u64, 1)[0], 0x5656_5656);
+        batch.add(&a, pa, 4 * PAGE);
+        batch.add(&b, pb, 4 * PAGE);
+        assert_eq!(batch.flush(), 0, "both copies are now current");
         done(pa, Some(a));
         done(pb, Some(b));
+    }
+
+    /// A non-aliased title copy flushes only overlapping pending refreshes,
+    /// invalidates their destination coverage, and leaves disjoint pending
+    /// shadows queued so subsequent `add`s coalesce until final `flush()`.
+    #[test]
+    fn selective_title_copy_flushes_only_overlapping_pending_shadows() {
+        let Some((pa, a)) = plain(4) else {
+            return; // no host GPU here
+        };
+        let (pb, b) = plain(4).expect("second host buffer");
+        let (pc, c) = plain(2).expect("third host buffer");
+        fill(pa, 4 * PAGE, 0x11);
+        fill(pb, 4 * PAGE, 0x22);
+        fill(pc, 2 * PAGE, 0x33);
+
+        let mut batch = Batch::default();
+        batch.add(&a, pa, 4 * PAGE);
+        batch.add(&b, pb, 4 * PAGE);
+        batch.add(&c, pc, 2 * PAGE);
+        assert_eq!(batch.refreshes.len(), 3);
+        assert_eq!(batch.pending.len(), 3);
+
+        // Copy into `a` (overlapping) while `b` and `c` are disjoint.
+        let src = [0xAAu8; 64];
+        title_copy(&mut batch, pa + PAGE, src.as_ptr() as usize, src.len());
+
+        // `a` was flushed before the copy, while `b` and `c` stayed queued.
+        assert_eq!(
+            batch.refreshes.len(),
+            2,
+            "disjoint shadows remain queued across title_copied"
+        );
+        assert_eq!(batch.pending.len(), 2);
+        assert_eq!(
+            a.read_host(pa as u64, 1)[0],
+            0x1111_1111,
+            "overlapping shadow was flushed before title copy"
+        );
+        assert_eq!(
+            b.read_host(pb as u64, 1)[0],
+            0,
+            "disjoint shadow was not prematurely flushed"
+        );
+        assert_eq!(
+            c.read_host(pc as u64, 1)[0],
+            0,
+            "second disjoint shadow was not prematurely flushed"
+        );
+
+        // Subsequent adds for `b` and `c` coalesce into their still-pending
+        // entries; `a` queues only the invalidated destination window.
+        batch.add(&a, pa, 4 * PAGE);
+        batch.add(&b, pb, 4 * PAGE);
+        batch.add(&c, pc, 2 * PAGE);
+        assert_eq!(batch.refreshes.len(), 3);
+        assert_eq!(batch.pending.len(), 3);
+
+        let dest_len = if crate::watch::fault_tracking() {
+            PAGE
+        } else {
+            src.len()
+        };
+        assert_eq!(
+            batch.flush(),
+            dest_len + 4 * PAGE + 2 * PAGE,
+            "final flush copies only `a`'s destination plus the two deferred disjoint shadows once"
+        );
+        assert_eq!(a.read_host((pa + PAGE) as u64, 1)[0], 0xAAAA_AAAA);
+        assert_eq!(b.read_host(pb as u64, 1)[0], 0x2222_2222);
+        assert_eq!(c.read_host(pc as u64, 1)[0], 0x3333_3333);
+
+        batch.add(&a, pa, 4 * PAGE);
+        batch.add(&b, pb, 4 * PAGE);
+        batch.add(&c, pc, 2 * PAGE);
+        assert_eq!(batch.flush(), 0, "all three shadows are current after final flush");
+
+        done(pa, Some(a));
+        done(pb, Some(b));
+        done(pc, Some(c));
+    }
+
+    /// An aliased title copy still falls back to flushing every pending
+    /// shadow conservatively, even disjoint ones.
+    #[test]
+    fn aliased_title_copy_still_flushes_pending_disjoint_shadows() {
+        let (a, _b) = crate::watch::tests::twin_views(2);
+        let Some((pd, d)) = plain(2) else {
+            return; // no host GPU here
+        };
+        fill(pd, 2 * PAGE, 0x44);
+        let src = crate::watch::tests::pool(1);
+        fill(src, PAGE, 0x55);
+
+        let mut batch = Batch::default();
+        batch.add(&d, pd, 2 * PAGE);
+        assert_eq!(batch.refreshes.len(), 1);
+        title_copy(&mut batch, a, src, PAGE);
+        assert_eq!(
+            batch.refreshes.len(),
+            0,
+            "aliased copy must conservatively flush pending disjoint shadows"
+        );
+        assert_eq!(d.read_host(pd as u64, 1)[0], 0x4444_4444);
+
+        done(pd, Some(d));
+        done(src, None);
     }
 
     /// Two copies of title memory, every list of a submission asking for

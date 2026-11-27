@@ -162,8 +162,8 @@ fn key(
     h.update(&limit.to_le_bytes());
     h.update(&[u8::from(wave32), u8::from(switches.port_cbv)]);
     if switches.port_cbv {
-        // The flag changes both root binding and table load lowering.
-        h.update(b"bounded root CBVs and grouped table CBV loads");
+        // The flag changes how root CBVs are lowered and bound.
+        h.update(b"bounded root CBVs");
     }
     h.update(&switches.shader_opt.to_le_bytes());
     if switches.wide_scalar_loads {
