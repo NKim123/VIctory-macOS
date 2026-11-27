@@ -303,6 +303,25 @@ struct StagedView {
 }
 
 impl StagedView {
+    fn recheck_buffer(&mut self, epoch: u64) {
+        let StagedSource::Buffer(created, (shadow, address, len)) = &mut self.source else {
+            return;
+        };
+        // Preparing other descriptors can add unrelated shadows and
+        // invalidate the epoch before this batch reaches publication.
+        // Reuse the staged descriptor if the same range still resolves
+        // to the exact backing it names.
+        if *created != epoch
+            && crate::shadow::lookup_epoch() == epoch
+            && prepare(&self.view).is_some_and(|(current, from, bytes)| {
+                Arc::ptr_eq(&current, shadow) && from == *address && bytes == *len
+            })
+            && crate::shadow::lookup_epoch() == epoch
+        {
+            *created = epoch;
+        }
+    }
+
     fn hit(&self, epoch: u64) -> Option<TemplateHit> {
         let mut texture = None;
         let binding = match &self.source {
@@ -384,24 +403,29 @@ fn stage_views(workers: &StagingWorkers, records: &[ChangedRecord]) -> StagedVie
             job.push(record.record);
         }
     }
-    let results: [_; STAGING_WORKERS] = std::array::from_fn(|_| OnceLock::new());
+    let before = crate::shadow::lookup_epoch();
+    let results: [_; STAGING_WORKERS] = std::array::from_fn(|_| Mutex::new(Vec::new()));
     crate::texture::in_parallel(STAGING_WORKERS, |i| {
         let mut staging = workers[i].lock().unwrap_or_else(|e| e.into_inner());
-        let staged: Vec<_> = jobs[i]
+        *results[i].lock().unwrap_or_else(|e| e.into_inner()) = jobs[i]
             .iter()
             .filter_map(|&[_, index, generation]| view_at(index, generation))
             .enumerate()
-            .filter_map(|(slot, view)| {
-                staging
-                    .stage(slot, view)
-                    .map(|entry| (entry.view.key, entry))
-            })
+            .filter_map(|(slot, view)| staging.stage(slot, view))
             .collect();
-        let _ = results[i].set(staged);
     });
+    let epoch = crate::shadow::lookup_epoch();
+    if before != epoch {
+        crate::texture::in_parallel(STAGING_WORKERS, |i| {
+            for entry in &mut *results[i].lock().unwrap_or_else(|e| e.into_inner()) {
+                entry.recheck_buffer(epoch);
+            }
+        });
+    }
     let views = results
         .into_iter()
         .flat_map(|result| result.into_inner().unwrap())
+        .map(|entry| (entry.view.key, entry))
         .collect();
     let null = workers[0]
         .lock()
@@ -5599,6 +5623,40 @@ mod tests {
         crate::shadow::unregister(allocation + 1, address);
         crate::shadow::unregister(allocation, base);
         drop((staged, heap, original, replacement));
+        crate::watch::tests::free(allocation);
+    }
+
+    #[test]
+    fn materializing_another_shadow_keeps_a_valid_staged_cbv() {
+        let Some(workers) = view_staging() else {
+            return;
+        };
+        let page = crate::watch::PAGE;
+        let allocation = crate::watch::tests::pool(2);
+        let addresses = [allocation, allocation + page];
+        let mut slots = [[0u64; 4]; 2];
+        for (slot, address) in slots.iter_mut().zip(addresses) {
+            crate::shadow::register(address, address as u64, page as u64);
+            super::super::record(slot.as_mut_ptr() as u64, View::Constant(address as u64, 16));
+        }
+        let records: [_; 2] = std::array::from_fn(|index| ChangedRecord {
+            index: index as u32,
+            record: record_at(slots[index].as_ptr() as u64),
+            previous: 0,
+            clear: false,
+        });
+        let before = crate::shadow::lookup_epoch();
+        let staged = stage_views(&workers, &records);
+        let after = crate::shadow::lookup_epoch();
+        assert_ne!(before, after, "staging materializes the two shadows");
+        for record in records {
+            let staged = &staged.views[&record_key(record.record)];
+            assert!(staged.hit(after).is_some());
+        }
+        drop(staged);
+        for address in addresses {
+            crate::shadow::unregister(address, address as u64);
+        }
         crate::watch::tests::free(allocation);
     }
 
