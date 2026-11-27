@@ -1190,33 +1190,67 @@ impl Drop for ViewPin {
 #[cfg(any(windows, test))]
 fn view_at(i: u32, generation: u32) -> Option<ViewPin> {
     let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
-    let (view, current) = views.list.get(i as usize)?;
-    if *current != generation {
-        return None;
-    }
-    let view = view.clone();
-    let mut held = [0usize; 2];
-    let mut all = true;
-    for (slot, r) in view.resources().into_iter().enumerate() {
-        if r == 0 {
-            continue;
+    let (pin, all) = views.pin(i, generation)?;
+    drop(views);
+    // Partial pins can run a resource destructor when dropped.
+    all.then_some(pin)
+}
+
+#[cfg(any(windows, test))]
+impl Views {
+    fn pin(&self, i: u32, generation: u32) -> Option<(ViewPin, bool)> {
+        let (view, current) = self.list.get(i as usize)?;
+        if *current != generation {
+            return None;
         }
-        if crate::object::try_add_ref(r as This) {
-            held[slot] = r;
-        } else {
-            all = false;
+        let view = view.clone();
+        let mut held = [0; 2];
+        let mut all = true;
+        for (slot, r) in view.resources().into_iter().enumerate() {
+            if r == 0 {
+                continue;
+            }
+            if crate::object::try_add_ref(r as This) {
+                held[slot] = r;
+            } else {
+                all = false;
+            }
+        }
+        let pin = ViewPin {
+            view,
+            #[cfg(windows)]
+            key: (u64::from(generation) << 32) | u64::from(i),
+            held,
+        };
+        Some((pin, all))
+    }
+}
+
+/// Pin each changed view once, before the mirror lock or staging pool is
+/// acquired. Pins with only some of their resources must retire outside
+/// the registry lock as well.
+#[cfg(windows)]
+fn pin_changed_views(records: &[ChangedRecord]) -> std::collections::HashMap<u64, ViewPin> {
+    use std::collections::{HashMap, HashSet};
+    let keys: HashSet<_> = records
+        .iter()
+        .filter(|record| !record.clear)
+        .map(|record| (record.record[1], record.record[2]))
+        .collect();
+    let mut pins = HashMap::with_capacity(keys.len());
+    let mut partial = Vec::new();
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+    for (index, generation) in keys {
+        if let Some((pin, all)) = views.pin(index, generation) {
+            if all {
+                pins.insert(pin.key, pin);
+            } else {
+                partial.push(pin);
+            }
         }
     }
     drop(views);
-    // Dropped here, with the lock released, if a resource was already gone:
-    // the references taken on the others may be their last.
-    let pin = ViewPin {
-        view,
-        #[cfg(windows)]
-        key: (u64::from(generation) << 32) | u64::from(i),
-        held,
-    };
-    all.then_some(pin)
+    pins
 }
 
 /// Snapshot records that differ from the host slot, and the key observed
