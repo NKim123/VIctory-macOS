@@ -1825,6 +1825,23 @@ impl HostHeap {
         bytes: u64,
         uav: bool,
     ) {
+        self.raw_view(index, buffer, first, raw_elements(bytes, false), uav);
+    }
+
+    /// A root view indexed by an offset from the start of the shadow.
+    pub(crate) fn raw_shadow_at(&self, index: u32, shadow: &crate::shadow::Shadow, uav: bool) {
+        let elements = raw_elements(shadow.range().1, shadow.is_tiled());
+        self.raw_view(index, Some(&shadow.buffer), 0, elements, uav);
+    }
+
+    fn raw_view(
+        &self,
+        index: u32,
+        buffer: Option<&ID3D12Resource>,
+        first: u64,
+        elements: u32,
+        uav: bool,
+    ) {
         self.invalidate_ambient(index);
         let Some(host) = host() else { return };
         let writable = |b: &ID3D12Resource| {
@@ -1832,9 +1849,8 @@ impl HostHeap {
             unsafe { b.GetDesc() }.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0
         };
         let buffer = buffer.filter(|&b| !uav || writable(b));
-        // shortcut: a buffer view holds at most 2^27 elements (512 MiB raw).
         let (first, elements) = match buffer {
-            Some(_) => (first / 4, (bytes / 4).clamp(1, 1 << 27) as u32),
+            Some(_) => (first / 4, elements.max(1)),
             // A null view still names its size.
             None => (0, 1),
         };
@@ -2169,16 +2185,16 @@ impl HostHeap {
     }
 
     /// Makes slots `index` and `index + 1` (dynamic ones) a raw shader
-    /// resource view and a raw unordered access view of the first `bytes`
-    /// (a multiple of 4) of `buffer`, which they hold; null views for no
-    /// buffer.
-    pub(crate) fn raw_pair_at(&self, index: u32, buffer: Option<&ID3D12Resource>, bytes: u64) {
+    /// resource view and a raw unordered access view of the shadow's buffer,
+    /// which they hold; null views for no shadow.
+    pub(crate) fn raw_pair_at(&self, index: u32, shadow: Option<&crate::shadow::Shadow>) {
         self.invalidate_ambient(index);
         self.invalidate_ambient(index + 1);
         let Some(host) = host() else { return };
-        // shortcut: a buffer view holds at most 2^27 elements (512 MiB raw);
-        // a longer copy's rest reads 0 through it.
-        let elements = (bytes / 4).min(1 << 27) as u32;
+        let (buffer, elements) = shadow.map_or((None, 0), |shadow| {
+            let bytes = shadow.range().1.next_multiple_of(4);
+            (Some(&shadow.buffer), raw_elements(bytes, shadow.is_tiled()))
+        });
         let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
@@ -4566,6 +4582,18 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
     checked_buffer_range(base, buffer.FirstElement, buffer.NumElements, element)
 }
 
+/// D3DMetal accepts raw views of the entire physical reservation. Both
+/// root descriptors and computed addresses use offsets from its start. Other
+/// buffers use the 512 MiB view limit.
+fn raw_elements(bytes: u64, tiled: bool) -> u32 {
+    let limit = if tiled {
+        crate::tiled::MAX_TILED_BUFFER as u64
+    } else {
+        512 << 20
+    };
+    (bytes.min(limit) / 4) as u32
+}
+
 fn checked_buffer_range(base: u64, first: u64, count: u32, element: u64) -> Option<(u64, u64)> {
     let start = base.checked_add(first.checked_mul(element)?)?;
     let len = u64::from(count).checked_mul(element)?;
@@ -5912,6 +5940,82 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires Rosetta, D3DMetal and VICTORY_PHYSICAL_TILES=1"]
+    fn tiled_buffer_raw_views_reach_last_tile() {
+        use crate::compute::{Param, srv, uav};
+        use crate::watch::PAGE;
+        use windows_sys::Win32::System::Memory::{
+            MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc, VirtualFree,
+        };
+
+        assert!(crate::alias::physical_tiles_enabled());
+        let host = host().unwrap();
+        let size = crate::tiled::MAX_TILED_BUFFER;
+        let offset = size - PAGE;
+        // SAFETY: the reserved title range has no CPU mappings.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), size, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!base.is_null());
+        let title = crate::tiled::TiledAlias::new(base as usize, size).unwrap();
+        let physical = Arc::new(crate::alias::PhysicalHeap::new(&host.device, PAGE).unwrap());
+        let address = base as usize + offset;
+        title.map(address, PAGE, Some((&physical, 0)));
+        let words = physical.cpu_address() as *mut [u32; 3];
+        // SAFETY: the heap's CPU mapping is live and no GPU work is in flight.
+        unsafe { words.write([91, 0, 0]) };
+        let shadow = crate::shadow::find(address as u64, 4).unwrap();
+        assert!(shadow.is_tiled());
+        let heap = HostHeap::new(false, 3).unwrap();
+        heap.raw_shadow_at(0, &shadow, false);
+        heap.raw_pair_at(1, Some(&shadow));
+        let (output, data) = host.shared_buffer(PAGE as u64).unwrap();
+        let (root, pipeline) = crate::compute::pipeline(
+            r"
+cbuffer Address : register(b0) { uint dw; };
+StructuredBuffer<uint> root_view : register(t0);
+StructuredBuffer<uint> computed_view : register(t1);
+RWByteAddressBuffer computed_store : register(u0);
+RWByteAddressBuffer dst : register(u1);
+[numthreads(1, 1, 1)]
+void main() {
+    dst.Store2(0, uint2(root_view[dw], computed_view[dw]));
+    computed_store.Store(dw * 4 + 8, 97);
+}
+",
+            windows::core::s!("raw views of the last physical tile"),
+            0,
+            &[
+                Param::Table(&[srv(0, 2)]),
+                Param::Table(&[uav(0, 1)]),
+                Param::Uav { register: 1 },
+                Param::Constants { register: 0, count: 1 },
+            ],
+        )
+        .unwrap();
+        let list = host.new_list().unwrap();
+        shadow.refresh(&list, address as u64, 12);
+        // SAFETY: all descriptors refer to live resources on the open list.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pipeline);
+            list.list.SetComputeRootDescriptorTable(0, heap.gpu(0));
+            list.list.SetComputeRootDescriptorTable(1, heap.gpu(2));
+            list.list
+                .SetComputeRootUnorderedAccessView(2, output.GetGPUVirtualAddress());
+            list.list.SetComputeRoot32BitConstant(3, (offset / 4) as u32, 0);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: the GPU is done and both mappings are live.
+        let (reads, written) = unsafe { (data.cast::<[u32; 2]>().read(), words.read()[2]) };
+        drop((list, heap, shadow, title));
+        // SAFETY: the test owns the reservation.
+        unsafe { VirtualFree(base, 0, MEM_RELEASE) };
+        assert_eq!((reads, written), ([91; 2], 97));
+    }
 
     #[test]
     fn capped_texture_array_views_clamp_mips_and_keep_slices() {
@@ -7750,7 +7854,7 @@ mod tests {
         assert_eq!(heap.address_at(first), Some(0), "a root view");
         heap.make_at(first, &view);
         heap.make_at(first + 1, &view);
-        heap.raw_pair_at(first, None, 0);
+        heap.raw_pair_at(first, None);
         assert_eq!(heap.address_at(first), Some(0), "a view pair");
         assert_eq!(heap.address_at(first + 1), Some(0), "a view pair");
         // Slots past the dynamic ones (host copies' view pairs) have no

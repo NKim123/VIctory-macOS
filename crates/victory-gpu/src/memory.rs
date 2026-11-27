@@ -411,7 +411,7 @@ impl Shared {
         let (table, data) = crate::host::host()?.upload_buffer(bytes)?;
         crate::host::name(&table, || "title memory page table".into());
         let null = heap.pair()?;
-        heap.raw_pair_at(null, None, 0);
+        heap.raw_pair_at(null, None);
         // SAFETY: a live buffer.
         let gpu = unsafe { table.GetGPUVirtualAddress() };
         Some(Shared {
@@ -437,7 +437,7 @@ impl Shared {
         self.pairs.retain(|copy, &mut slot| {
             let keep = live.contains(copy);
             if !keep {
-                heap.raw_pair_at(slot, None, 0);
+                heap.raw_pair_at(slot, None);
                 heap.free_pair(slot);
             }
             keep
@@ -453,7 +453,7 @@ impl Shared {
                         ONCE.call_once(|| tracing::warn!("no descriptor slots for a title memory copy's views: it reads as missing"));
                         continue;
                     };
-                    heap.raw_pair_at(slot, Some(&c.buffer), c.range().1.next_multiple_of(4));
+                    heap.raw_pair_at(slot, Some(&c));
                     self.pairs.insert(key, slot);
                     slot
                 }

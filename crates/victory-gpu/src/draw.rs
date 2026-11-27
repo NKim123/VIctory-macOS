@@ -1717,7 +1717,7 @@ impl State {
             return Some((index, offset));
         }
         let index = self.root_view_slot(key, host)?;
-        host.raw_view_at(index, Some(&shadow.buffer), 0, shadow.range().1 & !3, uav);
+        host.raw_shadow_at(index, &shadow, uav);
         if uav {
             host.set_mark(index, shadow.mark_entry(shadow.range().0));
         }
