@@ -2233,6 +2233,20 @@ impl HostGpu for Host {
 }
 
 impl Host {
+    /// Serializes direct command-queue operations (such as `UpdateTileMappings`)
+    /// with submissions on `self.queue`. Returns `None` if this thread already
+    /// holds the submission lock.
+    pub(crate) fn queue_lock(&self) -> Option<Quiet<'_>> {
+        if HOLDS_SUBMISSIONS.with(std::cell::Cell::get) {
+            return None;
+        }
+        let held = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        Some(Quiet {
+            _holding: Holding::enter(),
+            _held: held,
+        })
+    }
+
     /// Runs closed lists and waits for them, inserting a global UAV barrier
     /// command list before each `runs[i]` where `barrier_before.get(i) == Some(&true)`.
     pub(crate) fn execute_with_barriers(&self, runs: &[&HostList], barrier_before: &[bool]) {

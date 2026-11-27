@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::mem::ManuallyDrop;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -145,7 +146,7 @@ pub(crate) struct Tiled {
     run: Run,
     coords: Vec<D3D12_TILED_RESOURCE_COORDINATE>,
     sizes: Vec<D3D12_TILE_REGION_SIZE>,
-    mapped: Mutex<bool>,
+    mapped: AtomicBool,
 }
 
 impl Tiled {
@@ -242,7 +243,7 @@ impl Tiled {
                 run,
                 coords,
                 sizes,
-                mapped: Mutex::new(false),
+                mapped: AtomicBool::new(false),
             },
         ))
     }
@@ -264,12 +265,17 @@ impl Tiled {
     }
 
     fn map(&self, texture: &ID3D12Resource) {
-        let mut mapped = self.mapped.lock().unwrap_or_else(|e| e.into_inner());
-        if *mapped {
+        if self.mapped.load(Ordering::Acquire) {
             return;
         }
         let host = crate::host::host().expect("the device that made the texture");
+        // Serialize UpdateTileMappings with submissions on the direct queue
+        // before taking POOL (matches Host::execute's lock order).
+        let _queue = host.queue_lock();
         let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        if self.mapped.load(Ordering::Acquire) {
+            return;
+        }
         let heap = &pool.heaps[self.run.heap].as_ref().unwrap().resource;
         let offset = (self.run.offset / TILE) as u32;
         let count = (self.run.bytes / TILE) as u32;
@@ -289,7 +295,7 @@ impl Tiled {
                 D3D12_TILE_MAPPING_FLAG_NONE,
             );
         }
-        *mapped = true;
+        self.mapped.store(true, Ordering::Release);
     }
 
     pub(crate) fn retire(self, texture: ID3D12Resource) {
