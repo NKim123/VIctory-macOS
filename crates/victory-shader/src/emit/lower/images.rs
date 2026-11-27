@@ -1,9 +1,22 @@
-//! Texture loads, samples, gathers, and image atomics.
+//! DXIL lowering of console image instructions.
 
 use super::*;
 
 impl Lower<'_> {
-    pub(super) fn image_op(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
+    /// An image instruction, its reads of texture views marked (module
+    /// notes, "Read marks") after it.
+    pub(super) fn image(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
+        self.s.texture_reads.clear();
+        let lowered = self.image_op(inst, b, i);
+        for index in std::mem::take(&mut self.s.texture_reads) {
+            if lowered.is_ok() {
+                self.mark_view_read(index);
+            }
+        }
+        lowered
+    }
+
+    fn image_op(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Image {
             data,
             addr,
@@ -169,11 +182,9 @@ impl Lower<'_> {
                 // taken where the guard is live — inside, a ballot of the
                 // branch's own condition is not exact under D3DMetal. A
                 // glc-set umax reads its old value, so it cannot reduce.
-                let (value, not_rep) = if self.x.atomic_umax
-                    && self.x.atomic_lock_rounds
-                    && op == "umax"
-                    && !cache.glc
-                {
+                let reduce =
+                    self.x.atomic_umax && self.x.atomic_lock_rounds && op == "umax" && !cache.glc;
+                let (value, not_rep) = if reduce {
                     let bit = guard.unwrap_or_else(|| self.s.m.bool(true));
                     let four = self.s.m.named_struct("dx.types.fouri32", vec![self.s.t.i32; 4]);
                     let present = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
@@ -184,7 +195,16 @@ impl Lower<'_> {
                     (value, self.s.m.bool(false))
                 };
                 let at = self.begin_guarded(guard);
-                let (lo, hi) = self.locked_atomic64(h, &cs, coords, op, value, compare, not_rep);
+                let (lo, hi) = self.locked_atomic64(
+                    h,
+                    &cs,
+                    coords,
+                    op,
+                    value,
+                    compare,
+                    not_rep,
+                    reduce && self.x.atomic_early_exit,
+                );
                 let r = self.end_guarded(at, &[(lo, old[0]), (hi, old[1])]);
                 if cache.glc {
                     for (k, x) in (0..).zip(r) {

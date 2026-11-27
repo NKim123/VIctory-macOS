@@ -55,7 +55,7 @@ fn check_rows(address: usize, mixed: bool) {
     assert_eq!(layout.offset(0, 0, ROWS_PER_PAGE as u32, 0).unwrap(), PAGE as u64);
     assert_eq!(layout.size, (3 * PAGE) as u64);
     let copy = crate::resource::host_copy(object).unwrap();
-    let staging = crate::texture::staging(object, &copy.texture).unwrap();
+    let staging = crate::texture::staging(object, &copy).unwrap();
     let ordinary = crate::texture::tests::untracked_bytes(&staging);
     if mixed {
         assert_eq!(ordinary, [(address, address + PAGE)]);
@@ -181,7 +181,7 @@ fn check_block_rows(address: usize, mixed: bool) {
     assert_eq!(layout.offset(0, 0, rows_per_page as u32 / 4, 0).unwrap(), PAGE as u64);
     assert_eq!(layout.size, (3 * PAGE) as u64);
     let copy = crate::resource::host_copy(object).unwrap();
-    let staging = crate::texture::staging(object, &copy.texture).unwrap();
+    let staging = crate::texture::staging(object, &copy).unwrap();
     let ordinary = crate::texture::tests::untracked_bytes(&staging);
     if mixed {
         assert_eq!(ordinary, [(address, address + PAGE)]);

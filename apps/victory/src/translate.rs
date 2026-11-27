@@ -7,8 +7,11 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
+use victory_shader::emit;
+#[cfg(windows)]
 use victory_shader::emit::host::{self, Host};
-use victory_shader::emit::{self, validator::Validator};
+#[cfg(windows)]
+use victory_shader::emit::validator::Validator;
 use victory_shader::structure::{self, Atom, LaneExit};
 use victory_shader::{
     Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, ir, native_programs,
@@ -141,14 +144,18 @@ impl Tally {
 }
 
 /// Emitted shaders by label, shared between threads.
+#[cfg(windows)]
 type Kept = std::sync::Arc<Mutex<Vec<(String, emit::HostShader)>>>;
 
 /// The optional checks after emission, one set per thread.
 struct Checks {
     /// Shaders named in `VICTORY_PAIRS` (`vs+ps,...`, label substrings),
     /// kept to build those pipelines after the walk.
+    #[cfg(windows)]
     keep: Option<Kept>,
+    #[cfg(windows)]
     validator: Option<Validator>,
+    #[cfg(windows)]
     host: Option<(Host, emit::HostShader)>,
     /// Translate for a host of 32-lane waves (`--wave32`, or the GPU
     /// `--pipelines` makes them on).
@@ -168,7 +175,13 @@ pub fn run(
         victory_core::ensure_outside_repo(Path::new(&dir))?;
     }
     let paths = crate::default_paths(paths)?;
+    #[cfg(not(windows))]
+    if validate || pipelines || std::env::var_os("VICTORY_PAIRS").is_some_and(|v| !v.is_empty()) {
+        anyhow::bail!("DXIL validation and D3D12 pipeline creation require Windows");
+    }
+    #[cfg(windows)]
     let dll = validate.then(Validator::default_path).flatten();
+    #[cfg(windows)]
     if validate {
         Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;
         println!(
@@ -177,6 +190,7 @@ pub fn run(
                 .map_or("dxil.dll".into(), |p| p.display().to_string())
         );
     }
+    #[cfg(windows)]
     let wave32 = if pipelines {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         // As `run` translates for this GPU.
@@ -187,12 +201,14 @@ pub fn run(
     if wave32 {
         println!("waves        of 32 lanes at most (wave64 programs in halves)");
     }
+    #[cfg(windows)]
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
         .split(',')
         .filter_map(|p| p.split_once('+'))
         .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned()))
         .collect();
+    #[cfg(windows)]
     let kept = std::sync::Arc::new(Mutex::new(Vec::new()));
     let threads = thread_count(jobs);
     let seen = Mutex::new(HashSet::new());
@@ -200,6 +216,7 @@ pub fn run(
     let started = std::time::Instant::now();
     for root in &paths {
         for entry in walkdir::WalkDir::new(root)
+            .follow_links(true)
             .into_iter()
             .filter_map(Result::ok)
         {
@@ -220,10 +237,13 @@ pub fn run(
                                 ..Tally::default()
                             };
                             let mut checks = Checks {
+                                #[cfg(windows)]
                                 keep: (!pairs.is_empty()).then(|| kept.clone()),
+                                #[cfg(windows)]
                                 validator: validate
                                     .then(|| Validator::load(dll.as_deref()).ok())
                                     .flatten(),
+                                #[cfg(windows)]
                                 host: pipelines
                                     .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
                                     .flatten(),
@@ -297,6 +317,7 @@ pub fn run(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
+    #[cfg(windows)]
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
@@ -333,14 +354,28 @@ pub fn run(
 /// same code, so a run finds it translated or refused. With `pipelines`,
 /// then the shader pack's pipelines go into the pipeline library
 /// (`prebuild`).
-pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result<()> {
+pub fn warm(
+    paths: Vec<PathBuf>,
+    jobs: Option<usize>,
+    pipelines: bool,
+    wine_defaults: bool,
+) -> Result<()> {
+    #[cfg(not(windows))]
+    if pipelines {
+        anyhow::bail!("D3D12 pipeline creation requires Windows");
+    }
     let paths = crate::default_paths(paths)?;
     let shaders = victory_core::Config::load()?.cache_subdir("shaders")?;
-    let Some(dir) = victory_gpu::shader_cache::use_shader_cache(shaders.clone()) else {
-        anyhow::bail!("no shader cache in {}", shaders.display());
-    };
+    let cache = victory_gpu::shader_cache::ShaderCache::open(&shaders, wine_defaults)?;
+    #[cfg(windows)]
+    if pipelines {
+        victory_gpu::shader_cache::use_shader_cache(shaders)
+            .ok_or_else(|| anyhow::anyhow!("no runtime shader cache"))?;
+    }
+    let dir = cache.dir();
     let threads = thread_count(jobs);
     // The pre-build's key listing (diagnostics) translates nothing.
+    #[cfg(windows)]
     if pipelines && std::env::var_os("VICTORY_PREBUILD_KEYS").is_some() {
         return crate::prebuild::run(&paths, threads);
     }
@@ -350,6 +385,7 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
     let counts = [const { AtomicUsize::new(0) }; 3];
     for root in &paths {
         for entry in walkdir::WalkDir::new(root)
+            .follow_links(true)
             .into_iter()
             .filter_map(Result::ok)
         {
@@ -378,8 +414,7 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
                                     continue;
                                 }
                                 let one = std::time::Instant::now();
-                                let (done, cached) =
-                                    victory_gpu::shader_cache::host_shader(container);
+                                let (done, cached) = cache.host_shader(container);
                                 let k = if cached {
                                     0
                                 } else if done.is_ok() {
@@ -421,7 +456,7 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
         }
     }
     let [cached, translated, refused] = counts.map(AtomicUsize::into_inner);
-    let bytes: u64 = walkdir::WalkDir::new(&dir)
+    let bytes: u64 = walkdir::WalkDir::new(dir)
         .into_iter()
         .filter_map(Result::ok)
         .filter_map(|e| e.metadata().ok())
@@ -434,6 +469,7 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
         cached + translated + refused,
         started.elapsed().as_secs_f64()
     );
+    #[cfg(windows)]
     if pipelines {
         crate::prebuild::run(&paths, threads)?;
     }
@@ -621,12 +657,13 @@ fn emit_options(wave32: bool, narrow: bool) -> emit::Options {
 
 /// Validates an emitted shader if asked to.
 fn check(
-    mut shader: emit::HostShader,
+    shader: emit::HostShader,
     t: &mut Tally,
-    checks: &mut Checks,
+    _checks: &mut Checks,
     label: impl Fn() -> String,
 ) {
-    if let Some(keep) = &checks.keep {
+    #[cfg(windows)]
+    if let Some(keep) = &_checks.keep {
         lock(keep).push((label(), shader.clone()));
     }
     // `VICTORY_EMIT_DUMP` with `--list`: every emitted shader as a file.
@@ -642,6 +679,21 @@ fn check(
             &shader.dxil,
         );
     }
+    #[cfg(not(windows))]
+    if t.list {
+        t.lines.push(format!("{}  emitted", label()));
+    }
+    #[cfg(windows)]
+    check_with_host(shader, t, _checks, label);
+}
+
+#[cfg(windows)]
+fn check_with_host(
+    mut shader: emit::HostShader,
+    t: &mut Tally,
+    checks: &mut Checks,
+    label: impl Fn() -> String,
+) {
     if let Some((h, stub_ps)) = &checks.host {
         let made = match shader.stage {
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),

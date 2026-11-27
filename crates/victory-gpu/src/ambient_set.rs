@@ -13,7 +13,17 @@
 pub(crate) fn is_on(value: Option<&str>) -> bool {
     value
         .map(str::trim)
-        .is_some_and(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("off"))
+        .is_some_and(|v| {
+            !v.is_empty()
+                && v != "0"
+                && !v.eq_ignore_ascii_case("off")
+                && !is_wave_mode(v)
+        })
+}
+
+/// The Wave renderer accepts numeric strengths and explicit constants.
+fn is_wave_mode(value: &str) -> bool {
+    value != "1" && (value.starts_with("constant:") || value.parse::<f32>().is_ok())
 }
 
 /// 0.6 looked balanced in the fork's run a2.
@@ -386,8 +396,11 @@ mod tests {
         for off in [None, Some(""), Some("  "), Some("0"), Some(" 0 "), Some("off"), Some("OFF")] {
             assert!(!is_on(off), "{off:?}");
         }
-        for on in ["1", "on", "yes", "0.6", "2"] {
+        for on in ["1", "on", "yes", "estimate", "estimate:0.6"] {
             assert!(is_on(Some(on)), "{on:?}");
+        }
+        for wave in ["1.0", "0.6", "2", "0.0", "-1", "constant:0.8", "constant:0"] {
+            assert!(!is_on(Some(wave)), "{wave:?}");
         }
     }
 

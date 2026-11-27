@@ -10,6 +10,58 @@ use crate::{io, ir, resource, structure};
 const S_ENDPGM: u32 = 0xBF81_0000;
 
 #[test]
+fn a_swap_does_not_make_a_lane_varying_destination_wave_uniform() {
+    use crate::ir::Reg;
+
+    let words = [
+        0x7E02_0280u32, // v_mov_b32 v1, 0
+        0x7E00_CB01,    // v_swap_b32 v0, v1
+        S_ENDPGM,
+    ];
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 8,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 0,
+            threads: [64, 1, 1],
+        }),
+        code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
+    };
+    let p = ir::build(&native.code, true, 8).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let swap = &p.blocks[0].insts[1];
+    assert_eq!(swap.name(), "v_swap_b32");
+    let parts = Parts {
+        halves_rendezvous: false,
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+        atomic_locks: false,
+        atomic_lock_rounds: false,
+        atomic_umax: false,
+        atomic_early_exit: false,
+        bias_as_gradients: false,
+        host_wave32: true,
+        narrow_waves: true,
+        uav_size_level0: false,
+        view_marks: false,
+    };
+    let uniform = super::halves::lane_uniform(&parts, &super::LoopCaps::new(&p, &st));
+    assert!(!uniform.contains(&swap.write(Reg::V(1)).unwrap()));
+}
+
+#[test]
 fn direct_barycentric_modes_match_dxil_semantics() {
     use crate::io::Barycentric::*;
 
@@ -79,7 +131,8 @@ fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
         mesh_stride: 0,
         atomic_locks: false,
         atomic_lock_rounds: false,
-            atomic_umax: false,
+        atomic_umax: false,
+        atomic_early_exit: false,
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
@@ -139,6 +192,7 @@ fn lower_wave(
         atomic_locks: false,
         atomic_lock_rounds: false,
         atomic_umax: false,
+        atomic_early_exit: false,
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
@@ -274,6 +328,7 @@ fn spilled_compute_constants_compact_before_the_dispatch_tail_word() {
         atomic_locks: false,
         atomic_lock_rounds: false,
         atomic_umax: false,
+        atomic_early_exit: false,
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
@@ -632,6 +687,7 @@ fn perm_features(selector: u32) -> u64 {
         atomic_locks: false,
         atomic_lock_rounds: false,
         atomic_umax: false,
+        atomic_early_exit: false,
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
@@ -1583,6 +1639,15 @@ fn lowered_result(
     lanes: u32,
     narrow_waves: bool,
 ) -> Result<super::Lowered, crate::ShaderError> {
+    lowered_result_with_predication(words, lanes, narrow_waves, false)
+}
+
+fn lowered_result_with_predication(
+    words: &[u32],
+    lanes: u32,
+    narrow_waves: bool,
+    disable_selective_predication: bool,
+) -> Result<super::Lowered, crate::ShaderError> {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -1600,7 +1665,7 @@ fn lowered_result(
     let st = structure::structure(&p).unwrap();
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
     let io = io::raise(&p, &native).unwrap();
-    lower(&Parts {
+    let parts = Parts {
         halves_rendezvous: false,
         native: &native,
         p: &p,
@@ -1614,12 +1679,14 @@ fn lowered_result(
         atomic_locks: false,
         atomic_lock_rounds: false,
         atomic_umax: false,
+        atomic_early_exit: false,
         bias_as_gradients: false,
         narrow_waves,
         uav_size_level0: false,
         host_wave32: false,
         view_marks: false,
-    })
+    };
+    super::lower_pruned(&parts, None, false, false, disable_selective_predication)
 }
 
 #[test]
@@ -1683,6 +1750,8 @@ fn no_barrier_in_divergent_code() {
     w.push(S_ENDPGM);
     assert!(barriers_at(&wave64(&w)).is_none());
     assert_eq!(split_barriers(&w, 64, true), 1);
+    let per_lane = lowered_result_with_predication(&w, 64, true, true).unwrap();
+    assert_eq!(per_lane.split_barriers, 0);
 }
 
 const S_MOV_S20_0: u32 = 0xBE94_0380; // s_mov_b32 s20, 0
@@ -1846,6 +1915,7 @@ fn lowered_halves(words: &[u32], lanes: u32) -> Result<Lowered, crate::ShaderErr
         atomic_locks: false,
         atomic_lock_rounds: false,
         atomic_umax: false,
+        atomic_early_exit: false,
         bias_as_gradients: false,
         narrow_waves: false,
         uav_size_level0: false,
@@ -1856,8 +1926,7 @@ fn lowered_halves(words: &[u32], lanes: u32) -> Result<Lowered, crate::ShaderErr
 
 /// A uniform outer loop (on the scalar `s20`) holding a divergent inner
 /// loop — entered on `vcc`, the lanes with thread id below 40 — whose latch
-/// is an unconditional `s_branch` back to its header: the back edge that
-/// lowering caps with an early return at the loop iteration limit. After
+/// is an unconditional `s_branch` back to its header. After
 /// the inner loop, `v_readlane_b32` of console lane 40, which in halves
 /// passes between the 32-lane halves behind group barriers (its result is
 /// only read after the outer loop, so no branch in the loop depends on it).
@@ -1886,8 +1955,8 @@ fn capped_back_edge_in_a_divergent_loop() -> Vec<u32> {
 }
 
 /// The same outer loop with an inner loop every lane enters together: its
-/// unconditional back edge is capped too, but every lane of the group
-/// leaves the loop through it together, so nothing after it is skipped.
+/// unconditional back edge is capped by the existing exit condition, and
+/// every lane of the group leaves the loop together.
 fn capped_back_edge_in_a_uniform_loop() -> Vec<u32> {
     vec![
         0xBE94_0380, // s_mov_b32 s20, 0
@@ -1999,25 +2068,14 @@ fn the_back_edge_programs_are_what_their_comments_say() {
     }
 }
 
-/// A half-wave exchange after a divergent loop whose unconditional back
-/// edge lowering caps with an early return: one wave may leave the program
-/// at the cap while another reaches the exchange's group barrier with
-/// missing participants, so the exchange is refused in halves. As one
-/// wave64 there are no halves and it translates.
+/// Taking the ordinary exit at the cap lets every lane reach the exchange.
 #[test]
-fn an_exchange_after_a_divergent_capped_back_edge_is_refused() {
+fn an_exchange_after_a_divergent_capped_back_edge_translates() {
     let w = capped_back_edge_in_a_divergent_loop();
-    let why = lowered_halves(&w, 64)
-        .err()
-        .expect("refused in halves")
-        .to_string();
-    assert!(
-        why.contains("a lane read that may cross 32-lane halves"),
-        "{why}"
-    );
-    // One wave64: no halves, no exchange, and it translates.
-    let whole = lowered(&w, 64, false);
-    assert_eq!(whole.wave_size, Some(64));
+    let l = lowered_halves(&w, 64).expect("in halves");
+    assert_eq!(l.wave_size, Some(32));
+    assert!(l.barriers > 0);
+    assert_eq!(lowered(&w, 64, false).wave_size, Some(64));
 }
 
 /// The same exchange after a loop whose unconditional back edge is capped
@@ -2400,9 +2458,7 @@ fn an_s_barrier_on_the_sibling_behind_a_uniform_branch_translates() {
 }
 
 /// The divergent capped loop of [`capped_back_edge_in_a_divergent_loop`],
-/// with an explicit `s_barrier` at the join instead of the lane read: a lane
-/// may have left the program early at the inner loop's cap, so the barrier
-/// is refused even without any exchange.
+/// with an explicit `s_barrier` at the join instead of the lane read.
 fn a_divergent_capped_loop_then_an_s_barrier_at_the_join() -> Vec<u32> {
     vec![
         0xBE94_0380, // s_mov_b32 s20, 0
@@ -2427,24 +2483,16 @@ fn a_divergent_capped_loop_then_an_s_barrier_at_the_join() -> Vec<u32> {
     ]
 }
 
-/// Blocker 3: an explicit `s_barrier` at the join after a divergent loop
-/// whose capped back edge may have let a lane leave the program early is
-/// refused, in halves and as one wave64 alike.
+/// The capped loop has a normal exit. Its limit must take that exit so
+/// every lane can still reach the group's barrier.
 #[test]
-fn an_s_barrier_after_a_divergent_capped_loop_is_refused() {
+fn an_s_barrier_after_a_divergent_capped_loop_translates() {
     let w = a_divergent_capped_loop_then_an_s_barrier_at_the_join();
-    for why in [
-        lowered_halves(&w, 64).err().expect("refused in halves"),
-        lowered_result(&w, 64, false)
-            .err()
-            .expect("refused as one wave64"),
-    ] {
-        let why = why.to_string();
-        assert!(
-            why.contains("an s_barrier where a lane may have left the program early"),
-            "{why}"
-        );
-    }
+    let l = super::super::with_thread_ticket(false, || lowered_halves(&w, 64)).expect("in halves");
+    assert_eq!(l.wave_size, Some(32));
+    // The explicit barrier and the two barriers used for the lane exchange.
+    assert_eq!(l.barriers, 3);
+    assert_eq!(lowered(&w, 64, false).barriers, 1);
 }
 
 /// The same `s_barrier` where no lane can have left early — a uniform loop
@@ -2513,7 +2561,7 @@ fn ds_bpermute_wave64_preserves_32_lane_half() {
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
-        let mut lowered = lower(&Parts {
+        let lowered = lower(&Parts {
             halves_rendezvous: false,
             native: &native,
             p: &p,
@@ -2526,7 +2574,8 @@ fn ds_bpermute_wave64_preserves_32_lane_half() {
             mesh_stride: 0,
             atomic_locks: false,
             atomic_lock_rounds: false,
-        atomic_umax: false,
+            atomic_umax: false,
+            atomic_early_exit: false,
             bias_as_gradients: false,
             narrow_waves: false,
             uav_size_level0: false,
@@ -2541,7 +2590,7 @@ fn ds_bpermute_wave64_preserves_32_lane_half() {
         if let Ok(mut v) = crate::emit::validator::Validator::load(
             crate::emit::validator::Validator::default_path().as_deref(),
         ) {
-            v.validate(&mut lowered.dxil).unwrap();
+            v.validate(&mut { lowered.dxil }).unwrap();
         }
     }
 }
@@ -2627,6 +2676,7 @@ fn lower_ps_for_early_z(
         atomic_locks: false,
         atomic_lock_rounds: false,
         atomic_umax: false,
+        atomic_early_exit: false,
         bias_as_gradients: false,
         narrow_waves: false,
         uav_size_level0: false,
@@ -2840,7 +2890,7 @@ fn buffer_load_readfirstlane_loop_is_in_step() {
     ];
     let p = wave64(&w);
     let st = structure::structure(&p).unwrap();
-    let step = super::in_step(&p, &st);
+    let step = super::in_step(&p, &st, &[], &super::LoopCaps::new(&p, &st));
     assert!(
         step.iter().all(|&s| s),
         "expected all blocks in_step, got {step:?}; exits={:?}; blocks={:?}",
@@ -2854,6 +2904,58 @@ fn buffer_load_readfirstlane_loop_is_in_step() {
                 .collect::<Vec<_>>())
             .collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn descriptor_index_matches_ordered_search_across_large_control_flow() {
+    use super::descriptor_load_uses;
+    use crate::resource::{Descriptor, Resources, Role, Source};
+
+    let mut resources = Resources::default();
+    let blocks = 2048;
+    let loaded = |block, first| Source::Loaded {
+        load: (block, 0),
+        first,
+    };
+    resources.descriptors.push(Descriptor {
+        site: (0, 1),
+        role: Role::Sampler,
+        source: loaded(0, 3),
+    });
+    for block in 0..blocks {
+        resources.descriptors.push(Descriptor {
+            site: (block, 1),
+            role: Role::Resource,
+            source: Source::Phi {
+                block,
+                args: vec![loaded(block, 1), loaded(block.saturating_sub(1), 2)],
+            },
+        });
+    }
+    let queries = (0..=blocks).map(|b| (b, 0));
+    let start = std::time::Instant::now();
+    let searched: Vec<_> = queries
+        .clone()
+        .map(|site| {
+            resources
+                .descriptors
+                .iter()
+                .filter(|d| d.role == Role::Resource)
+                .find_map(|d| {
+                    d.source.leaves().into_iter().find_map(|leaf| match *leaf {
+                        Source::Loaded { load, first } if load == site => Some((d.site, first)),
+                        _ => None,
+                    })
+                })
+        })
+        .collect();
+    let scan_time = start.elapsed();
+    let start = std::time::Instant::now();
+    let indexed = descriptor_load_uses(&resources);
+    let found: Vec<_> = queries.map(|site| indexed.get(&site).copied()).collect();
+    let index_time = start.elapsed();
+    assert_eq!(found, searched);
+    eprintln!("{blocks} blocks: ordered scan {scan_time:?}, indexed {index_time:?}");
 }
 
 /// SMEM `op` (`s_load_dword*` 0-4, `s_buffer_load_dword*` 8-12) of
@@ -3168,6 +3270,7 @@ fn lower_halves_io(
             atomic_locks: false,
             atomic_lock_rounds: false,
             atomic_umax: false,
+            atomic_early_exit: false,
             bias_as_gradients: false,
             host_wave32: true,
             narrow_waves: false,
@@ -3224,7 +3327,7 @@ fn a_uniform_global_loads_first_lane_read_needs_no_exchange() {
 /// its cross-half exchange.
 #[test]
 fn a_lane_varying_global_load_keeps_the_first_lane_refusal() {
-    let first_across = super::halves::FIRST_ACROSS;
+    let first_across = super::FIRST_ACROSS;
     let refused = |w: &[u32]| matches!(lower_halves(w), Err(crate::ShaderError::Unsupported { what, .. }) if what == first_across);
     // The VGPR offset is the thread id.
     let mut w = vec![0x7E02_0300]; // v_mov_b32 v1, v0
@@ -3262,7 +3365,7 @@ const fn global_store(vdata: u8, vaddr: u8, saddr: u8, offset: u32) -> [u32; 2] 
 /// The first-lane read of a `global_load_dword*`'s result is refused
 /// (`FIRST_ACROSS`) in a divergent block.
 fn refused_in_halves(w: &[u32]) -> bool {
-    let first_across = super::halves::FIRST_ACROSS;
+    let first_across = super::FIRST_ACROSS;
     matches!(lower_halves(w), Err(crate::ShaderError::Unsupported { what, .. }) if what == first_across)
 }
 
@@ -3373,7 +3476,7 @@ fn a_root_srv_load_with_a_root_uav_store_keeps_the_first_lane_refusal() {
     w.extend(global_store(2, 1, 2, 0)); // global_store_dword v2, v1, s[2:3], 0 (the root UAV)
     w.extend(global(0x0C, 3, 1, 0, 0)); // global_load_dword v3, v1, s[0:1], 0 (the root SRV)
     divergent_read(&mut w, 0x7E0E_0503, 0xBF07_8007); // v_readfirstlane_b32 s7, v3; s_cmp_lg_u32 s7, 0
-    let first_across = super::halves::FIRST_ACROSS;
+    let first_across = super::FIRST_ACROSS;
     assert!(
         matches!(lower_halves_with(&w, vec![srv, uav], used), Err(crate::ShaderError::Unsupported { what, .. }) if what == first_across),
         "a root SRV a root UAV store can alias keeps the refusal"
@@ -3413,7 +3516,7 @@ fn a_buffer_atomic_with_a_global_load_keeps_the_first_lane_refusal() {
     ];
     w.extend(global(0x0C, 3, 1, 0, 0)); // global_load_dword v3, v1, s[0:1], 0
     divergent_read(&mut w, 0x7E0E_0503, 0xBF07_8007); // v_readfirstlane_b32 s7, v3; s_cmp_lg_u32 s7, 0
-    let first_across = super::halves::FIRST_ACROSS;
+    let first_across = super::FIRST_ACROSS;
     assert!(
         matches!(lower_halves_with(&w, vec![constants, root(RootType::Table, 4, 1)], vec![buffer]), Err(crate::ShaderError::Unsupported { what, .. }) if what == first_across),
         "a global load a buffer atomic can alias keeps the refusal"
@@ -3463,7 +3566,7 @@ fn a_buffer_load_aliased_by_a_buffer_atomic_keeps_the_first_lane_refusal() {
         0x8000_0301, // buffer_atomic_add v3, v1, s[0:3], 0 offen (the same UAV dword)
     ]);
     divergent_read(&mut w, 0x7E0C_0502, 0xBF07_8006); // v_readfirstlane_b32 s6, v2; s_cmp_lg_u32 s6, 0
-    let first_across = super::halves::FIRST_ACROSS;
+    let first_across = super::FIRST_ACROSS;
     assert!(
         matches!(lower_halves_with(&w, vec![uav], vec![buffer]), Err(crate::ShaderError::Unsupported { what, .. }) if what == first_across),
         "a buffer load a buffer atomic at the same UAV offset can alias keeps the refusal"
@@ -3530,7 +3633,7 @@ fn a_buffer_load_with_an_s_load_soffset_keeps_the_first_lane_refusal() {
         0x0800_0201, // buffer_load_dword v2, v1, s[0:3], s8 offen
     ]);
     divergent_read(&mut w, 0x7E0C_0502, 0xBF07_8006); // v_readfirstlane_b32 s6, v2; s_cmp_lg_u32 s6, 0
-    let first_across = super::halves::FIRST_ACROSS;
+    let first_across = super::FIRST_ACROSS;
     assert!(
         matches!(lower_halves_with(&w, vec![srv, constants], vec![buffer]), Err(crate::ShaderError::Unsupported { what, .. }) if what == first_across),
         "a buffer load with an s_load_dword-derived soffset keeps the refusal"
@@ -3591,7 +3694,7 @@ fn an_overlapping_buffer_load_with_a_lane_varying_vaddr_keeps_the_first_lane_ref
     // load is not lane-uniform.
     let mut w = head(&[0x7E02_0300]); // v_mov_b32 v1, v0
     divergent_read(&mut w, 0x7E0C_0501, 0xBF07_8006); // v_readfirstlane_b32 s6, v1; s_cmp_lg_u32 s6, 0
-    let first_across = super::halves::FIRST_ACROSS;
+    let first_across = super::FIRST_ACROSS;
     assert!(
         matches!(lower_halves_with(&w, vec![srv], vec![buffer]), Err(crate::ShaderError::Unsupported { what, .. }) if what == first_across),
         "an overlapping buffer load with a lane-varying vaddr keeps the refusal"
@@ -3646,7 +3749,7 @@ fn a_ds_read_u16_d16_into_a_lane_varying_destination_keeps_the_first_lane_refusa
     // high 16 bits, so the _d16 load's result is lane-varying.
     let mut w = head(&[0x3402_0090]); // v_lshlrev_b32 v1, 16, v0
     divergent_read(&mut w, 0x7E0C_0501, 0xBF07_8006); // v_readfirstlane_b32 s6, v1; s_cmp_lg_u32 s6, 0
-    let first_across = super::halves::FIRST_ACROSS;
+    let first_across = super::FIRST_ACROSS;
     assert!(
         matches!(lower(&w), Err(crate::ShaderError::Unsupported { what, .. }) if what == first_across),
         "a ds_read_u16_d16 into a lane-varying destination keeps the refusal"
@@ -3729,7 +3832,7 @@ fn a_buffer_load_offset_to_code_with_a_store_keeps_the_first_lane_refusal() {
     w.extend(global(0x0C, 5, 2, 0, 0x40)); // global_load_dword v5, v2, s[0:1], 0x40 (the code table)
     divergent_read(&mut w, 0x7E12_0505, 0xBF07_8009); // v_readfirstlane_b32 s9, v5; s_cmp_lg_u32 s9, 0
     w.extend([0x1111_1111, 0x2222_2222]); // the code's constant table, past the instructions
-    let first_across = super::halves::FIRST_ACROSS;
+    let first_across = super::FIRST_ACROSS;
     assert!(
         matches!(lower_halves_with(&w, vec![constants, root(RootType::Table, 4, 1)], vec![buffer]), Err(crate::ShaderError::Unsupported { what, .. }) if what == first_across),
         "a buffer-load offset into the code table with a store present keeps the refusal"
@@ -3787,7 +3890,7 @@ fn a_phi_over_a_load_controlled_branch_keeps_the_first_lane_refusal() {
     w.extend(global(0x0C, 5, 3, 0, 0x40)); // global_load_dword v5, v3 (the phi), s[0:1], 0x40 (the code table)
     divergent_read(&mut w, 0x7E12_0505, 0xBF07_8009); // v_readfirstlane_b32 s9, v5; s_cmp_lg_u32 s9, 0
     w.extend([0x1111_1111, 0x2222_2222]); // the code's constant table, past the instructions
-    let first_across = super::halves::FIRST_ACROSS;
+    let first_across = super::FIRST_ACROSS;
     assert!(
         matches!(lower_halves_with(&w, vec![constants, root(RootType::Table, 4, 1)], vec![buffer]), Err(crate::ShaderError::Unsupported { what, .. }) if what == first_across),
         "a phi over a load-controlled branch with a store present keeps the refusal"
@@ -3839,7 +3942,7 @@ fn a_code_load_under_a_buffer_load_guard_keeps_the_first_lane_refusal() {
     w.push(0xBEFE_0410); // s_mov_b64 exec, s[16:17]
     divergent_read(&mut w, 0x7E12_0505, 0xBF07_8009); // v_readfirstlane_b32 s9, v5; s_cmp_lg_u32 s9, 0
     w.extend([0x1111_1111, 0x2222_2222]); // the code's constant table, past the instructions
-    let first_across = super::halves::FIRST_ACROSS;
+    let first_across = super::FIRST_ACROSS;
     assert!(
         matches!(lower_halves_with(&w, vec![constants, root(RootType::Table, 4, 1)], vec![buffer]), Err(crate::ShaderError::Unsupported { what, .. }) if what == first_across),
         "a code-table load under a buffer-load guard with a store present keeps the refusal"
@@ -3889,7 +3992,7 @@ fn a_dot4c_accumulator_from_a_buffer_load_keeps_the_first_lane_refusal() {
     w.extend(global(0x0C, 5, 2, 0, 0x40)); // global_load_dword v5, v2, s[0:1], 0x40
     divergent_read(&mut w, 0x7E12_0505, 0xBF07_8009); // v_readfirstlane_b32 s9, v5; s_cmp_lg_u32 s9, 0
     w.extend([0x1111_1111, 0x2222_2222]);
-    let first_across = super::halves::FIRST_ACROSS;
+    let first_across = super::FIRST_ACROSS;
     assert!(
         matches!(lower_halves_with(&w, vec![constants, root(RootType::Table, 4, 1)], vec![buffer]), Err(crate::ShaderError::Unsupported { what, .. }) if what == first_across),
         "a v_dot4c_i32_i8 with a buffer-loaded accumulator must not enter pure"
@@ -3926,7 +4029,7 @@ fn a_64bit_shift_with_an_unproven_high_scalar_keeps_the_first_lane_refusal() {
     w.extend(global(0x0C, 5, 4, 0, 0x40)); // global_load_dword v5, v4, s[0:1], 0x40 (the code table)
     divergent_read(&mut w, 0x7E12_0505, 0xBF07_8009); // v_readfirstlane_b32 s9, v5; s_cmp_lg_u32 s9, 0
     w.extend([0x1111_1111, 0x2222_2222]); // the code's constant table, past the instructions
-    let first_across = super::halves::FIRST_ACROSS;
+    let first_across = super::FIRST_ACROSS;
     assert!(
         matches!(lower_halves_with(&w, vec![constants], vec![]), Err(crate::ShaderError::Unsupported { what, .. }) if what == first_across),
         "a 64-bit shift with an unproven high scalar word keeps the refusal"
@@ -4224,7 +4327,7 @@ fn a_guarded_v_mov_under_a_buffer_load_guard_with_a_store_keeps_the_first_lane_r
     w.extend([0x7E0A_02FF, 0x0000_0001]); // v_mov_b32 v5, 1 (under the guard)
     w.push(0xBEFE_0410); // s_mov_b64 exec, s[16:17]
     divergent_read(&mut w, 0x7E12_0505, 0xBF07_8009); // v_readfirstlane_b32 s9, v5; s_cmp_lg_u32 s9, 0
-    let first_across = super::halves::FIRST_ACROSS;
+    let first_across = super::FIRST_ACROSS;
     assert!(
         matches!(lower_halves_with(&w, vec![constants, root(RootType::Table, 4, 1)], vec![buffer]), Err(crate::ShaderError::Unsupported { what, .. }) if what == first_across),
         "a guarded v_mov under a buffer-load guard with a store present keeps the refusal"
@@ -4269,5 +4372,3 @@ fn a_cndmask_with_vccz_as_its_mask_keeps_the_first_lane_refusal() {
         "no cross-half exchange was emitted for the all-zeros mask"
     );
 }
-
-

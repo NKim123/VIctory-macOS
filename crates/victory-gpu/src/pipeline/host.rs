@@ -23,19 +23,19 @@ use crate::host::host;
 /// A stream's graphics state, owned (the title's stream lives only for the
 /// creation call). Subobjects the stream leaves out keep D3D12's defaults.
 pub(crate) struct GraphicsState {
-    blend: D3D12_BLEND_DESC,
-    sample_mask: u32,
-    rasterizer: D3D12_RASTERIZER_DESC,
-    depth: D3D12_DEPTH_STENCIL_DESC,
-    depth_bounds: bool,
+    pub(super) blend: D3D12_BLEND_DESC,
+    pub(super) sample_mask: u32,
+    pub(super) rasterizer: D3D12_RASTERIZER_DESC,
+    pub(super) depth: D3D12_DEPTH_STENCIL_DESC,
+    pub(super) depth_bounds: bool,
     /// Input elements, their names pointing into `names`.
-    inputs: Vec<D3D12_INPUT_ELEMENT_DESC>,
-    names: Vec<CString>,
-    strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE,
+    pub(super) inputs: Vec<D3D12_INPUT_ELEMENT_DESC>,
+    pub(super) names: Vec<CString>,
+    pub(super) strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE,
     pub(crate) topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE,
     pub(crate) targets: D3D12_RT_FORMAT_ARRAY,
-    depth_format: DXGI_FORMAT,
-    samples: DXGI_SAMPLE_DESC,
+    pub(super) depth_format: DXGI_FORMAT,
+    pub(super) samples: DXGI_SAMPLE_DESC,
 }
 
 impl Default for GraphicsState {
@@ -463,6 +463,7 @@ pub(crate) struct HostPipeline {
     /// A mesh pipeline (graphics without vertex input).
     pub(crate) mesh: bool,
     pub(crate) pso: ID3D12PipelineState,
+    pub(crate) cache_status: super::library::CacheStatus,
     pub(crate) root: ID3D12RootSignature,
     /// Vertex, then pixel stage, or the compute stage.
     pub(crate) stages: Vec<Stage>,
@@ -544,8 +545,7 @@ impl HostPipeline {
                 .and_then(|ps| ps.translated())
                 .is_some_and(|ps| victory_shader::emit::needs_vertex_deltas(&ps.host.dxil));
         let linked = mesh.and_then(|ms| {
-            let over_limit = super::link_mesh_outputs()
-                && over_limit_mesh_output_bytes(&ms.translated()?.host.dxil).is_some();
+            let over_limit = super::link_mesh_outputs().applies_to(&ms.translated()?.host.dxil);
             if over_limit {
                 super::translate_linked(ms, find("pixel").map(Arc::as_ref), ps_deltas)
             } else if ps_deltas {
@@ -762,8 +762,8 @@ impl HostPipeline {
                 // SAFETY: as above.
                 || unsafe { host.device.CreateComputePipelineState(&desc) },
             );
-            let pso = match made {
-                Ok(pso) => pso,
+            let (pso, cache_status) = match made {
+                Ok(result) => result,
                 Err(e) => {
                     record_refusal("compute pipeline refused", Some(e.code().0));
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
@@ -777,6 +777,7 @@ impl HostPipeline {
                 compute: true,
                 mesh: false,
                 pso,
+                cache_status,
                 root,
                 stages: bound,
                 name: format!("{shaders:?}"),
@@ -818,8 +819,8 @@ impl HostPipeline {
                     &name,
                 ),
             };
-            let pso = match made {
-                Ok(pso) => pso,
+            let (pso, cache_status) = match made {
+                Ok(result) => result,
                 Err(e) => {
                     record_refusal("mesh pipeline refused", Some(e.code().0));
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
@@ -833,6 +834,7 @@ impl HostPipeline {
                 compute: false,
                 mesh: true,
                 pso,
+                cache_status,
                 root,
                 stages: bound,
                 name: format!("{shaders:?}"),
@@ -931,8 +933,8 @@ impl HostPipeline {
                 || unsafe { host.device.CreateGraphicsPipelineState(&desc) },
             )
         };
-        let pso = match made {
-            Ok(pso) => pso,
+        let (pso, cache_status) = match made {
+            Ok(result) => result,
             Err(e) => {
                 record_refusal("graphics pipeline refused", Some(e.code().0));
                 tracing::warn!(error = %e, ?shaders, "host pipeline refused");
@@ -961,6 +963,7 @@ impl HostPipeline {
             compute: false,
             mesh: false,
             pso,
+            cache_status,
             root,
             stages: bound,
             name: format!("{shaders:?}"),
@@ -1004,7 +1007,7 @@ fn stream_pipeline<S, D>(
     g: &GraphicsState,
     depth: Sub<D>,
     name: &str,
-) -> windows::core::Result<ID3D12PipelineState> {
+) -> windows::core::Result<(ID3D12PipelineState, super::library::CacheStatus)> {
     #[repr(C)]
     struct Stream<S, D> {
         root: Sub<*mut std::ffi::c_void>,

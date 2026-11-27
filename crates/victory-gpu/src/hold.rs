@@ -129,6 +129,8 @@ pub(crate) fn can_join_batch(
 
 /// What a queue holds, in its order.
 pub(crate) enum Item<S> {
+    /// Flushes the current piece before a wait on an in-flight queue.
+    Boundary,
     /// A list segment and the waits at its start.
     Segment(S, Vec<ValueWait>),
     /// A fence Signal: the fence and its value.
@@ -186,8 +188,8 @@ pub(crate) struct World<'a, S> {
     pub(crate) read: &'a dyn Fn(u64, u8) -> Option<u64>,
     /// A fence's value.
     pub(crate) fence: &'a dyn Fn(usize) -> u64,
-    /// Whether a segment's deferred bottom-of-pipe writes satisfy `wait`.
-    pub(crate) will_write: &'a dyn Fn(&S, &ValueWait) -> bool,
+    /// Whether the last overlapping write satisfies `wait` (none if untouched).
+    pub(crate) pending_write: &'a dyn Fn(&S, &ValueWait) -> Option<bool>,
     /// Whether `next` can join a non-empty coalesced `piece` without violating
     /// ordering hazards or batch limits.
     pub(crate) can_join: CanJoin<'a, S>,
@@ -198,6 +200,8 @@ pub(crate) struct World<'a, S> {
     pub(crate) run: &'a mut dyn FnMut(Vec<(S, bool)>),
     /// Signals a fence.
     pub(crate) signal: &'a mut dyn FnMut(usize, u64),
+    /// Releases the fence reference held by a completed Wait.
+    pub(crate) release_wait: &'a mut dyn FnMut(usize),
 }
 
 impl<S> Held<S> {
@@ -256,7 +260,7 @@ impl<S> Held<S> {
                         }
                         // A Signal or Wait keeps its place: the piece before
                         // it runs first.
-                        Some((Item::Signal(..), ..)) => {
+                        Some((Item::Signal(..) | Item::Boundary, ..)) => {
                             if !piece.is_empty() {
                                 (w.run)(std::mem::take(&mut piece));
                                 done.pieces += 1;
@@ -281,7 +285,8 @@ impl<S> Held<S> {
                             done.segments += 1;
                         }
                         Some(Item::Signal(fence, value)) => (w.signal)(fence, value),
-                        Some(Item::FenceWait(..)) | None => {}
+                        Some(Item::FenceWait(fence, _)) => (w.release_wait)(fence),
+                        Some(Item::Boundary) | None => {}
                     }
                 }
                 if !piece.is_empty() {
@@ -307,6 +312,7 @@ impl<S> Held<S> {
             Blocked,
             FlushFirst,
             TakeSegment(bool),
+            TakeBoundary,
             TakeSignal,
             TakeFenceWait(bool),
         }
@@ -342,16 +348,19 @@ impl<S> Held<S> {
                             let mut via_bop = 0u32;
                             let mut unknown = 0u32;
                             for wait in waits.iter() {
-                                match wait.holds(w.read) {
-                                    Some(true) => {}
-                                    Some(false) => {
-                                        if piece.iter().rev().any(|(prev, _)| (w.will_write)(prev, wait)) {
-                                            via_bop += 1;
-                                        } else {
-                                            ok = false;
-                                        }
-                                    }
-                                    None => unknown += 1,
+                                // Only the most recent overlapping write can satisfy
+                                // this wait. An older write or the published bytes
+                                // could contain a value that has already been replaced.
+                                let pending = piece.iter().rev()
+                                    .find_map(|(prev, _)| (w.pending_write)(prev, wait));
+                                match pending {
+                                    Some(true) => via_bop += 1,
+                                    Some(false) => ok = false,
+                                    None => match wait.holds(w.read) {
+                                        Some(true) => {}
+                                        Some(false) => ok = false,
+                                        None => unknown += 1,
+                                    },
                                 }
                             }
                             // Only check `can_join` when crossing a join boundary (another queue,
@@ -378,13 +387,16 @@ impl<S> Held<S> {
                                 Decision::TakeSegment(barrier)
                             }
                         }
+                        Some((Item::Boundary, ..)) => Decision::TakeBoundary,
                         Some((Item::Signal(..), ..)) => Decision::TakeSignal,
                         Some((Item::FenceWait(fence, value), _, fresh)) => {
                             let mem_ok = (w.fence)(*fence) >= *value;
                             let pending_ok = !mem_ok
                                 && pending_signals
                                     .iter()
-                                    .any(|&(f, v)| f == *fence && v >= *value);
+                                    .rev()
+                                    .find(|&&(f, _)| f == *fence)
+                                    .is_some_and(|&(_, v)| v >= *value);
                             if !mem_ok && !pending_ok {
                                 *fresh = false;
                                 Decision::Blocked
@@ -410,6 +422,12 @@ impl<S> Held<S> {
                                 done.segments += 1;
                             }
                         }
+                        Decision::TakeBoundary => {
+                            flush(&mut piece, &mut pending_signals, &mut last_queue, w, &mut done);
+                            pending_fence_barrier = false;
+                            items.pop_front();
+                            moved = true;
+                        }
                         Decision::TakeSignal => {
                             moved = true;
                             if let Some((Item::Signal(fence, value), ..)) = items.pop_front() {
@@ -425,7 +443,9 @@ impl<S> Held<S> {
                             if via_pending {
                                 pending_fence_barrier = true;
                             }
-                            items.pop_front();
+                            if let Some((Item::FenceWait(fence, _), ..)) = items.pop_front() {
+                                (w.release_wait)(fence);
+                            }
                         }
                     }
                 }
@@ -497,6 +517,7 @@ mod tests {
         memory: HashMap<u64, u64>,
         fences: HashMap<usize, u64>,
         log: Vec<String>,
+        released_waits: Vec<usize>,
         /// Bottom-of-pipe writes of each segment: (address, value).
         writes: HashMap<&'static str, Vec<(u64, u64)>>,
         /// Per-segment hazard flags for `can_join_batch`.
@@ -515,7 +536,7 @@ mod tests {
     ) -> Pumped {
         let read = |a: u64, _| Some(*fake.borrow().memory.get(&a).unwrap_or(&0));
         let fence = |f: usize| *fake.borrow().fences.get(&f).unwrap_or(&0);
-        let will_write = |seg: &&'static str, wait: &ValueWait| {
+        let pending_write = |seg: &&'static str, wait: &ValueWait| {
             fake.borrow()
                 .writes
                 .get(seg)
@@ -526,7 +547,6 @@ mod tests {
                         .find(|&&(addr, _)| addr == wait.address)
                         .map(|&(_, v)| wait.holds_for(v) == Some(true))
                 })
-                .unwrap_or(false)
         };
         let can_join = |piece: &[(&'static str, bool)], next: &&'static str| {
             let f = fake.borrow();
@@ -559,11 +579,12 @@ mod tests {
         held.pump(&mut World {
             read: &read,
             fence: &fence,
-            will_write: &will_write,
+            pending_write: &pending_write,
             can_join: &can_join,
             coalesce,
             run: &mut run,
             signal: &mut signal,
+            release_wait: &mut |fence| fake.borrow_mut().released_waits.push(fence),
         })
     }
 
@@ -814,6 +835,34 @@ mod tests {
         assert_eq!(p.pieces, 1);
         assert_eq!(p.segments, 3);
         assert_eq!(fake.borrow().fences.get(&5), Some(&3));
+        assert_eq!(fake.borrow().released_waits, [5]);
+    }
+
+    #[test]
+    fn coalesced_wait_observes_the_last_pending_write() {
+        let fake = RefCell::new(Fake::default());
+        fake.borrow_mut().memory.insert(0x100, 1);
+        fake.borrow_mut().writes.insert("set", vec![(0x100, 1)]);
+        fake.borrow_mut().writes.insert("reset", vec![(0x100, 0)]);
+        let mut held = Held::default();
+        held.push(1, Item::Segment("set", vec![]));
+        held.push(1, Item::Segment("reset", vec![]));
+        held.push(2, Item::Segment("consumer", vec![ge(0x100, 1)]));
+        assert_eq!(pump_coalesced(&mut held, &fake).segments, 2);
+        assert_eq!(fake.borrow().log, ["run: set reset"]);
+        assert!(held.holds_work(2));
+    }
+
+    #[test]
+    fn an_explicit_piece_boundary_flushes_before_the_next_segment() {
+        let fake = RefCell::new(Fake::default());
+        fake.borrow_mut().writes.insert("producer", vec![(0x100, 1)]);
+        let mut held = Held::default();
+        held.push(1, Item::Segment("producer", vec![]));
+        held.push(1, Item::Boundary);
+        held.push(1, Item::Segment("consumer", vec![ge(0x100, 1)]));
+        assert_eq!(pump_coalesced(&mut held, &fake).pieces, 2);
+        assert_eq!(fake.borrow().log, ["run: producer", "run: consumer"]);
     }
 
     /// Order within a queue never changes in coalesced mode: a later segment

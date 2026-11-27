@@ -364,6 +364,11 @@ impl Source for ScriptedSource {
         keys
     }
 
+    fn fallback_pad(&mut self, keys: &[KeyState], active: bool) -> PadState {
+        let replaying = self.replay.is_some() && (self.world_frame)() > 0;
+        self.inner.fallback_pad(keys, active && !replaying)
+    }
+
     #[cfg(any(test, feature = "diagnostics"))]
     fn scripted_keys(&mut self) -> Vec<KeyState> {
         let wf = (self.world_frame)();

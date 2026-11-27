@@ -180,7 +180,7 @@ fn exercise(layout: Layout) -> (bool, bool) {
     }
     MARKED_COPY_BACK_PARALLEL.with(|taken| taken.set(None));
     let started = std::time::Instant::now();
-    copy_back_marks(&[], false);
+    copy_back_marks(&[], false, None, true);
     let elapsed_ns = started.elapsed().as_nanos();
     let parallel =
         MARKED_COPY_BACK_PARALLEL.with(|taken| taken.take().expect("marked copy-back ran"));

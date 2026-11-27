@@ -247,6 +247,7 @@ fn build(
         atomic_locks: false,
         atomic_lock_rounds: false,
         atomic_umax: false,
+        atomic_early_exit: false,
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
@@ -353,6 +354,73 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
             )
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
         let want: Vec<u32> = (0..32).map(|l| 200 + l).collect();
+        assert_eq!(words[0], want, "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// A structured table SRV uses the console stride with a raw host slot.
+#[test]
+fn a_structured_table_read_uses_the_raw_views_byte_offsets() {
+    let mut input = entry(ResourceType::Srv, 4, 1);
+    input.stride = 12;
+    let mut program = HEAP_ELEMENT_WAVE32.to_vec();
+    // Add descriptor dword 2 (the record count) to the loaded component.
+    program.insert(program.len() - 3, 0x25 << 25 | 2 << 17 | 2 << 9 | 10);
+    let shader = super::TEST_RAW_STRUCTURED_VIEWS.with(|setting| {
+        let old = setting.replace(Some(true));
+        let shader = build(
+            &program,
+            vec![
+                param(RootType::Constants, 0),
+                param(RootType::Table, 1),
+                param(RootType::Table, 2),
+            ],
+            vec![input, entry(ResourceType::Uav, 4, 2)],
+            32,
+        );
+        setting.set(old);
+        shader
+    });
+    assert!(!shader.heap, "both buffers are table entries");
+    let data: Vec<u32> = (0..32).flat_map(|e| [100 + e, 200 + e, 300 + e]).collect();
+    let views = [
+        View::RawUav(32),
+        View::Buffer {
+            data: &data,
+            stride: Stride::Raw,
+        },
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .expect("a raw table pipeline");
+        let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = if u.slot == 1 { 32 } else { 0 };
+        }
+        let words = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        let want: Vec<u32> = (0..32).map(|l| 200 + l + 32).collect();
         assert_eq!(words[0], want, "{label}");
         ran += 1;
     }

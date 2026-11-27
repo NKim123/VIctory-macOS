@@ -133,13 +133,13 @@ impl PredicatePlan {
     /// 32-lane host. Returns an empty plan (zero codegen overhead) when no
     /// non-`in_step` block needs cross-half or split-wave LDS execution.
     pub(super) fn build(
-        p: &Program,
-        st: &Structured,
+        x: &Parts,
+        loop_caps: &LoopCaps,
         base_step: Vec<bool>,
         one_wave_lds: bool,
-        host_wave32: bool,
         local: &super::super::own_bits::OwnBits,
     ) -> Self {
+        let (p, st) = (x.p, x.st);
         let n = p.blocks.len();
         if n <= 1 {
             return Self::empty(base_step);
@@ -184,7 +184,11 @@ impl PredicatePlan {
             let ipdom = immediate_post_dominators(&eff_exits, &pdom);
 
             for &d in &order {
-                if !plan.step[d] || plan.exits.contains_key(&d) || plan.dead_blocks.contains(&d) {
+                if !plan.step[d]
+                    || plan.exits.contains_key(&d)
+                    || plan.dead_blocks.contains(&d)
+                    || loop_caps.exits.contains_key(&d)
+                {
                     continue;
                 }
                 let LaneExit::Branch {
@@ -215,8 +219,14 @@ impl PredicatePlan {
                     }) {
                         plan.dead_blocks.insert(end_blk);
                     }
-                    plan.step =
-                        barriers::in_step_with(p, st, &eff_exits, &plan.uniform_branches);
+                    plan.step = barriers::in_step_with(
+                        p,
+                        st,
+                        &eff_exits,
+                        &plan.uniform_branches,
+                        &x.res.waterfall.reads,
+                        loop_caps,
+                    );
                     changed = true;
                     break;
                 }
@@ -241,8 +251,14 @@ impl PredicatePlan {
                     plan.skip_joins.insert(join, d);
                     plan.skipped_edges.insert((d, join));
                     eff_exits[d] = LaneExit::Jump(body);
-                    plan.step =
-                        barriers::in_step_with(p, st, &eff_exits, &plan.uniform_branches);
+                    plan.step = barriers::in_step_with(
+                        p,
+                        st,
+                        &eff_exits,
+                        &plan.uniform_branches,
+                        &x.res.waterfall.reads,
+                        loop_caps,
+                    );
                     changed = true;
                     break;
                 }
@@ -274,18 +290,25 @@ impl PredicatePlan {
                     }
                     plan.diamond_joins.insert(join, d);
                     plan.linear_merges.insert(join);
-                    plan.step =
-                        barriers::in_step_with(p, st, &eff_exits, &plan.uniform_branches);
+                    plan.step = barriers::in_step_with(
+                        p,
+                        st,
+                        &eff_exits,
+                        &plan.uniform_branches,
+                        &x.res.waterfall.reads,
+                        loop_caps,
+                    );
                     changed = true;
                     break;
                 }
             }
 
-            if !changed && host_wave32 {
+            if !changed && x.host_wave32 {
                 // Shape 4: single-latch, single-exit divergent loop promoted
                 // to group-uniform lockstep execution (`group_any_true`).
                 for &h in &order {
-                    if plan.dead_blocks.contains(&h)
+                    if loop_caps.checked_at_exit.contains(&h)
+                        || plan.dead_blocks.contains(&h)
                         || plan.lockstep_headers.contains_key(&h)
                         || plan.in_diamond.contains(&h)
                     {
@@ -306,8 +329,14 @@ impl PredicatePlan {
                         plan.lockstep_exits.insert(exit, h);
                         plan.uniform_branches.insert(latch);
                         plan.in_lockstep_loop.extend(body);
-                        plan.step =
-                            barriers::in_step_with(p, st, &eff_exits, &plan.uniform_branches);
+                        plan.step = barriers::in_step_with(
+                            p,
+                            st,
+                            &eff_exits,
+                            &plan.uniform_branches,
+                            &x.res.waterfall.reads,
+                            loop_caps,
+                        );
                         changed = true;
                         break;
                     }
@@ -561,7 +590,8 @@ fn match_skip_guard(
     } else {
         return None;
     };
-    if join == d
+    if has_scalar_join(p, join)
+        || join == d
         || rpo[join] <= rpo[d]
         || rpo[body] <= rpo[d]
         || plan.diamond_joins.contains_key(&join)
@@ -650,6 +680,15 @@ fn match_skip_guard(
     Some(body)
 }
 
+/// A scalar phi needs the console wave's selected value. A per-lane
+/// select at a flattened join would leave inactive lanes with the old SGPR.
+fn has_scalar_join(p: &Program, join: usize) -> bool {
+    p.blocks[join].phis.iter().any(|phi| {
+        matches!(phi.reg, Reg::Scc)
+            || matches!(phi.reg, Reg::S(reg) if ![EXEC, EXEC + 1, VCC, VCC + 1].contains(&reg))
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn match_sese_diamond(
     p: &Program,
@@ -665,7 +704,8 @@ fn match_sese_diamond(
     if join == d || rpo[join] <= rpo[d] {
         return None;
     }
-    if plan.diamond_joins.contains_key(&join)
+    if has_scalar_join(p, join)
+        || plan.diamond_joins.contains_key(&join)
         || plan.skip_joins.contains_key(&join)
         || p.blocks[join].preds.iter().any(|&q| rpo[q] >= rpo[join])
     {
@@ -1351,7 +1391,8 @@ impl Lower<'_> {
                 let any = self
                     .group_any_true(next_act, cur)
                     .map_err(|w| unsupported(offset, w))?;
-                let ok = self.count_iteration(header, pred::IULT);
+                let next = self.count_iteration(header);
+                let ok = self.check_iteration(next, pred::IULT);
                 let go = self.s.m.bin(cur, Bin::And, any, ok);
                 let exit_blk = self.edge(b, exit);
                 let from = if Some(exit_blk) == self.block[exit] {

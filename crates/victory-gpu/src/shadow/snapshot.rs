@@ -21,6 +21,10 @@ struct SnapshotSpan {
 }
 
 impl Snapshot {
+    pub(super) fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.bytes.len()
@@ -98,6 +102,11 @@ impl Snapshot {
             give_back(old);
         }
         moved
+    }
+
+    pub(super) fn overlaps(&self, start: usize, end: usize) -> bool {
+        let first = self.spans.partition_point(|span| span.end <= start);
+        self.spans.get(first).is_some_and(|span| span.start < end)
     }
 
     pub(super) fn covers(&self, start: usize, end: usize) -> bool {

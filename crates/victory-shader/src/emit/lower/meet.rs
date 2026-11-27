@@ -129,13 +129,18 @@ pub(super) struct Meet {
 /// entered only from the branch, left only to one block or the end, and,
 /// where the branch block is in a cycle, left to a block in step (where a
 /// group barrier goes). A block in two such regions is in none.
-pub(super) fn meet_regions(p: &Program, st: &Structured, step: &[bool]) -> Meet {
+pub(super) fn meet_regions(
+    p: &Program,
+    st: &Structured,
+    step: &[bool],
+    loop_caps: &LoopCaps,
+) -> Meet {
     let n = st.exits.len();
     let mut meet = Meet {
         regions: Vec::new(),
         region_of: vec![None; n],
     };
-    let Some(regions) = halves::branch_regions(p, st) else {
+    let Some(regions) = halves::branch_regions(p, st, loop_caps) else {
         return meet;
     };
     let succ = |b: usize| -> Vec<usize> {

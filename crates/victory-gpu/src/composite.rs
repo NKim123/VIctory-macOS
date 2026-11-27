@@ -1,8 +1,9 @@
 //! Draws a presented overlay plane over the picture plane (#15).
 //!
 //! The title can present a scene and a UI plane at different resolutions.
-//! VIctory blends the other plane over the selected picture when
-//! `VICTORY_PRESENT_COMPOSITE=1`. The overlay uses straight alpha and
+//! VIctory blends the other plane over the selected picture on Series S
+//! by default. `VICTORY_PRESENT_COMPOSITE=0` disables blending and `1`
+//! enables it on either console. The overlay uses straight alpha and
 //! nearest-texel sampling in picture coordinates. `VICTORY_PRESENT_MAX`
 //! fits the final picture into the requested size, with or without an overlay.
 
@@ -10,10 +11,16 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::{Result, s};
 
-/// Whether `VICTORY_PRESENT_COMPOSITE=1` asks for the pass.
+/// Whether to compose the second plane. Series S usually presents UI there.
 pub(crate) fn wanted() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_PRESENT_COMPOSITE").is_ok_and(|v| v == "1"))
+    static OVERRIDE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    OVERRIDE
+        .get_or_init(|| {
+            std::env::var("VICTORY_PRESENT_COMPOSITE")
+                .ok()
+                .map(|v| v == "1")
+        })
+        .unwrap_or_else(|| crate::console::current() == crate::console::Console::SeriesS)
 }
 
 /// Fit the final presentation texture inside a requested host size, keeping

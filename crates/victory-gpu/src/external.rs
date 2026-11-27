@@ -47,7 +47,7 @@ pub fn prepare_input(list: *const Object, resource: *const Object) -> Option<()>
 /// Mark the provider's output as host-authored when its list is submitted.
 pub fn output_written(list: *const Object, resource: *const Object) {
     if let Some(list) = crate::list::host_list(list) {
-        crate::texture::host_writes(list, resource);
+        crate::texture::note_host_write(list, resource);
     }
 }
 
@@ -67,6 +67,7 @@ pub fn record<R>(
 ) -> Option<R> {
     let mut out = None;
     crate::list::with_state(list, |host, state| {
+        host.require_synchronous_submission();
         out = Some(f(&host.list));
         state.host_state_lost();
     });

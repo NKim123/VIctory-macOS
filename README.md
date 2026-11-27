@@ -124,6 +124,29 @@ secondary display, it leaves the game window hidden. With more than one extra di
 `VICTORY_WINDOW_MAX=WIDTHxHEIGHT`
 can further limit the window size without changing the render target.
 
+## Warming the pipeline cache
+
+Set `VICTORY_PIPELINE_BOOK=1` for a title run to record the PSOs it creates.
+Then run `victory warm` on the same Windows or CrossOver setup, with the title
+closed. It replays the recorded PSOs in batches of up to 40 in a separate
+process, building into the cache that `victory run` reads. If a compile crashes
+or stalls for three minutes, warm reports the affected PSO, tries the rest of
+the batch, and exits with a failure status. Workers checkpoint during long
+batches and at batch end. Later invocations skip completed PSOs once the host
+opens the library and its saved key list matches. Failed PSOs are retried.
+
+The records live in `pipelines/known-v1` under the configured cache directory
+and contain shader data from the title. With `VICTORY_SPILL_SHADERS=1` they
+can refer to the shared `shader-containers` cache. Recording adds disk I/O
+during title loading. Keep both directories local. With shader-pack and
+shader-database paths, `victory warm <paths>` runs the existing pack prebuild
+(`victory translate <paths> --cache --pipelines`) with two workers by default.
+
+The runtime uses up to a quarter of its pipeline workers (at least one) for
+early starts previously measured at one second or longer, after other early
+starts. A draw request can promote a queued PSO to the regular priority queue. Set
+`VICTORY_PIPELINE_SLOW=0` to use the usual queue order for every early start.
+
 ## Running the tests
 
 These commands are useful for anyone who works on the code. The first runs the tests natively on the Mac, and the second runs them as Windows programs on Wine with D3DMetal, which includes the GPU tests.

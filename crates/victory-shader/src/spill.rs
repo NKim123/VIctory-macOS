@@ -23,23 +23,37 @@ use crate::native::{HwStage, NativeProgram, StageIo};
 /// The user-data index of the table's first dword.
 pub(crate) const FIRST: u32 = 16;
 
-/// Whether the compute program keeps all its root parameters in the
-/// spilled table starting at index 16. Its synthetic input registers must
-/// be above the user and system SGPRs initialized by hardware.
-pub(crate) fn is_spilled(native: &NativeProgram) -> bool {
+/// Whether the native compute layout starts a spill table at dword 16 and
+/// leaves at least two user SGPRs for its address.
+pub fn is_spilled(native: &NativeProgram) -> bool {
     let StageIo::Cs(cs) = &native.io else {
         return false;
     };
+    let registers = cs.user_sgprs();
     native.stage == HwStage::Cs
-        && cs.user_sgprs() >= 2
+        && registers >= 2
+        && native
+            .layout
+            .iter()
+            .filter(|e| e.sgprs > 0 && e.user_data >= registers)
+            .map(|e| u32::from(e.user_data))
+            .min()
+            == Some(FIRST)
+}
+
+/// Whether the compute program keeps all its root parameters in the
+/// spilled table starting at index 16. Its synthetic input registers must
+/// be above the user and system SGPRs initialized by hardware.
+pub(crate) fn can_compact(native: &NativeProgram) -> bool {
+    let StageIo::Cs(cs) = &native.io else {
+        return false;
+    };
+    is_spilled(native)
         && u32::from(cs.initialized_sgprs()) <= FIRST
         && native
             .layout
             .iter()
-            .filter(|e| e.sgprs > 0)
-            .map(|e| u32::from(e.user_data))
-            .min()
-            == Some(FIRST)
+            .all(|e| e.sgprs == 0 || u32::from(e.user_data) >= FIRST)
 }
 
 /// Rewrites the loads of `native`'s spilled user-data table in `p`; returns
@@ -49,7 +63,7 @@ pub(crate) fn is_spilled(native: &NativeProgram) -> bool {
 /// as before) when its offset is not a constant on a dword, or when a dword
 /// it reads and the program uses is in no layout entry.
 pub(crate) fn user_data(p: &mut Program, native: &NativeProgram) -> usize {
-    if !is_spilled(native) {
+    if !can_compact(native) {
         return 0;
     }
     let entry = |reg: Reg, p: &Program| p.inputs.iter().find(|i| i.0 == reg).map(|i| i.1);
@@ -371,5 +385,47 @@ mod tests {
         assert_eq!(loads, 1);
         // The pointer is still read, by the load that stays.
         assert!(p.inputs.iter().any(|i| i.0 == Reg::S(0)));
+    }
+
+    #[test]
+    fn spill_requires_a_compute_table_starting_at_dword_16() {
+        let mut native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 0,
+            layout: vec![RootParam {
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 16,
+                slot: 0,
+            }],
+            used: Vec::new(),
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 2 << 1,
+                threads: [1; 3],
+            }),
+            code: Vec::new(),
+        };
+        assert!(is_spilled(&native));
+        assert!(can_compact(&native));
+        native.layout.push(param(RootType::Constants, 0, 1, 1));
+        assert!(is_spilled(&native));
+        assert!(!can_compact(&native));
+        native.layout.pop();
+        native.layout[0].user_data = 17;
+        assert!(!is_spilled(&native));
+        native.layout[0].user_data = 16;
+        native.stage = HwStage::Ps;
+        assert!(!is_spilled(&native));
+        native.stage = HwStage::Cs;
+        for registers in [1, 18] {
+            native.io = StageIo::Cs(ComputeIo {
+                rsrc2: registers << 1,
+                threads: [1; 3],
+            });
+            assert!(!is_spilled(&native));
+        }
     }
 }

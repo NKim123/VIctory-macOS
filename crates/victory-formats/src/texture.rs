@@ -766,6 +766,33 @@ impl Layout {
         )
     }
 
+    /// Visits the tiled destination runs and their source bytes. The
+    /// callback sees only texels, including in a tile shared by other mips.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tile_into(
+        &self,
+        tiled_len: usize,
+        mip: u32,
+        slice: u32,
+        linear: &[u8],
+        row_pitch: usize,
+        depth_pitch: usize,
+        mut store: impl FnMut(usize, &[u8]),
+    ) -> Result<(), Error> {
+        self.walk(
+            Buffers::Visit {
+                tiled_len,
+                linear,
+                store: &mut store,
+            },
+            mip,
+            slice,
+            row_pitch,
+            depth_pitch,
+            None,
+        )
+    }
+
     /// Validates the full subresource before writing any bytes.
     fn walk(
         &self,
@@ -811,6 +838,9 @@ impl Layout {
         let (tiled_len, tiled_need, linear_len) = match &copy {
             Buffers::Tile { tiled, linear } => (tiled.len(), self.size, linear.len()),
             Buffers::Detile { tiled, linear } => (tiled.len(), self.bytes_from(mip), linear.len()),
+            Buffers::Visit {
+                tiled_len, linear, ..
+            } => (*tiled_len, self.size, linear.len()),
         };
         if tiled_len < tiled_need as usize || linear_len < need || row_pitch < bytes {
             return Err(Error::TooSmall);
@@ -966,6 +996,11 @@ enum Buffers<'a> {
         tiled: &'a mut [u8],
         linear: &'a [u8],
     },
+    Visit {
+        tiled_len: usize,
+        linear: &'a [u8],
+        store: &'a mut dyn FnMut(usize, &[u8]),
+    },
 }
 
 impl Buffers<'_> {
@@ -975,6 +1010,7 @@ impl Buffers<'_> {
                 linear[l..][..len].copy_from_slice(&tiled[t..][..len])
             }
             Self::Tile { tiled, linear } => tiled[t..][..len].copy_from_slice(&linear[l..][..len]),
+            Self::Visit { linear, store, .. } => store(t, &linear[l..][..len]),
         }
     }
 
@@ -1001,6 +1037,16 @@ impl Buffers<'_> {
                 } else {
                     for (out, &x) in top.iter_mut().zip(columns) {
                         *out = src[x];
+                    }
+                }
+            }
+            Self::Visit { linear, store, .. } => {
+                for (i, &x) in columns.iter().enumerate() {
+                    let source = l + i * N;
+                    let target = t + x * N;
+                    store(target, &linear[source..][..N]);
+                    if let Some(dy) = second {
+                        store(target + dy, &linear[source + pitch..][..N]);
                     }
                 }
             }

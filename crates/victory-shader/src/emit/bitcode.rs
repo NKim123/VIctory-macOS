@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use crate::structure::Map;
 
 pub mod census;
-mod opt;
+pub(super) mod opt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Ty(u32);
@@ -522,14 +522,8 @@ impl Module {
         }
     }
 
-    /// Optimizes the finished body before the caller emits feature flags.
-    /// DXIL validation requires the flags to match the written instructions.
-    pub fn uses(&mut self) -> Uses {
-        self.optimise(opt::ALL);
-        self.written_uses()
-    }
-
-    fn written_uses(&self) -> Uses {
+    /// Features used by the instructions the writer will emit.
+    pub fn uses(&self) -> Uses {
         let plan = self.plan();
         let wide = |t: Ty| self.types[t.0 as usize] == TypeDef::Int(64);
         let mut u = Uses::default();
@@ -881,6 +875,25 @@ impl Module {
             plan.pos[b] = n as u64;
         }
         plan
+    }
+
+    /// Check that no use can be reached from the entry without its
+    /// definition. Lowering may refer back to a branch vote from a guard.
+    pub fn blocks_dominate_uses(&self, uses: &[(usize, usize)]) -> bool {
+        let mut reachable_without = HashMap::new();
+        uses.iter().all(|&(def, use_block)| {
+            let bypass = reachable_without.entry(def).or_insert_with(|| {
+                let mut seen = vec![false; self.blocks.len()];
+                let mut pending = vec![0];
+                while let Some(b) = pending.pop() {
+                    if b != def && !std::mem::replace(&mut seen[b], true) {
+                        pending.extend(successors(self.term(b)).iter().copied());
+                    }
+                }
+                seen
+            });
+            !bypass[use_block]
+        })
     }
 
     pub fn write(&self) -> Vec<u8> {
@@ -1834,13 +1847,13 @@ mod tests {
         let _ = m.call(dead, sink, vec![one]);
         let _ = h;
         m.terminate(dead, Term::Ret);
-        assert_eq!(m.written_uses(), Uses::default());
+        assert_eq!(m.uses(), Uses::default());
         // Read where the program goes: counted.
         let h = m.call(live, heap, vec![op, zero, no, no]);
         let wide = m.bin(live, Bin::Add, five, five);
         let t = m.cast(live, Cast::Trunc, wide, i32t);
         let _ = (m.call(live, sink, vec![t]), h);
-        let u = m.written_uses();
+        let u = m.uses();
         assert!(u.int64 && !u.heap && !u.sampler_heap, "{u:?}");
     }
 

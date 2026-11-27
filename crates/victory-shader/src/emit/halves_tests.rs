@@ -156,29 +156,30 @@ fn lower_halves(
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, native).expect("io::raise");
     let parts = lower::Parts {
-            native,
-            p: &p,
-            st: &st,
-            io: &io,
-            res: &res,
-            inputs: Vec::new(),
-            outputs: Vec::new(),
-            prims: Vec::new(),
-            mesh_stride: 0,
-            view_marks: false,
-            atomic_locks: false,
-            atomic_lock_rounds: false,
-            atomic_umax: false,
-            bias_as_gradients: false,
-            narrow_waves,
-            uav_size_level0: false,
-            halves_rendezvous: true,
-            host_wave32,
+        native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        view_marks: false,
+        atomic_locks: false,
+        atomic_lock_rounds: false,
+        atomic_umax: false,
+        atomic_early_exit: false,
+        bias_as_gradients: false,
+        narrow_waves,
+        uav_size_level0: false,
+        host_wave32,
+        halves_rendezvous: true,
     };
     if literal && matches!(&native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64) {
         lower::lower_literal(&parts, None, false)
     } else {
-        lower::lower_pruned(&parts, None, false, literal)
+        lower::lower_pruned(&parts, None, false, literal, false)
     }
 }
 
@@ -578,6 +579,237 @@ fn reduction(op: u32, ident: u32, input: u32) -> Vec<u32> {
     w.extend(store(1, 0));
     w.push(S_ENDPGM);
     w
+}
+
+/// The whole console wave chooses between a masked reduction and a
+/// scalar fallback. The scalar result survives the join and is stored
+/// after EXEC has been restored, including by lanes outside the mask.
+fn conditional_reduction(op: u32, ident: u32, mask: u64, branch_on_vcc: bool) -> Vec<u32> {
+    let reduction = reduction(op, ident, V_MOV_V3_V0);
+    let start = PROLOGUE.len() + 2;
+    let after = reduction.len() - 4;
+    let section = &reduction[start..after];
+    let mut words = reduction[..start].to_vec();
+    words.extend(conditional_scalar(section, mask, branch_on_vcc));
+    words.extend(&reduction[after..]);
+    words
+}
+
+fn conditional_scalar(section: &[u32], mask: u64, branch_on_vcc: bool) -> Vec<u32> {
+    let mut words = Vec::new();
+    words.extend([
+        0xBE94_047E, // s_mov_b64 s[20:21], exec
+        0xBE88_03FF, // s_mov_b32 s8, literal
+        mask as u32,
+        0xBE89_03FF, // s_mov_b32 s9, literal
+        (mask >> 32) as u32,
+        0x7D88_00A0, // v_cmp_gt_u32 vcc, 32, v0
+        0xD501_0002,
+        0x01A8_1009, // v_cndmask_b32 v2, s9, s8, vcc
+        0x2C04_0500, // v_lshrrev_b32 v2, v0, v2
+        0x3604_0481, // v_and_b32 v2, 1, v2
+    ]);
+    if branch_on_vcc {
+        words.push(0x7D84_00BF); // v_cmp_eq_u32 vcc, 63, v0
+    }
+    words.push(0x7DAA_0480); // v_cmpx_ne_u32 exec, 0, v2
+    // s_cbranch_vccnz or s_cbranch_execz to fallback.
+    let branch = if branch_on_vcc {
+        0xBF87_0000
+    } else {
+        0xBF88_0000
+    };
+    words.push(branch | (section.len() as u32 + 1));
+    words.extend(section);
+    words.extend([
+        0xBF82_0001, // s_branch join
+        0xBE8F_03A5, // fallback: s_mov_b32 s15, 37
+        0xBEFE_0414, // join: s_mov_b64 exec, s[20:21]
+    ]);
+    words
+}
+
+#[test]
+#[cfg(windows)]
+fn whole_group_selects_reductions_for_divergent_masks() {
+    use super::{Options, container, emit_with};
+    use crate::Container;
+
+    let bytes = container::build(&[]);
+    let c = Container::parse(&bytes).expect("empty container");
+    let mut failed = Vec::new();
+    for (mask, branch_on_vcc) in [
+        (0u64, false),
+        (1 << 4, false),
+        (1 << 45, false),
+        ((1 << 2) | (1 << 19) | (1 << 42) | (1 << 60), false),
+        // The VCC branch sees lane 63 even though EXEC has only lane 4.
+        (1 << 4, true),
+    ] {
+        for (op, ident, expected) in [
+            (V_MIN_U32, 0xC1, mask.trailing_zeros()),
+            (V_MAX_U32, 0x80, 63u32.saturating_sub(mask.leading_zeros())),
+        ] {
+            let words = conditional_reduction(op, ident, mask, branch_on_vcc);
+            let why = refusal(&words, 64, 0);
+            assert!(
+                why.contains("a wave reduction over both 32-lane halves"),
+                "{why}"
+            );
+            let n = native(&words, true, 64, 0);
+            let p = ir::build(&n.code, n.wave64, n.vgprs).expect("ir::build");
+            let st = structure::structure(&p).expect("structure");
+            let res = resource::track(&p, &n.layout, n.stage, Some(&st)).expect("track");
+            let io = io::raise(&p, &n).expect("io::raise");
+            let host = emit_with(
+                &c,
+                &n,
+                &p,
+                &st,
+                &io,
+                &res,
+                Options {
+                    host_wave32: true,
+                    ..Options::default()
+                },
+            )
+            .expect("group vote makes the reduction convergent");
+            let expected = if mask == 0 || branch_on_vcc {
+                37
+            } else {
+                expected
+            };
+            let want = [expected; 64];
+            failed.extend(check_differences(&[("group vote", host)], 64, 1, &want));
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+#[test]
+#[cfg(windows)]
+fn whole_group_reads_first_active_lane_under_divergent_masks() {
+    use super::{Options, container, emit_with};
+    use crate::Container;
+
+    let bytes = container::build(&[]);
+    let c = Container::parse(&bytes).expect("empty container");
+    let mut failed = Vec::new();
+    for (mask, branch_on_vcc) in [
+        (0u64, false),
+        (1 << 4, false),
+        (1 << 45, false),
+        ((1 << 2) | (1 << 42), false),
+        (1 << 4, true),
+    ] {
+        let mut words = PROLOGUE.to_vec();
+        words.push(0x3420_0085); // v_lshlrev_b32 v16, 5, v0
+        let read = [
+            0xD765_0003,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v3, -1, 0
+            0xD766_0003,
+            0x0002_06C1, // v_mbcnt_hi_u32_b32 v3, -1, v3
+            0x7E1E_0503, // v_readfirstlane_b32 s15, v3
+        ];
+        words.extend(conditional_scalar(&read, mask, branch_on_vcc));
+        words.push(0x7E02_020F); // v_mov_b32 v1, s15
+        words.extend(store(1, 0));
+        words.push(S_ENDPGM);
+
+        let n = native(&words, true, 64, 0);
+        let p = ir::build(&n.code, n.wave64, n.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &n.layout, n.stage, Some(&st)).expect("track");
+        let io = io::raise(&p, &n).expect("io::raise");
+        let host = emit_with(
+            &c,
+            &n,
+            &p,
+            &st,
+            &io,
+            &res,
+            Options {
+                host_wave32: true,
+                ..Options::default()
+            },
+        )
+        .expect("group vote lets both halves reach the first-lane read");
+        let expected = if mask == 0 || branch_on_vcc {
+            37
+        } else {
+            mask.trailing_zeros()
+        };
+        failed.extend(check_differences(
+            &[("group vote", host)],
+            64,
+            1,
+            &[expected; 64],
+        ));
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// The group exchanges LDS values before a mask selects the first active
+/// lane. With only the upper half active in the branch, the lower half
+/// must still take the branch and receive the value read by that lane.
+#[test]
+#[cfg(windows)]
+fn whole_group_reads_first_lane_after_lds() {
+    let host = super::tests::translate_group_with_lds(true)
+        .expect("the group can synchronize its LDS and vote across halves");
+    let failed = check_differences(&[("LDS and group vote", host)], 64, 1, &[13; 64]);
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+#[test]
+#[cfg(windows)]
+fn whole_group_branches_on_the_upper_ballot_word() {
+    let mut failed = Vec::new();
+    for (lane, expected) in [(45, 45), (46, 59), (13, 59)] {
+        let host = super::tests::translate_group_with_ballot(lane)
+            .expect("both halves see the same ballot");
+        failed.extend(check_differences(
+            &[("ballot branch", host)],
+            64,
+            1,
+            &[expected; 64],
+        ));
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+#[test]
+#[cfg(windows)]
+fn whole_group_materializes_a_mask_inside_an_exec_branch() {
+    let mut failed = Vec::new();
+    for (lane, expected) in [(45, 45), (5, 5), (64, 37)] {
+        let host = super::tests::translate_group_with_mask_as_data(lane)
+            .expect("both halves reach the mask's definition");
+        failed.extend(check_differences(
+            &[("mask as data", host)],
+            64,
+            1,
+            &[expected; 64],
+        ));
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+#[test]
+#[cfg(windows)]
+fn whole_group_reads_exec_after_a_loop_back_edge() {
+    let mut failed = Vec::new();
+    for (lane, keep, expected) in [(45, 45, 45), (5, 5, 5), (45, 5, u32::MAX), (64, 5, 37)] {
+        let host = super::tests::translate_group_with_loop_mask(lane, keep)
+            .expect("the back edge carries the original or narrowed EXEC mask");
+        failed.extend(check_differences(
+            &[("loop mask", host)],
+            64,
+            1,
+            &[expected; 64],
+        ));
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
 /// The console's low-half f16 whole-wave64 sum of `v0`: DPP within rows,
@@ -1141,6 +1373,27 @@ fn differences_with_buffer(
             shader(lowered_with(&n, false, narrow_waves).expect("one wave32")),
         )]
     };
+    check_differences_with_buffer(&forms, threads, per_lane, want, buf_data)
+}
+
+#[cfg(windows)]
+fn check_differences(
+    forms: &[(&str, super::HostShader)],
+    threads: u32,
+    per_lane: usize,
+    want: &[u32],
+) -> Vec<String> {
+    check_differences_with_buffer(forms, threads, per_lane, want, &[0; 4])
+}
+
+#[cfg(windows)]
+fn check_differences_with_buffer(
+    forms: &[(&str, super::HostShader)],
+    threads: u32,
+    per_lane: usize,
+    want: &[u32],
+    buf_data: &[u32],
+) -> Vec<String> {
     let views = [
         View::Texture(1, 1, &[[0.0; 4]]),
         View::Buffer {
@@ -1159,7 +1412,7 @@ fn differences_with_buffer(
     let mut failed = Vec::new();
     for (adapter, host) in &hosts {
         let wave32 = host.wave32().unwrap_or(false);
-        for (form, shader) in &forms {
+        for (form, shader) in forms {
             let label = format!("{adapter} ({form})");
             // A host of 32-lane waves only ever runs the halves. NVIDIA
             // refuses the console's own form; D3DMetal makes its pipeline
@@ -1397,6 +1650,57 @@ fn lds_synced_in_halves_matches_the_console_on_every_gpu() {
     let want: Vec<u32> = (0..64u32).map(|l| (l ^ 32).min(32)).collect();
     let failed = differences_with(&lds_across_halves(), 64, 1, &want, 256, true);
     assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// Only the low half runs the loop and writes LDS. The whole group reads
+/// the result after reconvergence, including when the loop reaches the cap.
+#[cfg(windows)]
+fn lds_after_divergent_loop(bound: u32, explicit_barrier: bool) -> Vec<u32> {
+    let mut words = PROLOGUE.to_vec();
+    words.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x3604_009F, // v_and_b32 v2, 31, v0
+        0x3404_0482, // v_lshlrev_b32 v2, 2, v2
+        0x7D88_00FF,
+        32,          // v_cmp_gt_u32 vcc, 32, v0
+        0xBF87_0001, // s_cbranch_vccnz -> initialise the loop
+        0xBF82_000A, // s_branch -> join
+        0xBE94_0380, // s_mov_b32 s20, 0
+        0x8014_8114, // s_add_u32 s20, s20, 1
+        0xBF06_FF14,
+        bound,       // s_cmp_eq_u32 s20, bound
+        0xBF85_0001, // s_cbranch_scc1 -> write to LDS
+        0xBF82_FFFB, // s_branch -> increment the loop counter
+        0x7E02_0214, // v_mov_b32 v1, s20
+        0xD834_0000,
+        0x0000_0102, // ds_write_b32 v2, v1
+        S_WAITCNT_LGKM,
+    ]);
+    if explicit_barrier {
+        words.push(0xBF8A_0000); // s_barrier
+    }
+    words.extend([
+        0xD8D8_0000,
+        0x0300_0002, // ds_read_b32 v3, v2
+        S_WAITCNT_LGKM,
+    ]);
+    words.extend(store(3, 0));
+    words.push(S_ENDPGM);
+    words
+}
+
+#[test]
+#[cfg(windows)]
+fn lds_after_a_capped_divergent_loop_reaches_both_halves() {
+    let limit = super::loop_limit();
+    for explicit_barrier in [false, true] {
+        for bound in [3, limit.saturating_add(1)] {
+            let words = lds_after_divergent_loop(bound, explicit_barrier);
+            let want = vec![bound.min(limit); 64];
+            let failed = differences_with(&words, 64, 1, &want, 256, true);
+            assert!(failed.is_empty(), "{}", failed.join("\n"));
+        }
+    }
 }
 
 /// Per thread `l` of a one-wave group of 64: four passes of a loop on a
@@ -1663,6 +1967,92 @@ fn the_permlanex16_model_follows_the_instruction() {
     assert_eq!(permlanex16_console(16)[0], 15);
     assert_eq!(permlanex16_console(32)[0], 63);
     assert_eq!(permlanex16_console(48)[0], 47);
+}
+
+/// A divergent branch writes one flag, then reads it before joining. Its
+/// final value is read after the join. An optional store after the internal
+/// read checks that the branch cannot write a different value.
+fn idempotent_lds_flag(second: Option<u32>) -> Vec<u32> {
+    let mut words = PROLOGUE.to_vec();
+    words.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x7E12_0280, // v_mov_b32 v9, 0
+        0xD834_0000,
+        0x0000_0909, // ds_write_b32 v9, v9
+        0x7D88_00FF,
+        33, // v_cmp_gt_u32 vcc, 33, v0
+    ]);
+    let mut branch = vec![
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0xD834_0000,
+        0x0000_0209, // ds_write_b32 v9, v2
+        0xD8D8_0000,
+        0x0300_0009, // ds_read_b32 v3, v9
+    ];
+    if let Some(value) = second {
+        branch.extend([
+            0x7E04_02FF,
+            value, // v_mov_b32 v2, literal
+            0xD834_0000,
+            0x0000_0209, // ds_write_b32 v9, v2
+        ]);
+    }
+    words.extend([
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0000 | branch.len() as u32,
+    ]);
+    words.extend(branch);
+    words.extend([
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0xD8D8_0000,
+        0x0500_0009, // ds_read_b32 v5, v9
+    ]);
+    words.extend(store(5, 0));
+    words.push(S_ENDPGM);
+    words
+}
+
+#[test]
+fn divergent_lds_flag_is_visible_to_both_halves_after_rejoining() {
+    let words = idempotent_lds_flag(Some(1));
+    let n = native(&words, true, 64, 512);
+    let result = lowered_with(&n, true, true).expect("a branch that only writes one flag");
+    assert!(result.split_barriers >= 2);
+    #[cfg(windows)]
+    {
+        let failures = differences_with(&words, 64, 1, &[1; 64], 512, true);
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    let different_words = idempotent_lds_flag(Some(2));
+    let different = native(&different_words, true, 64, 512);
+    let legacy = lower::NO_PREDICATION.with(|flag| {
+        let prev = flag.replace(true);
+        let result = lowered_with(&different, true, true);
+        flag.set(prev);
+        result
+    });
+    assert!(legacy.is_err());
+}
+
+#[test]
+#[cfg(windows)]
+fn first_lane_can_be_in_the_upper_half_after_an_exec_filter() {
+    let mut words = PROLOGUE.to_vec();
+    words.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0xD765_0001,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0 (console lanes)
+        0x7D82_00A7, // v_cmp_lt_u32 vcc, 39, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0x7E1C_0500, // v_readfirstlane_b32 s14, v0
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x7E02_020E, // v_mov_b32 v1, s14
+    ]);
+    words.extend(store(1, 0));
+    words.push(S_ENDPGM);
+    let failures = differences(&words, 64, 1, &[40; 64]);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// A single result in v3, stored after the body restores EXEC.
@@ -2165,6 +2555,7 @@ fn early_out_program(keep_below: bool, limit: u32) -> Vec<u32> {
     w
 }
 
+#[cfg(windows)]
 fn console_early_out(keep_below: bool, limit: u32, l: u32) -> [u32; 8] {
     let active = |t: u32| if keep_below { t < limit } else { t >= limit };
     if !active(l) {
@@ -2261,6 +2652,7 @@ fn diamond_program() -> Vec<u32> {
     w
 }
 
+#[cfg(windows)]
 fn console_diamond(l: u32) -> [u32; 3] {
     if l < 36 {
         let sum: u32 = (0..36).sum();
@@ -2296,6 +2688,7 @@ fn half_add_reduction() -> Vec<u32> {
 }
 
 /// Exact IEEE-754 f16 encoding of an exact non-negative integer `n` in `0..=65504`.
+#[cfg(windows)]
 fn u32_to_f16_bits(n: u32) -> u32 {
     if n == 0 {
         return 0;
@@ -2855,6 +3248,7 @@ fn thread_ticket_env_toggle_defaults_on() {
 /// blocks from the group-shared ticket counter so every console thread id in
 /// the group is executed once on 32-lane hardware (issue #1243).
 #[test]
+#[cfg(windows)]
 fn thread_ticket_relabels_2d_and_partial_tail_groups_bijectively() {
     // Console wave32 program: triggers `console_lanes` via `v_mbcnt_lo_u32_b32`,
     // computes `slot = (y * 32 + x) * 4`, and stores `1` to raw UAV `s[40:43]`.
@@ -2899,6 +3293,7 @@ fn thread_ticket_relabels_2d_and_partial_tail_groups_bijectively() {
                 atomic_locks: false,
                 atomic_lock_rounds: false,
                 atomic_umax: false,
+                atomic_early_exit: false,
                 bias_as_gradients: false,
                 host_wave32: true,
                 narrow_waves: false,
@@ -3243,6 +3638,7 @@ fn lane_masks_in_divergent_code_meet_between_halves() {
         atomic_locks: false,
         atomic_lock_rounds: false,
         atomic_umax: false,
+        atomic_early_exit: false,
         bias_as_gradients: false,
         narrow_waves: false,
         halves_rendezvous: false,

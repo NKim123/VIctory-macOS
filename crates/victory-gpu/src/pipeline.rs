@@ -79,6 +79,10 @@ pub(crate) struct Shader {
     #[cfg(windows)]
     spilled: OnceLock<[u8; 32]>,
     #[cfg(windows)]
+    builder: OnceLock<bool>,
+    #[cfg(windows)]
+    pub(crate) ambient: Option<crate::ambient_wave::Role>,
+    #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
 
@@ -114,10 +118,15 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
             })
             .clone()
     };
-    // Written outside the lock every pipeline creation takes.
     #[cfg(windows)]
-    if created && ray_tracing::policy().omission(shader.ray_work).is_none() {
-        spill(&shader, full.as_bytes());
+    {
+        // Classify once using the caller's bytes, outside the shader map lock.
+        if stage == "compute" {
+            shader.builder.get_or_init(|| of_builder(bytes));
+        }
+        if created && ray_tracing::policy().omission(shader.ray_work).is_none() {
+            spill(&shader, full.as_bytes());
+        }
     }
     #[cfg(not(windows))]
     let _ = created;
@@ -152,10 +161,15 @@ fn spill(shader: &Shader, full: &[u8; 32]) {
 #[cfg(windows)]
 fn spill_to(dir: &std::path::Path, shader: &Shader, full: &[u8; 32]) {
     let path = spill_path(dir, full);
-    let there = std::fs::File::open(&path).is_ok();
+    let there = std::fs::File::open(&path).is_ok_and(|file| {
+        !known::enabled()
+            || blake3::Hasher::new()
+                .update_reader(file)
+                .is_ok_and(|h| h.finalize().as_bytes() == full)
+    });
+    let mut container = shader.container.lock().unwrap_or_else(|e| e.into_inner());
     if !there {
         let Some(shard) = path.parent() else { return };
-        let mut container = shader.container.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
         let ok = crate::make_dir(shard).is_ok()
             && std::fs::write(&tmp, &*container).is_ok()
@@ -164,11 +178,10 @@ fn spill_to(dir: &std::path::Path, shader: &Shader, full: &[u8; 32]) {
             let _ = std::fs::remove_file(&tmp);
             return;
         }
-        *container = Vec::new();
-    } else {
-        *shader.container.lock().unwrap_or_else(|e| e.into_inner()) = Vec::new();
     }
+    // A recorder holding the container lock can rely on this publication.
     let _ = shader.spilled.set(*full);
+    *container = Vec::new();
 }
 
 impl Shader {
@@ -201,6 +214,12 @@ impl Shader {
             container: Mutex::new(container),
             #[cfg(windows)]
             spilled: OnceLock::new(),
+            #[cfg(windows)]
+            builder: OnceLock::new(),
+            #[cfg(windows)]
+            ambient: (stage == "compute")
+                .then(|| crate::ambient_wave::Role::detect(bytes))
+                .flatten(),
             #[cfg(windows)]
             translated: OnceLock::new(),
         }
@@ -245,17 +264,13 @@ impl Shader {
                     let done = translate(&container);
                     // After the translation, not before: if it panics, the
                     // bytes are still there for the next try.
-                    let keep = (link_mesh_outputs()
+                    let link = link_mesh_outputs();
+                    let keep = self.spilled.get().is_none()
                         && done.0.as_ref().is_ok_and(|t| {
-                            self.stage == "pixel"
-                                || (self.stage == "mesh"
-                                    && over_limit_mesh_output_bytes(&t.host.dxil).is_some())
-                        }))
-                        || (mesh_per_vertex_center()
-                            && self.stage == "pixel"
-                            && done.0.as_ref().is_ok_and(|t| {
-                                victory_shader::emit::needs_vertex_deltas(&t.host.dxil)
-                            }));
+                            (self.stage == "pixel" && (link != MeshLink::Off
+                                || mesh_per_vertex_center() && victory_shader::emit::needs_vertex_deltas(&t.host.dxil)))
+                                || (self.stage == "mesh" && link.applies_to(&t.host.dxil))
+                        });
                     if !keep {
                         *container = Vec::new();
                     }
@@ -505,13 +520,34 @@ fn written_used(
 }
 
 #[cfg(windows)]
-fn link_mesh_outputs() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MeshLink {
+    Off,
+    OverLimit,
+    All,
+}
+
+#[cfg(windows)]
+impl MeshLink {
+    fn applies_to(self, dxil: &[u8]) -> bool {
+        match self {
+            Self::Off => false,
+            Self::All => true,
+            Self::OverLimit => over_limit_mesh_output_bytes(dxil).is_some(),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn link_mesh_outputs() -> MeshLink {
+    static MODE: OnceLock<MeshLink> = OnceLock::new();
     // On by default under Wine (D3DMetal): an over-limit mesh pipeline there
     // is made, draws nothing and its submission never completes (#172).
-    *ON.get_or_init(|| match std::env::var_os("VICTORY_LINK_MESH_OUTPUTS") {
-        Some(v) => crate::switch::value_is_on(Some(&v)),
-        None => crate::shader_cache::under_wine(),
+    *MODE.get_or_init(|| match std::env::var_os("VICTORY_LINK_MESH_OUTPUTS") {
+        Some(v) if v == "all" => MeshLink::All,
+        Some(v) if crate::switch::value_is_on(Some(&v)) => MeshLink::OverLimit,
+        None if crate::shader_cache::under_wine() => MeshLink::OverLimit,
+        _ => MeshLink::Off,
     })
 }
 
@@ -580,6 +616,8 @@ impl Shader {
             size: self.size,
             container: Mutex::new(Vec::new()),
             spilled: OnceLock::new(),
+            builder: self.builder.clone(),
+            ambient: self.ambient,
             translated: cell,
         })
     }
@@ -761,6 +799,24 @@ fn pipeline<'a>(this: This) -> &'a Pipeline {
     unsafe { &*this.cast::<Pipeline>() }
 }
 
+/// Classify the original container before it can be spilled or discarded.
+#[cfg(windows)]
+fn of_builder(bytes: &[u8]) -> bool {
+    use victory_shader::{Container, FourCC};
+    let Ok(container) = Container::parse(bytes) else {
+        return false;
+    };
+    container
+        .part(FourCC::DXIL)
+        .and_then(|part| victory_shader::native_programs(part.data).ok())
+        .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
+}
+
+#[cfg(windows)]
+pub(crate) fn is_builder(this: This) -> bool {
+    !this.is_null() && pipeline(this).builder
+}
+
 /// List method: logs each pipeline's shaders the first time a list binds
 /// it, so a run lists the shaders its frames need first.
 pub(crate) fn bound(this: This) {
@@ -785,7 +841,11 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     if this.is_null() {
         return None;
     }
-    make::ready(&pipeline(this).host)
+    let p = pipeline(this);
+    if p.builder && !builder::allowed() {
+        return None;
+    }
+    make::ready(&p.host)
 }
 
 /// As [`host_pipeline`], for a draw into render target and depth views of
@@ -992,10 +1052,11 @@ fn hand_out(
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
-    let builder = (!code.is_empty() && builder::created_by_builder(code))
-        || shaders
-            .iter()
-            .any(|s| s.ray_work == ray_tracing::Work::Builder);
+    let builder = graphics.is_none()
+        && matches!(&shaders[..], [shader] if shader.stage == "compute"
+            && (shader.ray_work == ray_tracing::Work::Builder
+                 || shader.builder.get() == Some(&true)
+                || (!code.is_empty() && builder::created_by_builder(code))));
     #[cfg(not(windows))]
     let _ = code;
     #[cfg(windows)]
@@ -1007,16 +1068,18 @@ fn hand_out(
         skip_hashes(),
     );
     #[cfg(windows)]
-    make::early(&host);
-    #[cfg(windows)]
     if builder {
-        builder::note(&host);
+        if builder::allowed() {
+            builder::note(&host);
+        }
+    } else {
+        make::early(&host);
     }
     #[cfg(windows)]
     let ambient = crate::ambient::role(shaders.iter().map(|s| s.hash.as_str()));
     // Never a program the stand-in works after (it would not run).
     #[cfg(windows)]
-    let ray_pass = if ambient == 0 {
+    let ray_pass = if ambient == 0 && !shaders.iter().any(|s| s.ambient.is_some()) {
         crate::ray_skip::kind(shaders.iter().map(|s| s.hash.as_str()))
     } else {
         0
@@ -1036,6 +1099,21 @@ fn hand_out(
         bound: std::sync::atomic::AtomicBool::new(false),
     });
     object::hand_out(PIPELINE, pipeline, iid, &PIPELINE_IIDS, out)
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn test_compute(shader: Arc<Shader>) -> This {
+    let mut pipeline = std::ptr::null();
+    assert_eq!(
+        hand_out(vec![shader], None, &[], &PIPELINE_IIDS[0], &mut pipeline),
+        crate::object::S_OK
+    );
+    let start = std::time::Instant::now();
+    while host_pipeline(pipeline).is_none() {
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        std::thread::yield_now();
+    }
+    pipeline
 }
 
 /// Device method.
@@ -1229,7 +1307,11 @@ mod builder;
 #[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
+mod known;
+#[cfg(windows)]
 mod library;
+#[cfg(all(windows, test))]
+pub(crate) use library::CacheStatus;
 #[cfg(windows)]
 mod make;
 #[cfg(any(windows, test))]
@@ -1254,10 +1336,40 @@ pub fn use_pipeline_cache(dir: std::path::PathBuf) {
     library::use_pipeline_cache(dir);
 }
 
+/// Saves title pipeline descriptions and shader containers for offline replay.
+#[cfg(windows)]
+pub fn record_pipelines(dir: std::path::PathBuf) {
+    known::enable(dir);
+}
+
+/// Whether a name identifies a recorded pipeline.
+#[cfg(windows)]
+pub fn is_pipeline_key(key: &str) -> bool {
+    known::valid_key(key)
+}
+
 /// Saves the pipeline cache now if anything was added (at the end of a run).
 #[cfg(windows)]
 pub fn save_pipeline_cache() {
     library::save(true);
+}
+
+/// Opens the host library before starting an offline build batch.
+#[cfg(windows)]
+pub fn require_pipeline_cache() -> std::io::Result<()> {
+    library::require_library()
+}
+
+/// Title pipeline keys from the prebuilt list validated against the host library.
+#[cfg(windows)]
+pub fn prebuilt_keys() -> Vec<String> {
+    library::prebuilt_keys()
+}
+
+/// Saves a batch and reports any publication error to offline callers.
+#[cfg(windows)]
+pub fn flush_pipeline_cache() -> std::io::Result<()> {
+    library::save_result(true)
 }
 
 /// The pre-build: a title pipeline made ahead of a run into the pipeline
@@ -1302,6 +1414,11 @@ impl Prebuild {
         }
     }
 
+    /// Loads one title pipeline previously recorded by a run.
+    pub fn recorded(dir: &std::path::Path, key: &str) -> std::io::Result<Prebuild> {
+        known::load(dir, key)
+    }
+
     /// What a run lists the pipeline by (its early list).
     pub fn key(&self) -> String {
         make::key(&self.shaders, self.graphics.as_deref())
@@ -1316,6 +1433,24 @@ impl Prebuild {
     /// Makes the host pipeline, or finds it in the library; why not if it
     /// gets none.
     pub fn make(&self) -> Result<(), String> {
+        let result = self.build();
+        library::save(false);
+        result.map(|_| ())
+    }
+
+    /// Warms a recorded pipeline. Returns true for a library load and false
+    /// for a newly compiled and stored pipeline.
+    pub fn make_cached(&self) -> Result<bool, String> {
+        match self.build()? {
+            library::CacheStatus::Loaded => Ok(true),
+            library::CacheStatus::Stored => Ok(false),
+            library::CacheStatus::Uncached => {
+                Err("the host library refused to store the pipeline".into())
+            }
+        }
+    }
+
+    fn build(&self) -> Result<library::CacheStatus, String> {
         if let Some(reason) = ray_omission(&self.shaders, false) {
             return Err(reason.into());
         }
@@ -1329,18 +1464,20 @@ impl Prebuild {
         });
         #[cfg(feature = "diagnostics")]
         make::log_built(&key);
-        if made.is_some() {
-            // shortcut: a pipeline the library refused to store is listed
-            // too; a run then makes it at first use.
+        if made
+            .as_ref()
+            .is_some_and(|pipeline| pipeline.cache_status != library::CacheStatus::Uncached)
+        {
             library::note_prebuilt(key);
         }
-        library::save(false);
         match made {
-            Some(_) => Ok(()),
-            None => Err(match self.shaders.iter().find(|s| s.translated().is_none()) {
-                Some(s) => format!("{} shader does not translate", s.stage),
-                None => "the host refuses it".into(),
-            }),
+            Some(pipeline) => Ok(pipeline.cache_status),
+            None => Err(
+                match self.shaders.iter().find(|s| s.translated().is_none()) {
+                    Some(s) => format!("{} shader does not translate", s.stage),
+                    None => "the host refuses it".into(),
+                },
+            ),
         }
     }
 }
@@ -1434,6 +1571,7 @@ mod tests {
     #[test]
     fn builder_dispatches_wait_for_every_builder_pipeline() {
         let _one = builder::test_lock();
+        let _allowed = builder::allow_for_test();
         let code = [0xB0u8; 64];
         let create = |code: &[u8]| {
             let desc = ComputeHead {

@@ -823,7 +823,7 @@ fn inplace_probe_6_remap_cpu_visible_tiles() {
                 1,
                 Some(&start),
                 Some(&size),
-                &backing._heap,
+                &backing.heap,
                 TILES as u32,
                 Some(flags.as_ptr()),
                 Some(offsets.as_ptr()),

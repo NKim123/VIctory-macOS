@@ -21,10 +21,14 @@
 //!    point on a thread with the stack size the image asks for; from then
 //!    on, pass every thread start and end on to the attached images.
 
+#[cfg(any(windows, test))]
+pub mod amd_patch;
 #[cfg(windows)]
 mod crash;
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub mod descriptor_sites;
+pub mod frame_rate;
 pub mod masked;
-pub mod wide;
 #[cfg(windows)]
 mod patch;
 pub mod prepare;
@@ -33,14 +37,20 @@ pub mod resolution;
 pub mod resolve;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod stacks;
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod startup_patch;
 #[cfg(windows)]
 mod threads;
 #[cfg(windows)]
 mod thunks;
 #[cfg(windows)]
 mod tls;
+#[cfg(any(windows, test))]
+pub mod wide;
 #[cfg(windows)]
 mod windows;
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub mod write_sites;
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use crash::save_on_crash;

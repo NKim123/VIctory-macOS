@@ -376,6 +376,28 @@ struct Voice {
     trace: Trace,
 }
 
+impl Voice {
+    fn new(skip: usize) -> Self {
+        Self {
+            decoder: None,
+            pcm: VecDeque::new(),
+            skip,
+            ended: false,
+            trace: Trace {
+                since: Instant::now(),
+                produced: 0,
+                taken: 0,
+                takes: 0,
+                partial_takes: 0,
+                frames: 0,
+                bad_frames: 0,
+                peak: 0,
+                ended_ms: None,
+            },
+        }
+    }
+}
+
 /// What a voice did, for the debug log when it is disabled.
 struct Trace {
     since: Instant,
@@ -473,23 +495,9 @@ impl Xma {
         );
         #[cfg(feature = "diagnostics")]
         dump_input(index, context);
-        *slot = Some(Box::new(Voice {
-            decoder: None,
-            pcm: VecDeque::new(),
-            skip: context.field(1, 24, 3) as usize * xma::SUBFRAME_SAMPLES,
-            ended: false,
-            trace: Trace {
-                since: Instant::now(),
-                produced: 0,
-                taken: 0,
-                takes: 0,
-                partial_takes: 0,
-                frames: 0,
-                bad_frames: 0,
-                peak: 0,
-                ended_ms: None,
-            },
-        }));
+        *slot = Some(Box::new(Voice::new(
+            context.field(1, 24, 3) as usize * xma::SUBFRAME_SAMPLES,
+        )));
         self.occupied[index as usize / 64].fetch_or(1 << (index % 64), Ordering::Release);
         drop(slot);
         wake_decoder();
@@ -564,6 +572,9 @@ impl Xma {
     /// Fills every enabled context's output as far as it has room; false
     /// when there was none to fill.
     fn pump(&self) -> bool {
+        static REFILL: OnceLock<bool> = OnceLock::new();
+        let refill = *REFILL
+            .get_or_init(|| std::env::var_os("VICTORY_XMA_REFILL").is_some_and(|v| v == "1"));
         let start = Instant::now();
         let mut active = 0;
         for index in self.enabled() {
@@ -571,7 +582,7 @@ impl Xma {
                 self.context(index),
                 &mut *lock(&self.voices[index as usize]),
             ) {
-                pump(context, voice);
+                pump(context, voice, refill);
                 active += 1;
             }
         }
@@ -583,13 +594,25 @@ impl Xma {
     }
 }
 
-fn pump(context: Context, voice: &mut Voice) {
+fn pump(context: Context, voice: &mut Voice, refill: bool) {
     let size = context.field(0, 22, 5);
     if size == 0 {
         return;
     }
     while context.field(1, 31, 1) == 1 {
-        if voice.pcm.len() < SAMPLES_PER_BLOCK && !decode(context, voice) {
+        if refill {
+            // A skipped frame or an input boundary may advance the decoder
+            // without adding PCM. Bound the work spent waiting for a full
+            // block and pad only the flushed tail of a finished stream.
+            for _ in 0..8 {
+                if voice.pcm.len() >= SAMPLES_PER_BLOCK || !decode(context, voice, refill) {
+                    break;
+                }
+            }
+            if voice.pcm.is_empty() || (voice.pcm.len() < SAMPLES_PER_BLOCK && !voice.ended) {
+                return;
+            }
+        } else if voice.pcm.len() < SAMPLES_PER_BLOCK && !decode(context, voice, refill) {
             return;
         }
         // The write block is the title's too: taken modulo the ring before
@@ -620,13 +643,22 @@ fn pump(context: Context, voice: &mut Voice) {
 
 /// Decodes the next frame of the current input into `voice.pcm`; false
 /// when there is nothing left to decode.
-fn decode(context: Context, voice: &mut Voice) -> bool {
+fn decode(context: Context, voice: &mut Voice, refill: bool) -> bool {
+    let valid = context.field(0, 20, 2);
     if voice.ended {
-        return false;
+        // VICTORY_XMA_REFILL=1 lets the title queue either input again
+        // without disabling and enabling the context. The end-of-input
+        // flush already reset the decoder overlap.
+        if !refill || valid == 0 {
+            return false;
+        }
+        voice.ended = false;
+        if context.field(2, 26, 5) == INPUT_INVALID {
+            context.set_field(2, 26, 6, 0);
+        }
     }
     let channels = context.channels();
     let mut current = context.field(4, 31, 1);
-    let valid = context.field(0, 20, 2);
     if valid & (1 << current) == 0 {
         if valid & (1 << (1 - current)) == 0 {
             // Out of input: the overlap tail, then nothing.
@@ -1489,26 +1521,10 @@ mod tests {
         context.set(3, first);
         context.set(4, second);
         context.set(5, input_apu);
-        let mut voice = Voice {
-            decoder: None,
-            pcm: VecDeque::new(),
-            skip: 0,
-            ended: false,
-            trace: Trace {
-                since: Instant::now(),
-                produced: 0,
-                taken: 0,
-                takes: 0,
-                partial_takes: 0,
-                frames: 0,
-                bad_frames: 0,
-                peak: 0,
-                ended_ms: None,
-            },
-        };
+        let mut voice = Voice::new(0);
         let mut step = |expect_next: u32| {
             let before = voice.pcm.len();
-            assert!(decode(context, &mut voice));
+            assert!(decode(context, &mut voice, false));
             assert_eq!(context.field(2, 0, 26), expect_next);
             voice.pcm.len() - before
         };
@@ -1523,6 +1539,54 @@ mod tests {
         // No loops left: both frames whole, and on to the third.
         assert_eq!(step(third), 4 * subframe);
         ApuFree(input);
+    }
+
+    #[test]
+    fn xma_refills_an_ended_voice_without_publishing_a_block_at_an_input_boundary() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let (mut input, mut input_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut input, &mut input_apu, 0x1000, 0x800, 1), S_OK);
+        let stream = silent_stream();
+        // SAFETY: input has room for both packets.
+        unsafe { std::ptr::copy_nonoverlapping(stream.as_ptr(), input.cast(), stream.len()) };
+        let (mut output, mut output_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(
+            ApuAlloc(&mut output, &mut output_apu, 0x100, 0x100, 2),
+            S_OK
+        );
+        let mut words = [0; 16];
+        let context = Context(words.as_mut_ptr());
+        context.set(0, 1 << 22); // one-block ring, no valid input
+        context.set(1, 1 << 31 | 3 << 27 | 2); // writable, 48 kHz mono, two packets in bank 1
+        context.set(6, input_apu);
+        context.set(7, output_apu);
+        let mut voice = Voice::new(0);
+        voice.pcm.push_back(37);
+
+        pump(context, &mut voice, true);
+        assert!(voice.ended);
+        assert_eq!(context.field(2, 26, 6), INPUT_INVALID | 1 << 5);
+        assert_eq!(voice.trace.produced, SAMPLES_PER_BLOCK);
+
+        context.set_field(1, 31, 1, 1);
+        pump(context, &mut voice, true);
+        assert_eq!(context.field(1, 31, 1), 1, "no empty block was written");
+        // Bank 0 ends immediately; bank 1 has audio ready to decode.
+        context.set_field(0, 20, 2, 3);
+        pump(context, &mut voice, false);
+        assert!(voice.ended, "refills are opt-in");
+        pump(context, &mut voice, true);
+        let (ended, frames, produced) = (voice.ended, voice.trace.frames, voice.trace.produced);
+        ApuFree(input);
+        ApuFree(output);
+        assert!(!ended);
+        assert_eq!(context.field(2, 26, 6), 0);
+        assert_eq!(context.field(4, 31, 1), 1);
+        assert_eq!(
+            frames, 1,
+            "the decoder must cross the empty input before publishing"
+        );
+        assert_eq!(produced, 2 * SAMPLES_PER_BLOCK);
     }
 
     #[test]

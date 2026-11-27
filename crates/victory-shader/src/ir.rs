@@ -21,6 +21,7 @@ use std::collections::HashMap;
 
 use crate::ShaderError;
 use crate::gfx10::{self, Fields, Flow, Instruction, Operand};
+use crate::structure::{self, Bool, Structured};
 
 /// One register dword. Scalar codes as in [`Operand::Scalar`]: 0-105 SGPRs,
 /// 106/107 VCC, 108-123 trap temporaries, 124 M0, 126/127 EXEC.
@@ -379,6 +380,383 @@ pub(crate) fn thread_edges(
     link(&mut blocks);
     split_irreducible(&mut blocks)?;
     Ok(rename(blocks, p.wave64))
+}
+
+/// Whether block `b` only ends the program.
+fn ends_program(p: &Program, b: usize) -> bool {
+    p.blocks[b].exit == Exit::End
+        && p.blocks[b]
+            .insts
+            .iter()
+            .all(|i| i.name().starts_with("s_endpgm"))
+}
+
+/// Whether block `b` is the far jump of a console branch whose target is too far for the
+/// branch's 16-bit offset (`s_getpc_b64`, an address added to it, `s_setpc_b64`) to a block
+/// that only ends the program. Code that does any work on the way stays what it is.
+fn far_jump_to_end(p: &Program, b: usize) -> bool {
+    let block = &p.blocks[b];
+    matches!(block.exit, Exit::Jump(target) if ends_program(p, target))
+        && block.insts.iter().all(|i| {
+            matches!(
+                i.name(),
+                "s_getpc_b64" | "s_add_u32" | "s_addc_u32" | "s_setpc_b64"
+            )
+        })
+}
+
+/// Where the lanes that stay go when block `b` ends in an early-out: `s_cbranch_execz` to a
+/// block that only ends the program, or `s_cbranch_execnz` whose other way is a far jump to
+/// such a block (a program too long for the branch to reach its end). The branch is then
+/// left out and the code goes on there.
+fn early_out_continuation(p: &Program, b: usize) -> Option<usize> {
+    let Exit::Branch { taken, not_taken } = p.blocks[b].exit else {
+        return None;
+    };
+    match p.blocks[b].insts.last()?.name() {
+        "s_cbranch_execz" if ends_program(p, taken) => Some(not_taken),
+        "s_cbranch_execnz" if far_jump_to_end(p, not_taken) => Some(taken),
+        _ => None,
+    }
+}
+
+/// Removes EXEC-empty early-outs and, unless requested otherwise, branches that only skip a
+/// region when no lane is left for it: an `s_cbranch_execz` whose target is
+/// where the skipped code ends up anyway (`if (c) { ... }` with nothing
+/// else leaving the region). Every lane then walks the region with EXEC
+/// clear for those that would have skipped it, and LDS accesses and
+/// exchanges inside it are in code every lane runs.
+/// The console takes such a branch only when no lane of the wave is left,
+/// and then its scalar code does not run: a branch is kept if the code
+/// after it could see that (a scalar register or SCC that the region
+/// changes and the join merges with the value from before; EXEC aside,
+/// which is empty either way). `None` if nothing changes.
+///
+/// The analysis follows scalar copies that the code after the branch can see. A scalar the region moves
+/// away and back (the compiler parks scalars in VGPR lanes around a branch and takes them
+/// back before the join, `unspill`) is the value it copies, and so is a scalar phi whose
+/// arguments all come to one value (a join of branches that left it alone); a join nothing
+/// reads shows no one the difference (a restore of EXEC that the next one overwrites reads
+/// nothing); and the join may have other ways in (an inner branch that ends together with an
+/// outer one).
+/// That leaves out most of the skips of the title's large lighting programs, whose bodies
+/// are then code every lane runs.
+pub(crate) fn without_exec_skips(
+    p: &Program,
+    st: &Structured,
+    early_outs_only: bool,
+) -> Option<(Program, Structured)> {
+    let n = p.blocks.len();
+    // Scalars moved from register to register (a scalar the compiler parked in a VGPR lane
+    // comes back by such a move, `unspill`) are the value they copy.
+    let mut copy: std::collections::HashMap<Value, Value> = Default::default();
+    // Values something reads, directly or through joins. A scalar operation none of whose
+    // results is read reads nothing either (the compiler restores EXEC from a saved mask
+    // and overwrites it at once where two branches end together).
+    let mut live: std::collections::HashSet<Value> = Default::default();
+    let idle = |inst: &Inst, live: &std::collections::HashSet<Value>| {
+        let name = inst.name();
+        matches!(inst.fields, crate::gfx10::Fields::Sop { .. })
+            && !(name.starts_with("s_setpc")
+                || name.starts_with("s_swappc")
+                || name.starts_with("s_call")
+                || name.starts_with("s_rfe")
+                || name.starts_with("s_movrel")
+                || name.starts_with("s_subvector"))
+            && inst.writes.iter().all(|w| !live.contains(&w.1))
+    };
+    for block in p.blocks.iter().filter(|_| !early_outs_only) {
+        for inst in &block.insts {
+            if matches!(inst.name(), "s_mov_b32" | "s_mov_b64")
+                && inst.reads.len() == inst.writes.len()
+                && inst
+                    .reads
+                    .iter()
+                    .chain(&inst.writes)
+                    .all(|r| matches!(r.0, Reg::S(_)))
+            {
+                copy.extend(inst.writes.iter().zip(&inst.reads).map(|(w, r)| (w.1, r.1)));
+            }
+        }
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in &p.blocks {
+            for inst in &block.insts {
+                if !idle(inst, &live) {
+                    for r in &inst.reads {
+                        changed |= live.insert(r.1);
+                    }
+                }
+            }
+            for phi in &block.phis {
+                if live.contains(&phi.value) {
+                    for &a in &phi.args {
+                        changed |= live.insert(a);
+                    }
+                }
+            }
+        }
+    }
+    copy.extend(st.restored.iter().map(|(&loaded, &saved)| (loaded, saved)));
+    copy_through_phis(p, &mut copy);
+    let root = |v: Value| follow(&copy, v);
+    // The region a skip of `b` to `target` leaves out, if it is a pure skip.
+    let skipped = |b: usize, target: usize, first: usize| -> Option<Vec<bool>> {
+        let mut inside = vec![false; n];
+        let mut stack = vec![first];
+        while let Some(x) = stack.pop() {
+            if x == target || inside[x] {
+                continue;
+            }
+            if x == b {
+                return None; // a loop back to the branch
+            }
+            if p.blocks[x].insts.iter().any(|i| {
+                i.name() == "s_swappc_b64"
+                    || i.name().starts_with("s_sendmsg")
+                    || i.name().starts_with("s_store")
+                    || i.name().starts_with("s_atomic")
+            }) {
+                return None;
+            }
+            inside[x] = true;
+            match p.blocks[x].exit {
+                Exit::End | Exit::Indirect => return None,
+                exit => stack.extend(exit.successors()),
+            }
+        }
+        // entered only through the branch
+        for x in (0..n).filter(|&x| inside[x]) {
+            if p.blocks[x].preds.iter().any(|&q| q != b && !inside[q]) {
+                return None;
+            }
+        }
+        // A lane write can change a VGPR even with EXEC empty. Any such
+        // write that reaches a live vector join must keep its skip.
+        let lane_writes: std::collections::HashSet<_> = (0..n)
+            .filter(|&x| inside[x])
+            .flat_map(|x| &p.blocks[x].insts)
+            .filter(|inst| inst.name() == "v_writelane_b32")
+            .flat_map(|inst| inst.writes.iter().map(|w| w.0))
+            .collect();
+        // The join sees no scalar the region changed.
+        let join = &p.blocks[target];
+        for phi in &join.phis {
+            if lane_writes.contains(&phi.reg) && live.contains(&phi.value) {
+                return None;
+            }
+            let scalar = match phi.reg {
+                Reg::S(c) => c != 126 && c != 127,
+                Reg::Scc => true,
+                Reg::V(_) => false,
+            };
+            // (a join nothing reads shows no one the difference)
+            if !scalar || !live.contains(&phi.value) {
+                continue;
+            }
+            let before: Vec<Value> = join
+                .preds
+                .iter()
+                .zip(&phi.args)
+                .filter(|(q, _)| **q == b)
+                .map(|(_, a)| root(*a))
+                .collect();
+            let within = join
+                .preds
+                .iter()
+                .zip(&phi.args)
+                .filter(|(q, _)| inside[**q])
+                .map(|(_, a)| root(*a));
+            if within.into_iter().any(|a| !before.contains(&a)) {
+                return None;
+            }
+        }
+        Some(inside)
+    };
+    let mut removed = Vec::new();
+    for b in 0..n {
+        let Exit::Branch { taken, not_taken } = p.blocks[b].exit else {
+            continue;
+        };
+        let early_out = early_out_continuation(p, b);
+        let next = early_out.or_else(|| {
+            let skip = p.blocks[b]
+                .insts
+                .last()
+                .is_some_and(|i| i.name() == "s_cbranch_execz");
+            (!early_outs_only && skip && skipped(b, taken, not_taken).is_some())
+                .then_some(not_taken)
+        });
+        if let Some(next) = next {
+            removed.push((b, next, early_out.is_none().then_some(taken)));
+        }
+    }
+    while !removed.is_empty() {
+        let mut blocks = p.blocks.clone();
+        for &(b, next, _) in &removed {
+            // Retain the EXEC read for the proof. The jump edge, not this
+            // SOPP instruction, is emitted.
+            blocks[b].exit = Exit::Jump(next);
+        }
+
+        // Remove edges from newly unreachable blocks before rebuilding SSA.
+        let mut reachable = vec![false; n];
+        for b in reverse_postorder(&blocks) {
+            reachable[b] = true;
+        }
+        for (b, block) in blocks.iter_mut().enumerate() {
+            block.phis.clear();
+            if !reachable[b] {
+                block.insts.clear();
+                block.exit = Exit::End;
+            }
+        }
+        link(&mut blocks);
+        split_irreducible(&mut blocks).ok()?;
+        if blocks.len() != n {
+            return None;
+        }
+        let rewritten = rename(blocks, p.wave64);
+        let st = structure::structure(&rewritten).ok()?;
+        let mut rejected = vec![false; n];
+        let mut rejected_local = false;
+        for &(b, body, join) in &removed {
+            if reachable[b] && !empty_exec_region(&rewritten, &st, b, body, join) {
+                rejected[b] = true;
+                rejected_local |= join.is_some();
+            }
+        }
+        if !rejected.iter().any(|&b| b) {
+            return Some((rewritten, st));
+        }
+        // A local skip can change the reachability proof for an enclosing
+        // early-out. Recheck the early-outs after restoring those skips.
+        removed.retain(|&(b, _, join)| !rejected[b] || rejected_local && join.is_none());
+    }
+    None
+}
+
+/// Lanes previously excluded by an EXEC-empty skip must stay inactive
+/// through any vector work brought onto their path. For terminal skips
+/// this covers the entire remaining path, including later EXEC restores.
+fn empty_exec_region(
+    p: &Program,
+    st: &Structured,
+    branch: usize,
+    body: usize,
+    join: Option<usize>,
+) -> bool {
+    let Some(exec) = p.blocks[branch]
+        .insts
+        .last()
+        .and_then(|inst| st.mask_bits(inst.read(Reg::S(EXEC))?, inst.read(Reg::S(EXEC + 1))))
+    else {
+        return false;
+    };
+    let mut seen = vec![false; p.blocks.len()];
+    let mut pending = vec![body];
+    while let Some(b) = pending.pop() {
+        if b == branch {
+            return false;
+        }
+        if Some(b) == join || std::mem::replace(&mut seen[b], true) {
+            continue;
+        }
+        let block = &p.blocks[b];
+        if block.exit == Exit::Indirect {
+            return false;
+        }
+        for (i, inst) in block.insts.iter().enumerate() {
+            let name = inst.name();
+            if name.starts_with("s_sendmsg")
+                || name.starts_with("s_trap")
+                || name.starts_with("s_setreg")
+                || matches!(inst.fields, Fields::Smem { .. })
+                    && (name.contains("store") || name.contains("atomic"))
+            {
+                return false;
+            }
+            if inst.write(Reg::S(EXEC)).is_some() || inst.write(Reg::S(EXEC + 1)).is_some() {
+                let Some(result) = inst
+                    .write(Reg::S(EXEC))
+                    .and_then(|lo| st.mask_bits(lo, inst.write(Reg::S(EXEC + 1))))
+                else {
+                    return false;
+                };
+                if st
+                    .bools
+                    .meet(&[(exec, false), (st.reach[b], true), (result, true)])
+                {
+                    return false;
+                }
+            }
+            // An SGPR lane spill has no external effect. A non-terminal
+            // skip checked whether the spill could escape at the join.
+            if inst.read(Reg::S(EXEC)).is_some()
+                && !matches!(inst.fields, Fields::Sop { .. } | Fields::Sopp { .. })
+                && !matches!(
+                    name,
+                    "v_readlane_b32" | "v_writelane_b32" | "v_readfirstlane_b32"
+                )
+                && st.bools.meet(&[
+                    (exec, false),
+                    (st.reach[b], true),
+                    (st.guards[b][i].unwrap_or(Bool::TRUE), true),
+                ])
+            {
+                return false;
+            }
+        }
+        pending.extend(block.exit.successors());
+    }
+    true
+}
+
+/// The value `v` is a copy of, followed to the end of `copy`'s chains.
+fn follow(copy: &std::collections::HashMap<Value, Value>, mut v: Value) -> Value {
+    while let Some(&c) = copy.get(&v) {
+        v = c;
+    }
+    v
+}
+
+/// The one value every argument of the scalar `phi` comes to (the phi's own value left
+/// aside, as a loop's back edge brings it), if there is one.
+fn single_source(copy: &std::collections::HashMap<Value, Value>, phi: &Phi) -> Option<Value> {
+    let mut one = None;
+    for x in phi
+        .args
+        .iter()
+        .map(|&a| follow(copy, a))
+        .filter(|&x| x != phi.value)
+    {
+        if *one.get_or_insert(x) != x {
+            return None;
+        }
+    }
+    one
+}
+
+/// Adds to `copy` the scalar phis that pass one value through (a join of branches none of
+/// which changed it, one after the other, as the console's compiler leaves them): such a phi
+/// is a copy of that value. A phi that merges a real change is not. Repeats until no phi is
+/// added, for a phi may pass through the ones before it.
+fn copy_through_phis(p: &Program, copy: &mut std::collections::HashMap<Value, Value>) {
+    let mut added = true;
+    while added {
+        added = false;
+        for phi in p.blocks.iter().flat_map(|b| &b.phis) {
+            if copy.contains_key(&phi.value) || !matches!(phi.reg, Reg::S(_) | Reg::Scc) {
+                continue;
+            }
+            if let Some(one) = single_source(copy, phi) {
+                copy.insert(phi.value, one);
+                added = true;
+            }
+        }
+    }
 }
 
 /// Placeholder before renaming.
@@ -1238,6 +1616,33 @@ mod tests {
 
     fn input(p: &Program, reg: Reg) -> Value {
         p.inputs.iter().find(|i| i.0 == reg).expect("input").1
+    }
+
+    #[test]
+    fn exec_empty_far_exit_keeps_lanes_available_for_exchanges() {
+        let words = [
+            0x7D88_0081, // v_cmp_gt_u32 vcc, 1, v0
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            0xBF89_0005, // s_cbranch_execnz past the far jump
+            0xBE8E_1F00, // s_getpc_b64 s[14:15]
+            0x800E_FF0E,
+            20,          // s_add_u32 s14, s14, 20
+            0x820F_800F, // s_addc_u32 s15, s15, 0
+            0xBE80_200E, // s_setpc_b64 s[14:15]
+            0x7E06_0281, // v_mov_b32 v3, 1
+            S_ENDPGM,
+        ];
+        let p = build_words(&words, true);
+        let st = structure::structure(&p).unwrap();
+        let (new, _) = without_exec_skips(&p, &st, true).expect("leave out the far early exit");
+        assert!(matches!(new.blocks[0].exit, Exit::Jump(_)));
+
+        let mut reactivated = words.to_vec();
+        reactivated[5] += 4; // extend the far jump over the extra instruction
+        reactivated.insert(8, 0xBEFE_040C); // s_mov_b64 exec, s[12:13]
+        let p = build_words(&reactivated, true);
+        let st = structure::structure(&p).unwrap();
+        assert!(without_exec_skips(&p, &st, true).is_none());
     }
 
     #[test]

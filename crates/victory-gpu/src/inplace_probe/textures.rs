@@ -586,7 +586,7 @@ fn placed_srv_uploads_only_its_backed_mips() {
         };
         let resource = resource as crate::object::This;
         let copy = crate::resource::host_copy(resource).unwrap();
-        let staging = crate::texture::staging(resource, &copy.texture).unwrap();
+        let staging = crate::texture::staging(resource, &copy).unwrap();
         (copy, staging)
     };
     let (coarse, coarse_staging) = get_copy(3);

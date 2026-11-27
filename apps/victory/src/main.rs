@@ -9,8 +9,9 @@ mod inspect;
 mod prebuild;
 mod run;
 mod shader;
-#[cfg(windows)]
 mod translate;
+#[cfg(windows)]
+mod warm;
 
 use std::num::NonZeroUsize;
 #[cfg(any(windows, test))]
@@ -112,6 +113,25 @@ enum Command {
         /// (with `--pipelines`, then the shader pack's pipelines).
         #[arg(long, conflicts_with_all = ["validate", "list"])]
         cache: bool,
+        /// Target 32-lane D3DMetal with Wine defaults and the same
+        /// VICTORY_* overrides as the game. No GPU is needed.
+        #[arg(long, requires = "cache", conflicts_with = "pipelines")]
+        wine_defaults: bool,
+    },
+    /// Build recorded title pipelines offline, or prebuild from shader pack paths.
+    Warm {
+        /// Warm from these shader pack and shader database paths instead.
+        paths: Vec<PathBuf>,
+        /// Worker threads for shader pack input (default: 2).
+        #[arg(long, value_parser = positive_jobs)]
+        jobs: Option<usize>,
+    },
+    #[cfg(windows)]
+    #[command(hide = true)]
+    WarmBatch {
+        #[arg(long)]
+        list_cached: bool,
+        keys: Vec<String>,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -187,18 +207,9 @@ fn main() -> Result<()> {
             jobs,
             pipelines,
             cache: true,
+            wine_defaults,
             ..
-        } => {
-            #[cfg(windows)]
-            {
-                translate::warm(paths, jobs.map(NonZeroUsize::get), pipelines)
-            }
-            #[cfg(not(windows))]
-            {
-                let _ = (paths, jobs, pipelines);
-                anyhow::bail!("translate needs a Windows host for now")
-            }
-        }
+        } => translate::warm(paths, jobs.map(NonZeroUsize::get), pipelines, wine_defaults),
         Command::Translate {
             paths,
             validate,
@@ -207,19 +218,28 @@ fn main() -> Result<()> {
             jobs,
             cache: false,
             wave32,
-        } => {
+            ..
+        } => translate::run(
+            paths,
+            validate,
+            pipelines,
+            list,
+            jobs.map(NonZeroUsize::get),
+            wave32,
+        ),
+        Command::Warm { paths, jobs } => {
             #[cfg(windows)]
             {
-                translate::run(paths, validate, pipelines, list, jobs.map(NonZeroUsize::get), wave32)
+                warm::run(paths, jobs)
             }
-            // Translation checks shaders with the Windows DXC host, which
-            // other hosts do not have yet.
             #[cfg(not(windows))]
             {
-                let _ = (paths, validate, pipelines, list, jobs, wave32);
-                anyhow::bail!("translate needs a Windows host for now")
+                let _ = (paths, jobs);
+                anyhow::bail!("warm needs a Windows host for now")
             }
         }
+        #[cfg(windows)]
+        Command::WarmBatch { list_cached, keys } => warm::batch(keys, list_cached),
         Command::Run {
             exe,
             unimplemented,
@@ -238,6 +258,14 @@ fn main() -> Result<()> {
         Command::Config => show_config(),
         Command::GpuCheck => gpu_check(),
     }
+}
+
+fn positive_jobs(value: &str) -> Result<usize, &'static str> {
+    value
+        .parse()
+        .ok()
+        .filter(|&n| n > 0)
+        .ok_or("expected a positive worker count")
 }
 
 #[cfg(windows)]

@@ -16,7 +16,7 @@
 //! return address in its image on the stack) or from bytecode in its image.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use super::make::{self, Pending};
 
@@ -102,6 +102,37 @@ pub(super) fn quarantine(reason: &'static str) {
     }
 }
 
+/// The unbounded title-memory views make the builder opt-in.
+pub(crate) fn allowed() -> bool {
+    #[cfg(test)]
+    if TEST_ALLOWED.get() {
+        return true;
+    }
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    *ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_ALLOWED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(super) struct AllowForTest;
+
+#[cfg(test)]
+impl Drop for AllowForTest {
+    fn drop(&mut self) {
+        TEST_ALLOWED.set(false);
+    }
+}
+
+#[cfg(test)]
+pub(super) fn allow_for_test() -> AllowForTest {
+    TEST_ALLOWED.set(true);
+    AllowForTest
+}
+
 /// The frame [`runs`] last decided for, and its decision.
 static DECIDED: Mutex<(u64, bool)> = Mutex::new((u64::MAX, true));
 
@@ -110,6 +141,9 @@ static DECIDED: Mutex<(u64, bool)> = Mutex::new((u64::MAX, true));
 pub(crate) fn runs() -> bool {
     static SAID: AtomicBool = AtomicBool::new(false);
     let frame = crate::frame::current();
+    if !allowed() || QUARANTINED.load(Ordering::Acquire) {
+        return false;
+    }
     let mut decided = DECIDED.lock().unwrap_or_else(|e| e.into_inner());
     if QUARANTINED.load(Ordering::Acquire) {
         return false;

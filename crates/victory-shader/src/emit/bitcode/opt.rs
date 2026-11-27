@@ -26,25 +26,58 @@
 //!   with an effect stands between them (another thread's unsynchronised
 //!   store may fall between any two reads or before both: the title's code
 //!   cannot tell which).
+//!
+//! Which passes run is `emit::shader_opt()` (`VICTORY_SHADER_OPT`), part of
+//! the translation and so of the shader cache's key.
 
 use std::collections::HashMap;
 
 use super::{
-    Attr, Bin, Cast, Const, Func, MdDef, Module, Op, Term, Ty, TypeDef, V, pred, successors,
+    Attr, Bin, Cast, Const, Func, MdDef, Module, Op, Term, Ty, TypeDef, V, for_each_operand, pred,
+    successors,
 };
 
 /// Dead-code elimination.
-const DEAD: u32 = 1;
+pub const DEAD: u32 = 1;
 /// Constants folded, identities removed.
-const FOLD: u32 = 2;
+pub const FOLD: u32 = 2;
 /// One instruction for one value.
-const REUSE: u32 = 4;
+pub const REUSE: u32 = 4;
 /// What a branch taken says about its condition.
-const FACTS: u32 = 8;
+pub const FACTS: u32 = 8;
 /// One read for one place within a block, while nothing is stored.
-const LOADS: u32 = 16;
-/// Every pass over the module.
-pub(super) const ALL: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
+pub const LOADS: u32 = 16;
+/// Not a pass over the module: the lowering of a first-lane read in a
+/// wave64 program run as two host waves skips the exchange that asks which
+/// half has a lane where every lane is in EXEC (`lower.rs`,
+/// `v_readfirstlane_b32`).
+pub const FIRST: u32 = 32;
+/// Not a pass over the module either: the lowering reads the dwords of one
+/// console load (`s_buffer_load_dwordx2` to `x16` from an SRV, a
+/// `global_load_dwordx2` to `x4`) by one call for every four of them, not
+/// by a call each (`lower.rs`, `raw_dwords`). The same bytes are read.
+/// From fxceless/victory-fork c36971b2. On an RX 7900 XTX it is worth nothing:
+/// the yard's frame replayed turn by turn, dispatches and draws 18.47 -> 18.45
+/// ms (12 loops) and 18.23 -> 18.16 (5 loops): the driver joins the loads.
+pub const WIDE: u32 = 64;
+/// The passes over the module.
+pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
+/// Every pass.
+pub const ALL: u32 = MODULE | FIRST | WIDE;
+/// The optimizer is opt-in on macOS.
+pub const DEFAULT: u32 = 0;
+
+/// What the instructions a module writes use, of the features a shader
+/// declares by flag (the validator's "flags must match usage").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Usage {
+    /// A rasterizer ordered view.
+    pub rovs: bool,
+    /// A typed load of several components from a UAV.
+    pub typed_uav_loads: bool,
+    /// A 64-bit atomic.
+    pub atomic64: bool,
+}
 
 /// What makes two instructions without an effect the same value.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -176,9 +209,10 @@ fn effect(f: &Func) -> Effect {
     };
     let class = name.split('.').next().unwrap_or(name);
     match class {
-        "waveGetLaneIndex" | "waveGetLaneCount" | "waveIsFirstLane" | "waveReadLaneAt"
+        "waveGetLaneIndex" => Effect::Pure,
+        "waveGetLaneCount" | "waveIsFirstLane" | "waveReadLaneAt"
         | "waveReadLaneFirst" | "waveActiveBallot" | "waveActiveBit" | "waveActiveOp"
-        | "wavePrefixOp" | "quadReadLaneAt" | "quadOp" => Effect::Lanes,
+        | "wavePrefixOp" | "waveAnyTrue" | "quadReadLaneAt" | "quadOp" => Effect::Lanes,
         // An unknown wave or quad instruction may have execution effects.
         _ if class.starts_with("wave") || class.starts_with("quad") => Effect::Writes,
         _ if class.starts_with("barrier")
@@ -233,7 +267,7 @@ impl Module {
     }
 
     /// The blocks reached from the entry.
-    fn reached(&self) -> Vec<bool> {
+    pub(super) fn reached(&self) -> Vec<bool> {
         let mut seen = vec![false; self.blocks.len()];
         if self.blocks.is_empty() {
             return seen;
@@ -381,7 +415,7 @@ impl Module {
     }
 
     /// An integer constant's width and value (the bits of that width).
-    fn int_k(&self, v: V) -> Option<(u32, u64)> {
+    pub(crate) fn int_k(&self, v: V) -> Option<(u32, u64)> {
         let V::Const(i) = v else { return None };
         let (ty, Const::Int(x)) = &self.consts[i as usize] else {
             return None;
@@ -647,6 +681,9 @@ impl Module {
             Op::Cmp(p, a, b) => Key::Cmp(*p, *a, *b),
             Op::Select(c, t, f) => Key::Select(*c, *t, *f),
             Op::Extract(a, n) => Key::Extract(*a, *n),
+            // Keeping equal size queries separate avoids a pipeline compiler
+            // crash with a dominating getDimensions (Belobug #324).
+            Op::Call(f, _) if self.funcs[*f as usize].name == "dx.op.getDimensions" => return None,
             Op::Call(f, args) => Key::Call(*f, args.clone()),
             Op::Gep(ty, p, idx) => Key::Gep(*ty, *p, idx.clone()),
             Op::Load(p) => Key::Load(*p),
@@ -922,6 +959,160 @@ impl Module {
                 blk.phis.clear();
             }
         }
+        self.drop_unused_functions();
+        self.drop_unused_tables();
+    }
+
+    /// Resource features used by the instructions the writer will emit.
+    pub(crate) fn resource_usage(&self) -> Usage {
+        let mut u = Usage::default();
+        let plan = self.plan();
+        // The first field of a handle's annotation: its kind, with the UAV
+        // bit; the second: the component type and count.
+        let annotation = |h: V| -> Option<(i64, i64)> {
+            let V::Inst(a) = h else { return None };
+            let Op::Call(f, args) = &self.insts[a as usize].op else {
+                return None;
+            };
+            if self.funcs[*f as usize].name != "dx.op.annotateHandle" {
+                return None;
+            }
+            let V::Const(props) = *args.get(2)? else {
+                return None;
+            };
+            let Const::Aggregate(fields) = &self.consts[props as usize].1 else {
+                return None;
+            };
+            match (
+                &self.consts[fields[0] as usize].1,
+                &self.consts[fields[1] as usize].1,
+            ) {
+                (Const::Int(kind), Const::Int(components)) => Some((*kind, *components)),
+                _ => None,
+            }
+        };
+        for &b in &plan.layout {
+            for &i in self.blocks[b]
+                .body
+                .iter()
+                .filter(|&&i| plan.live[i as usize])
+            {
+                let Op::Call(f, args) = &self.insts[i as usize].op else {
+                    continue;
+                };
+                let name = self.funcs[*f as usize].name.as_str();
+                let name = name.strip_prefix("dx.op.").unwrap_or(name);
+                if name == "annotateHandle" {
+                    u.rovs |= annotation(V::Inst(i)).is_some_and(|(kind, _)| kind & 0x2000 != 0);
+                } else if name.starts_with("atomic") && name.ends_with(".i64") {
+                    u.atomic64 = true;
+                } else if name.starts_with("textureLoad") || name.starts_with("bufferLoad") {
+                    u.typed_uav_loads |= args.get(1).and_then(|&h| annotation(h)).is_none_or(
+                        |(kind, components)| kind & 0x1000 != 0 && components >> 8 & 0xff > 1,
+                    );
+                }
+            }
+        }
+        u
+    }
+
+    /// A constant table no remaining load reads leaves the module (the
+    /// validator refuses an internal declaration nothing uses). Shared
+    /// memory stays declared whether it is read or not.
+    fn drop_unused_tables(&mut self) {
+        let mut used: Vec<bool> = self.globals.iter().map(|g| g.init.is_none()).collect();
+        if used.iter().all(|&u| u) {
+            return;
+        }
+        for blk in &self.blocks {
+            for &i in blk.phis.iter().chain(&blk.body) {
+                for_each_operand(&self.insts[i as usize].op, |v| {
+                    if let V::Global(g) = v {
+                        used[g as usize] = true;
+                    }
+                });
+            }
+        }
+        for md in &self.mds {
+            if let MdDef::Value(_, V::Global(g)) = md {
+                used[*g as usize] = true;
+            }
+        }
+        if used.iter().all(|&u| u) {
+            return;
+        }
+        let mut new = vec![u32::MAX; used.len()];
+        for (next, (old, _)) in used.iter().enumerate().filter(|u| *u.1).enumerate() {
+            new[old] = next as u32;
+        }
+        let mut old = 0;
+        self.globals.retain(|_| {
+            old += 1;
+            used[old - 1]
+        });
+        let renumber = |v: V| match v {
+            V::Global(g) if used[g as usize] => V::Global(new[g as usize]),
+            v => v,
+        };
+        for inst in &mut self.insts {
+            map_operands(&mut inst.op, renumber);
+        }
+        for md in &mut self.mds {
+            if let MdDef::Value(_, v) = md {
+                *v = renumber(*v);
+            }
+        }
+    }
+
+    /// Declarations no remaining call names leave the module (the validator
+    /// refuses an external function nothing uses); the others keep their
+    /// order, so `main` stays function 0.
+    fn drop_unused_functions(&mut self) {
+        let mut used: Vec<bool> = self.funcs.iter().map(|f| f.body).collect();
+        for blk in &self.blocks {
+            for &i in blk.phis.iter().chain(&blk.body) {
+                if let Op::Call(f, _) = self.insts[i as usize].op {
+                    used[f as usize] = true;
+                }
+            }
+        }
+        for md in &self.mds {
+            if let MdDef::Value(_, V::Func(f)) = md {
+                used[*f as usize] = true;
+            }
+        }
+        if used.iter().all(|&u| u) {
+            return;
+        }
+        let mut new = vec![u32::MAX; used.len()];
+        for (next, (old, _)) in used.iter().enumerate().filter(|u| *u.1).enumerate() {
+            new[old] = next as u32;
+        }
+        let mut old = 0;
+        self.funcs.retain(|_| {
+            old += 1;
+            used[old - 1]
+        });
+        self.func_ids = self
+            .funcs
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.name.clone(), i as u32))
+            .collect();
+        // Instructions that left their block keep a stale number: nothing
+        // reads them again.
+        for inst in &mut self.insts {
+            if let Op::Call(f, _) = &mut inst.op
+                && used[*f as usize]
+            {
+                *f = new[*f as usize];
+            }
+        }
+        for md in &mut self.mds {
+            if let MdDef::Value(_, V::Func(f)) = md {
+                *f = new[*f as usize];
+            }
+        }
     }
 }
 
@@ -1038,15 +1229,9 @@ mod tests {
         k.m.terminate(k.b, Term::Ret);
         k.m.optimise(DEAD);
         assert_eq!(body(&k.m, k.b), 1, "the barrier");
-        // Only the declarations used by the optimized program are written.
-        let (_, (kept, _)) = k.m.kept(&k.m.plan());
-        let names: Vec<_> =
-            k.m.funcs
-                .iter()
-                .zip(kept)
-                .filter(|&(_, id)| id != u32::MAX)
-                .map(|(f, _)| f.name.as_str())
-                .collect();
+        // The declarations nothing calls any more are gone, and the call
+        // that stayed names its function by the new number.
+        let names: Vec<&str> = k.m.funcs.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, ["main", "dx.op.barrier"]);
         let Op::Call(f, _) = k.m.insts[k.m.blocks[k.b].body[0] as usize].op else {
             panic!("a call");
@@ -1118,6 +1303,7 @@ mod tests {
         let lane_ops = [
             ("dx.op.waveActiveOp.i32", Attr::NoUnwind),
             ("dx.op.quadReadLaneAt.i32", Attr::ReadNone),
+            ("dx.op.quadOp.i32", Attr::ReadNone),
         ];
         let one = k.m.i32(1);
         for (name, attr) in lane_ops {
@@ -1297,6 +1483,31 @@ mod tests {
         assert_eq!(body(&m, then), 2);
         assert_eq!(body(&m, other), 2);
         assert_eq!(body(&m, join), 2);
+        m.write();
+    }
+
+    #[test]
+    fn a_size_query_is_not_reused() {
+        let Diamond {
+            k: Kit {
+                mut m, b, writes, ..
+            },
+            x,
+            y,
+            then,
+            ..
+        } = diamond();
+        let i32t = m.int(32);
+        let fty = m.func_ty(i32t, vec![i32t, i32t]);
+        m.ptr(fty);
+        let dims = m.function("dx.op.getDimensions", fty, Some(Attr::ReadOnly), false);
+        let top = m.call(b, dims, vec![x, y]);
+        m.call(b, writes, vec![top, top]);
+        let again = m.call(then, dims, vec![x, y]);
+        m.call(then, writes, vec![again, again]);
+        m.optimise(REUSE | LOADS | DEAD);
+        assert_eq!(stores(&m, then), [[again, again]]);
+        assert_eq!(body(&m, then), 2);
         m.write();
     }
 

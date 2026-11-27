@@ -15,35 +15,73 @@
 //! The entry is our own encoding of [`HostShader`]; this file's text is part
 //! of the key, so changing the encoding invalidates every entry.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use victory_pipeline::{Cache, Converter};
 use victory_shader::emit::{
-    BufferBinding, HeapIndexSource, HostShader, ScalarSource, StaticSampler, UserData,
+    BufferBinding, HeapIndexSource, HostShader, Options, ScalarSource, StaticSampler, UserData,
 };
 use victory_shader::{HwStage, RootType};
 
-static CACHE: OnceLock<Cache> = OnceLock::new();
+static CACHE: OnceLock<ShaderCache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 
-/// Keeps translated shaders in a folder of `dir` from now on: the folder
-/// of this translator, `None` if it cannot be opened.
+/// An offline or runtime cache using the same translation and fingerprint.
+pub struct ShaderCache {
+    dir: PathBuf,
+    cache: Cache,
+    options: Options,
+}
+
+impl ShaderCache {
+    /// Uses the current host, or targets D3DMetal's 32-lane GPU for
+    /// offline translation. Both use the same environment overrides.
+    pub fn open(dir: &Path, wine_defaults: bool) -> anyhow::Result<Self> {
+        let options = if wine_defaults {
+            options_for(true, true)
+        } else {
+            runtime_options()
+        };
+        let base = build(options.host_wave32);
+        let dir = dir.join(&blake3::Hash::from(*base).to_hex()[..16]);
+        let cache = Cache::open(&dir)?;
+        tracing::info!(dir = %dir.display(), "shader cache");
+        Ok(Self {
+            dir,
+            cache,
+            options,
+        })
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn host_shader(&self, container: &[u8]) -> (Result<HostShader, String>, bool) {
+        let options = options_for_container(self.options, container);
+        cached(&self.cache, translation_build(options), container, |c| {
+            translate(c, options)
+        })
+    }
+}
+
+/// Keeps translated shaders in a folder of `dir` for this process.
 pub fn use_shader_cache(dir: PathBuf) -> Option<PathBuf> {
-    let dir = dir.join(&blake3::Hash::from(*build()).to_hex()[..16]);
-    match Cache::open(&dir) {
-        Ok(cache) => {
-            tracing::info!(dir = %dir.display(), "shader cache");
-            let _ = CACHE.set(cache);
-            Some(dir)
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "no shader cache");
-            None
+    if CACHE.get().is_none() {
+        match ShaderCache::open(&dir, false) {
+            Ok(cache) => {
+                let _ = CACHE.set(cache);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "no shader cache");
+                return None;
+            }
         }
     }
+    CACHE.get().map(|cache| cache.dir.clone())
 }
 
 /// Shaders found in the cache and translated since the start.
@@ -57,9 +95,9 @@ pub fn counts() -> (u64, u64) {
 /// translation settings (the loop limit, which a diagnostics build can
 /// change at run time, and whether the host's waves are 32 lanes at most,
 /// [`host_wave32`]).
-fn build() -> &'static [u8; 32] {
-    static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
-    BUILD.get_or_init(|| {
+fn build(wave32: bool) -> &'static [u8; 32] {
+    static BUILD: [OnceLock<[u8; 32]>; 2] = [const { OnceLock::new() }; 2];
+    BUILD[usize::from(wave32)].get_or_init(|| {
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
@@ -71,8 +109,8 @@ fn build() -> &'static [u8; 32] {
             victory_shader::SOURCE_HASH,
             ENCODING,
             limit,
-            host_wave32(),
-            victory_shader::emit::thread_ticket(),
+            wave32,
+            LoweringSwitches::read(),
         )
     })
 }
@@ -80,110 +118,111 @@ fn build() -> &'static [u8; 32] {
 /// Whether translations are for a host of 32-lane waves: the host GPU's
 /// (made here if it is not yet: the cache belongs to the GPU it was filled
 /// on, as the pipeline library does); none without one.
+#[cfg(windows)]
 fn host_wave32() -> bool {
     crate::host::host().is_some_and(crate::backend::HostGpu::wave32)
 }
 
+#[cfg(not(windows))]
+fn host_wave32() -> bool {
+    false
+}
+
 /// This file, whose `encode` and `decode` define the entries.
 const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
+
+#[derive(Clone, Copy, Default)]
+struct LoweringSwitches {
+    port_cbv: bool,
+    raw_structured_views: bool,
+    wide_scalar_loads: bool,
+    shader_opt: u32,
+    thread_ticket: bool,
+}
+
+impl LoweringSwitches {
+    fn read() -> Self {
+        Self {
+            port_cbv: victory_shader::emit::raw_root_cbvs(),
+            raw_structured_views: victory_shader::emit::raw_structured_views(),
+            wide_scalar_loads: victory_shader::emit::wide_scalar_loads(),
+            shader_opt: victory_shader::emit::shader_opt(),
+            thread_ticket: victory_shader::emit::thread_ticket(),
+        }
+    }
+}
 
 fn key(
     translator: &str,
     encoding: &[u8],
     limit: u32,
     wave32: bool,
-    thread_ticket: bool,
+    switches: LoweringSwitches,
 ) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(translator.as_bytes());
     h.update(blake3::hash(encoding).as_bytes());
     h.update(&limit.to_le_bytes());
-    h.update(&[u8::from(wave32), u8::from(thread_ticket)]);
+    h.update(&[
+        u8::from(wave32),
+        u8::from(switches.port_cbv),
+        u8::from(switches.thread_ticket),
+    ]);
+    if switches.port_cbv {
+        // The flag changes how root CBVs are lowered and bound.
+        h.update(b"bounded root CBVs");
+    }
+    h.update(&switches.shader_opt.to_le_bytes());
+    if switches.wide_scalar_loads {
+        h.update(b"wide scalar loads");
+    }
+    if switches.raw_structured_views {
+        h.update(b"raw structured views");
+    }
     *h.finalize().as_bytes()
 }
 
-/// Whether translations put 64-bit image atomics under locks: under Wine,
-/// whose D3DMetal claims the atomics and leaves the texels untouched.
-/// `VICTORY_ATOMIC_LOCKS=0` or `1` overrides.
-fn atomic_locks() -> bool {
-    static LOCKS: OnceLock<bool> = OnceLock::new();
-    *LOCKS.get_or_init(|| match std::env::var("VICTORY_ATOMIC_LOCKS").as_deref() {
+fn flag(name: &str, default: bool) -> bool {
+    match std::env::var(name).as_deref() {
         Ok("0") => false,
         Ok("1") => true,
-        _ => under_wine(),
-    })
+        _ => default,
+    }
 }
 
-/// Whether the lanes of a wave first try their 64-bit atomics' locks in
-/// rounds before the lanes still not done take turns (`emit`, "Atomic
-/// locks"; #240): wherever [`atomic_locks`] are on. In the game the rounds
-/// took a world frame from 7.9 to 2.5 s on an M2 Max, from 5.29 to 0.71 s
-/// on an M4 Pro and from 2.9 to 0.88 s on an M4, and left no GPU resets.
-/// `VICTORY_ATOMIC_LOCK_ROUNDS=0` goes back to the turns alone.
-fn atomic_lock_rounds() -> bool {
-    static ROUNDS: OnceLock<bool> = OnceLock::new();
-    *ROUNDS.get_or_init(|| {
-        let var = std::env::var("VICTORY_ATOMIC_LOCK_ROUNDS").ok();
-        rounds_on(atomic_locks(), var.as_deref())
-    })
+/// Uses the same wave64-to-wave32 default as runtime translation.
+pub fn narrow_waves() -> bool {
+    flag("VICTORY_NARROW_WAVES", under_wine())
 }
 
-/// Whether a glc-clear 64-bit `umax` first reduces each texel's lanes of
-/// a wave to their maximum key, one representative locking (`emit`,
-/// "Atomic locks"; #240): opt-in while it is measured,
-/// `VICTORY_ATOMIC_UMAX=1`. Only with [`atomic_lock_rounds`].
-fn atomic_umax() -> bool {
-    static UMAX: OnceLock<bool> = OnceLock::new();
-    *UMAX.get_or_init(|| {
-        atomic_lock_rounds() && std::env::var("VICTORY_ATOMIC_UMAX").as_deref() == Ok("1")
-    })
+/// Respect the same emission overrides for native warm-up and Wine.
+fn options_for(wine: bool, wave32: bool) -> Options {
+    let atomic_locks = flag("VICTORY_ATOMIC_LOCKS", wine);
+    let rounds = std::env::var("VICTORY_ATOMIC_LOCK_ROUNDS").ok();
+    let atomic_lock_rounds = rounds_on(atomic_locks, rounds.as_deref());
+    let atomic_umax = atomic_lock_rounds && flag("VICTORY_ATOMIC_UMAX", false);
+    Options {
+        view_marks: flag("VICTORY_VIEW_MARKS", true),
+        atomic_locks,
+        atomic_lock_rounds,
+        atomic_umax,
+        atomic_early_exit: atomic_umax && flag("VICTORY_ATOMIC_EARLY_EXIT", true),
+        bias_as_gradients: flag("VICTORY_BIAS_AS_GRADIENTS", wine),
+        host_wave32: wave32,
+        narrow_waves: flag("VICTORY_NARROW_WAVES", wine),
+        disable_literal_halves: !flag("VICTORY_LITERAL_HALVES", true),
+        // Predicated wave64 compute regions substantially slow D3DMetal.
+        disable_selective_predication: wine && wave32,
+        per_vertex_center: false,
+        halves_rendezvous: std::env::var("VICTORY_HALVES_RENDEZVOUS").as_deref() != Ok("0"),
+        uav_size_level0: uav_size_level0(),
+    }
 }
 
 /// The rounds, given whether the locks are on and
 /// `VICTORY_ATOMIC_LOCK_ROUNDS`: on with the locks unless it is `0`.
 fn rounds_on(locks: bool, var: Option<&str>) -> bool {
     locks && var != Some("0")
-}
-
-/// Whether compute shaders' biased samples run as scaled gradient samples:
-/// under Wine, whose D3DMetal ignores the bias there (#30).
-/// `VICTORY_BIAS_AS_GRADIENTS=0` or `1` overrides.
-fn bias_as_gradients() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("VICTORY_BIAS_AS_GRADIENTS").as_deref() {
-        Ok("0") => false,
-        Ok("1") => true,
-        _ => under_wine(),
-    })
-}
-
-/// Whether translations take wave64 programs to run in 32-lane host waves:
-/// under Wine, whose D3DMetal reports 32 lanes and ignores `WaveSize(64)`.
-/// `VICTORY_NARROW_WAVES=0` or `1` overrides. Also what the offline
-/// `translate --wave32` follows, so its results match `run`'s.
-pub fn narrow_waves() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("VICTORY_NARROW_WAVES").as_deref() {
-        Ok("0") => false,
-        Ok("1") => true,
-        _ => under_wine(),
-    })
-}
-
-/// Whether the two 32-lane halves of a console wave64 pass each other
-/// values in divergent code by waiting for each other on group-shared
-/// memory (`victory_shader::emit::Options::halves_rendezvous`): on, wherever
-/// programs run in halves. `VICTORY_HALVES_RENDEZVOUS=0` goes back to
-/// refusing such programs.
-fn halves_rendezvous() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_HALVES_RENDEZVOUS").as_deref() != Ok("0"))
-}
-
-/// Whether 64-thread wave64 shaders keep only the per-lane translation.
-fn literal_halves_disabled() -> bool {
-    static OFF: OnceLock<bool> = OnceLock::new();
-    *OFF.get_or_init(|| std::env::var("VICTORY_LITERAL_HALVES").as_deref() == Ok("0"))
 }
 
 /// Whether a size query on a writable image asks for level 0 in every
@@ -264,36 +303,54 @@ pub(crate) fn under_wine() -> bool {
 }
 
 /// [`build`] for translations with host workarounds (atomic locks, their
-/// rounds and umax reduction, bias as gradients, narrow waves, level-0
-/// size queries on writable images, and literal halves): their own cache
-/// entries, one per combination.
-pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'static [u8; 32] {
+/// rounds and umax reduction, bias as gradients, narrow waves, and view
+/// instrumentation): their own
+/// cache entries, one per combination.
+pub(crate) fn translation_build(options: Options) -> &'static [u8; 32] {
     let locks = options.atomic_locks;
     let bias = options.bias_as_gradients;
     let narrow = options.narrow_waves;
+    let no_marks = !options.view_marks;
     let rounds = locks && options.atomic_lock_rounds;
     let umax = rounds && options.atomic_umax;
-    let uav_level0 = options.uav_size_level0;
+    let early_exit = umax && options.atomic_early_exit;
     let no_literal = options.host_wave32 && options.disable_literal_halves;
-    // Only where programs run in halves does the rendezvous change them.
+    let level0 = options.uav_size_level0;
+    let center = options.per_vertex_center;
+    let no_predication = options.disable_selective_predication;
     let apart = options.host_wave32 && !options.halves_rendezvous;
     let cap_barriers = victory_shader::emit::cap_barriers_refused();
-    if !locks && !bias && !narrow && !no_literal && !uav_level0 && !apart && !cap_barriers {
-        return build();
+    if !locks
+        && !bias
+        && !narrow
+        && !no_marks
+        && !no_literal
+        && !level0
+        && !center
+        && !no_predication
+        && !apart
+        && !cap_barriers
+    {
+        return build(options.host_wave32);
     }
-    static BUILDS: [OnceLock<[u8; 32]>; 512] = [const { OnceLock::new() }; 512];
+    static BUILDS: [OnceLock<[u8; 32]>; 16384] = [const { OnceLock::new() }; 16384];
     let n = usize::from(locks)
         | usize::from(bias) << 1
         | usize::from(narrow) << 2
         | usize::from(rounds) << 3
         | usize::from(umax) << 4
-        | usize::from(no_literal) << 5
-        | usize::from(uav_level0) << 6
-        | usize::from(apart) << 7
-        | usize::from(cap_barriers) << 8;
+        | usize::from(early_exit) << 5
+        | usize::from(options.host_wave32) << 6
+        | usize::from(no_marks) << 7
+        | usize::from(no_literal) << 8
+        | usize::from(level0) << 9
+        | usize::from(center) << 10
+        | usize::from(no_predication) << 11
+        | usize::from(apart) << 12
+        | usize::from(cap_barriers) << 13;
     BUILDS[n].get_or_init(|| {
         let mut h = blake3::Hasher::new();
-        h.update(build());
+        h.update(build(options.host_wave32));
         if locks {
             h.update(b"atomic locks");
         }
@@ -303,61 +360,48 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         if umax {
             h.update(b"atomic umax");
         }
+        if early_exit {
+            h.update(b"atomic early exit");
+        }
         if bias {
             h.update(b"bias as gradients");
         }
         if narrow {
             h.update(b"narrow waves");
         }
-        if uav_level0 {
-            h.update(b"uav size level 0");
+        if no_marks {
+            h.update(b"no view marks");
         }
-        if no_literal {
-            h.update(b"literal halves disabled");
-        }
-        if apart {
-            h.update(b"no halves rendezvous");
-        }
-        if cap_barriers {
-            h.update(b"cap barriers refused");
-        }
+        h.update(&(n as u16).to_le_bytes());
         *h.finalize().as_bytes()
     })
 }
 
-pub(crate) fn runtime_options() -> victory_shader::emit::Options {
-    // Writes through views mark their pages: copy-backs compare only those
-    // (`crate::shadow::copy_back_marks`).
-    // Under Wine (D3DMetal), 64-bit image atomics run under locks: its own
-    // leave the texels untouched (`emit`, "Atomic locks"). On a host of
-    // 32-lane waves, wave64 programs run in halves (`build` keys on it).
-    victory_shader::emit::Options {
-        view_marks: true,
-        atomic_locks: atomic_locks(),
-        atomic_lock_rounds: atomic_lock_rounds(),
-        atomic_umax: atomic_umax(),
-        bias_as_gradients: bias_as_gradients(),
-        host_wave32: host_wave32(),
-        narrow_waves: narrow_waves(),
-        disable_literal_halves: literal_halves_disabled(),
-        per_vertex_center: false,
-        uav_size_level0: uav_size_level0(),
-        halves_rendezvous: halves_rendezvous(),
-    }
+pub(crate) fn runtime_options() -> Options {
+    static OPTIONS: OnceLock<Options> = OnceLock::new();
+    *OPTIONS.get_or_init(|| options_for(under_wine(), host_wave32()))
 }
 
-/// The translation of a console shader container, from the cache when
-/// there is one, and whether it came from there.
-pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
-    let mut options = runtime_options();
-    // One program at a time, if the switch lists hashes.
+fn options_for_container(mut options: Options, container: &[u8]) -> Options {
     options.uav_size_level0 = uav_size_level0_for(container);
-    let translate =
-        |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
-    let build = translation_build(options);
+    options
+}
+
+fn translate(container: &[u8], options: Options) -> Result<HostShader, String> {
+    victory_shader::emit::translate_with(container, options).map_err(|e| e.to_string())
+}
+
+/// The translation of a console shader container, and whether it was cached.
+pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
     match CACHE.get() {
-        Some(cache) => cached(cache, build, container, translate),
-        None => (translate(container), false),
+        Some(cache) => cache.host_shader(container),
+        None => (
+            translate(
+                container,
+                options_for_container(runtime_options(), container),
+            ),
+            false,
+        ),
     }
 }
 
@@ -830,13 +874,16 @@ mod tests {
     /// their own.
     #[test]
     fn the_size_query_switch_keys_the_cache() {
-        let plain = victory_shader::emit::Options::default();
+        let plain = Options {
+            view_marks: true,
+            ..Options::default()
+        };
         let level0 = victory_shader::emit::Options {
             uav_size_level0: true,
             ..plain
         };
-        assert_eq!(translation_build(plain), build());
-        assert_ne!(translation_build(level0), build());
+        assert_eq!(translation_build(plain), build(plain.host_wave32));
+        assert_ne!(translation_build(level0), build(level0.host_wave32));
     }
 
     #[test]
@@ -854,6 +901,19 @@ mod tests {
             ..options
         });
         assert_ne!(on, off);
+    }
+
+    #[test]
+    fn wine_wave32_bypasses_selective_predication_with_its_own_cache_key() {
+        let wine = options_for(true, true);
+        assert!(wine.disable_selective_predication);
+        assert!(!options_for(true, false).disable_selective_predication);
+        assert!(!options_for(false, true).disable_selective_predication);
+        let predicated = Options {
+            disable_selective_predication: false,
+            ..wine
+        };
+        assert_ne!(translation_build(wine), translation_build(predicated));
     }
 
     fn shader() -> HostShader {
@@ -1003,21 +1063,38 @@ mod tests {
     /// another key, so no entry written before it is read.
     #[test]
     fn the_key_covers_translator_encoding_and_settings() {
-        let k = key("0123456789abcdef", b"encoding", 1 << 20, false, true);
-        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, false, true));
-        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, false, true));
-        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, false, true));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, false, true));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, true, true));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, false, false));
+        let version = "0123456789abcdef";
+        let encoding = b"encoding";
+        let limit = 1 << 20;
+        let switches = LoweringSwitches::default();
+        let k = key(version, encoding, limit, false, switches);
+        assert_eq!(k, key(version, encoding, limit, false, switches));
+        assert_ne!(k, key("0123456789abcdee", encoding, limit, false, switches));
+        assert_ne!(k, key(version, b"encoding.", limit, false, switches));
+        assert_ne!(k, key(version, encoding, limit / 2, false, switches));
+        assert_ne!(k, key(version, encoding, limit, true, switches));
+
+        let mut seen = std::collections::HashSet::new();
+        for flags in 0..16 {
+            for shader_opt in 0..128 {
+                let switches = LoweringSwitches {
+                    port_cbv: flags & 1 != 0,
+                    raw_structured_views: flags & 2 != 0,
+                    wide_scalar_loads: flags & 4 != 0,
+                    shader_opt,
+                    thread_ticket: flags & 8 != 0,
+                };
+                assert!(seen.insert(key(version, encoding, limit, false, switches)));
+            }
+        }
         assert_eq!(
-            *build(),
+            *build(host_wave32()),
             key(
                 victory_shader::SOURCE_HASH,
                 ENCODING,
                 victory_shader::emit::loop_limit(),
                 host_wave32(),
-                victory_shader::emit::thread_ticket(),
+                LoweringSwitches::read(),
             )
         );
         // The encoding part is this file as built.
@@ -1026,6 +1103,34 @@ mod tests {
                 .unwrap()
                 .contains("fn encode(translation: &Result<HostShader, String>)")
         );
+    }
+
+    #[test]
+    fn effective_host_workarounds_have_separate_translation_keys() {
+        let atomic_modes = [
+            (false, false, false, false),
+            (true, false, false, false),
+            (true, true, false, false),
+            (true, true, true, false),
+            (true, true, true, true),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for (atomic_locks, atomic_lock_rounds, atomic_umax, atomic_early_exit) in atomic_modes {
+            for flags in 0..16 {
+                let options = Options {
+                    atomic_locks,
+                    atomic_lock_rounds,
+                    atomic_umax,
+                    atomic_early_exit,
+                    bias_as_gradients: flags & 1 != 0,
+                    narrow_waves: flags & 2 != 0,
+                    host_wave32: flags & 4 != 0,
+                    view_marks: flags & 8 != 0,
+                    ..Options::default()
+                };
+                assert!(seen.insert(translation_build(options)));
+            }
+        }
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {

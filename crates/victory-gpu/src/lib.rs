@@ -32,11 +32,13 @@ mod ambient_estimate_set;
 #[cfg(any(windows, test))]
 mod ambient_set;
 #[cfg(windows)]
+mod ambient_wave;
+#[cfg(windows)]
 mod bindless;
-#[cfg(all(windows, feature = "diagnostics"))]
-mod capture;
 #[cfg(any(windows, test))]
 mod caption;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod capture;
 #[cfg(windows)]
 mod composite;
 #[cfg(windows)]
@@ -64,6 +66,8 @@ mod hold;
 mod host;
 #[cfg(windows)]
 mod indirect;
+#[cfg(windows)]
+mod land;
 pub mod list;
 #[cfg(all(windows, test))]
 mod list_bench;
@@ -73,6 +77,9 @@ pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
 mod placement;
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[doc(hidden)]
+pub mod port_descriptors;
 #[cfg(windows)]
 mod primitive;
 pub mod query;
@@ -89,7 +96,6 @@ pub mod resource;
 pub mod root;
 #[cfg(windows)]
 mod sampler;
-#[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]
 mod shadow;
@@ -97,10 +103,12 @@ pub mod signature;
 mod switch;
 #[cfg(windows)]
 mod tdr;
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 mod texback;
 #[cfg(windows)]
 mod texture;
+#[cfg(windows)]
+mod tiled;
 #[cfg(windows)]
 mod tiles;
 #[cfg(windows)]
@@ -113,19 +121,28 @@ mod widened;
 #[cfg(all(windows, test))]
 mod inplace_probe;
 
-#[cfg(all(windows, feature = "diagnostics"))]
-pub use copystat::CountingAlloc;
+#[cfg(windows)]
+pub use alias::{PhysicalHeap, physical_heap, physical_tiles_enabled};
 #[cfg(windows)]
 pub use alias::{alias_region, enabled as alias_buffers, unalias_region};
 #[cfg(all(windows, feature = "diagnostics"))]
-pub use alias::{PhysicalHeap, physical_heap};
+pub use copystat::CountingAlloc;
 #[cfg(windows)]
 pub use host::{MeshSupport, host_mesh_support, on_failure};
 #[cfg(windows)]
+pub use land::{LandingPage, enabled as landing_enabled, next_mapping_epoch, use_landing_pages};
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use tiled::probe_tiled_alias;
+#[cfg(windows)]
+pub use tiled::{MAX_TILED_BUFFER, TiledAlias, with_inflight_mapping, with_physical_mapping};
+#[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, fault_tracking, rosetta, stores_need_patching, title_memory_aliased,
-    title_memory_remapped, title_memory_unmapping, writing as kernel_will_write,
+    title_memory_unmapping, title_memory_moving, title_memory_remapped, title_memory_restored, title_memory_splitting,
+    writing as kernel_will_write, writing_beside as kernel_will_write_beside,
 };
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub use watch::{observe_write_sites, write_site_guards};
 
 /// [`shader_cache::under_wine`], asked once: it looks `wine_get_version` up
 /// in ntdll, which takes Wine's loader lock, and draws ask it per descriptor,

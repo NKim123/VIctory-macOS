@@ -39,7 +39,7 @@ fn growing_write_ranges() {
             let value = round + 1;
             copy.write_host(at as u64, &[value]);
             for &(offset, bytes) in ranges {
-                copy.copy_back(p + offset, bytes);
+                copy.copy_back(p + offset, bytes, None);
             }
             // SAFETY: the test owns this pool; copy-back has returned.
             assert_eq!(unsafe { (at as *const u8).read_volatile() }, value);

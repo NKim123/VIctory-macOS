@@ -414,6 +414,7 @@ fn build_wave32_cs(pattern: MaskPattern, div: Divergence, op_words: &[u32]) -> H
         atomic_locks: false,
         atomic_lock_rounds: false,
         atomic_umax: false,
+        atomic_early_exit: false,
         bias_as_gradients: false,
         narrow_waves: false,
         uav_size_level0: false,

@@ -18,7 +18,7 @@
 //! guess; a pass the title runs only once and whose pipeline takes longer
 //! is lost.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
@@ -161,10 +161,17 @@ impl Pending {
             });
             #[cfg(feature = "diagnostics")]
             log_built(&self.key);
+            let elapsed = started.elapsed();
+            if made
+                .as_ref()
+                .is_some_and(|p| p.cache_status != super::library::CacheStatus::Loaded)
+            {
+                super::library::note_time(&self.key, elapsed);
+            }
             let (user, kernel) = super::thread_cpu_since(cpu);
             tracing::debug!(
                 shaders = ?self.shaders,
-                ms = started.elapsed().as_millis() as u64,
+                ms = elapsed.as_millis() as u64,
                 user_ms = user,
                 kernel_ms = kernel,
                 "pipeline made"
@@ -384,6 +391,7 @@ fn enqueue(p: &Pending, now: bool) -> Option<Lane> {
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
     super::library::note_created(&p.key);
+    super::known::record(&p.key, &p.shaders, p.graphics.as_deref());
     if p.made.get().is_none() && !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, false);
@@ -423,15 +431,61 @@ fn wait(p: &Pending, frame: u64) {
     }
 }
 
-/// Pipelines for the workers: requested compute first, then requested
-/// graphics, then early depth and other pre-warms.
-static QUEUES: (Mutex<PriorityQueue<Arc<Pending>>>, Condvar) =
-    (Mutex::new(PriorityQueue::new()), Condvar::new());
+/// Requested work takes priority. Known slow early starts can use only
+/// some workers, so newly queued ordinary work can still start.
+struct Queue {
+    ready: PriorityQueue<Arc<Pending>>,
+    slow: VecDeque<Arc<Pending>>,
+    slow_active: usize,
+}
+
+impl Queue {
+    const fn new() -> Self {
+        Self {
+            ready: PriorityQueue::new(),
+            slow: VecDeque::new(),
+            slow_active: 0,
+        }
+    }
+
+    fn push(&mut self, p: Arc<Pending>, lane: Lane, slow: bool) {
+        if slow {
+            self.slow.push_back(p);
+        } else {
+            self.ready.push(lane, p);
+        }
+    }
+
+    fn pop(&mut self, slow_limit: usize) -> Option<(Arc<Pending>, bool)> {
+        // A draw can promote an entry while its original is still queued.
+        fn claim(lane: &mut VecDeque<Arc<Pending>>) -> Option<Arc<Pending>> {
+            std::iter::from_fn(|| lane.pop_front()).find(|p| !p.taken.swap(true, Ordering::Relaxed))
+        }
+        if let Some(p) = std::iter::from_fn(|| self.ready.pop()).find(|p| !p.taken.swap(true, Ordering::Relaxed)) {
+            return Some((p, false));
+        }
+        if self.slow_active < slow_limit
+            && let Some(p) = claim(&mut self.slow)
+        {
+            self.slow_active += 1;
+            return Some((p, true));
+        }
+        None
+    }
+}
+
+static QUEUES: (Mutex<Queue>, Condvar) = (Mutex::new(Queue::new()), Condvar::new());
+static WORKERS: OnceLock<usize> = OnceLock::new();
+
+/// Reserve most workers when there is more than one. A lone worker must
+/// still be able to drain the slow queue.
+fn slow_limit(workers: usize) -> usize {
+    (workers / 4).max(1)
+}
 
 /// Hands `p` to the workers (half the logical processors, 2 to 8), started
 /// on first use.
 fn queue(p: &Arc<Pending>, now: bool) {
-    static WORKERS: OnceLock<usize> = OnceLock::new();
     let workers = *WORKERS.get_or_init(|| {
         let n = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
         (0..n)
@@ -458,7 +512,8 @@ fn queue(p: &Arc<Pending>, now: bool) {
         }
         return;
     }
-    queues.push(lane, p.clone());
+    let slow = matches!(lane, Lane::Early | Lane::EarlyDepth) && super::library::known_slow(&p.key);
+    queues.push(p.clone(), lane, slow);
     work.notify_one();
 }
 
@@ -473,10 +528,12 @@ fn work() {
     }
     let (lock, work) = &QUEUES;
     loop {
-        let p = {
+        let (p, slow) = {
             let mut queues = lock.lock().unwrap_or_else(|e| e.into_inner());
             loop {
-                if let Some(p) = queues.pop() {
+                // No work is queued until worker startup has returned.
+                let limit = slow_limit(WORKERS.get().copied().unwrap_or_default());
+                if let Some(p) = queues.pop(limit) {
                     break p;
                 }
                 let (held, waited) = work
@@ -490,10 +547,11 @@ fn work() {
                 }
             }
         };
-        if p.taken.swap(true, Ordering::Relaxed) {
-            continue; // its other queue entry
-        }
         p.make();
+        if slow {
+            lock.lock().unwrap_or_else(|e| e.into_inner()).slow_active -= 1;
+            work.notify_one();
+        }
         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
             drained();
         } else {
@@ -621,6 +679,68 @@ mod tests {
         WAITING.fetch_sub(4, Ordering::Relaxed);
     }
 
+    fn empty_pending() -> Arc<Pending> {
+        Arc::new(Pending::new(
+            Vec::new(),
+            None,
+            String::new(),
+            None,
+            #[cfg(feature = "diagnostics")]
+            &[],
+        ))
+    }
+
+    #[test]
+    fn early_compiles_leave_workers_free_and_promotions_keep_priority() {
+        let (slow, next, promoted, quick) = (
+            empty_pending(),
+            empty_pending(),
+            empty_pending(),
+            empty_pending(),
+        );
+        let mut queue = Queue::new();
+        for p in [&slow, &next, &promoted] {
+            queue.push(p.clone(), Lane::Early, true);
+        }
+        assert!(Arc::ptr_eq(&queue.pop(1).unwrap().0, &slow));
+        assert!(queue.pop(1).is_none());
+
+        queue.push(quick.clone(), Lane::Early, false);
+        queue.push(promoted.clone(), Lane::Graphics, false);
+        let (p, slow) = queue.pop(1).unwrap();
+        assert!(Arc::ptr_eq(&p, &promoted));
+        assert!(!slow);
+        assert!(Arc::ptr_eq(&queue.pop(1).unwrap().0, &quick));
+        assert!(queue.pop(1).is_none());
+
+        queue.slow_active -= 1;
+        assert!(Arc::ptr_eq(&queue.pop(1).unwrap().0, &next));
+        queue.slow_active -= 1;
+        assert!(queue.pop(1).is_none(), "promoted work must only run once");
+        assert_eq!(
+            (1..=8).map(slow_limit).collect::<Vec<_>>(),
+            [1, 1, 1, 1, 1, 1, 1, 2]
+        );
+    }
+
+    #[test]
+    fn quick_early_starts_precede_slow_work() {
+        let mut queue = Queue::new();
+        let limit = slow_limit(8);
+        for _ in 0..8 {
+            queue.push(empty_pending(), Lane::Early, true);
+            queue.push(empty_pending(), Lane::Early, false);
+        }
+        // Saturate the pool without completing any work.
+        assert!((0..8).all(|_| !queue.pop(limit).unwrap().1));
+        assert!((0..limit).all(|_| queue.pop(limit).unwrap().1));
+        assert!(queue.pop(limit).is_none());
+        assert_eq!(queue.slow_active, 2);
+        queue.slow_active -= 1;
+        assert!(queue.pop(limit).unwrap().1);
+        assert_eq!(queue.slow_active, 2);
+    }
+
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).
     #[test]
@@ -656,6 +776,8 @@ mod tests {
             container: std::sync::Mutex::new(vec![1, 2, 3, 4]),
             translated: OnceLock::new(),
             spilled: OnceLock::new(),
+            builder: OnceLock::new(),
+            ambient: None,
         });
 
         // 1. Driver refusal keeps HRESULT (hex) and shader identity.
@@ -743,6 +865,8 @@ mod tests {
             container: std::sync::Mutex::new(Vec::new()),
             translated: OnceLock::new(),
             spilled: OnceLock::new(),
+            builder: OnceLock::new(),
+            ambient: None,
         });
         let cold = Arc::new(Pending::new(
             vec![shader.clone()],

@@ -7,7 +7,7 @@
 //! operands of `v_mul_legacy_f32`.
 
 use super::host::{Dispatch, Host, Root, View};
-use super::{HostShader, lower, validator};
+use super::{HostShader, Options, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
@@ -154,6 +154,7 @@ fn lower_valu_cs(native: &NativeProgram) -> Result<HostShader, crate::ShaderErro
         atomic_locks: false,
         atomic_lock_rounds: false,
         atomic_umax: false,
+        atomic_early_exit: false,
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
@@ -1684,19 +1685,15 @@ fn bfe_signed_and_unsigned_match_rdna2() {
 /// tables at s4 and s6 (slots 1 and 2); `used` lists (table user SGPR,
 /// kind, table offset in dwords, descriptor dwords).
 fn lower_cs32(words: &[u32], used: &[(u8, ResourceType, u32, u8)], validate: bool) -> HostShader {
-    lower_cs32_with(words, used, validate, false, false, false, false)
+    lower_cs32_with(words, used, validate, Options::default(), false)
 }
 
-/// [`lower_cs32`], with 64-bit image atomics under locks if `atomic_locks`,
-/// tried first in rounds if `atomic_lock_rounds`, and a glc-clear umax
-/// reduced a texel a representative if `atomic_umax`.
+/// [`lower_cs32`], with configurable 64-bit image atomics and partial dispatch.
 fn lower_cs32_with(
     words: &[u32],
     used: &[(u8, ResourceType, u32, u8)],
     validate: bool,
-    atomic_locks: bool,
-    atomic_lock_rounds: bool,
-    atomic_umax: bool,
+    options: Options,
     partial: bool,
 ) -> HostShader {
     let param = |root, user_data, slot| RootParam {
@@ -1752,9 +1749,10 @@ fn lower_cs32_with(
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-        atomic_locks,
-        atomic_lock_rounds,
-        atomic_umax,
+        atomic_locks: options.atomic_locks,
+        atomic_lock_rounds: options.atomic_lock_rounds,
+        atomic_umax: options.atomic_umax,
+        atomic_early_exit: options.atomic_early_exit,
         bias_as_gradients: super::host::under_wine(),
         host_wave32: false,
         narrow_waves: false,
@@ -1920,9 +1918,7 @@ fn partial_compute_dispatch_only_runs_threads_below_the_limit() {
         &words,
         &[(4, ResourceType::Uav, 0, 4)],
         true,
-        false,
-        false,
-        false,
+        Options::default(),
         true,
     );
     assert_eq!(shader.compute_threads(), Some([32, 1, 1]));
@@ -2200,7 +2196,17 @@ fn image_atomics_of_64_bits() {
     // rounds first. Texel (0, 0) puts all 32 lanes on one lock.
     for (locks, rounds) in [(false, false), (true, false), (true, true)] {
         let used = &[(4, ResourceType::Uav, 0, 8)];
-        let shader = lower_cs32_with(&words, used, true, locks, rounds, false, false);
+        let shader = lower_cs32_with(
+            &words,
+            used,
+            true,
+            Options {
+                atomic_locks: locks,
+                atomic_lock_rounds: rounds,
+                ..Options::default()
+            },
+            false,
+        );
         assert_eq!(shader.view_marks, locks, "the lock words' buffer");
         for (label, warp) in [("hardware", false), ("warp", true)] {
             let Ok(host) = Host::new(warp) else {
@@ -2265,10 +2271,23 @@ fn locked_atomics64(
     words: &[u32],
     rounds: bool,
     umax: bool,
+    early_exit: bool,
     (width, height): (u32, u32),
     groups: u32,
 ) -> Option<(Vec<u64>, Vec<u32>, &'static str, std::time::Duration)> {
-    let shader = lower_cs32_with(words, &[(4, ResourceType::Uav, 0, 8)], true, true, rounds, umax, false);
+    let shader = lower_cs32_with(
+        words,
+        &[(4, ResourceType::Uav, 0, 8)],
+        true,
+        Options {
+            atomic_locks: true,
+            atomic_lock_rounds: rounds,
+            atomic_umax: umax,
+            atomic_early_exit: early_exit,
+            ..Options::default()
+        },
+        false,
+    );
     let (host, label) = [("hardware", false), ("warp", true)]
         .into_iter()
         .find_map(|(label, warp)| Host::new(warp).ok().map(|h| (h, label)))?;
@@ -2372,7 +2391,7 @@ fn image_atomics_of_64_bits_in_rounds_match_the_turns() {
             let mut rows = Vec::new();
             for (rounds, umax) in [(false, false), (true, false), (true, true)] {
                 let Some((got, locks, label, _)) =
-                    locked_atomics64(&words, rounds, umax, (32, 2), groups)
+                    locked_atomics64(&words, rounds, umax, true, (32, 2), groups)
                 else {
                     eprintln!("no SM 6.6 device; skipped");
                     return;
@@ -2459,7 +2478,7 @@ fn image_atomics_of_64_bits_umax_matches_the_locks() {
             let mut rows = Vec::new();
             for umax in [false, true] {
                 let Some((got, locks, label, _)) =
-                    locked_atomics64(&words, true, umax, (32, 2), groups)
+                    locked_atomics64(&words, true, umax, true, (32, 2), groups)
                 else {
                     eprintln!("no SM 6.6 device; skipped");
                     return;
@@ -2478,6 +2497,90 @@ fn image_atomics_of_64_bits_umax_matches_the_locks() {
             assert_eq!(rows[0][..32], rows[1][..32], "row 0 reduced and in rounds");
         }
     }
+}
+
+/// Repeated lower keys contend for four already populated texels. First,
+/// equal high words must still allow the low word to win. The high words
+/// straddle the sign bit so a signed probe also changes the result.
+#[test]
+#[ignore = "hardware contention and wall-time A/B for D3DMetal"]
+fn image_atomic_umax_early_exit_under_contention() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut words = atomics64_prologue();
+    words.extend([
+        0x1B << 25 | 3 << 17 | 131, // v_and_b32 v3, 3, v0
+        vop1(0x001, 4, 128),        // y = 0
+        vop1(0x001, 1, 128),        // low = 0
+        vop1(0x001, 2, 255),
+        0x8000_0000,
+    ]);
+    words.extend(image_atomic(0x17, 1, 3, 8, 3, false));
+    words.push(vop1(0x001, 1, vgpr(0))); // equal high, low = lane
+    words.extend(image_atomic(0x17, 1, 3, 8, 3, false));
+    words.extend([vop1(0x001, 2, 255), 0x7fff_ffff]);
+    for _ in 0..128 {
+        words.extend(image_atomic(0x17, 1, 3, 8, 3, false));
+    }
+    words.push(S_ENDPGM);
+
+    let mut samples = [Vec::new(), Vec::new()];
+    for early_exit in [false, true, true, false, false, true, true, false] {
+        let (got, locks, label, took) =
+            locked_atomics64(&words, true, true, early_exit, (4, 1), 128)
+                .expect("requires a D3D12 device");
+        assert_eq!(label, "hardware");
+        assert_eq!(
+            got,
+            (28..32)
+                .map(|lo| 0x8000_0000_0000_0000 | lo)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            locks.iter().all(|&word| word == 0),
+            "a lane gave up or left a lock held"
+        );
+        samples[usize::from(early_exit)].push(took);
+    }
+    for timings in &mut samples {
+        timings.remove(0);
+        timings.sort_unstable();
+    }
+    eprintln!(
+        "128 groups, median dispatch and readback: early exit off {:?}, on {:?}",
+        samples[0][1], samples[1][1]
+    );
+}
+
+#[test]
+fn image_atomic_early_exit_requires_a_discarded_return_value() {
+    let lower = |op, glc, early_exit| {
+        let mut words = atomics64_prologue();
+        words.extend([
+            vop1(0x001, 1, vgpr(0)),
+            vop1(0x001, 2, 129),
+            vop1(0x001, 3, 128),
+            vop1(0x001, 4, 128),
+        ]);
+        words.extend(image_atomic(op, 1, 3, 8, 3, glc));
+        words.push(S_ENDPGM);
+        lower_cs32_with(
+            &words,
+            &[(4, ResourceType::Uav, 0, 8)],
+            true,
+            Options {
+                atomic_locks: true,
+                atomic_lock_rounds: true,
+                atomic_umax: true,
+                atomic_early_exit: early_exit,
+                ..Options::default()
+            },
+            false,
+        )
+        .dxil
+    };
+    assert_ne!(lower(0x17, false, false), lower(0x17, false, true));
+    assert_eq!(lower(0x17, true, false), lower(0x17, true, true));
+    assert_eq!(lower(0x15, false, false), lower(0x15, false, true));
 }
 
 /// 64-bit adds under the locks, in turns and in rounds, apply once per lane
@@ -2514,7 +2617,7 @@ fn image_atomic_adds_finish_when_only_the_upper_half_contends() {
     words.extend(image_atomic(0x11, 1, 3, 8, 3, false));
     words.push(S_ENDPGM);
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let Some((texels, locks, label, _)) = locked_atomics64(&words, true, false, (32, 1), 1) else {
+    let Some((texels, locks, label, _)) = locked_atomics64(&words, true, false, false, (32, 1), 1) else {
         eprintln!("no SM 6.6 device; skipped");
         return;
     };
@@ -2576,7 +2679,8 @@ fn adds64_words() -> Vec<u32> {
 /// `rounds`) and checks that every add applied once and no lock is left
 /// taken. `false` with no SM 6.6 device.
 fn adds64_apply_once(words: &[u32], groups: u64, rounds: bool) -> bool {
-    let Some((got, locks, label, _)) = locked_atomics64(words, rounds, false, (32, 2), groups as u32)
+    let Some((got, locks, label, _)) =
+        locked_atomics64(words, rounds, false, false, (32, 2), groups as u32)
     else {
         return false;
     };
@@ -2658,7 +2762,8 @@ fn atomic_lock_rounds_timing() {
             let want: Vec<u64> = (0..n).flat_map(|_| (0..32).map(|l| l | 1 << 32)).collect();
             let mut warm = None;
             for _ in 0..2 {
-                let Some((got, _, label, took)) = locked_atomics64(&words, rounds, false, (32, n), 1)
+                let Some((got, _, label, took)) =
+                    locked_atomics64(&words, rounds, false, false, (32, n), 1)
                 else {
                     eprintln!("no SM 6.6 device; skipped");
                     return;
@@ -3131,6 +3236,7 @@ fn halves_go_through_a_table_as_they_are_and_name_their_views() {
         atomic_locks: false,
         atomic_lock_rounds: false,
         atomic_umax: false,
+        atomic_early_exit: false,
         bias_as_gradients: false,
         narrow_waves: false,
         uav_size_level0: false,
@@ -3304,6 +3410,7 @@ fn half_places_are_the_descriptors_the_program_loads() {
             atomic_locks: false,
             atomic_lock_rounds: false,
             atomic_umax: false,
+            atomic_early_exit: false,
             bias_as_gradients: false,
             narrow_waves: false,
             uav_size_level0: false,
@@ -3436,6 +3543,7 @@ fn a_format_load_read_as_halves_loads_the_integer() {
             atomic_locks: false,
             atomic_lock_rounds: false,
             atomic_umax: false,
+            atomic_early_exit: false,
             bias_as_gradients: false,
             narrow_waves: false,
             uav_size_level0: false,

@@ -2,10 +2,13 @@
 //! so fence signals complete at once.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
+
+#[cfg(windows)]
+mod prepare;
 
 const QUEUE_IIDS: [Iid; 4] = [
     guid(
@@ -54,6 +57,8 @@ struct Queue {
     object: Object,
     kind: u32,
     desc: QueueDesc,
+    #[cfg(windows)]
+    key: usize,
 }
 const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 
@@ -73,6 +78,8 @@ pub(crate) extern "system" fn create(
         return E_INVALIDARG;
     };
     tracing::debug!(?desc, "command queue");
+    #[cfg(windows)]
+    static NEXT_QUEUE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
     let queue = Box::new(Queue {
         object: if crate::device::newer() {
             Object::new(&NEWER_FUNCTIONS)
@@ -81,6 +88,8 @@ pub(crate) extern "system" fn create(
         },
         kind: desc.kind,
         desc,
+        #[cfg(windows)]
+        key: (NEXT_QUEUE.fetch_add(1, Ordering::Relaxed) << 32) | desc.kind as usize,
     });
     object::hand_out(QUEUE, queue, iid, &QUEUE_IIDS, out)
 }
@@ -138,16 +147,50 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     }
     #[cfg(windows)]
     if crate::host::host().is_some() {
+        let setup = CpuTimer::new(CpuPhase::QueueSetup);
+        crate::descriptor::request_heap_records();
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
-        let mut held = held_for(Why::Submission);
-        for &l in lists {
-            for segment in crate::list::segments(l) {
-                let waits = segment.waits();
-                held.push(this as usize, Item::Segment(segment, waits));
+        let lane = prepare::Lane::get();
+        let _ordered = lane.map(prepare::Lane::order);
+        let key = queue_key(this);
+        let mut fast = None;
+        if let Some(lane) = lane {
+            // The lane only runs jobs with no waits, and joins only when
+            // there is no held work that might run between the parts.
+            if lists.len() <= prepare::LIST_LIMIT
+                && HELD.try_lock().is_ok_and(|held| held.is_empty())
+                && !crate::host::retires_pending()
+                && !lists
+                    .iter()
+                    .copied()
+                    .any(crate::list::owns_submission_storage)
+            {
+                let segments = lists
+                    .iter()
+                    .flat_map(|&list| crate::list::segments(list))
+                    .collect::<Vec<_>>();
+                match lane.submit(key, segments) {
+                    Ok(()) => {
+                        account().submissions += 1;
+                        return;
+                    }
+                    Err(segments) => fast = Some(segments),
+                }
             }
+            lane.drain();
+        }
+        let mut held = held_for(Why::Submission);
+        let mut push = |segment| push_segment(&mut held, key, segment);
+        match fast {
+            Some(segments) => segments.into_iter().for_each(push),
+            None => lists
+                .iter()
+                .flat_map(|&list| crate::list::segments(list))
+                .for_each(&mut push),
         }
         account().submissions += 1;
+        drop(setup);
         pump(&mut held, Why::Submission);
         return;
     }
@@ -182,6 +225,27 @@ static HELD: std::sync::Mutex<Holding> = std::sync::Mutex::new(crate::hold::Held
 #[cfg(windows)]
 fn held() -> std::sync::MutexGuard<'static, Holding> {
     HELD.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(windows)]
+fn push_segment(held: &mut Holding, queue: usize, segment: std::sync::Arc<crate::host::HostList>) {
+    let waits = segment.waits();
+    if !waits.is_empty() && crate::host::inflight_enabled() && held.holds_work(queue) {
+        held.push(queue, Item::Boundary);
+    }
+    held.push(queue, Item::Segment(segment, waits));
+}
+
+#[cfg(all(windows, test))]
+pub(crate) fn submit_test_segments(
+    queue: usize,
+    segments: impl IntoIterator<Item = std::sync::Arc<crate::host::HostList>>,
+) {
+    let mut held = held();
+    for segment in segments {
+        push_segment(&mut held, queue, segment);
+    }
+    pump(&mut held, Why::Submission);
 }
 
 /// Microseconds the threads that ran held work spent on it, by what ran it
@@ -305,15 +369,18 @@ fn pump_work(held: &mut Holding, why: Why) {
         return;
     }
     let Some(host) = crate::host::host() else { return };
-    let read = read_value;
+    let read = |address, bytes| {
+        host.queued_wait_value(address as usize, usize::from(bytes))
+            .or_else(|| read_value(address, bytes))
+    };
     for (queue, waits) in held.force_older_than(VALVE) {
         account().forced += 1;
         tracing::warn!(queue = kind(queue), ?waits, "held work runs without its waits after {VALVE:?} (safety valve)");
     }
     let fence = |f: usize| crate::fence::value(f as This);
     let max_lists = join_lists();
-    let will_write = |seg: &std::sync::Arc<crate::host::HostList>, wait: &crate::hold::ValueWait| {
-        seg.will_write(wait)
+    let pending_write = |seg: &std::sync::Arc<crate::host::HostList>, wait: &crate::hold::ValueWait| {
+        seg.pending_write(wait)
     };
     let can_join = |piece: &[(std::sync::Arc<crate::host::HostList>, bool)],
                     next: &std::sync::Arc<crate::host::HostList>| {
@@ -330,30 +397,31 @@ fn pump_work(held: &mut Holding, why: Why) {
     let started = std::time::Instant::now();
     let mut ran = std::time::Duration::ZERO;
     let mut run = |segments: Vec<(std::sync::Arc<crate::host::HostList>, bool)>| {
-        let lists: Vec<&crate::host::HostList> = segments.iter().map(|(s, _)| &**s).collect();
-        let barriers: Vec<bool> = segments.iter().map(|&(_, b)| b).collect();
+        let (segments, barriers): (Vec<_>, Vec<_>) = segments.into_iter().unzip();
         let at = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::PumpExecutes, 1);
-        host.execute_with_barriers(&lists, &barriers);
+        if barriers.iter().any(|&barrier| barrier) {
+            host.execute_title_with_barriers(&segments, &barriers);
+        } else {
+            host.execute_title(&segments);
+        }
         ran += at.elapsed();
-        drop(lists);
-        segments
-            .into_iter()
-            .for_each(|(s, _)| crate::list::recycle(s));
+        segments.into_iter().for_each(crate::list::recycle);
     };
     let mut signal = |f: usize, value: u64| {
-        crate::fence::set(f as This, value);
+        signal_host(f as This, value);
         crate::fence::let_go(f as This);
     };
     let pumped = held.pump(&mut crate::hold::World {
         read: &read,
         fence: &fence,
-        will_write: &will_write,
+        pending_write: &pending_write,
         can_join: &can_join,
         coalesce: coalesce_pieces(),
         run: &mut run,
         signal: &mut signal,
+        release_wait: &mut |f| crate::fence::let_go(f as This),
     });
     if pumped.segments > 0 || pumped.unknown > 0 {
         let mut a = account();
@@ -388,11 +456,94 @@ fn read_value(address: u64, bytes: u8) -> Option<u64> {
     crate::host::read_into(address as *const u8, &mut value[..usize::from(bytes.min(8))]).then(|| u64::from_le_bytes(value))
 }
 
-/// A queue's type, for logs (0 graphics, 2 compute, 3 copy). Titles do not
-/// release queues that hold work.
+/// An identity that is never a dangling or reused title object address.
+#[cfg(windows)]
+fn queue_key(this: This) -> usize {
+    if this.is_null() { 0 } else { queue(this).key }
+}
+
+/// A queue's type, for logs (0 graphics, 2 compute, 3 copy).
 #[cfg(windows)]
 fn kind(queue: usize) -> u32 {
-    self::queue(queue as This).kind
+    queue as u32
+}
+
+#[cfg(windows)]
+fn synchronous_boundary() -> Option<std::sync::MutexGuard<'static, ()>> {
+    let lane = prepare::Lane::get()?;
+    let ordered = lane.order();
+    lane.drain();
+    Some(ordered)
+}
+
+/// Optional aggregate call durations for CPU work outside host submission.
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+pub(crate) enum CpuPhase {
+    State,
+    Barriers,
+    ListLifecycle,
+    QueueSetup,
+    PresentSetup,
+    SubmitLock,
+    ReaperLock,
+    SubmitRetire,
+    ReaperRetire,
+    FlightFeedback,
+}
+
+#[cfg(windows)]
+static CPU_PHASE_NS: [AtomicU64; CpuPhase::FlightFeedback as usize + 1] =
+    [const { AtomicU64::new(0) }; CpuPhase::FlightFeedback as usize + 1];
+
+#[cfg(windows)]
+pub(crate) struct CpuTimer(Option<(CpuPhase, std::time::Instant)>);
+
+#[cfg(windows)]
+impl CpuTimer {
+    pub(crate) fn new(phase: CpuPhase) -> Self {
+        Self(cpu_phases_enabled().then(|| (phase, std::time::Instant::now())))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for CpuTimer {
+    fn drop(&mut self) {
+        if let Some((phase, start)) = self.0 {
+            CPU_PHASE_NS[phase as usize]
+                .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn cpu_phases_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_CPU_PHASES"))
+}
+
+#[cfg(windows)]
+pub(crate) fn log_cpu_phases(frames: f64) {
+    if !cpu_phases_enabled() {
+        return;
+    }
+    let ms = |phase: CpuPhase| {
+        CPU_PHASE_NS[phase as usize].swap(0, Ordering::Relaxed) as f64 / (1_000_000.0 * frames)
+    };
+    tracing::info!(
+        frames,
+        state_ms = ms(CpuPhase::State),
+        barriers_ms = ms(CpuPhase::Barriers),
+        lifecycle_ms = ms(CpuPhase::ListLifecycle),
+        queue_setup_ms = ms(CpuPhase::QueueSetup),
+        present_setup_ms = ms(CpuPhase::PresentSetup),
+        submit_lock_ms = ms(CpuPhase::SubmitLock),
+        reaper_lock_ms = ms(CpuPhase::ReaperLock),
+        submit_retire_ms = ms(CpuPhase::SubmitRetire),
+        reaper_retire_ms = ms(CpuPhase::ReaperRetire),
+        flight_feedback_ms = ms(CpuPhase::FlightFeedback),
+        "title CPU calls per frame"
+    );
 }
 
 /// What queues did with held work since the last presented frame.
@@ -513,6 +664,17 @@ extern "system" fn signal2_x(
 }
 /// Markers and events only matter to profilers.
 extern "system" fn marker(_: This) {}
+#[cfg(windows)]
+fn signal_host(fence: This, value: u64) {
+    if crate::host::inflight_enabled()
+        && let Some(host) = crate::host::host()
+    {
+        host.signal_title(fence, value);
+    } else {
+        crate::fence::set(fence, value);
+    }
+}
+
 /// At once, or behind the work the queue holds (its fence, and the memory
 /// the title reads it at, move only once that work has run).
 extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
@@ -521,12 +683,14 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     }
     #[cfg(windows)]
     {
+        let _ordered = synchronous_boundary();
+        let key = queue_key(this);
         let mut held = held_for(Why::Signal);
-        if held.holds_work(this as usize) {
+        if held.holds_work(key) {
             crate::fence::keep(fence);
-            held.push(this as usize, Item::Signal(fence as usize, value));
+            held.push(key, Item::Signal(fence as usize, value));
         } else {
-            crate::fence::set(fence, value);
+            signal_host(fence, value);
         }
         // Another queue may wait for this fence.
         pump(&mut held, Why::Signal);
@@ -539,18 +703,20 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     S_OK
 }
 /// The queue's later work waits until the fence reaches `value`.
-///
-/// shortcut: the fence is not kept alive while the queue waits for it;
-/// Grand Theft Auto VI makes no queue wait for a fence.
 extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
     #[cfg(windows)]
-    if crate::host::host().is_some() && crate::fence::value(fence) < value {
+    if crate::host::host().is_some() {
+        let _ordered = synchronous_boundary();
         let mut held = held_for(Why::Wait);
-        held.push(this as usize, Item::FenceWait(fence as usize, value));
-        pump(&mut held, Why::Wait);
+        let key = queue_key(this);
+        if held.holds_work(key) || crate::fence::value(fence) < value {
+            crate::fence::keep(fence);
+            held.push(key, Item::FenceWait(fence as usize, value));
+            pump(&mut held, Why::Wait);
+        }
     }
     #[cfg(not(windows))]
     let _ = (this, value);
@@ -591,9 +757,16 @@ impl Written {
             Written::SystemTimestamp => system_timestamp(),
         };
         // SAFETY: the title names writable GPU memory (unified with ours).
+        // Naturally aligned labels are also used as polled completion words.
         unsafe {
             if bytes == 4 {
-                at.cast::<u32>().write_unaligned(value as u32);
+                if at.cast::<AtomicU32>().is_aligned() {
+                    AtomicU32::from_ptr(at.cast()).store(value as u32, Ordering::Release);
+                } else {
+                    at.cast::<u32>().write_unaligned(value as u32);
+                }
+            } else if at.cast::<AtomicU64>().is_aligned() {
+                AtomicU64::from_ptr(at.cast()).store(value, Ordering::Release);
             } else {
                 at.cast::<u64>().write_unaligned(value);
             }
@@ -758,10 +931,20 @@ extern "system" fn present(
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    #[cfg(windows)]
+    let _ordered = synchronous_boundary();
     // What may run before the frame is shown does.
     // shortcut: PresentX does not wait behind work the queue still holds (it
     // shows the frame as far as it ran); the frame line names such work.
     pump_held(Why::Present);
+    #[cfg(windows)]
+    if crate::host::inflight_enabled()
+        && let Some(host) = crate::host::host()
+    {
+        host.present_boundary();
+    }
+    #[cfg(windows)]
+    let setup = CpuTimer::new(CpuPhase::PresentSetup);
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     #[cfg(windows)]
     account_frame(frame);
@@ -816,6 +999,8 @@ extern "system" fn present(
     let shown = shown_plane(&found);
     #[cfg(windows)]
     log_planes(frame, planes, &found, shown);
+    #[cfg(windows)]
+    drop(setup);
     #[cfg(windows)]
     if let Some(&resource) = found.get(shown).and_then(|p| p.first())
         && let Some(texture) = crate::resource::host_resource(resource)
@@ -934,7 +1119,9 @@ extern "system" fn copy_page_mappings(
         return E_INVALIDARG;
     }
     #[cfg(windows)]
-    if held().holds_work(this as usize) {
+    let _ordered = synchronous_boundary();
+    #[cfg(windows)]
+    if held().holds_work(queue_key(this)) {
         account().mappings += 1;
     }
     #[cfg(not(windows))]
@@ -1029,6 +1216,46 @@ static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn a_wait_and_signal_survive_the_queue_and_wait_fence_being_released() {
+        use super::*;
+
+        let null = std::ptr::null();
+        let mut queue = null;
+        let desc = QueueDesc {
+            kind: 2,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut queue), S_OK);
+
+        let mut source = null;
+        let mut finished = null;
+        for fence in [&mut source, &mut finished] {
+            assert_eq!(
+                crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], fence),
+                S_OK
+            );
+        }
+
+        assert_eq!(wait(queue, source, 1), S_OK);
+        assert_eq!(signal(queue, finished, 2), S_OK);
+        assert_eq!(crate::fence::value(finished), 0);
+        assert_eq!(object::refs(source), 2, "the pending wait owns a reference");
+        assert_eq!(release(queue), 0);
+        crate::fence::let_go(source);
+        // Keep the timer from consuming the wait's last reference to the
+        // source fence until the write is complete.
+        let mut held = held();
+        crate::fence::set(source, 1);
+        pump(&mut held, Why::Fence);
+        assert_eq!(crate::fence::value(finished), 2);
+        assert_eq!(object::refs(finished), 1);
+        crate::fence::let_go(finished);
+    }
+
     use super::*;
     use crate::object::slot;
 

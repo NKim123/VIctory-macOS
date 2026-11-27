@@ -25,6 +25,33 @@ const ORIGIN: u32 = 0;
 const TOKEN_ON_TIMEOUT: u32 = 2;
 const SIXTIETH: Duration = Duration::from_micros(16_667);
 
+/// The requested interval in milliseconds, including zero for no wait.
+pub fn interval_override_ms() -> Option<f64> {
+    static ASKED: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    *ASKED.get_or_init(|| {
+        let spec = std::env::var("VICTORY_FRAME_INTERVAL_MS").ok()?;
+        let interval = parse_interval_ms(&spec);
+        if interval.is_none() {
+            tracing::warn!(
+                spec,
+                "VICTORY_FRAME_INTERVAL_MS expects milliseconds from 0 to 1000"
+            );
+        }
+        interval
+    })
+}
+
+fn parse_interval_ms(spec: &str) -> Option<f64> {
+    spec.trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|ms| (0.0..=1000.0).contains(ms))
+}
+
+fn interval_override() -> Option<Duration> {
+    interval_override_ms().map(|ms| Duration::from_nanos((ms * 1e6).round() as u64))
+}
+
 struct Clock {
     start: Instant,
     interval: Duration,
@@ -65,6 +92,7 @@ pub(crate) extern "system" fn set_interval(
     let interval = test_interval(requested, std::env::var("VICTORY_FRAME_HZ").ok().as_deref());
     #[cfg(not(feature = "diagnostics"))]
     let interval = requested;
+    let interval = interval_override().unwrap_or(interval);
     if interval != requested {
         tracing::info!(?interval, ?requested, "frame interval override");
     } else {
@@ -132,9 +160,15 @@ fn next_tick(kind: u32, limit: Duration, now: impl FnOnce() -> Instant) -> (u64,
     let now = now();
     let c = clock.get_or_insert_with(|| Clock {
         start: now,
-        interval: SIXTIETH,
+        interval: interval_override().unwrap_or(SIXTIETH),
         first: 0,
     });
+    if c.interval.is_zero() {
+        return (
+            last(kind).fetch_add(1, Ordering::Relaxed) + 1,
+            Duration::ZERO,
+        );
+    }
     let elapsed = now.saturating_duration_since(c.start).as_nanos();
     let interval = c.interval.as_nanos().max(1);
     let tick = (c.first + (elapsed / interval) as u64).max(last(kind).load(Ordering::Relaxed) + 1);
@@ -167,7 +201,9 @@ pub(crate) extern "system" fn wait(
         std::thread::sleep(limit);
         TIMEOUT
     } else {
-        std::thread::sleep(wait);
+        if !wait.is_zero() {
+            std::thread::sleep(wait);
+        }
         S_OK
     };
     #[cfg(feature = "diagnostics")]
@@ -217,7 +253,7 @@ pub(crate) fn presented() {
 }
 
 /// Diagnostics: logs [`WAITS`] since the last call.
-#[cfg(feature = "diagnostics")]
+#[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn log() {
     let [waits, at_once, shared] = [0, 1, 2].map(|i| WAITS[i].swap(0, Ordering::Relaxed));
     tracing::info!("frame waits: {waits}, {at_once} of them ended at once; presents sharing a flip tick: {shared}");
@@ -291,6 +327,15 @@ mod tests {
                 slot.store(*saved, Ordering::Relaxed);
             }
             FRAME.store(self.frame, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn parses_the_frame_interval_setting() {
+        assert_eq!(parse_interval_ms(" 16.667 "), Some(16.667));
+        assert_eq!(parse_interval_ms("0"), Some(0.0));
+        for invalid in ["NaN", "-1", "1001", "inf", "fast"] {
+            assert_eq!(parse_interval_ms(invalid), None);
         }
     }
 

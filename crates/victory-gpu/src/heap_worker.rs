@@ -151,7 +151,7 @@ impl ReadyDrain {
         self.batches.is_empty()
     }
 
-    pub(crate) fn iter_uploads(&self) -> impl Iterator<Item = &ReadyUpload> {
+    pub(crate) fn iter_uploads(&self) -> impl Iterator<Item = &ReadyUpload> + Clone {
         self.batches.iter().flat_map(|b| b.uploads.iter())
     }
 }
@@ -590,7 +590,7 @@ fn process_heap(heap: &Heap) {
         if !copy.title_written() || copy.host_written.load(Relaxed) || copy.is_gpu_written() {
             // Host/GPU-written texture: publish slot if unmade, no CPU upload.
             if !host.texture_slot_made_from(index, handle)
-                && let Some(staging) = crate::texture::staging(resource, &copy.texture)
+                && let Some(staging) = crate::texture::staging(resource, &copy)
             {
                 batch.push(
                     ReadyUpload {
@@ -611,7 +611,7 @@ fn process_heap(heap: &Heap) {
             host.texture_slot_done(index, write);
             continue;
         }
-        let Some(staging) = crate::texture::staging(resource, &copy.texture) else {
+        let Some(staging) = crate::texture::staging(resource, &copy) else {
             host.texture_slot_later(index, write, frame, max_wait);
             continue;
         };
@@ -693,7 +693,7 @@ fn process_heap(heap: &Heap) {
         {
             continue;
         }
-        let Some(staging) = crate::texture::staging(r as This, &copy.texture) else {
+        let Some(staging) = crate::texture::staging(r as This, &copy) else {
             continue;
         };
         if !staging.maybe_changed() {

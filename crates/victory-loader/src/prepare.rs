@@ -290,10 +290,8 @@ mod tests {
         assert_eq!(dir64_relocations(&bytes, &info), vec![(0x208, 0x1123)]);
     }
 
-    /// A minimal PE32+ image whose single section sits at RVA 0xFFFF_F000
-    /// (file offset 0x200, 0x2000 bytes) and whose TLS directory is at
-    /// `directory_rva`, with an empty callback array at RVA 0xFFFF_FF00.
-    /// Parses with `ImageInfo::parse` on any host.
+    /// A minimal PE32+ image with TLS data in its single section. The
+    /// directory entry can point to that data or to an invalid RVA.
     fn synthetic_tls_image(directory_rva: u32) -> Vec<u8> {
         let mut d = vec![0u8; 0x200];
         d[..2].copy_from_slice(b"MZ");
@@ -308,7 +306,7 @@ mod tests {
         d[opt + 24..opt + 32].copy_from_slice(&0x1_8000_0000u64.to_le_bytes()); // image base
         d[opt + 32..opt + 36].copy_from_slice(&0x1000u32.to_le_bytes()); // section alignment
         d[opt + 36..opt + 40].copy_from_slice(&0x200u32.to_le_bytes()); // file alignment
-        d[opt + 56..opt + 60].copy_from_slice(&0x2000u32.to_le_bytes()); // size of image
+        d[opt + 56..opt + 60].copy_from_slice(&0x3000u32.to_le_bytes()); // size of image
         d[opt + 60..opt + 64].copy_from_slice(&0x200u32.to_le_bytes()); // size of headers
         let count = opt + layout::OPT_NUMBER_OF_RVA_AND_SIZES;
         d[count..count + 4].copy_from_slice(&16u32.to_le_bytes());
@@ -318,30 +316,31 @@ mod tests {
         let sec = opt + 240;
         d[sec..sec + 4].copy_from_slice(b".tls");
         d[sec + 8..sec + 12].copy_from_slice(&0x2000u32.to_le_bytes()); // virtual size
-        d[sec + 12..sec + 16].copy_from_slice(&0xFFFF_F000u32.to_le_bytes()); // RVA
+        d[sec + 12..sec + 16].copy_from_slice(&0x1000u32.to_le_bytes()); // RVA
         d[sec + 16..sec + 20].copy_from_slice(&0x2000u32.to_le_bytes()); // raw size
         d[sec + 20..sec + 24].copy_from_slice(&0x200u32.to_le_bytes()); // raw offset
         d[sec + 36..sec + 40].copy_from_slice(&0x4000_0040u32.to_le_bytes()); // read, data
         d.resize(0x2200, 0);
-        // The TLS directory's AddressOfCallBacks points at an empty array
-        // at RVA 0xFFFF_FF00 (image base 0x1_8000_0000).
-        let at = 0x200 + (directory_rva - 0xFFFF_F000) as usize;
-        let cb = at + layout::TLS64_ADDRESS_OF_CALLBACKS;
-        d[cb..cb + 8].copy_from_slice(&(0x1_8000_0000u64 + 0xFFFF_FF00).to_le_bytes());
-        let array = 0x200 + (0xFFFF_FF00u32 - 0xFFFF_F000) as usize;
-        d[array..array + 8].copy_from_slice(&0u64.to_le_bytes());
+        // The TLS directory at RVA 0x1000 points to an empty callback
+        // array at RVA 0x1100.
+        let field = 0x200 + layout::TLS64_ADDRESS_OF_CALLBACKS;
+        d[field..field + 8].copy_from_slice(&(0x1_8000_0000u64 + 0x1100).to_le_bytes());
         d
     }
 
     #[test]
     fn a_tls_directory_past_the_4_gib_limit_is_an_error_not_a_panic() {
+        let err = prepare(&synthetic_tls_image(0xFFFF_FFF0)).err().unwrap();
+        assert!(err.to_string().contains("TLS directory"), "{err}");
+        let prepared = prepare(&synthetic_tls_image(0x1000)).unwrap();
+        assert_ne!(prepared.info.tls.unwrap().callbacks_va, 0);
+        let tls = ImageInfo::parse(&prepared.bytes).unwrap().tls.unwrap();
+        assert_eq!(tls.callbacks_va, 0);
         // directory_rva + TLS64_ADDRESS_OF_CALLBACKS overflows u32: a panic
         // in debug builds, a wrapped RVA in release ones, before. The parse
         // now refuses a directory outside the image, so `prepare` never
         // gets to the addition.
-        let image = synthetic_tls_image(0xFFFF_FFF0);
-        assert!(ImageInfo::parse(&image).is_err());
-        assert!(prepare(&image).is_err());
+        assert!(ImageInfo::parse(&synthetic_tls_image(0xFFFF_FFF0)).is_err());
     }
 
     #[test]

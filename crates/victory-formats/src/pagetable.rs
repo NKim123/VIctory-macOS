@@ -59,6 +59,20 @@ impl Scratch {
         null: u32,
         out: &'out mut Outputs,
     ) -> Built<'scratch, 'out> {
+        self.build_with_aliases(copies, pairs, null, out, &[])
+    }
+
+    /// Gives the alias ranges precedence over ordinary copies. A range
+    /// may cover only part of copy `k`; its shader address offset still
+    /// starts at `copies[k].0`.
+    pub fn build_with_aliases<'scratch, 'out>(
+        &'scratch mut self,
+        copies: &[(u64, u64)],
+        pairs: &[u32],
+        null: u32,
+        out: &'out mut Outputs,
+        aliases: &[(usize, u64, u64)],
+    ) -> Built<'scratch, 'out> {
         self.order.clear();
         self.order.extend(0..copies.len());
         self.order.sort_by_key(|&k| std::cmp::Reverse(copies[k].1));
@@ -72,8 +86,28 @@ impl Scratch {
         owners.clear();
         owners.resize(BLOCK, None);
         let mut full = false;
-        for &k in &self.order {
+        // Reserve space for alias blocks before a set of small ordinary
+        // copies can fill the table.
+        for &(_, start, len) in aliases {
+            let Some(end) = start.checked_add(len) else {
+                continue;
+            };
+            if len == 0 || end > 1 << 40 {
+                continue;
+            }
+            for l1 in (start >> 28) as usize..=((end - 1) >> 28) as usize {
+                if self.level1[l1] == 0 && out.blocks.len() <= CAPACITY {
+                    self.level1[l1] = out.blocks.len() as u32;
+                    out.blocks.push(l1);
+                    owners.resize(owners.len() + BLOCK, None);
+                }
+            }
+        }
+        let ordinary = self.order.iter().map(|&k| {
             let (start, len) = copies[k];
+            (k, start, len)
+        });
+        for (k, start, len) in ordinary.chain(aliases.iter().copied()) {
             let Some(end) = start.checked_add(len) else {
                 continue;
             };
@@ -157,6 +191,28 @@ pub fn table(
 #[cfg(test)]
 mod tests {
     use super::{BLOCK, CAPACITY, LEVEL1, Outputs, Scratch};
+
+    #[test]
+    fn sparse_alias_takes_precedence_and_keeps_the_buffer_base() {
+        const PAGE: u64 = 1 << 16;
+        let mut table = Scratch::default();
+        let mut out = Outputs::default();
+        let base = 4 * PAGE;
+        let copies = [(base, 0), (base, 3 * PAGE)];
+        let aliases = [(0, base, PAGE), (0, base + 2 * PAGE, PAGE)];
+        let built = table.build_with_aliases(&copies, &[19, 33], 0, &mut out, &aliases);
+        let block = built.dwords[0] as usize;
+        let start = block * BLOCK + (base / PAGE) as usize;
+        assert_eq!(
+            &built.owners[start..start + 3],
+            &[Some(0), Some(1), Some(0)]
+        );
+        let first = LEVEL1 + 2 * start;
+        assert_eq!(
+            &built.dwords[first..first + 6],
+            &[19, base as u32, 33, base as u32, 19, base as u32]
+        );
+    }
 
     /// The build as it was, page by page: dwords, blocks, owners, full.
     fn page_by_page(

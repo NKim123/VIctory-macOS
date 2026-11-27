@@ -32,14 +32,18 @@
 //!   ([`Lower::read_lane_across`]);
 //! * whole-wave reductions and prefix sums: each half reduces its own lanes,
 //!   and they pass each other the result; a prefix in the upper half adds
-//!   the lower half's total ([`Lower::reduce_across`]);
+//!   the lower half's total ([`Lower::reduce_across`]). A group of one
+//!   full console wave can retry a refused reduction by restoring the
+//!   console's wave-wide mask branches, if lowering can also synchronize
+//!   any guest LDS. Both halves follow the same edges and mask their
+//!   contributions with EXEC;
 //! * `v_readfirstlane_b32` reads the host wave's first lane, which in the
 //!   upper half is console lane 32 or later: kept as it is for a value the
 //!   same in every lane of the console wave ([`lane_uniform`], what the
 //!   compiler reads first lanes for) and in a group of 32 threads or fewer
 //!   (one host wave holds the whole console wave); otherwise the lower
 //!   half's first lane ([`Lower::first_lane_across`]); refused where no
-//!   exchange can go ([`FIRST_ACROSS`]).
+//!   exchange can go ([`super::FIRST_ACROSS`]).
 //!
 //! A refusal in a value no instruction ends up needing costs nothing (the
 //! lowering retries with that value missing), so a program is refused only
@@ -89,12 +93,13 @@ impl Lower<'_> {
 
     pub(super) fn half_predication(
         x: &Parts,
+        loop_caps: &LoopCaps,
+        base_step: Vec<bool>,
         one_wave_lds: bool,
         local: &mut OwnBits,
     ) -> predicate::PredicatePlan {
-        let base_step = in_step(x.p, x.st);
         let build = |step, local: &OwnBits| {
-            predicate::PredicatePlan::build(x.p, x.st, step, one_wave_lds, x.host_wave32, local)
+            predicate::PredicatePlan::build(x, loop_caps, step, one_wave_lds, local)
         };
         if local.totals.is_empty() {
             return build(base_step, local);
@@ -296,6 +301,25 @@ impl Lower<'_> {
         self.exchange_halves(own, zero, at)
     }
 
+    /// One console wave per group: take its original scalar branch when
+    /// any lane in either half has its mask bit set.
+    pub(super) fn group_any(&mut self, mask: Bool) -> Result<V, Why> {
+        if !self.across_here() {
+            return Err("a group vote in divergent code");
+        }
+        let c = self.cur;
+        let bit = self.boolean(mask, c)?;
+        let any = self
+            .s
+            .op(c, "waveAnyTrue", Attr::NoUnwind, self.s.t.i1, 113, &[bit]);
+        self.s.flags |= flags::WAVE_OPS;
+        let own = self.s.m.cast(c, Cast::ZExt, any, self.s.t.i32);
+        let zero = self.s.m.i32(0);
+        let (lo, hi) = self.exchange_halves(own, zero, c)?;
+        let either = self.s.m.bin(c, Bin::Or, lo, hi);
+        Ok(self.s.m.cmp(c, pred::NE, either, zero))
+    }
+
     /// Group-wide logical OR of `bit` across every lane of every host wave in
     /// the threadgroup, so every host wave exits a lockstep predicated loop on
     /// the exact same iteration (never deadlocking at group barriers inside
@@ -366,7 +390,9 @@ impl Lower<'_> {
         let group: u32 = self.s.threads.map_or(0, |t| t.iter().product());
         // Two dwords per console wave, so the high dword of the last one is
         // inside even where the group has no upper half.
-        let dwords = group.div_ceil(2 * HALF) * 2;
+        let private_slots = !self.x.st.group_branches.is_empty();
+        let stride = if private_slots { HALF } else { 1 };
+        let dwords = group.div_ceil(2 * HALF) * 2 * stride;
         if self.s.lds_dwords + dwords > GROUP_SHARED_DWORDS {
             return Err("no group-shared memory left to pass values between 32-lane halves");
         }
@@ -396,15 +422,32 @@ impl Lower<'_> {
             l.s.op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
         };
         sync(self);
-        let mine = self.s.m.element(at, words, slot);
+        // When replaying the console's branch order, each lane publishes
+        // its half's result to a separate dword so the exchange has no
+        // concurrent writes to the same word. Read the first lane's slot.
+        let mine = self
+            .s
+            .m
+            .element(at, words, if private_slots { f } else { slot });
         self.s.m.store(at, mine, own);
         sync(self);
-        let lo = self.s.m.element(at, words, low);
+        let first_thread = |l: &mut Self, half| l.s.m.bin(at, Bin::Shl, half, five);
+        let lo_index = if private_slots {
+            first_thread(self, low)
+        } else {
+            low
+        };
+        let hi_index = if private_slots {
+            first_thread(self, high)
+        } else {
+            high
+        };
+        let lo = self.s.m.element(at, words, lo_index);
         let lo = self.s.m.load(at, lo);
-        let hi = self.s.m.element(at, words, high);
+        let hi = self.s.m.element(at, words, hi_index);
         let mut hi = self.s.m.load(at, hi);
         if !group.is_multiple_of(2 * HALF) {
-            let first = self.s.m.bin(at, Bin::Shl, high, five);
+            let first = first_thread(self, high);
             let n = self.s.m.i32(group);
             let there = self.s.m.cmp(at, pred::IULT, first, n);
             hi = self.s.m.select(at, there, hi, missing);
@@ -437,6 +480,10 @@ impl Lower<'_> {
         let c = self.cur;
         let (i32t, zero) = (self.s.t.i32, self.s.m.i32(0));
         self.s.flags |= flags::WAVE_OPS;
+        let active = active.filter(|&guard| {
+            super::super::shader_opt() & super::super::bitcode::opt::FIRST == 0
+                || self.s.m.int_value(guard).is_none_or(|x| x == 0)
+        });
         let Some(act) = active else {
             let own = self
                 .s
@@ -599,13 +646,8 @@ impl Lower<'_> {
     }
 }
 
-pub(super) const LDS_ACROSS: Why =
-    "LDS one console wave64 shares without barriers, on a host of 32-lane waves";
-pub(super) const REDUCTION_ACROSS: Why =
-    "a wave reduction over both 32-lane halves (wave64 on a 32-lane host)";
-/// A `v_writelane_b32` in a block the predication runs in every lane: the
-/// lane it names may be inactive there, and the merge after the block keeps
-/// that lane's old value (the console writes it whatever EXEC holds).
+/// A lane write may target a lane whose value the predicated block's merge
+/// keeps, even though the console writes it regardless of EXEC.
 pub(super) const WRITE_ACROSS: Why =
     "a lane write in a predicated block (wave64 on a 32-lane host)";
 pub(super) const READ_ACROSS: Why =
@@ -626,18 +668,9 @@ pub(super) fn uniform_selector(inst: &Inst, alike: &Set<Value>) -> bool {
     }
 }
 
-/// Why a lane mask read as data stops in halves: it is written where the
-/// lanes of the group may not all be, as often, so no group barrier can pass
-/// it between the halves.
-pub(super) const MASK_ACROSS: Why = "a lane mask read as data (wave64 on a 32-lane host)";
-
 /// The group-shared dwords a D3D12 compute program may declare, at most
 /// (32 KiB).
 const GROUP_SHARED_DWORDS: u32 = 8192;
-
-/// Why a first-lane read stops in halves: the console's first lane may be
-/// in the other half, and the value is not known to be the same there.
-pub(super) const FIRST_ACROSS: Why = "a first-lane read of a value that may differ between 32-lane halves (wave64 on a 32-lane host)";
 
 /// Every branch (by its block) with its region: the blocks reachable from
 /// it that do not post-dominate it, which only the lanes taking one side may
@@ -646,18 +679,23 @@ pub(super) const FIRST_ACROSS: Why = "a first-lane read of a value that may diff
 ///
 /// Lowering caps an unconditional back edge — a `Jump` to a block at or
 /// before the jump, by reverse postorder — with an early return at the loop
-/// iteration limit: the latch leaves the program there too. That generated
+/// iteration limit when it cannot use the loop's normal exit. That generated
 /// exit is block `n` here, a terminal exit just like a `Ret`, so a closed
 /// loop with a capped back edge does not look like it has no way out (which
 /// would make everything post-dominate its branches).
-pub(super) fn branch_regions(p: &Program, st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
-    branch_regions_with(p, &st.exits)
+pub(super) fn branch_regions(
+    p: &Program,
+    st: &Structured,
+    loop_caps: &LoopCaps,
+) -> Option<Vec<(usize, Vec<bool>)>> {
+    branch_regions_with(p, &st.exits, loop_caps)
 }
 
 /// [`branch_regions`] over an explicit `exits` slice (used by `step_and_cap_with`).
 pub(super) fn branch_regions_with(
     p: &Program,
     exits: &[LaneExit],
+    loop_caps: &LoopCaps,
 ) -> Option<Vec<(usize, Vec<bool>)>> {
     let n = exits.len();
     // Reverse postorder ranks, as lowering numbers them.
@@ -667,7 +705,8 @@ pub(super) fn branch_regions_with(
         rpo[b] = r;
     }
     let capped = |b: usize| {
-        matches!(exits[b], LaneExit::Jump(t) if rpo[b] != usize::MAX && rpo[t] <= rpo[b])
+        matches!(exits[b], LaneExit::Jump(t) if rpo[b] != usize::MAX && rpo[t] <= rpo[b]
+            && !loop_caps.checked_at_exit.contains(&t))
     };
     // Block `n` is the virtual exit of every capped latch.
     let m = n + 1;
@@ -872,11 +911,11 @@ fn uniform_entry_tids(x: &Parts) -> Vec<Value> {
 /// them (a branch on alike values does not). The analysis runs to a fixed
 /// point from nothing, so a loop-carried value that needs itself to be
 /// alike never is.
-pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
+pub(super) fn lane_uniform(x: &Parts, loop_caps: &LoopCaps) -> HashSet<Value> {
     let (p, st) = (x.p, x.st);
     let wave_tid = wave_tid(x);
     let entry_tids = uniform_entry_tids(x);
-    let regions = branch_regions(p, st);
+    let regions = branch_regions(p, st, loop_caps);
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let per_lane = |v: Value| x.res.waterfall.reads.contains(&v);
     // Scalar SSA values the same in every lane of a console wave, proven the
@@ -990,6 +1029,7 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
                     Reg::Scc => false,
                 })
             }),
+            Atom::GroupAny(_) => true,
             Atom::Lane(v) => same.contains(&v),
             _ => false,
         };
@@ -1366,15 +1406,18 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
                     }
                     continue;
                 }
-                let ops: Vec<Operand> = match &inst.fields {
+                let ops = match &inst.fields {
                     Fields::Valu(v)
                         if v.dpp.is_none()
                             && v.sdwa.is_none()
                             && !name.starts_with("v_mbcnt")
                             && !name.starts_with("v_cmpx")
+                            && !name.starts_with("v_movrel")
+                            && !name.starts_with("v_swaprel")
+                            && !name.starts_with("v_div_fmas")
                             && !name.contains("lane") =>
                     {
-                        v.src.clone()
+                        v.src.as_slice()
                     }
                     _ => continue,
                 };
@@ -1387,10 +1430,8 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
                     _ => None,
                 };
                 if !tid_aliases.is_empty() {
-                    let is_tid = |op: &Operand| {
-                        matches!(*op, Operand::Vector { reg, .. } if inst.read(Reg::V(reg)).is_some_and(|x| tid_aliases.contains(&x)))
-                    };
-                    let wave_derived = match (name, ops.as_slice()) {
+                    let is_tid = |op: &Operand| matches!(*op, Operand::Vector { reg, .. } if inst.read(Reg::V(reg)).is_some_and(|x| tid_aliases.contains(&x)));
+                    let wave_derived = match (name, ops) {
                         ("v_lshrrev_b32", [shift, src, ..])
                             if is_tid(src) && inline_u32(shift).is_some_and(|s| (s & 31) >= 6) =>
                         {
@@ -1455,15 +1496,12 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
                         | "v_bfi_b32"
                         | "v_cndmask_b32"
                 );
-                let src_regs: Vec<Reg> = ops
-                    .iter()
-                    .flat_map(|op| match *op {
-                        Operand::Vector { reg, dwords } => {
-                            (0..dwords).map(move |k| Reg::V(reg + k)).collect::<Vec<_>>()
-                        }
-                        _ => Vec::new(),
+                let source_vgpr = |r: Reg| {
+                    ops.iter().any(|op| {
+                        matches!((*op, r), (Operand::Vector { reg, dwords }, Reg::V(v))
+                            if v.checked_sub(reg).is_some_and(|offset| offset < dwords))
                     })
-                    .collect();
+                };
                 // The select mask of a `v_cndmask_b32` or the carry-in of a
                 // `*_co_ci_u32` (the third source) is a 64-bit lane mask read
                 // per lane: bit `lane_id` of it, not the mask as one value.
@@ -1474,34 +1512,27 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
                 };
                 let guarded = st.guards[b][i].is_some();
                 let alike = ops.iter().all(|op| match *op {
-                    Operand::Vector { reg, .. } => {
-                        // every dword the instruction reads from that register on
-                        let read: Vec<Value> = inst
-                            .reads
-                            .iter()
-                            .filter(|r| matches!(r.0, Reg::V(x) if x >= reg))
-                            .map(|r| r.1)
-                            .collect();
-                        !read.is_empty() && read.iter().all(|x| known(&next, x))
-                    }
-                    // A scalar operand needs positive proof of uniformity
-                    // ([`same_s`]): an unproven read (an `s_load_dword`'s
-                    // result, a waterfall dword) is unknown. A lane mask is
-                    // not one value per lane, unless a compare of alike
-                    // values made it. EXEC is the mask the guard tests.
-                    Operand::Scalar { code, .. } if code != NULL => {
+                    Operand::Vector { reg, dwords } => (0..dwords).all(|i| {
+                        reg.checked_add(i)
+                            .and_then(|r| inst.read(Reg::V(r)))
+                            .is_some_and(|v| known(&next, &v))
+                    }),
+                    Operand::Scalar { code, dwords } if code != NULL => (0..dwords).all(|i| {
+                        let Some(code) = code.checked_add(i) else {
+                            return false;
+                        };
                         if code == EXEC || code == EXEC + 1 {
-                            true
-                        } else {
-                            inst.read(Reg::S(code)).is_none_or(|x| {
-                                if is_mask(x) {
-                                    known(&next, &x)
-                                } else {
-                                    !per_lane(x) && known_s(&next_s, &x)
-                                }
-                            })
+                            return true;
                         }
-                    }
+                        inst.read(Reg::S(code)).is_some_and(|v| {
+                            if is_mask(v) {
+                                known(&next, &v)
+                            } else {
+                                !per_lane(v) && known_s(&next_s, &v)
+                            }
+                        })
+                    }),
+                    Operand::Const(251..=254) | Operand::Attr { .. } => false,
                     _ => true,
                 }) && mask_op.is_none_or(|op| {
                     // The mask's per-lane bit must be the same in every lane,
@@ -1518,7 +1549,7 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
                         if full_overwrite
                             && !guarded
                             && inst.write(*r).is_some()
-                            && !src_regs.contains(r) =>
+                            && !source_vgpr(*r) =>
                     {
                         true
                     }
@@ -1568,7 +1599,7 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
                         Reg::V(_)
                             if full_overwrite
                                 && inst.write(*r).is_some()
-                                && !src_regs.contains(r) =>
+                                && !source_vgpr(*r) =>
                         {
                             true
                         }

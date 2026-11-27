@@ -1,6 +1,8 @@
 use std::path::Path;
 
-use anyhow::{Context, Result};
+#[cfg(windows)]
+use anyhow::Context;
+use anyhow::Result;
 
 use crate::{Console, Unimplemented};
 
@@ -75,9 +77,14 @@ pub fn run(
         }
         None => println!("build          unknown ({hash})"),
     }
+    const SERIES_1021_HASH: &str =
+        "b99f876b74d4a77f03af5f878223b27bd647b5c35a79d5decd9f716504239e93";
     // Rosetta cannot resume these when they fault partway (#14, #50).
     let masked = victory_loader::masked::masked_stores(&prepared.info, &original);
-    println!("masked stores  {}", victory_loader::masked::summary(&masked));
+    println!(
+        "masked stores  {}",
+        victory_loader::masked::summary(&masked)
+    );
     // Under Rosetta, tracking is off unless asked for, and the stores it
     // cannot resume are patched when it is on (`victory_gpu::fault_tracking`).
     println!(
@@ -98,19 +105,30 @@ pub fn run(
     // a few loops (#144). Their offsets are specific to Series 1.0.2.1, so
     // they are added here only for that build, and an explicit
     // `VICTORY_PATCH_MASKED` always wins.
-    if needs_patch
-        && requested.is_none()
-        && hash.as_str() == "b99f876b74d4a77f03af5f878223b27bd647b5c35a79d5decd9f716504239e93"
-    {
-        requested = Some("all,1e09b31,1e09b37,259509f,25950a5,1e759f0,1e759f7,1e759fe,1e75a05".into());
+    if needs_patch && requested.is_none() && hash.as_str() == SERIES_1021_HASH {
+        requested =
+            Some("all,1e09b31,1e09b37,259509f,25950a5,1e759f0,1e759f7,1e759fe,1e75a05".into());
     }
     let patching = victory_loader::masked::choice(requested, needs_patch);
     let original = patching.is_some().then_some(original);
 
     let images = cfg.cache_subdir("images")?;
+    cfg.cache_subdir("pipelines")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+    if execute && std::env::var_os("VICTORY_PIPELINE_BOOK").is_some_and(|v| v == "1") {
+        victory_gpu::pipeline::record_pipelines(cfg.cache_subdir(crate::warm::RECORDS)?);
+    }
+    #[cfg(target_arch = "x86_64")]
+    let amd_patches = execute.then(|| victory_loader::amd_patch::Patches::from_env(&prepared));
     let image = victory_loader::load(&prepared, &images)?;
-    // Mapped: the patched bytes (the exe's size, 114 MB) are not needed.
+    // Retain the prepared bytes after mapping only when write sites need them.
+    #[cfg(target_arch = "x86_64")]
+    let prepared = (execute
+        && victory_gpu::fault_tracking()
+        && (std::env::var_os("VICTORY_WRITE_SITES").is_some()
+            || std::env::var_os("VICTORY_WRITE_SITES_RECORD").is_some()))
+    .then_some(prepared);
+    #[cfg(not(target_arch = "x86_64"))]
     drop(prepared);
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
@@ -164,7 +182,28 @@ pub fn run(
     if execute {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped and nothing of it has run yet.
-        unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+        unsafe {
+            victory_loader::resolution::apply_asked(
+                image.base(),
+                size,
+                matches!(console, Console::SeriesS),
+            )
+        };
+    }
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    if execute && let Some(ms) = victory_gpu::frame::interval_override_ms() {
+        use victory_loader::frame_rate::{apply, title_rate};
+        let title_fps = std::env::var("VICTORY_TITLE_FPS").ok();
+        if let Some(rate) = title_rate(ms, title_fps.as_deref()) {
+            if hash.as_str() == SERIES_1021_HASH {
+                let size = image.info().size_of_image as usize;
+                // SAFETY: the main image stays mapped and its code has yet to run.
+                let patched = unsafe { apply(image.base(), size, rate) };
+                println!("frame interval {ms} ms, title rate {rate}: {patched:?}");
+            } else {
+                println!("frame interval {ms} ms, unknown title build for the rate patch");
+            }
+        }
     }
     // Masked stores redone as plain stores Rosetta can resume, so fault
     // tracking (`VICTORY_FAULT_TRACKING=1`) can run under Rosetta (#50).
@@ -174,16 +213,64 @@ pub fn run(
             victory_loader::masked::patch(image.base() as u64, image.info(), &original, &wanted);
         println!("masked stores  {n} patched to plain stores");
     }
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    let mut descriptor_windows = Vec::new();
+    #[cfg(all(windows, not(target_arch = "x86_64")))]
+    let descriptor_windows = [];
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    if execute && victory_gpu::port_descriptors::on() {
+        use victory_loader::descriptor_sites::{SITES, apply};
+        // The offsets and surrounding instruction bytes belong to this build.
+        if hash.as_str() == SERIES_1021_HASH {
+            // SAFETY: the image stays mapped and its code has yet to run.
+            descriptor_windows = unsafe {
+                apply(
+                    image.base(),
+                    image.info().size_of_image as usize,
+                    victory_gpu::port_descriptors::marks_address(),
+                )
+            }?;
+            if descriptor_windows.len() == SITES.len() {
+                victory_gpu::port_descriptors::enable();
+            }
+        }
+        println!(
+            "descriptor stores {} of {} patched",
+            descriptor_windows.len(),
+            SITES.len()
+        );
+    }
     // Every other 256-bit store of the title split into 128-bit halves, from
     // a list made offline (`cargo xtask wide-stores`): Rosetta cannot resume
     // one that faults in its second page.
     #[cfg(windows)]
     if let Some(list) = std::env::var_os("VICTORY_PATCH_WIDE").filter(|v| !v.is_empty() && v != "0")
     {
-        let (n, refused) =
-            victory_loader::wide::patch(image.base() as u64, std::path::Path::new(&list));
+        let (n, refused) = victory_loader::wide::patch_except(
+            image.base() as u64,
+            std::path::Path::new(&list),
+            &descriptor_windows,
+        );
         println!("wide stores    {n} split into 128-bit halves ({refused} refused)");
     }
+    #[cfg(target_arch = "x86_64")]
+    if let Some(patches) = amd_patches {
+        // SAFETY: this is the main image, and no title code has run.
+        unsafe { patches.apply(&image) }?;
+    }
+    #[cfg(target_arch = "x86_64")]
+    let _write_sites = if let Some(prepared) = prepared {
+        let (guards, shift) = victory_gpu::write_site_guards();
+        // SAFETY: the main image stays mapped and title threads have yet to start.
+        let session =
+            unsafe { victory_loader::write_sites::start(&image, &prepared, guards, shift) }?;
+        if session.is_some() {
+            victory_gpu::observe_write_sites(victory_loader::write_sites::observe);
+        }
+        session
+    } else {
+        None
+    };
     let resolver = HleResolver::new(if strict {
         HostPolicy::none()
     } else {

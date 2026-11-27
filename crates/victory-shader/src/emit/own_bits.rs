@@ -1203,6 +1203,7 @@ mod tests {
                         atomic_locks: false,
                         atomic_lock_rounds: false,
                         atomic_umax: false,
+                        atomic_early_exit: false,
                         bias_as_gradients: false,
                         narrow_waves: true,
                         uav_size_level0: false,
@@ -1210,6 +1211,7 @@ mod tests {
                         host_wave32: true,
                     },
                     None,
+                    false,
                     false,
                     false,
                 )
