@@ -316,6 +316,10 @@ impl Submission {
         !self.flights.is_empty()
     }
 
+    pub(super) fn first_flight(&self) -> Option<u64> {
+        self.flights.front().map(|flight| flight.value)
+    }
+
     pub(super) fn has_bottom_writes(&self) -> bool {
         self.flights.iter().any(|f| !f.writes.is_empty())
     }
@@ -830,7 +834,7 @@ impl Host {
                 fence: fence as usize,
                 value,
             });
-            self.wake_reaper();
+            self.wake_reaper(s.first_flight().expect("pending title signal"));
         } else {
             crate::fence::set(fence, value);
         }
@@ -861,18 +865,25 @@ impl Host {
         false
     }
 
-    pub(super) fn wake_reaper(&'static self) {
+    pub(super) fn wake_reaper(&'static self, first: u64) {
         let sender = self.reaper.get_or_init(|| {
-            let (sender, receiver) = std::sync::mpsc::sync_channel::<()>(1);
+            let (sender, receiver) = std::sync::mpsc::sync_channel::<u64>(1);
             let worker = std::thread::Builder::new().name("victory GPU completion".into());
             worker
                 .spawn(move || {
                     // SAFETY: an auto-reset event private to this process-lifetime
                     // worker. Synchronous waits use the host's separate event.
                     let event = unsafe { CreateEventW(None, false, false, None) };
-                    while receiver.recv().is_ok() {
+                    while let Ok(mut next) = receiver.recv() {
                         loop {
-                            let (published, next) = {
+                            // Past hints are harmless. The fence is monotonic
+                            // and retirement always checks the current front.
+                            if let Ok(event) = event {
+                                self.wait_for_submission_event(next, event);
+                            } else {
+                                poll_fence(&self.fence, next);
+                            }
+                            let (published, front) = {
                                 let lock =
                                     crate::queue::CpuTimer::new(crate::queue::CpuPhase::ReaperLock);
                                 let mut s =
@@ -883,21 +894,15 @@ impl Host {
                                     crate::queue::CpuPhase::ReaperRetire,
                                 );
                                 let published = self.retire_inflight(&mut s);
-                                (published, s.flights.front().map(|f| f.value))
+                                (published, s.first_flight())
                             };
                             if published {
                                 crate::queue::pump_held_if_free(crate::queue::Why::Fence);
                             }
-                            let Some(next) = next else {
+                            let Some(front) = front else {
                                 break;
                             };
-                            // Never wait for the native fence with the submission lock.
-                            // Retirement checks for removal after the wait.
-                            if let Ok(event) = event {
-                                self.wait_for_submission_event(next, event);
-                            } else {
-                                poll_fence(&self.fence, next);
-                            }
+                            next = front;
                         }
                     }
                 })
@@ -908,14 +913,14 @@ impl Host {
                 });
             sender
         });
-        if let Err(TrySendError::Disconnected(())) = sender.try_send(()) {
+        if let Err(TrySendError::Disconnected(_)) = sender.try_send(first) {
             fail(format_args!("GPU completion worker stopped"));
         }
     }
 }
 
 /// The completion worker is unique to the process host.
-pub(super) type Reaper = OnceLock<SyncSender<()>>;
+pub(super) type Reaper = OnceLock<SyncSender<u64>>;
 
 #[cfg(test)]
 mod tests;

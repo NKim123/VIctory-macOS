@@ -2309,10 +2309,10 @@ impl Host {
             inflight_enabled().then_some(owned),
             Boundary::Synchronous,
         );
-        if queued {
-            self.wake_reaper();
+        if let Some(first) = queued {
+            self.wake_reaper(first);
         }
-        queued
+        queued.is_some()
     }
 
     fn execute_lists(
@@ -2320,7 +2320,7 @@ impl Host {
         runs: &[&HostList],
         owned: Option<&[Arc<HostList>]>,
         boundary: Boundary,
-    ) -> bool {
+    ) -> Option<u64> {
         // A last title pin can destroy a resource. Drop it outside the lock.
         let mut pending_pins = Vec::new();
         let lock = crate::queue::CpuTimer::new(crate::queue::CpuPhase::SubmitLock);
@@ -2335,14 +2335,14 @@ impl Host {
             owned,
             boundary,
         );
-        let busy = submitted.busy();
+        let first = submitted.first_flight();
         drop((holding, submitted));
         #[cfg(feature = "diagnostics")]
         if let Some((sub, targets)) = capture {
             crate::capture::dump_submission(sub, &targets);
         }
         let _ = capture;
-        busy
+        first
     }
 
     /// Runs consecutive self-contained parts under one submission lock.
