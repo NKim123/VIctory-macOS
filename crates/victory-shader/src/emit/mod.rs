@@ -834,7 +834,7 @@ pub fn emit_with(
         // narrow waves, lowering must also be able to synchronize guest LDS.
         if matches!(
             *what,
-            lower::REDUCTION_ACROSS | lower::FIRST_ACROSS | lower::MASK_ACROSS
+            lower::REDUCTION_ACROSS | lower::FIRST_ACROSS | lower::MASK_ACROSS | lower::LDS_ACROSS
         ) && matches!(native.io, crate::native::StageIo::Cs(cs)
                 if cs.threads.iter().product::<u32>() == 64
                     && (cs.lds_bytes() == 0 || options.narrow_waves))
@@ -1330,6 +1330,32 @@ mod tests {
     #[test]
     fn group_retry_materializes_the_mask_as_data() {
         translate_group_with_mask_as_data(45).expect("both halves reach the mask's definition");
+    }
+
+    pub(super) fn translate_group_with_loop_mask(
+        lane: u8,
+        keep: u8,
+    ) -> Result<HostShader, ShaderError> {
+        translate_group_with_uav(&[
+            0xBE94_047E,                   // s_mov_b64 s[20:21], exec
+            0xBE8A_0380,                   // s_mov_b32 s10, 0
+            0xBE8F_03A5,                   // s_mov_b32 s15, 37
+            0x7DA4_0080 + u32::from(lane), // v_cmpx_eq_u32 exec, lane, v0
+            0xBF88_0007,                   // s_cbranch_execz restore
+            0xBE8F_147E,                   // loop: s_ff1_i32_b64 s15, exec
+            0xBF06_800A,                   // s_cmp_eq_u32 s10, 0
+            0xBF84_0001,                   // s_cbranch_scc0 latch
+            0x7DA4_0080 + u32::from(keep), // v_cmpx_eq_u32 exec, keep, v0
+            0x810A_810A,                   // latch: s_add_i32 s10, s10, 1
+            0xBF06_830A,                   // s_cmp_eq_u32 s10, 3
+            0xBF84_FFF9,                   // s_cbranch_scc0 loop
+            0xBEFE_0414,                   // restore: s_mov_b64 exec, s[20:21]
+        ])
+    }
+
+    #[test]
+    fn group_retry_carries_a_mask_between_iterations() {
+        translate_group_with_loop_mask(45, 5).expect("the back edge carries EXEC");
     }
 
     #[test]

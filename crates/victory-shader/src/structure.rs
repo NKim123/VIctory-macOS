@@ -559,6 +559,8 @@ struct Lanes<'a> {
     scc_lane: Map<Value, Bool>,
     /// Joins resolved to a constant, to check once all edges are known.
     joins: Vec<Join>,
+    /// Incoming values of mask phis that need a value on every edge.
+    mask_phi_args: Vec<Key>,
     /// Per block: what a lane knows on entry, over forward edges only.
     first: Vec<Bool>,
     /// Per block ending in a branch: when a lane takes it.
@@ -637,6 +639,7 @@ impl<'a> Lanes<'a> {
             other: Map::default(),
             scc_lane: Map::default(),
             joins: Vec::new(),
+            mask_phi_args: Vec::new(),
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
             vote_across_group: false,
@@ -717,6 +720,7 @@ impl<'a> Lanes<'a> {
         self.other.clear();
         self.scc_lane.clear();
         self.joins.clear();
+        self.mask_phi_args.clear();
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
         self.group_branches.clear();
@@ -824,12 +828,19 @@ impl<'a> Lanes<'a> {
         }
     }
 
-    /// Joins whose constant fails on some edge, given what lanes know.
+    /// Resolve late incoming masks and find joins whose constant fails on
+    /// some edge, given what lanes know.
     fn wrong_joins(&mut self, cond: &[Bool]) -> Vec<Value> {
         let mut wrong = Vec::new();
         let mut j = 0;
         // Checking an argument can resolve another join; it is checked too.
-        while j < self.joins.len() {
+        loop {
+            while let Some(arg) = self.mask_phi_args.pop() {
+                self.mask(arg);
+            }
+            if j == self.joins.len() {
+                break;
+            }
             let (block, id, value) = (self.joins[j].block, self.joins[j].id, self.joins[j].value);
             for (n, a) in self.joins[j].args.clone().into_iter().enumerate() {
                 let (q, taken) = self.incoming[block][n];
@@ -1064,6 +1075,11 @@ impl<'a> Lanes<'a> {
             }
         }
         let born = self.index[block];
+        if self.vote_across_group {
+            // Kept wave-wide branches can leave inactive lanes in the loop.
+            // Resolve backedge masks even if no later instruction reads them.
+            self.mask_phi_args.extend(args);
+        }
         Some((self.b.atom(Atom::Phi(id), born), derived))
     }
 
@@ -1515,6 +1531,39 @@ mod tests {
 
     /// `exp null done vm`: a pixel program's end with no color output.
     const EXP_NULL_DONE: [u32; 2] = [0xF800_1890, 0x0000_0000];
+
+    #[test]
+    fn group_branches_track_exec_through_an_unused_backedge() {
+        let p = build(
+            &[
+                0xBE8A_0380, // s_mov_b32 s10, 0
+                0x7E02_020A, // loop: v_mov_b32 v1, s10
+                0xBF06_800A, // s_cmp_eq_u32 s10, 0
+                0xBF84_0001, // s_cbranch_scc0 latch
+                0x7DA4_0081, // v_cmpx_eq_u32 exec, 1, v0
+                0x810A_810A, // latch: s_add_i32 s10, s10, 1
+                0xBF06_830A, // s_cmp_eq_u32 s10, 3
+                0xBF84_FFF9, // s_cbranch_scc0 loop
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = with_group_branches(&p).unwrap();
+        let header = &p.blocks[1];
+        let exec = header
+            .phis
+            .iter()
+            .find(|phi| phi.reg == Reg::S(EXEC))
+            .unwrap();
+        assert!(
+            s.bools
+                .support(s.masks[&exec.value])
+                .contains(&Atom::Phi(exec.value))
+        );
+        for arg in &exec.args {
+            assert!(s.masks.contains_key(arg), "missing incoming EXEC {arg:?}");
+        }
+    }
 
     /// A loop that leaves through `s_andn2 X, X, exec` and its SCC to a
     /// program end with no output (a pixel program that only writes

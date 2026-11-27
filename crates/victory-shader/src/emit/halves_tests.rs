@@ -765,6 +765,22 @@ fn whole_group_materializes_a_mask_inside_an_exec_branch() {
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
+#[test]
+fn whole_group_reads_exec_after_a_loop_back_edge() {
+    let mut failed = Vec::new();
+    for (lane, keep, expected) in [(45, 45, 45), (5, 5, 5), (45, 5, u32::MAX), (64, 5, 37)] {
+        let host = super::tests::translate_group_with_loop_mask(lane, keep)
+            .expect("the back edge carries the original or narrowed EXEC mask");
+        failed.extend(check_differences(
+            &[("loop mask", host)],
+            64,
+            1,
+            &[expected; 64],
+        ));
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
 /// What the console gives [`reduction`] of `f` (folding the inputs of a
 /// console wave's lanes) in lane `l` of a group of `threads`.
 fn console_reduction(
