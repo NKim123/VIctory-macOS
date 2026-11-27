@@ -544,7 +544,7 @@ fn reserved_texture_tier_two_probe() {
 
 #[test]
 fn placed_srv_uploads_only_its_backed_mips() {
-    use crate::backend::HostGpu;
+    use crate::backend::{HostGpu, HostMemory};
     use crate::descriptor::View;
 
     let Some(host) =
@@ -603,7 +603,13 @@ fn placed_srv_uploads_only_its_backed_mips() {
     let list = host.new_list().unwrap();
     let mut reads = Vec::new();
     for (copy, staging) in [(&coarse, &coarse_staging), (&fine, &fine_staging)] {
-        let upload = staging.refresh().expect("available title mip bytes");
+        let crate::texture::WorkerRefresh::Uploaded { upload, .. } =
+            staging.refresh_for_worker(&mut |sz| {
+                host.upload_buffer(sz).map(|(b, p)| (b, 0, p))
+            })
+        else {
+            panic!("available title mip bytes");
+        };
         assert_eq!(upload.2.len(), (10 - copy.first_mip()) as usize);
         eprintln!(
             "SPARSE production: mip {}, {} upload bytes, {} tiles",
