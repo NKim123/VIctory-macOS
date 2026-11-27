@@ -2046,32 +2046,37 @@ impl Host {
     /// wake-up: the fence's completed value decides. Under D3DMetal a
     /// submission's work can finish without its event ever being set
     /// (#50: the title's main thread slept for good in this wait while the
-    /// queue was idle), so the wait periodically checks the fence itself. A late event left set by an earlier wait cannot end a later
-    /// wait early, as the fence is checked after every wake-up too.
-    fn wait_for(&self, value: u64, event: HANDLE) -> bool {
-        use std::sync::atomic::AtomicU64;
+    /// queue was idle), so the wait periodically checks the fence itself.
+    /// A late event from an earlier wait cannot end a later wait early.
+    fn wait_for(fence: &ID3D12Fence, value: u64, event: HANDLE) -> bool {
+        use windows::Win32::Foundation::{WAIT_FAILED, WAIT_TIMEOUT};
         static MISSED: AtomicU64 = AtomicU64::new(0);
         let started = Instant::now();
-        let interval = if inflight_enabled() { 2 } else { 1000 };
+        const FIRST_MS: u32 = 2;
+        const MAX_MS: u32 = 8;
+        let mut interval = FIRST_MS;
         let mut seconds = 0;
         loop {
             // SAFETY: our event and fence.
             let woke = unsafe { WaitForSingleObject(event, interval) };
-            if woke == windows::Win32::Foundation::WAIT_FAILED {
-                return poll_fence(&self.fence, value);
+            if woke == WAIT_FAILED {
+                return poll_fence(fence, value);
             }
             // SAFETY: as above.
-            let completed = unsafe { self.fence.GetCompletedValue() };
+            let completed = unsafe { fence.GetCompletedValue() };
             if completed == u64::MAX {
                 return false;
             }
             if completed >= value {
-                if woke != windows::Win32::Foundation::WAIT_OBJECT_0
-                    && started.elapsed().as_secs() != 0
-                {
+                if woke == WAIT_TIMEOUT {
                     let n = MISSED.fetch_add(1, Ordering::Relaxed) + 1;
                     if n.is_power_of_two() {
-                        tracing::warn!(n, value, completed, "a host submission finished without setting its event; went on after checking the fence");
+                        tracing::warn!(
+                            n,
+                            value,
+                            completed,
+                            "a host submission completed without an event wake; found completion by polling the fence"
+                        );
                     }
                 }
                 return true;
@@ -2087,6 +2092,11 @@ impl Host {
                     tracing::error!(%what, value, "host GPU hang: the submission waited on");
                 }
             }
+            interval = if woke == WAIT_TIMEOUT {
+                (interval * 2).min(MAX_MS)
+            } else {
+                FIRST_MS
+            };
         }
     }
 
@@ -2196,6 +2206,14 @@ impl Host {
     }
 
     fn wait_for_submission(&self, value: u64) -> bool {
+        #[cfg(feature = "diagnostics")]
+        if tracing::enabled!(target: "victory_gpu::host::fence", tracing::Level::TRACE) {
+            let started = Instant::now();
+            let waited = self.wait_for_submission_event(value, self.event);
+            tracing::trace!(target: "victory_gpu::host::fence", value,
+                wait_us = started.elapsed().as_micros() as u64, "host fence wait");
+            return waited;
+        }
         self.wait_for_submission_event(value, self.event)
     }
 
@@ -2213,7 +2231,7 @@ impl Host {
                 return poll_fence(&self.fence, value);
             }
         }
-        self.wait_for(value, event)
+        Self::wait_for(&self.fence, value, event)
     }
 
     #[cfg(feature = "diagnostics")]
@@ -7463,6 +7481,27 @@ mod marks {
             host.queue().Signal(&fence, 1).unwrap();
             assert!(super::poll_fence(&fence, 1));
             assert_eq!(fence.GetCompletedValue(), 1);
+        }
+    }
+
+    #[test]
+    fn an_unsignalled_event_does_not_hold_a_completed_fence() {
+        use std::time::{Duration, Instant};
+        use windows::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+        use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+
+        let Some(host) = super::host() else { return };
+        // SAFETY: a private fence and auto-reset event. No call registers a wake.
+        unsafe {
+            let fence: ID3D12Fence = host.device.CreateFence(1, D3D12_FENCE_FLAG_NONE).unwrap();
+            let event = CreateEventW(None, false, false, None).unwrap();
+            let started = Instant::now();
+            let complete = super::Host::wait_for(&fence, 1, event);
+            let elapsed = started.elapsed();
+            let unsignalled = WaitForSingleObject(event, 0) == WAIT_TIMEOUT;
+            CloseHandle(event).unwrap();
+            assert!(complete && unsignalled);
+            assert!(elapsed < Duration::from_millis(10), "poll took {elapsed:?}");
         }
     }
 

@@ -1898,43 +1898,604 @@ pub(crate) fn take_counts() -> (u64, u64) {
     (DRAWS.swap(0, Relaxed), DISPATCHES.swap(0, Relaxed))
 }
 
+#[cfg(windows)]
+mod enhanced {
+    use super::This;
+    use crate::{host::HostList, resource::HostTexture, shadow::Shadow};
+    use std::sync::{Arc, OnceLock};
+    use windows::Win32::Graphics::Direct3D12::*;
 
-/// The enhanced barriers `(group count, groups)`: buffer, texture and
-/// global barriers with layouts instead of states. Every host use of a
-/// title texture (clears, copies) moves its host copy to the state it needs
-/// first, so only their ordering matters: one barrier on every shader
-/// write (the title's buffer barriers order compute passes).
-extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+    #[repr(C)]
+    pub(super) struct Group {
+        pub(super) kind: D3D12_BARRIER_TYPE,
+        pub(super) count: u32,
+        pub(super) entries: *const u8,
+    }
+
+    #[repr(C)]
+    pub(super) struct Buffer {
+        pub(super) scope: D3D12_GLOBAL_BARRIER,
+        pub(super) resource: This,
+        pub(super) offset: u64,
+        pub(super) size: u64,
+    }
+
+    #[repr(C)]
+    pub(super) struct Texture {
+        pub(super) scope: D3D12_GLOBAL_BARRIER,
+        pub(super) before: D3D12_BARRIER_LAYOUT,
+        pub(super) after: D3D12_BARRIER_LAYOUT,
+        pub(super) resource: This,
+        pub(super) range: D3D12_BARRIER_SUBRESOURCE_RANGE,
+        pub(super) flags: D3D12_TEXTURE_BARRIER_FLAGS,
+    }
+
+    const _: () = {
+        assert!(size_of::<Group>() == 16 && size_of::<Group>() == size_of::<D3D12_BARRIER_GROUP>());
+        assert!(
+            size_of::<Buffer>() == 40 && size_of::<Buffer>() == size_of::<D3D12_BUFFER_BARRIER>()
+        );
+        assert!(
+            size_of::<Texture>() == 64
+                && size_of::<Texture>() == size_of::<D3D12_TEXTURE_BARRIER>()
+        );
+        assert!(size_of::<D3D12_GLOBAL_BARRIER>() == 16);
+    };
+
+    pub(super) fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| crate::switch::on("VICTORY_SCOPED_BARRIERS"))
+    }
+
+    fn reads_only(access: D3D12_BARRIER_ACCESS) -> bool {
+        const READS: i32 = D3D12_BARRIER_ACCESS_VERTEX_BUFFER.0
+            | D3D12_BARRIER_ACCESS_CONSTANT_BUFFER.0
+            | D3D12_BARRIER_ACCESS_INDEX_BUFFER.0
+            | D3D12_BARRIER_ACCESS_DEPTH_STENCIL_READ.0
+            | D3D12_BARRIER_ACCESS_SHADER_RESOURCE.0
+            | D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT.0
+            | D3D12_BARRIER_ACCESS_COPY_SOURCE.0
+            | D3D12_BARRIER_ACCESS_RESOLVE_SOURCE.0
+            | D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_READ.0
+            | D3D12_BARRIER_ACCESS_SHADING_RATE_SOURCE.0;
+        access.0 != 0 && access.0 & !READS == 0
+    }
+
+    fn independent(scope: &D3D12_GLOBAL_BARRIER) -> bool {
+        let unused = |sync, access| {
+            sync == D3D12_BARRIER_SYNC_NONE && access == D3D12_BARRIER_ACCESS_NO_ACCESS
+        };
+        unused(scope.SyncBefore, scope.AccessBefore)
+            || unused(scope.SyncAfter, scope.AccessAfter) && reads_only(scope.AccessBefore)
+            || reads_only(scope.AccessBefore) && reads_only(scope.AccessAfter)
+    }
+
+    fn split(scope: &D3D12_GLOBAL_BARRIER) -> bool {
+        (scope.SyncBefore | scope.SyncAfter).contains(D3D12_BARRIER_SYNC_SPLIT)
+    }
+
+    fn layout_state(layout: D3D12_BARRIER_LAYOUT) -> Option<u32> {
+        let state = match layout {
+            D3D12_BARRIER_LAYOUT_RENDER_TARGET => D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE => D3D12_RESOURCE_STATE_DEPTH_WRITE,
+            D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_READ => D3D12_RESOURCE_STATE_DEPTH_READ,
+            D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS
+            | D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_UNORDERED_ACCESS
+            | D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_UNORDERED_ACCESS => {
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+            }
+            D3D12_BARRIER_LAYOUT_SHADER_RESOURCE
+            | D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_SHADER_RESOURCE
+            | D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_SHADER_RESOURCE => {
+                D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE
+            }
+            D3D12_BARRIER_LAYOUT_COPY_SOURCE
+            | D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_COPY_SOURCE
+            | D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COPY_SOURCE => D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_BARRIER_LAYOUT_COPY_DEST
+            | D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_COPY_DEST
+            | D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COPY_DEST => D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_BARRIER_LAYOUT_RESOLVE_SOURCE => D3D12_RESOURCE_STATE_RESOLVE_SOURCE,
+            D3D12_BARRIER_LAYOUT_RESOLVE_DEST => D3D12_RESOURCE_STATE_RESOLVE_DEST,
+            _ => return None,
+        };
+        Some(state.0 as u32)
+    }
+
+    enum TextureOp {
+        Move(Arc<HostTexture>, u32),
+        Uav(Arc<HostTexture>),
+    }
+
+    fn plan_texture(list: &HostList, entry: &Texture, ops: &mut Vec<TextureOp>) -> Option<()> {
+        if split(&entry.scope) {
+            return None;
+        }
+        if independent(&entry.scope) {
+            // The actual use still selects the tracked legacy layout, including
+            // when a read-only transition changes the title's layout.
+            return Some(());
+        }
+        if entry.flags != D3D12_TEXTURE_BARRIER_FLAG_NONE
+            || entry.scope.AccessBefore == D3D12_BARRIER_ACCESS_NO_ACCESS
+            || entry.scope.AccessAfter == D3D12_BARRIER_ACCESS_NO_ACCESS
+            || !crate::resource::is_resource(entry.resource)
+        {
+            return None;
+        }
+        let copy = crate::resource::made_copy(entry.resource)?;
+        if copy.evicted.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32;
+        let before = layout_state(entry.before)?;
+        let after = layout_state(entry.after)?;
+        let uav_writer = entry.scope.AccessBefore == D3D12_BARRIER_ACCESS_UNORDERED_ACCESS;
+        if let Some(Some(twin)) = copy.twin.get() {
+            // Actual uses update which side of a depth twin is newer. Only
+            // same-side UAV dependencies can be resolved here without copying.
+            if before != uav || after != uav || !uav_writer {
+                return None;
+            }
+            ops.extend(twin.planes.iter().cloned().map(TextureOp::Uav));
+        } else if before != after
+            && entry.range.IndexOrFirstMipLevel == u32::MAX
+            && list.recorded_texture_state(&copy) == Some(before)
+            && copy.legal_state(after) == after
+        {
+            ops.push(TextureOp::Move(copy, after));
+        } else if uav_writer && copy.legal_state(uav) == uav {
+            // The legacy tracker uses whole resources. Scope the dependency
+            // to this texture and leave a partial layout change to actual uses.
+            ops.push(TextureOp::Uav(copy));
+        } else {
+            return None;
+        }
+        Some(())
+    }
+
+    fn buffer_range(entry: &Buffer) -> Option<(u64, u64)> {
+        if !crate::resource::is_resource(entry.resource) {
+            return None;
+        }
+        let (data, bytes) = crate::resource::buffer_bytes(entry.resource)?;
+        let remaining = bytes.checked_sub(entry.offset)?;
+        let size = if entry.size == u64::MAX {
+            remaining
+        } else {
+            entry.size
+        };
+        if data.is_null() || size == 0 || size > remaining {
+            return None;
+        }
+        let start = (data as u64).checked_add(entry.offset)?;
+        Some((start, start.checked_add(size)?))
+    }
+
+    fn unique_buffer(copies: &[Arc<Shadow>], start: u64, end: u64) -> Option<&Arc<Shadow>> {
+        if crate::watch::aliased(start as usize, (end - start) as usize) {
+            return None;
+        }
+        let mut owner: Option<&Arc<Shadow>> = None;
+        for copy in copies {
+            let (base, len) = copy.range();
+            if base >= end || base + len <= start {
+                continue;
+            }
+            if let Some(ranges) = copy.tiled_ranges() {
+                if !ranges
+                    .iter()
+                    .any(|&(base, len)| base < end && base + len > start)
+                {
+                    continue;
+                }
+                if !ranges
+                    .iter()
+                    .any(|&(base, len)| base <= start && base + len >= end)
+                {
+                    return None;
+                }
+            }
+            if base > start
+                || base + len < end
+                || owner.is_some_and(|other| other.buffer != copy.buffer)
+            {
+                return None;
+            }
+            owner = Some(copy);
+        }
+        owner
+    }
+
+    /// Returns how many texture and buffer operations were recorded. Plan
+    /// all entries first so an unresolved group leaves the list untouched.
+    pub(super) fn record(list: &HostList, groups: &[Group]) -> Option<(usize, usize)> {
+        let mut textures = Vec::new();
+        let mut buffers = Vec::<Arc<Shadow>>::new();
+        let mut copies = None;
+        let backing_epoch = crate::shadow::lookup_epoch();
+        for group in groups.iter().filter(|group| group.count != 0) {
+            if group.entries.is_null() {
+                return None;
+            }
+            let len = group.count as usize;
+            match group.kind {
+                D3D12_BARRIER_TYPE_TEXTURE => {
+                    // SAFETY: the group supplies this many texture entries.
+                    let entries = unsafe { std::slice::from_raw_parts(group.entries.cast(), len) };
+                    for entry in entries {
+                        plan_texture(list, entry, &mut textures)?;
+                    }
+                }
+                D3D12_BARRIER_TYPE_BUFFER => {
+                    // SAFETY: the group supplies this many buffer entries.
+                    let entries: &[Buffer] =
+                        unsafe { std::slice::from_raw_parts(group.entries.cast(), len) };
+                    for entry in entries {
+                        if split(&entry.scope) {
+                            return None;
+                        }
+                        if independent(&entry.scope) {
+                            continue;
+                        }
+                        // A legacy UAV barrier only orders UAV accesses. Other
+                        // writers retain the existing conservative path.
+                        if entry.scope.AccessBefore != D3D12_BARRIER_ACCESS_UNORDERED_ACCESS
+                            || entry.scope.AccessAfter == D3D12_BARRIER_ACCESS_NO_ACCESS
+                        {
+                            return None;
+                        }
+                        let (start, end) = buffer_range(entry)?;
+                        let copy = unique_buffer(
+                            copies.get_or_insert_with(crate::shadow::all),
+                            start,
+                            end,
+                        )?;
+                        if !buffers.iter().any(|other| Arc::ptr_eq(copy, other)) {
+                            buffers.push(copy.clone());
+                        }
+                    }
+                }
+                _ => return None,
+            }
+        }
+        if !buffers.is_empty()
+            && (backing_epoch != crate::shadow::lookup_epoch()
+                || !list.orders_widened_writes(&buffers))
+        {
+            return None;
+        }
+        let mut texture_count = 0;
+        for op in textures {
+            match op {
+                TextureOp::Move(texture, after) => {
+                    if let Some(barrier) = list.move_texture(&texture, after) {
+                        // SAFETY: the texture is tracked by this open list.
+                        unsafe { list.list.ResourceBarrier(&[barrier]) };
+                        texture_count += 1;
+                    }
+                }
+                TextureOp::Uav(texture) => {
+                    list.scoped_uav(&texture.texture);
+                    list.keep_untracked_texture(texture);
+                    texture_count += 1;
+                }
+            }
+        }
+        let buffer_count = buffers.len();
+        if buffer_count != 0 {
+            list.indirect_boundary();
+            for copy in buffers {
+                list.scoped_uav(&copy.buffer);
+                list.keep_shadow(&copy);
+            }
+            list.sync_widened();
+        }
+        Some((texture_count, buffer_count))
+    }
+
+    #[cfg(test)]
+    fn test_record<T>(
+        list: &HostList,
+        kind: D3D12_BARRIER_TYPE,
+        barrier: T,
+    ) -> Option<(usize, usize)> {
+        record(
+            list,
+            &[Group {
+                kind,
+                count: 1,
+                entries: std::ptr::from_ref(&barrier).cast(),
+            }],
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_enhanced_buffer_barrier(
+        list: &HostList,
+        resource: This,
+        write: bool,
+    ) -> Option<(usize, usize)> {
+        test_record(
+            list,
+            D3D12_BARRIER_TYPE_BUFFER,
+            Buffer {
+                scope: D3D12_GLOBAL_BARRIER {
+                    SyncBefore: D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                    SyncAfter: D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                    AccessBefore: if write {
+                        D3D12_BARRIER_ACCESS_UNORDERED_ACCESS
+                    } else {
+                        D3D12_BARRIER_ACCESS_SHADER_RESOURCE
+                    },
+                    AccessAfter: D3D12_BARRIER_ACCESS_SHADER_RESOURCE,
+                },
+                resource,
+                offset: 0,
+                size: u64::MAX,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_enhanced_texture_barrier(
+        list: &HostList,
+        resource: This,
+    ) -> Option<(usize, usize)> {
+        test_record(
+            list,
+            D3D12_BARRIER_TYPE_TEXTURE,
+            Texture {
+                scope: D3D12_GLOBAL_BARRIER {
+                    SyncBefore: D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                    SyncAfter: D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                    AccessBefore: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                    AccessAfter: D3D12_BARRIER_ACCESS_SHADER_RESOURCE,
+                },
+                before: D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS,
+                after: D3D12_BARRIER_LAYOUT_SHADER_RESOURCE,
+                resource,
+                range: D3D12_BARRIER_SUBRESOURCE_RANGE {
+                    IndexOrFirstMipLevel: u32::MAX,
+                    ..Default::default()
+                },
+                flags: D3D12_TEXTURE_BARRIER_FLAG_NONE,
+            },
+        )
+    }
+
+    #[cfg(feature = "diagnostics")]
+    static CENSUS: [std::sync::atomic::AtomicU64; 17] =
+        [const { std::sync::atomic::AtomicU64::new(0) }; 17];
+
+    #[cfg(feature = "diagnostics")]
+    static EMITTED: [std::sync::atomic::AtomicU64; 4] =
+        [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+    #[cfg(feature = "diagnostics")]
+    pub(super) fn outcome(result: Option<(usize, usize)>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let counts = match result {
+            None => [1, 0, 0, 0],
+            Some((0, 0)) => [0, 1, 0, 0],
+            Some((textures, buffers)) => [0, 0, textures as u64, buffers as u64],
+        };
+        for (total, count) in EMITTED.iter().zip(counts).filter(|&(_, count)| count != 0) {
+            total.fetch_add(count, Relaxed);
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn census_no_write(scope: &D3D12_GLOBAL_BARRIER) -> bool {
+        scope.SyncBefore == D3D12_BARRIER_SYNC_NONE
+            || scope.SyncAfter == D3D12_BARRIER_SYNC_NONE
+            || scope.AccessAfter == D3D12_BARRIER_ACCESS_NO_ACCESS
+            || reads_only(scope.AccessBefore)
+            || scope.AccessBefore == D3D12_BARRIER_ACCESS_NO_ACCESS
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(super) fn census(groups: &[Group]) {
+        use std::sync::atomic::Ordering::Relaxed;
+        static ON: OnceLock<bool> = OnceLock::new();
+        if !*ON.get_or_init(|| crate::switch::on("VICTORY_BARRIER_CENSUS")) {
+            return;
+        }
+        // Calls can contain multiple kinds. Count entry kinds and call properties separately.
+        let mut counts = [0; 17];
+        let (mut global, mut texture, mut buffer, mut ambiguous, mut no_write) =
+            (false, false, false, false, true);
+        let mut copies = None;
+        for group in groups.iter().filter(|group| group.count != 0) {
+            let len = group.count as usize;
+            counts[1] += len as u64;
+            if group.entries.is_null() {
+                ambiguous = true;
+                no_write = false;
+                counts[16] += len as u64;
+                continue;
+            }
+            match group.kind {
+                D3D12_BARRIER_TYPE_GLOBAL => {
+                    global = true;
+                    counts[8] += len as u64;
+                    // SAFETY: a nonempty global group points to this many global entries.
+                    let entries = unsafe { std::slice::from_raw_parts(group.entries.cast(), len) };
+                    no_write &= entries.iter().all(census_no_write);
+                }
+                D3D12_BARRIER_TYPE_TEXTURE => {
+                    texture = true;
+                    counts[9] += len as u64;
+                    // SAFETY: a nonempty texture group points to this many texture entries.
+                    let entries: &[Texture] =
+                        unsafe { std::slice::from_raw_parts(group.entries.cast(), len) };
+                    for entry in entries {
+                        let no_write_entry = census_no_write(&entry.scope);
+                        no_write &= no_write_entry;
+                        counts[10] += u64::from(no_write_entry);
+                        counts[14] += u64::from(entry.range.IndexOrFirstMipLevel == u32::MAX);
+                        counts[15] += u64::from(entry.resource.is_null());
+                    }
+                }
+                D3D12_BARRIER_TYPE_BUFFER => {
+                    buffer = true;
+                    counts[11] += len as u64;
+                    // SAFETY: a nonempty buffer group points to this many buffer entries.
+                    let entries: &[Buffer] =
+                        unsafe { std::slice::from_raw_parts(group.entries.cast(), len) };
+                    for entry in entries {
+                        let no_write_entry = census_no_write(&entry.scope);
+                        no_write &= no_write_entry;
+                        counts[12] += u64::from(no_write_entry);
+                        let mapped = buffer_range(entry).is_some_and(|(start, end)| {
+                            unique_buffer(copies.get_or_insert_with(crate::shadow::all), start, end)
+                                .is_some()
+                        });
+                        counts[13] += u64::from(mapped);
+                        ambiguous |= !mapped;
+                    }
+                }
+                _ => {
+                    ambiguous = true;
+                    no_write = false;
+                    counts[16] += len as u64;
+                }
+            }
+        }
+        counts[0] = 1;
+        counts[2] = u64::from(no_write);
+        counts[3] = u64::from(texture && !buffer && !global && !ambiguous);
+        counts[4] = u64::from(buffer && !global && !ambiguous);
+        counts[5] = u64::from(global);
+        counts[6] = u64::from(ambiguous);
+        counts[7] = u64::from(texture && buffer);
+        for (total, count) in CENSUS.iter().zip(counts).filter(|&(_, count)| count != 0) {
+            total.fetch_add(count, Relaxed);
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn report(frames: f64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let [global, skipped, texture, buffer] =
+            EMITTED.each_ref().map(|counter| counter.swap(0, Relaxed));
+        if global + skipped + texture + buffer != 0 {
+            tracing::info!(
+                frames,
+                global,
+                skipped,
+                texture,
+                buffer,
+                "enhanced barrier native operations"
+            );
+        }
+        let [
+            calls,
+            entries,
+            no_write_calls,
+            texture_only_calls,
+            mapped_buffer_calls,
+            global_calls,
+            ambiguous_calls,
+            mixed_calls,
+            global_entries,
+            texture_entries,
+            texture_no_write,
+            buffer_entries,
+            buffer_no_write,
+            mapped_buffers,
+            all_subresources,
+            null_textures,
+            unknown_entries,
+        ] = CENSUS.each_ref().map(|counter| counter.swap(0, Relaxed));
+        if calls != 0 {
+            tracing::info!(
+                frames,
+                calls,
+                entries,
+                no_write_calls,
+                texture_only_calls,
+                mapped_buffer_calls,
+                global_calls,
+                ambiguous_calls,
+                mixed_calls,
+                global_entries,
+                texture_entries,
+                texture_no_write,
+                buffer_entries,
+                buffer_no_write,
+                mapped_buffers,
+                all_subresources,
+                null_textures,
+                unknown_entries,
+                "enhanced barrier census"
+            );
+        }
+    }
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) use enhanced::report as report_enhanced_barriers;
+
+#[cfg(all(windows, test))]
+pub(crate) use enhanced::{test_enhanced_buffer_barrier, test_enhanced_texture_barrier};
+
+/// The console's enhanced barriers, with optional resource-scoped lowering.
+extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
     #[cfg(windows)]
     let _timer = crate::queue::CpuTimer::new(crate::queue::CpuPhase::Barriers);
     #[cfg(windows)]
     if count > 0
         && let Some(list) = host_list(this)
     {
-        list.indirect_boundary();
-        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
-        // Which kinds of barriers (0 global, 1 texture, 2 buffer) and how many.
-        #[cfg(feature = "diagnostics")]
-        if !_groups.is_null() {
+        let groups = if groups.is_null() {
+            None
+        } else {
             // SAFETY: the title passes `count` groups of 16 bytes: kind, count, pointer.
-            let groups = unsafe { std::slice::from_raw_parts(_groups.cast::<[u32; 4]>(), count as usize) };
-            list.note_op(|| format!("barrier groups {:?}", groups.iter().map(|g| (g[0], g[1])).collect::<Vec<_>>()));
-            crate::copystat::add(
-                crate::copystat::C::GroupBarriers,
-                groups.iter().map(|g| u64::from(g[1])).sum(),
-            );
-        }
+            Some(unsafe {
+                std::slice::from_raw_parts(groups.cast::<enhanced::Group>(), count as usize)
+            })
+        };
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::GroupCalls, 1);
-        // SAFETY: the same layout; no resource named.
-        let barrier =
-            unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
-        // SAFETY: an open list.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
-        list.sync_widened();
+        if let Some(groups) = groups {
+            list.note_op(|| {
+                format!(
+                    "barrier groups {:?}",
+                    groups
+                        .iter()
+                        .map(|group| (group.kind.0, group.count))
+                        .collect::<Vec<_>>()
+                )
+            });
+            enhanced::census(groups);
+        }
+        let result = if enhanced::enabled() {
+            groups.and_then(|groups| enhanced::record(list, groups))
+        } else {
+            None
+        };
+        #[cfg(feature = "diagnostics")]
+        enhanced::outcome(result);
+        if result.is_none() {
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                add(C::GroupCalls, 1);
+                if let Some(groups) = groups {
+                    add(
+                        C::GroupBarriers,
+                        groups.iter().map(|group| u64::from(group.count)).sum(),
+                    );
+                }
+            }
+            list.indirect_boundary();
+            // SAFETY: an open list; the barrier names no resource.
+            unsafe { list.list.ResourceBarrier(&[crate::host::uav_barrier()]) };
+            list.sync_widened();
+        }
     }
     #[cfg(not(windows))]
-    let _ = (this, count);
+    let _ = (this, count, groups);
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and
