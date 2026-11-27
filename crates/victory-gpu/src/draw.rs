@@ -8,12 +8,15 @@
 //! stencil reference, depth bounds, topology, targets) is set on the host
 //! list as the title sets it.
 
+use std::collections::HashMap;
+use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::ambient::{self, CheckedViews, Role};
-use crate::descriptor::View;
+use crate::descriptor::{RtvRecord, View};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -23,6 +26,136 @@ use windows::core::Interface;
 use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
+
+use crate::list::AddressHash;
+
+type AddressMap<K, V> = HashMap<K, V, BuildHasherDefault<AddressHash>>;
+
+/// Immutable descriptor metadata for a translated pipeline stage. Shader
+/// objects are shared by pipeline variants, including linked mesh stages
+/// with their own translations. Cache by that identity and keep live plans
+/// with the draw state, so binding the same stage needs no shared lock.
+struct TablePlan {
+    groups: Vec<TableGroup>,
+    direct: Vec<(usize, usize)>,
+}
+
+struct TableGroup {
+    slot: u8,
+    has_cbv: bool,
+    has_uav: bool,
+    max_dword: u32,
+    entries: Vec<UsedResource>,
+    by_descriptor: Vec<(u32, usize)>,
+}
+
+impl TablePlan {
+    fn new(used: &[UsedResource]) -> Self {
+        let mut slots: Vec<_> = used
+            .iter()
+            .filter(|u| u.root == RootType::Table)
+            .map(|u| u.slot)
+            .collect();
+        slots.sort_unstable();
+        slots.dedup();
+        let mut groups: Vec<_> = slots
+            .iter()
+            .map(|&slot| TableGroup {
+                slot,
+                has_cbv: false,
+                has_uav: false,
+                max_dword: 0,
+                entries: Vec::new(),
+                by_descriptor: Vec::new(),
+            })
+            .collect();
+        let mut direct = Vec::new();
+        for &entry in used.iter().filter(|u| u.root == RootType::Table) {
+            let index = slots
+                .binary_search(&entry.slot)
+                .expect("a planned table slot");
+            let group = &mut groups[index];
+            let declaration = group.entries.len();
+            group.has_cbv |= entry.kind == ResourceType::Cbv;
+            group.has_uav |= entry.kind == ResourceType::Uav;
+            group.max_dword = group.max_dword.max(entry.table_offset_dwords);
+            direct.push((index, declaration));
+            group.entries.push(entry);
+            group
+                .by_descriptor
+                .push((entry.table_offset_dwords / 8, declaration));
+        }
+        for group in &mut groups {
+            group.by_descriptor.sort_unstable();
+            group.by_descriptor.dedup_by_key(|item| item.0);
+        }
+        Self { groups, direct }
+    }
+}
+
+impl TableGroup {
+    fn entry(&self, descriptor: u32) -> Option<&UsedResource> {
+        let index = self
+            .by_descriptor
+            .binary_search_by_key(&descriptor, |item| item.0)
+            .ok()?;
+        Some(&self.entries[self.by_descriptor[index].1])
+    }
+
+    fn needs_snapshot(
+        &self,
+        heap: &crate::descriptor::Heap,
+        host_count: u32,
+        table: u64,
+        force: bool,
+    ) -> bool {
+        let index_at = |dword: u32| {
+            table
+                .checked_add(u64::from(dword) * 4)
+                .and_then(|end| heap.index(end))
+        };
+        match index_at(self.max_dword) {
+            Some(index) if force || index >= host_count => true,
+            // Offsets naming table descriptors are normally aligned. If the
+            // furthest declaration is out of range, inspect the earlier ones.
+            Some(_) => false,
+            None => self.entries.iter().any(|u| {
+                index_at(u.table_offset_dwords).is_some_and(|index| force || index >= host_count)
+            }),
+        }
+    }
+}
+
+type CachedPlan = (Weak<crate::pipeline::Shader>, Arc<TablePlan>);
+
+fn cached_plan(stage: &crate::pipeline::host::Stage) -> CachedPlan {
+    struct Cache {
+        entries: AddressMap<usize, CachedPlan>,
+        sweep_at: usize,
+    }
+    static CACHE: Mutex<Cache> = Mutex::new(Cache {
+        entries: HashMap::with_hasher(BuildHasherDefault::new()),
+        sweep_at: 256,
+    });
+    let mut cache = CACHE.lock().unwrap_or_else(|error| error.into_inner());
+    let key = Arc::as_ptr(&stage.shader) as usize;
+    if let Some(plan) = cache.entries.get(&key) {
+        // The weak reference keeps the allocation's address reserved.
+        return plan.clone();
+    }
+    if cache.entries.len() >= cache.sweep_at {
+        cache
+            .entries
+            .retain(|_, (shader, _)| shader.strong_count() != 0);
+        cache.sweep_at = cache.entries.len().saturating_mul(2).max(256);
+    }
+    let entry = (
+        Arc::downgrade(&stage.shader),
+        Arc::new(TablePlan::new(&stage.translated().used)),
+    );
+    cache.entries.insert(key, entry.clone());
+    entry
+}
 
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
@@ -77,7 +210,8 @@ pub(crate) struct State {
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
     /// Tables made afresh in this list, with their dynamic slots and UAV write-back metadata.
-    fresh_tables: std::collections::HashMap<TableRecords, FreshTable>,
+    fresh_tables: AddressMap<TableRecords, FreshTable>,
+    stage_plans: Vec<CachedPlan>,
     #[cfg(test)]
     force_fresh_tables: bool,
     /// CPU-only templates for buffer views shared by otherwise distinct tables.
@@ -94,9 +228,9 @@ pub(crate) struct State {
     memory: Option<(usize, crate::memory::Map)>,
     /// Views made for root SRVs and UAVs in this list ([`State::root_view`]):
     /// (view heap, host copy, unordered access) → dynamic slot.
-    root_slots: std::collections::HashMap<(usize, usize, bool), u32>,
+    root_slots: AddressMap<(usize, usize, bool), u32>,
     /// Bounded CBV views by (heap, backing resource, offset, length).
-    root_cbv_slots: std::collections::HashMap<(usize, usize, u64, u64), u32>,
+    root_cbv_slots: AddressMap<(usize, usize, u64, u64), u32>,
     /// The run of dynamic slots root views take from (view heap, next
     /// slot, end): taken [`ROOT_VIEW_RUN`] at a time, so that single slots
     /// do not break up the runs fresh tables need.
@@ -150,17 +284,30 @@ struct Fixed {
     scissors: Option<Vec<RECT>>,
     blend_factor: Option<Option<[f32; 4]>>,
     stencil_ref: Option<u32>,
-    /// Render target and depth view handles.
-    targets: Option<(Vec<u64>, u64)>,
+    targets: Option<TargetBindings>,
     topology: bool,
 }
 
+enum TargetBindings {
+    Handles(Vec<u64>, u64),
+    Records(RecordedTargets),
+}
+
+struct RecordedTargets {
+    colors: Vec<(u64, Option<RtvRecord>)>,
+    depth: Option<RtvRecord>,
+}
+
+// SAFETY: these are immutable view snapshots. Thin recording pins the
+// title resource on each record through replay and each segment cut.
+unsafe impl Send for RecordedTargets {}
+
 impl FreshTable {
-    fn record_writes(&self, list: &HostList, entries: &[&UsedResource]) {
-        if self.writes.is_empty() {
+    fn record_writes(&self, list: &HostList, group: &TableGroup) {
+        if !group.has_uav || self.writes.is_empty() {
             return;
         }
-        for u in entries.iter().filter(|u| u.kind == ResourceType::Uav) {
+        for u in group.entries.iter().filter(|u| u.kind == ResourceType::Uav) {
             if let Ok(index) = self
                 .writes
                 .binary_search_by_key(&(u.table_offset_dwords / 8), |entry| entry.0)
@@ -409,8 +556,14 @@ impl State {
         if let Some(s) = fixed.stencil_ref {
             self.stencil_ref(list, s);
         }
-        if let Some((targets, depth)) = &fixed.targets {
-            self.set_targets(list, targets, *depth);
+        match fixed.targets {
+            Some(TargetBindings::Handles(handles, depth)) => {
+                self.set_targets(list, &handles, depth)
+            }
+            Some(TargetBindings::Records(records)) => {
+                self.set_target_records(list, &records.colors, records.depth)
+            }
+            None => {}
         }
     }
 
@@ -503,15 +656,40 @@ impl State {
 
     /// Render targets and depth, set on the host list at once.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
-        self.fixed.targets = Some((handles.to_vec(), depth));
+        self.fixed.targets = Some(TargetBindings::Handles(handles.to_vec(), depth));
+        let records = handles
+            .iter()
+            .map(|&handle| (handle, crate::descriptor::rtv_record(handle)));
+        self.apply_targets(list, records, crate::descriptor::dsv_record(depth));
+    }
+
+    pub(crate) fn set_target_records(
+        &mut self,
+        list: &HostList,
+        colors: &[(u64, Option<RtvRecord>)],
+        depth: Option<RtvRecord>,
+    ) {
+        self.fixed.targets = Some(TargetBindings::Records(RecordedTargets {
+            colors: colors.to_vec(),
+            depth,
+        }));
+        self.apply_targets(list, colors.iter().copied(), depth);
+    }
+
+    fn apply_targets(
+        &mut self,
+        list: &HostList,
+        colors: impl ExactSizeIterator<Item = (u64, Option<RtvRecord>)>,
+        depth: Option<RtvRecord>,
+    ) {
         let Some(host) = crate::host::host() else {
             return;
         };
         self.targets.clear();
-        let mut rtv_views = Vec::with_capacity(handles.len());
-        let mut rtv_keys = Vec::with_capacity(handles.len());
-        for &h in handles {
-            let Some(record) = crate::descriptor::rtv_record(h) else {
+        let mut rtv_views = Vec::with_capacity(colors.len());
+        let mut rtv_keys = Vec::with_capacity(colors.len());
+        for (h, record) in colors {
+            let Some(record) = record else {
                 once!(
                     handle = format_args!("{h:#x}"),
                     "render target without a recorded view"
@@ -530,7 +708,7 @@ impl State {
         self.depth = 0;
         let mut dsv_view = None;
         let mut dsv_key = None;
-        if let Some(record) = crate::descriptor::dsv_record(depth)
+        if let Some(record) = depth
             && let Some(texture) = crate::resource::host_copy(record.resource)
         {
             self.depth = record.resource as usize;
@@ -834,8 +1012,22 @@ impl State {
             }
             crate::bindless::note_draw(writes);
         }
-        for stage in &p.stages {
+        for (index, stage) in p.stages.iter().enumerate() {
             let t = stage.translated();
+            let plan = match self.stage_plans.get_mut(index) {
+                Some(entry) => {
+                    if entry.0.as_ptr() != Arc::as_ptr(&stage.shader) {
+                        *entry = cached_plan(stage);
+                    }
+                    entry.1.clone()
+                }
+                None => {
+                    let entry = cached_plan(stage);
+                    let plan = entry.1.clone();
+                    self.stage_plans.push(entry);
+                    plan
+                }
+            };
             self.table_failed = false;
             // The view addresses exist before the stage's tables are made:
             // a table made afresh enters its views' addresses there.
@@ -844,7 +1036,7 @@ impl State {
                     .host()
                     .and_then(|h| h.view_addresses());
             }
-            let made = self.tables(list, &t.used, compute);
+            let made = self.tables(list, &plan, compute);
             // A depth copy of ours made readable a texture the tables hold
             // (`crate::twin`), with a compute pipeline: this one's again
             // (root arguments are set below).
@@ -1266,8 +1458,25 @@ impl State {
         float: bool,
         rects: &[RECT],
     ) {
+        self.clear_unordered_view(
+            list,
+            crate::descriptor::view(cpu).as_deref(),
+            values,
+            float,
+            rects,
+        );
+    }
+
+    pub(crate) fn clear_unordered_view(
+        &mut self,
+        list: &HostList,
+        view: Option<&View>,
+        values: [u32; 4],
+        float: bool,
+        rects: &[RECT],
+    ) {
         self.indirect = None;
-        let Some(view) = crate::descriptor::view(cpu) else {
+        let Some(view) = view else {
             once!("an unordered access clear of a slot without a view");
             return;
         };
@@ -1282,9 +1491,9 @@ impl State {
         };
         self.dynamic
             .push((std::ptr::from_ref(heap) as usize, slot, 1));
-        visible.make_at(slot, &view);
+        visible.make_at(slot, view);
         let at = host.cpu_view();
-        let Some(resource) = crate::descriptor::host::make_view(&view, at) else {
+        let Some(resource) = crate::descriptor::host::make_view(view, at) else {
             once!("an unordered access clear of a view the host cannot make");
             return;
         };
@@ -1298,7 +1507,7 @@ impl State {
             user_data: 0,
             slot: 0,
         };
-        readable(list, &written, &view, false);
+        readable(list, &written, view, false);
         self.bind_heaps(list, false);
         list.keep(&resource);
         let gpu = visible.gpu(slot);
@@ -1600,61 +1809,49 @@ impl State {
     ///
     /// Within a list, the same table holding the same descriptors is made
     /// once.
-    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
-        let tables = |u: &&UsedResource| u.root == RootType::Table;
-        let mut fresh: Vec<u8> = Vec::new();
-        // Tables reaching past a host heap smaller than the title's (the
-        // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
-        // title's slots there have no host slot of their own.
-        for u in used.iter().filter(tables) {
-            if fresh.contains(&u.slot) {
-                continue;
-            }
-            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
-                continue;
-            };
-            let end = table + u64::from(u.table_offset_dwords) * 4;
-            let Some(heap) = self.heap_of(table) else {
+    fn tables(&mut self, list: &HostList, plan: &TablePlan, compute: bool) -> Vec<(u8, u32)> {
+        #[cfg(test)]
+        let force = self.force_fresh_tables;
+        #[cfg(not(test))]
+        let force = false;
+        // Table slots are u8. Mark groups beyond the native heap with a
+        // fixed bitset and preserve original order for shared descriptors.
+        let mut fresh = [false; 256];
+        for group in &plan.groups {
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(group.slot))
+            else {
                 continue;
             };
-            let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
-                continue;
-            };
-            let needs_fresh = index >= host.count();
-            #[cfg(test)]
-            let needs_fresh = needs_fresh || self.force_fresh_tables;
-            if needs_fresh {
-                fresh.push(u.slot);
+            if let Some(heap) = self.heap_of(table)
+                && let Some(host) = heap.host()
+            {
+                fresh[usize::from(group.slot)] =
+                    group.needs_snapshot(heap, host.count(), table, force);
             }
         }
-        fresh.sort_unstable();
-        fresh.dedup();
-        for u in used.iter().filter(tables) {
-            if !fresh.contains(&u.slot) {
-                self.table_entry(list, u, compute);
+        for &(group, entry) in &plan.direct {
+            let group = &plan.groups[group];
+            if !fresh[usize::from(group.slot)] {
+                self.table_entry(list, &group.entries[entry], compute);
             }
         }
         let mut made = Vec::new();
-        for slot in fresh {
+        for group in plan
+            .groups
+            .iter()
+            .filter(|group| fresh[usize::from(group.slot)])
+        {
+            let slot = group.slot;
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
-            let entries: Vec<&UsedResource> = used
-                .iter()
-                .filter(tables)
-                .filter(|u| u.slot == slot)
-                .collect();
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
             let Some(host) = heap.host() else {
                 continue;
             };
-            let n = entries
-                .iter()
-                .map(|u| u.table_offset_dwords / 8 + 1)
-                .max()
-                .unwrap_or(1);
+            let n = group.max_dword / 8 + 1;
             // The exact records identify a table and supply the views below.
             let records = (0..n)
                 .map(|k| crate::descriptor::record_at(table + u64::from(k) * 32))
@@ -1689,7 +1886,11 @@ impl State {
             });
             if let Some(fresh) = reused {
                 let first = fresh.first;
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                for u in group
+                    .entries
+                    .iter()
+                    .filter(|u| !group.has_cbv || u.kind != ResourceType::Cbv)
+                {
                     let offset = u.table_offset_dwords / 8;
                     let record = key.1[offset as usize];
                     if let Some(view) = crate::descriptor::recorded_view(record) {
@@ -1700,7 +1901,7 @@ impl State {
                         prepare_readable(list, u, &view, true, range, false);
                     }
                 }
-                fresh.record_writes(list, &entries);
+                fresh.record_writes(list, group);
                 made.push((slot, fresh.first * 32));
                 continue;
             }
@@ -1723,7 +1924,7 @@ impl State {
             for (k, &record) in key.1.iter().enumerate() {
                 let k = k as u32;
                 let index = first + k;
-                let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
+                let used = group.entry(k);
                 match crate::descriptor::recorded_view(record) {
                     Some(view) => {
                         use crate::descriptor::host::{ListViews, align_view_copy, view_owner};
@@ -1769,7 +1970,7 @@ impl State {
                 backings,
                 writes,
             };
-            fresh.record_writes(list, &entries);
+            fresh.record_writes(list, group);
             self.fresh_tables.insert(key, fresh);
             made.push((slot, first * 32));
         }
@@ -2750,6 +2951,30 @@ void main() { record.Store(0, 17); }
     /// A root constant's dword 4 is a value: only a root descriptor's dword
     /// 4 names its view's offset.
     #[test]
+    fn table_plan_preserves_declaration_order_and_uses_the_first_descriptor() {
+        let first = UsedResource {
+            slot: 2,
+            table_offset_dwords: 8,
+            ..used(ResourceType::Srv)
+        };
+        let cbv = UsedResource {
+            table_offset_dwords: 16,
+            ..used(ResourceType::Cbv)
+        };
+        let second = UsedResource {
+            kind: ResourceType::Uav,
+            ..first
+        };
+        let plan = TablePlan::new(&[first, cbv, second]);
+        assert_eq!(plan.direct, [(1, 0), (0, 0), (1, 1)]);
+        assert_eq!(plan.groups[0].max_dword, 16);
+        assert!(plan.groups[0].has_cbv);
+        assert!(plan.groups[1].has_uav);
+        assert_eq!(plan.groups[1].entry(1).unwrap().kind, ResourceType::Srv);
+        assert!(plan.groups[1].entry(2).is_none());
+    }
+
+    #[test]
     fn only_a_root_descriptors_dword_four_is_a_view_offset() {
         let u = |root, dword| victory_shader::emit::UserData {
             index: 0,
@@ -3522,7 +3747,7 @@ void main(uint3 id : SV_DispatchThreadID) {{
         state.force_fresh_tables = true;
         let mut bind = |handle| {
             state.set_table(true, 0, handle);
-            let made = state.tables(&list, &[used(ResourceType::Srv)], true);
+            let made = state.tables(&list, &TablePlan::new(&[used(ResourceType::Srv)]), true);
             assert_eq!(made.len(), 1);
             made[0].1 / 32
         };
@@ -3682,16 +3907,16 @@ void main(uint3 id : SV_DispatchThreadID) {{
             table_offset_dwords: 8,
             ..used(ResourceType::Srv)
         }];
-        let first = state.tables(&list, &used, true);
+        let first = state.tables(&list, &TablePlan::new(&used), true);
         assert_eq!(first.len(), 1);
         assert!(
             !slots.kept(first[0].1 / 32),
             "the unsupported view leaves a null slot"
         );
         let unrelated = buffer(256);
-        assert_eq!(state.tables(&list, &used, true), first);
+        assert_eq!(state.tables(&list, &TablePlan::new(&used), true), first);
         crate::object::release_ref(unrelated);
-        assert_eq!(state.tables(&list, &used, true), first);
+        assert_eq!(state.tables(&list, &TablePlan::new(&used), true), first);
         assert_eq!(state.dynamic.len(), 1);
         list.close();
         drop(state);
@@ -4572,7 +4797,7 @@ void main() { dst.Store4(0, asuint(src[0])); }
         state.set_table(true, 0, title_heap.start);
         assert!(
             state
-                .tables(&list, &[used(ResourceType::Srv)], true)
+                .tables(&list, &TablePlan::new(&[used(ResourceType::Srv)]), true)
                 .is_empty(),
             "an in-place table"
         );
@@ -6571,13 +6796,13 @@ void main(uint3 id : SV_DispatchThreadID) { o[id.xy] = 13.5; }",
             let first = reuse.then(|| {
                 // A zero-work command may build a table but cannot commit writes.
                 let _writes = list.capture_texture_writes().unwrap();
-                let made = state.tables(&list, &used, true);
+                let made = state.tables(&list, &TablePlan::new(&used), true);
                 assert_eq!(made.len(), 1);
                 run(&list, &slots, &shader, made[0].1 / 32, None, (0, 8));
                 made[0].1
             });
             let writes = list.capture_texture_writes().unwrap();
-            let made = state.tables(&list, &used, true);
+            let made = state.tables(&list, &TablePlan::new(&used), true);
             assert_eq!(made.len(), 1);
             let dynamic = made[0].1 / 32;
             assert!(dynamic >= visible.count());
