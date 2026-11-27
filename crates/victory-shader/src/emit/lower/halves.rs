@@ -397,11 +397,15 @@ const GROUP_SHARED_DWORDS: u32 = 8192;
 ///
 /// Lowering caps an unconditional back edge — a `Jump` to a block at or
 /// before the jump, by reverse postorder — with an early return at the loop
-/// iteration limit: the latch leaves the program there too. That generated
+/// iteration limit when it cannot use the loop's normal exit. That generated
 /// exit is block `n` here, a terminal exit just like a `Ret`, so a closed
 /// loop with a capped back edge does not look like it has no way out (which
 /// would make everything post-dominate its branches).
-pub(super) fn branch_regions(p: &Program, st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
+pub(super) fn branch_regions(
+    p: &Program,
+    st: &Structured,
+    loop_caps: &LoopCaps,
+) -> Option<Vec<(usize, Vec<bool>)>> {
     let n = st.exits.len();
     // Reverse postorder ranks, as lowering numbers them.
     let order = crate::ir::reverse_postorder(&p.blocks);
@@ -410,7 +414,8 @@ pub(super) fn branch_regions(p: &Program, st: &Structured) -> Option<Vec<(usize,
         rpo[b] = r;
     }
     let capped = |b: usize| {
-        matches!(st.exits[b], LaneExit::Jump(t) if rpo[b] != usize::MAX && rpo[t] <= rpo[b])
+        matches!(st.exits[b], LaneExit::Jump(t) if rpo[b] != usize::MAX && rpo[t] <= rpo[b]
+            && !loop_caps.checked_at_exit.contains(&t))
     };
     // Block `n` is the virtual exit of every capped latch.
     let m = n + 1;
@@ -593,10 +598,10 @@ fn wave_tid(x: &Parts) -> Option<Value> {
 /// them (a branch on alike values does not). The analysis runs to a fixed
 /// point from nothing, so a loop-carried value that needs itself to be
 /// alike never is.
-pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
+pub(super) fn lane_uniform(x: &Parts, loop_caps: &LoopCaps) -> HashSet<Value> {
     let (p, st) = (x.p, x.st);
     let wave_tid = wave_tid(x);
-    let regions = branch_regions(p, st);
+    let regions = branch_regions(p, st, loop_caps);
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let per_lane = |v: Value| x.res.waterfall.reads.contains(&v);
     // Scalar SSA values the same in every lane of a console wave, proven the

@@ -36,7 +36,7 @@ fn a_swap_does_not_make_a_lane_varying_destination_wave_uniform() {
     let io = io::raise(&p, &native).unwrap();
     let swap = &p.blocks[0].insts[1];
     assert_eq!(swap.name(), "v_swap_b32");
-    let uniform = super::halves::lane_uniform(&Parts {
+    let parts = Parts {
         native: &native,
         p: &p,
         st: &st,
@@ -54,7 +54,8 @@ fn a_swap_does_not_make_a_lane_varying_destination_wave_uniform() {
         host_wave32: true,
         narrow_waves: true,
         view_marks: false,
-    });
+    };
+    let uniform = super::halves::lane_uniform(&parts, &super::LoopCaps::new(&p, &st));
     assert!(!uniform.contains(&swap.write(Reg::V(1)).unwrap()));
 }
 
@@ -1421,7 +1422,7 @@ fn wave64(words: &[u32]) -> ir::Program {
 /// [`super::split_wave_barriers`] of a program.
 fn barriers_at(p: &ir::Program) -> Option<Vec<(usize, usize)>> {
     let st = structure::structure(p).unwrap();
-    let mut at: Vec<_> = super::split_wave_barriers(p, &st, &[])?
+    let mut at: Vec<_> = super::split_wave_barriers(p, &st, &[], &super::LoopCaps::new(p, &st))?
         .into_iter()
         .collect();
     at.sort_unstable();
@@ -1714,8 +1715,7 @@ fn lowered_halves(words: &[u32], lanes: u32) -> Result<Lowered, crate::ShaderErr
 
 /// A uniform outer loop (on the scalar `s20`) holding a divergent inner
 /// loop — entered on `vcc`, the lanes with thread id below 40 — whose latch
-/// is an unconditional `s_branch` back to its header: the back edge that
-/// lowering caps with an early return at the loop iteration limit. After
+/// is an unconditional `s_branch` back to its header. After
 /// the inner loop, `v_readlane_b32` of console lane 40, which in halves
 /// passes between the 32-lane halves behind group barriers (its result is
 /// only read after the outer loop, so no branch in the loop depends on it).
@@ -1744,8 +1744,8 @@ fn capped_back_edge_in_a_divergent_loop() -> Vec<u32> {
 }
 
 /// The same outer loop with an inner loop every lane enters together: its
-/// unconditional back edge is capped too, but every lane of the group
-/// leaves the loop through it together, so nothing after it is skipped.
+/// unconditional back edge is capped by the existing exit condition, and
+/// every lane of the group leaves the loop together.
 fn capped_back_edge_in_a_uniform_loop() -> Vec<u32> {
     vec![
         0xBE94_0380, // s_mov_b32 s20, 0
@@ -1857,25 +1857,14 @@ fn the_back_edge_programs_are_what_their_comments_say() {
     }
 }
 
-/// A half-wave exchange after a divergent loop whose unconditional back
-/// edge lowering caps with an early return: one wave may leave the program
-/// at the cap while another reaches the exchange's group barrier with
-/// missing participants, so the exchange is refused in halves. As one
-/// wave64 there are no halves and it translates.
+/// Taking the ordinary exit at the cap lets every lane reach the exchange.
 #[test]
-fn an_exchange_after_a_divergent_capped_back_edge_is_refused() {
+fn an_exchange_after_a_divergent_capped_back_edge_translates() {
     let w = capped_back_edge_in_a_divergent_loop();
-    let why = lowered_halves(&w, 64)
-        .err()
-        .expect("refused in halves")
-        .to_string();
-    assert!(
-        why.contains("a lane read that may cross 32-lane halves"),
-        "{why}"
-    );
-    // One wave64: no halves, no exchange, and it translates.
-    let whole = lowered(&w, 64, false);
-    assert_eq!(whole.wave_size, Some(64));
+    let l = lowered_halves(&w, 64).expect("in halves");
+    assert_eq!(l.wave_size, Some(32));
+    assert!(l.barriers > 0);
+    assert_eq!(lowered(&w, 64, false).wave_size, Some(64));
 }
 
 /// The same exchange after a loop whose unconditional back edge is capped
@@ -2258,9 +2247,7 @@ fn an_s_barrier_on_the_sibling_behind_a_uniform_branch_translates() {
 }
 
 /// The divergent capped loop of [`capped_back_edge_in_a_divergent_loop`],
-/// with an explicit `s_barrier` at the join instead of the lane read: a lane
-/// may have left the program early at the inner loop's cap, so the barrier
-/// is refused even without any exchange.
+/// with an explicit `s_barrier` at the join instead of the lane read.
 fn a_divergent_capped_loop_then_an_s_barrier_at_the_join() -> Vec<u32> {
     vec![
         0xBE94_0380, // s_mov_b32 s20, 0
@@ -2285,24 +2272,16 @@ fn a_divergent_capped_loop_then_an_s_barrier_at_the_join() -> Vec<u32> {
     ]
 }
 
-/// Blocker 3: an explicit `s_barrier` at the join after a divergent loop
-/// whose capped back edge may have let a lane leave the program early is
-/// refused, in halves and as one wave64 alike.
+/// The capped loop has a normal exit. Its limit must take that exit so
+/// every lane can still reach the group's barrier.
 #[test]
-fn an_s_barrier_after_a_divergent_capped_loop_is_refused() {
+fn an_s_barrier_after_a_divergent_capped_loop_translates() {
     let w = a_divergent_capped_loop_then_an_s_barrier_at_the_join();
-    for why in [
-        lowered_halves(&w, 64).err().expect("refused in halves"),
-        lowered_result(&w, 64, false)
-            .err()
-            .expect("refused as one wave64"),
-    ] {
-        let why = why.to_string();
-        assert!(
-            why.contains("an s_barrier where a lane may have left the program early"),
-            "{why}"
-        );
-    }
+    let l = lowered_halves(&w, 64).expect("in halves");
+    assert_eq!(l.wave_size, Some(32));
+    // The explicit barrier and the two barriers used for the lane exchange.
+    assert_eq!(l.barriers, 3);
+    assert_eq!(lowered(&w, 64, false).barriers, 1);
 }
 
 /// The same `s_barrier` where no lane can have left early — a uniform loop

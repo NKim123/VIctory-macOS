@@ -29,9 +29,11 @@ mod bvh;
 #[path = "half_views.rs"]
 mod half_views;
 mod halves;
+mod loops;
 mod mesh;
 mod raw;
 use barriers::{split_wave_barriers, step_and_cap};
+use loops::LoopCaps;
 pub(crate) use mesh::KeptOutputs;
 use mesh::prune_signature;
 
@@ -457,6 +459,7 @@ struct Lower<'a> {
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
+    loop_caps: LoopCaps,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
     /// The 16/64-bit round mode (MODE bits 3:2) each block starts with, and
@@ -745,6 +748,7 @@ fn code_table_start(p: &crate::ir::Program, addresses: &[&crate::resource::Addre
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, keep: Option<&KeptOutputs>) -> Self {
         let p = x.p;
+        let loop_caps = LoopCaps::new(p, x.st);
         let mut phi_at = Map::default();
         for (b, block) in p.blocks.iter().enumerate() {
             for (i, phi) in block.phis.iter().enumerate() {
@@ -822,7 +826,7 @@ impl<'a> Lower<'a> {
                 // shortcut: a read in divergent code of what divergent code
                 // wrote gets no barrier (none could be placed there); the
                 // program then runs as before.
-                if let Some(b) = split_wave_barriers(p, x.st, &x.res.waterfall.reads) {
+                if let Some(b) = split_wave_barriers(p, x.st, &x.res.waterfall.reads, &loop_caps) {
                     split_barriers = b;
                     synced = true;
                 }
@@ -898,7 +902,7 @@ impl<'a> Lower<'a> {
                 }
             }
         }
-        let (step, cap_escaped) = step_and_cap(p, x.st, &x.res.waterfall.reads, halves);
+        let (step, cap_escaped) = step_and_cap(p, x.st, &x.res.waterfall.reads, halves, &loop_caps);
         Lower {
             s,
             x,
@@ -957,7 +961,7 @@ impl<'a> Lower<'a> {
             half_words: None,
             level: 0,
             alike: if halves {
-                halves::lane_uniform(x)
+                halves::lane_uniform(x, &loop_caps)
             } else {
                 HashSet::new()
             },
@@ -998,6 +1002,7 @@ impl<'a> Lower<'a> {
             memory_null: None,
             memory_offsets: HashSet::new(),
             counters: HashMap::new(),
+            loop_caps,
             abort: None,
             round16: round16(p),
             mode16: Some(0),
@@ -9351,7 +9356,8 @@ impl<'a> Lower<'a> {
         })
     }
 
-    /// What holds in a lane that goes from IR block `q` to `b`.
+    /// What holds in a lane that goes from IR block `q` to `b`. A loop
+    /// can take its normal exit even if only the iteration check chose it.
     fn lane_edge(&self, q: usize, b: usize) -> Vec<(Bool, bool)> {
         let st = self.x.st;
         let mut all = vec![(st.reach[q], true)];
@@ -9361,6 +9367,11 @@ impl<'a> Lower<'a> {
             not_taken,
         } = st.exits[q]
             && taken != not_taken
+            && self
+                .loop_caps
+                .exits
+                .get(&q)
+                .is_none_or(|&(_, exit)| exit != b)
         {
             all.push((when, taken == b));
         }
@@ -11354,9 +11365,14 @@ impl<'a> Lower<'a> {
         }
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
-                let ok = self.count_iteration(t, pred::IULT);
-                let abort = self.abort_block();
-                Term::CondBr(ok, self.block[t].expect("reachable"), abort)
+                let next = self.count_iteration(t);
+                let target = self.block[t].expect("reachable");
+                if self.loop_caps.checked_at_exit.contains(&t) {
+                    Term::Br(target)
+                } else {
+                    let ok = self.check_iteration(next, pred::IULT);
+                    Term::CondBr(ok, target, self.abort_block())
+                }
             }
             LaneExit::Jump(t) => {
                 self.enter_loop(b, t, self.cur);
@@ -11387,12 +11403,20 @@ impl<'a> Lower<'a> {
                     |l: &Self, to: usize| l.counters.contains_key(&to) && l.rpo[to] <= l.rpo[b];
                 // (No `xor` of a compare: a loop exit testing one hung the
                 // AMD driver.)
-                let cond = if back(self, taken) {
-                    let ok = self.count_iteration(taken, pred::IULT);
-                    self.s.m.bin(self.cur, Bin::And, cond, ok)
-                } else if back(self, not_taken) {
-                    let stop = self.count_iteration(not_taken, pred::IUGE);
-                    self.s.m.bin(self.cur, Bin::Or, cond, stop)
+                let counter = [(taken, false), (not_taken, true)]
+                    .into_iter()
+                    .find(|&(t, _)| back(self, t))
+                    .map(|(header, exits_when_true)| {
+                        (header, self.count_iteration(header), exits_when_true)
+                    });
+                let cond = if let Some(&(header, exit)) = self.loop_caps.exits.get(&b) {
+                    let next =
+                        counter.map_or_else(|| self.next_iteration(header), |(_, next, _)| next);
+                    self.cap_branch(cond, next, taken == exit)
+                } else if let Some((header, next, exits_when_true)) = counter
+                    && !self.loop_caps.checked_at_exit.contains(&header)
+                {
+                    self.cap_branch(cond, next, exits_when_true)
                 } else {
                     cond
                 };
@@ -11437,21 +11461,36 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// A back edge to header `to` (a back edge keeps its block, no
-    /// critical-edge block): the count goes up; the result compares it with
-    /// [`LOOP_LIMIT`] by `p` (below: go on; at or above: stop).
-    fn count_iteration(&mut self, to: usize, p: u8) -> V {
-        let c = self.cur;
-        let (phi, _) = self.counters[&to];
+    fn next_iteration(&mut self, header: usize) -> V {
+        let (phi, _) = self.counters[&header];
         let one = self.s.m.i32(1);
-        let next = self.s.m.bin(c, Bin::Add, phi, one);
-        let limit = self.s.m.i32(super::loop_limit());
+        self.s.m.bin(self.cur, Bin::Add, phi, one)
+    }
+
+    /// Back edges keep their DXIL source block and increment the header's count.
+    fn count_iteration(&mut self, to: usize) -> V {
+        let next = self.next_iteration(to);
         self.counters
             .get_mut(&to)
             .expect("header")
             .1
-            .push((next, c));
-        self.s.m.cmp(c, p, next, limit)
+            .push((next, self.cur));
+        next
+    }
+
+    fn check_iteration(&mut self, next: V, comparison: u8) -> V {
+        let limit = self.s.m.i32(super::loop_limit());
+        self.s.m.cmp(self.cur, comparison, next, limit)
+    }
+
+    fn cap_branch(&mut self, condition: V, next: V, exits_when_true: bool) -> V {
+        let (comparison, op) = if exits_when_true {
+            (pred::IUGE, Bin::Or)
+        } else {
+            (pred::IULT, Bin::And)
+        };
+        let check = self.check_iteration(next, comparison);
+        self.s.m.bin(self.cur, op, condition, check)
     }
 
     /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.
@@ -11599,9 +11638,10 @@ impl<'a> Lower<'a> {
                     not_taken,
                 } => {
                     let (no, yes) = self.can_be(when, &env, &mut HashMap::new());
+                    let exit = self.loop_caps.exits.get(&b).map(|&(_, exit)| exit);
                     !(no && yes && self.touches(when, &env, &tainted))
-                        && (!yes || go(taken, env.clone(), regs.clone()))
-                        && (!no || go(not_taken, env, regs))
+                        && (!(yes || exit == Some(taken)) || go(taken, env.clone(), regs.clone()))
+                        && (!(no || exit == Some(not_taken)) || go(not_taken, env, regs))
                 }
             };
             if !ok {
@@ -11843,6 +11883,7 @@ impl<'a> Lower<'a> {
                     not_taken,
                 } = st.exits[q]
                     && taken != not_taken
+                    && !self.loop_caps.exits.contains_key(&q)
                     && self.rpo[taken] > self.rpo[q]
                     && self.rpo[not_taken] > self.rpo[q]
                 {

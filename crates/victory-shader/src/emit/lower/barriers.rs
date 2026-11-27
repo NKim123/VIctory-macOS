@@ -29,6 +29,7 @@ pub(crate) fn split_wave_barriers(
     p: &Program,
     st: &Structured,
     waterfall_reads: &[Value],
+    loop_caps: &LoopCaps,
 ) -> Option<Set<(usize, usize)>> {
     /// LDS accesses since the last barrier.
     #[derive(Clone, Copy, Default, PartialEq)]
@@ -60,7 +61,7 @@ pub(crate) fn split_wave_barriers(
     };
     let n = p.blocks.len();
     let succ = |b: usize| p.blocks[b].exit.successors();
-    let step = step_and_cap(p, st, waterfall_reads, true).0;
+    let step = step_and_cap(p, st, waterfall_reads, true, loop_caps).0;
     let divergent_writes = (0..n).any(|b| {
         !step[b]
             && p.blocks[b]
@@ -154,9 +155,10 @@ pub(crate) fn split_wave_barriers(
 ///
 /// The other half is per block whether a lane may have left the program
 /// early at a capped back edge's iteration limit before reaching it. Lowering
-/// caps an unconditional back edge with an early return at the loop
-/// iteration limit (`LOOP_LIMIT`): a lane whose count reaches it leaves the
-/// program from the latch. The header's counter is shared by *every* back
+/// uses an early return at the loop iteration limit (`LOOP_LIMIT`) for an
+/// unconditional back edge when the loop's normal exit cannot take the cap.
+/// A lane whose count reaches it leaves the program from the latch. The
+/// header's counter is shared by *every* back
 /// edge to it, so the cap check holds for every lane only when the latch
 /// and the header run together and so does each back edge to the header — a
 /// conditional one with a uniform condition. Otherwise one wave's count can
@@ -180,6 +182,7 @@ pub(crate) fn step_and_cap(
     st: &Structured,
     waterfall_reads: &[Value],
     need_step: bool,
+    loop_caps: &LoopCaps,
 ) -> (Vec<bool>, Vec<bool>) {
     let n = p.blocks.len();
     // Reverse postorder ranks, as lowering numbers them: a Jump to a block at
@@ -190,12 +193,12 @@ pub(crate) fn step_and_cap(
         rpo[b] = r;
     }
     let back = |b: usize, t: usize| rpo[b] != usize::MAX && rpo[t] <= rpo[b];
-    // The unconditional back edges, (latch, header): lowering counts the
-    // loop's iterations and at the limit leaves the program from the latch
-    // with an early return.
+    // Unconditional back edges that return from the shader at the cap.
     let capped: Vec<(usize, usize)> = (0..n)
         .filter_map(|b| match st.exits[b] {
-            LaneExit::Jump(t) if back(b, t) => Some((b, t)),
+            LaneExit::Jump(t) if back(b, t) && !loop_caps.checked_at_exit.contains(&t) => {
+                Some((b, t))
+            }
             _ => None,
         })
         .collect();
@@ -208,7 +211,7 @@ pub(crate) fn step_and_cap(
     {
         return (Vec::new(), vec![false; n]);
     }
-    let Some(regions) = halves::branch_regions(p, st) else {
+    let Some(regions) = halves::branch_regions(p, st, loop_caps) else {
         return (
             if need_step {
                 once_per_lane(p)

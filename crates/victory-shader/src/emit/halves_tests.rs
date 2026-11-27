@@ -1560,6 +1560,55 @@ fn lds_synced_in_halves_matches_the_console_on_every_gpu() {
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
+/// Only the low half runs the loop and writes LDS. The whole group reads
+/// the result after reconvergence, including when the loop reaches the cap.
+fn lds_after_divergent_loop(bound: u32, explicit_barrier: bool) -> Vec<u32> {
+    let mut words = PROLOGUE.to_vec();
+    words.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x3604_009F, // v_and_b32 v2, 31, v0
+        0x3404_0482, // v_lshlrev_b32 v2, 2, v2
+        0x7D88_00FF,
+        32,          // v_cmp_gt_u32 vcc, 32, v0
+        0xBF87_0001, // s_cbranch_vccnz -> initialise the loop
+        0xBF82_000A, // s_branch -> join
+        0xBE94_0380, // s_mov_b32 s20, 0
+        0x8014_8114, // s_add_u32 s20, s20, 1
+        0xBF06_FF14,
+        bound,       // s_cmp_eq_u32 s20, bound
+        0xBF85_0001, // s_cbranch_scc1 -> write to LDS
+        0xBF82_FFFB, // s_branch -> increment the loop counter
+        0x7E02_0214, // v_mov_b32 v1, s20
+        0xD834_0000,
+        0x0000_0102, // ds_write_b32 v2, v1
+        S_WAITCNT_LGKM,
+    ]);
+    if explicit_barrier {
+        words.push(0xBF8A_0000); // s_barrier
+    }
+    words.extend([
+        0xD8D8_0000,
+        0x0300_0002, // ds_read_b32 v3, v2
+        S_WAITCNT_LGKM,
+    ]);
+    words.extend(store(3, 0));
+    words.push(S_ENDPGM);
+    words
+}
+
+#[test]
+fn lds_after_a_capped_divergent_loop_reaches_both_halves() {
+    let limit = super::loop_limit();
+    for explicit_barrier in [false, true] {
+        for bound in [3, limit.saturating_add(1)] {
+            let words = lds_after_divergent_loop(bound, explicit_barrier);
+            let want = vec![bound.min(limit); 64];
+            let failed = differences_with(&words, 64, 1, &want, 256, true);
+            assert!(failed.is_empty(), "{}", failed.join("\n"));
+        }
+    }
+}
+
 /// Per thread `l` of a one-wave group of 64: four passes of a loop on a
 /// scalar count, each writing the lane's sum to LDS and adding the sum of
 /// the lane 32 away, in the other half (`v_mbcnt` asks for the console's
