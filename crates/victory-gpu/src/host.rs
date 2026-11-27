@@ -972,6 +972,42 @@ pub(crate) mod tests {
         unsafe { host.device.GetDeviceRemovedReason() }.unwrap();
     }
 
+    #[test]
+    fn writeback_preserves_remapped_bytes_and_lands_unchanged_ranges() {
+        let Some(host) = host() else { return };
+        let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let p = crate::watch::tests::pool(3);
+        let page = crate::watch::PAGE;
+        let len = 3 * page;
+        crate::shadow::register(p, p as u64, len as u64);
+        let copy = crate::shadow::find(p as u64, len as u64).unwrap();
+        let submission = crate::watch::begin_submission();
+        copy.update(p, len);
+        copy.writing(p, len, false);
+        for at in [p, p + page, p + 2 * page] {
+            copy.write_host(at as u64, &[0xa5]);
+        }
+        std::thread::spawn(move || {
+            let _unmapping = crate::watch::title_memory_unmapping(p + page, page);
+            // SAFETY: simulate the bytes the replacement allocation exposes.
+            unsafe { ((p + page) as *mut u8).write_volatile(0x7b) };
+            crate::watch::title_memory_remapped(p + page, page);
+        })
+        .join()
+        .unwrap();
+        assert_eq!(copy.copy_back_page(p + page), 0);
+        assert_eq!(copy.copy_back_marked(&[p + page]), 0);
+        assert_eq!(copy.copy_back(p, len), 2 * page);
+        drop(submission);
+        // SAFETY: all three addresses are inside our pool.
+        let got =
+            [p, p + page, p + 2 * page].map(|at| unsafe { (at as *const u8).read_volatile() });
+        assert_eq!(got, [0xa5, 0x7b, 0xa5]);
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+
     /// Shaders that use title memory mark their reads in their own bitmap:
     /// read marks of both bitmaps are taken, each slot once until it is
     /// forgotten, and a forgotten slot's next read is taken again.
@@ -2204,6 +2240,7 @@ impl Host {
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let _holding = Holding::enter();
+        let remaps = crate::watch::begin_submission();
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
@@ -2755,6 +2792,7 @@ impl Host {
                 }
             }
         }
+        drop(remaps);
         for list in runs {
             for back in &list.deferred().texture_backs {
                 crate::texback::land(back);

@@ -547,6 +547,10 @@ impl Shadow {
             });
             return 0;
         }
+        let remaps = crate::watch::submission_remaps();
+        if remaps.overlaps(from, to) {
+            return 0;
+        }
         let n = to - from;
         // SAFETY: inside the mapping; only the submitting thread writes it.
         let host = unsafe { std::slice::from_raw_parts(self.data.add(from - start), n) };
@@ -820,8 +824,15 @@ impl Shadow {
             let mut scratch = Vec::new();
             let mut synced = Vec::new();
             let mut at = from;
+            let remaps = crate::watch::submission_remaps();
             while at < to {
-                let n = (PIECE - (start + at) % PIECE).min(to - at);
+                let piece = (PIECE - (start + at) % PIECE).min(to - at);
+                let (next, unchanged) = remaps.segment(start + at, start + at + piece);
+                let n = next - (start + at);
+                if !unchanged {
+                    at += n;
+                    continue;
+                }
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
@@ -850,7 +861,9 @@ impl Shadow {
                     // write was needed. A later partial overlap must not take
                     // those merged bytes for new GPU writes.
                     snapshot.refresh(at, host);
-                    synced.push((start + at) / PAGE);
+                    if n == PAGE {
+                        synced.push((start + at) / PAGE);
+                    }
                 }
                 if self.has_widened.load(Ordering::Acquire) {
                     self.refresh_widened(start + at, start + at + n);
@@ -938,9 +951,10 @@ impl Shadow {
         let mut taken = Vec::new();
         let mut title = Vec::new();
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let remaps = crate::watch::submission_remaps();
         for &page in pages {
             let (from, to) = (page.max(start), (page + PAGE).min(end));
-            if from >= to {
+            if from >= to || remaps.overlaps(from, to) {
                 continue;
             }
             // Our own write below must not save the page for this copy again.

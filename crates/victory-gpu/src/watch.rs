@@ -1215,9 +1215,77 @@ pub(crate) fn insert_interval(ranges: &mut Intervals, mut from: usize, mut to: u
     ranges.insert(from, to);
 }
 
+#[derive(Default)]
+pub(crate) struct SubmissionRemaps {
+    active: bool,
+    ranges: Intervals,
+}
+
+impl SubmissionRemaps {
+    pub(crate) fn overlaps(&self, from: usize, to: usize) -> bool {
+        self.ranges
+            .range(..to)
+            .next_back()
+            .is_some_and(|(_, end)| *end > from)
+    }
+
+    /// The end of the next unchanged or remapped segment within this piece.
+    pub(crate) fn segment(&self, from: usize, to: usize) -> (usize, bool) {
+        if let Some((_, &end)) = self.ranges.range(..=from).next_back()
+            && end > from
+        {
+            return (end.min(to), false);
+        }
+        let end = self
+            .ranges
+            .range(from..to)
+            .next()
+            .map_or(to, |(&start, _)| start);
+        (end, true)
+    }
+}
+
+static SUBMISSION_REMAPS: std::sync::RwLock<SubmissionRemaps> =
+    std::sync::RwLock::new(SubmissionRemaps {
+        active: false,
+        ranges: Intervals::new(),
+    });
+
+pub(crate) struct Submission;
+impl Drop for Submission {
+    fn drop(&mut self) {
+        let mut state = SUBMISSION_REMAPS.write().unwrap_or_else(|e| e.into_inner());
+        state.active = false;
+        state.ranges.clear();
+    }
+}
+
+/// Starts a new epoch under the host's submission lock, before preparing
+/// snapshots or running GPU work.
+pub(crate) fn begin_submission() -> Submission {
+    let mut state = SUBMISSION_REMAPS.write().unwrap_or_else(|e| e.into_inner());
+    debug_assert!(!state.active);
+    state.active = true;
+    Submission
+}
+
+/// Held through the write so a concurrent pre-unmap notification cannot
+/// pass between checking the range and copying into it.
+pub(crate) fn submission_remaps() -> std::sync::RwLockReadGuard<'static, SubmissionRemaps> {
+    SUBMISSION_REMAPS.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn record_remap(at: usize, len: usize) {
+    let mut state = SUBMISSION_REMAPS.write().unwrap_or_else(|e| e.into_inner());
+    if state.active {
+        insert_interval(&mut state.ranges, at, at.saturating_add(len));
+    }
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    record_remap(at, len);
     crate::heap_worker::title_remapped(at, len);
     crate::texback::remapped(at, len);
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
@@ -1238,10 +1306,15 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// around its unmappings and the title's frees, and a tracker taking the
 /// pages meanwhile leaves them changed, as during a kernel write.
 pub fn title_memory_unmapping(at: usize, len: usize) -> Writing {
-    if !fault_tracking() || at == 0 {
+    let tracking = fault_tracking();
+    if at == 0 || (!tracking && len == 0 && !submission_remaps().active) {
         return Writing { first: 0, last: 0 };
     }
     let len = if len == 0 { allocation_len(at) } else { len };
+    record_remap(at, len);
+    if !tracking {
+        return Writing { first: 0, last: 0 };
+    }
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
     g.busy.push((first, last));
