@@ -881,6 +881,10 @@ fn box32_nodes_across_a_page_boundary_equal_the_reference() {
             a[node / 4..node / 4 + 28].copy_from_slice(w);
         }
     }
+    let missing = 0x2_0000;
+    let ray = Ray::new([0.0; 3], [1.0; 3], 100.0);
+    write_ray(&mut a, 0, (missing >> 3) | 5, 0, &ray);
+    assert_ne!(intersect(&[0; 28], 5, &ray), [INVALID; 4]);
     // The next page's entry names copy B's views (heap index 5).
     let mut table = page_table(1, 3);
     let next = TITLE as u32 + 0x1_0000;
@@ -915,18 +919,18 @@ fn box32_nodes_across_a_page_boundary_equal_the_reference() {
             View::Memory(&b),
             View::Pair,
         ];
-        let out = host
-            .dispatch(
+        let run = |table: Vec<u32>| {
+            host.dispatch(
                 &root,
                 &pso,
                 &Dispatch {
                     roots: vec![
-                        (0, Root::Constants(ud)),
+                        (0, Root::Constants(ud.clone())),
                         (
                             1,
                             Root::View {
                                 srv: true,
-                                data: table.clone(),
+                                data: table,
                             },
                         ),
                         (2, Root::Uav(2 * 4096 / 32)),
@@ -936,8 +940,21 @@ fn box32_nodes_across_a_page_boundary_equal_the_reference() {
                     groups: [1, 1, 1],
                 },
             )
-            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-        for (n, (w, _, ray)) in cases.iter().enumerate() {
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"))
+        };
+        let out = run(table.clone());
+        assert_eq!(out[0][..4], [INVALID; 4], "{label}: unmapped head");
+        let mut missing_tail = table.clone();
+        missing_tail[entry..entry + 2].copy_from_slice(&[3, 0]);
+        let out_missing_tail = run(missing_tail);
+        for n in (1..LANES).step_by(2) {
+            assert_eq!(
+                out_missing_tail[0][4 * n..4 * n + 4],
+                [INVALID; 4],
+                "{label}: unmapped tail"
+            );
+        }
+        for (n, (w, _, ray)) in cases.iter().enumerate().skip(1) {
             let node = if n % 2 == 1 { shared } else { w };
             let want = intersect(node, 5, ray);
             let got = &out[0][4 * n..4 * n + 4];

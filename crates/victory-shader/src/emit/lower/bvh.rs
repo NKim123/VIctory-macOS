@@ -66,6 +66,7 @@ enum Nodes {
 /// offset in it, its address's low dword.
 #[derive(Clone, Copy)]
 struct Lookup {
+    miss: V,
     h: V,
     at: V,
     lo: V,
@@ -232,8 +233,8 @@ impl Lower<'_> {
         let five = self.s.m.i32(5);
         let is32 = self.s.m.cmp(c, pred::EQ, ty, five);
         let at = self.begin_guarded(Some(is32));
-        let tail = match self.node_dwords(nodes, 16, 12, head) {
-            Ok((t, _)) => t,
+        let (tail, tail_lookup) = match self.node_dwords(nodes, 16, 12, head) {
+            Ok(loaded) => loaded,
             Err(why) => {
                 self.end_guarded(at, &[]);
                 self.end_guarded(outer, &[]);
@@ -241,10 +242,22 @@ impl Lower<'_> {
             }
         };
         let zero = self.s.m.i32(0);
-        let pairs: Vec<(V, V)> = tail.iter().map(|&t| (t, zero)).collect();
-        let tail = self.end_guarded(at, &pairs);
+        let resident = self.s.m.bool(false);
+        let mut pairs: Vec<(V, V)> = tail.iter().map(|&t| (t, zero)).collect();
+        pairs.push((tail_lookup.map_or(resident, |lookup| lookup.miss), resident));
+        let mut tail = self.end_guarded(at, &pairs);
+        let tail_miss = tail.pop().unwrap();
         let w: Vec<V> = w.into_iter().chain(tail).collect();
+        let c = self.cur;
+        let miss = self.s.m.bin(
+            c,
+            Bin::Or,
+            head.map_or(resident, |lookup| lookup.miss),
+            tail_miss,
+        );
         let boxes = self.bvh_box(&w, ty, ray);
+        let none = self.s.m.i32(INVALID);
+        let boxes = boxes.map(|child| self.s.m.select(self.cur, miss, none, child));
         let tri = self.bvh_triangle(&w, ty, ray);
         let c = self.cur;
         let four = self.s.m.i32(4);
@@ -272,7 +285,8 @@ impl Lower<'_> {
                 return Ok((out, Some(lookup)));
             }
             (&Nodes::Raw(address), Some(head)) => {
-                return Ok((self.raw_load_past(address, head, 4 * from, n), None));
+                let (out, miss) = self.raw_load_past(address, head, 4 * from, n);
+                return Ok((out, Some(Lookup { miss, ..head })));
             }
         };
         let c = self.cur;
@@ -308,8 +322,8 @@ impl Lower<'_> {
         let mask = self.s.m.i32(0xFFFF);
         let hi = self.s.m.bin(c, Bin::And, hi, mask);
         // A node (64 bytes, 64-byte aligned) lies in one 64 KiB page.
-        let (h, at) = self.memory(lo, hi, 4 * dwords, false, None);
-        let lookup = Lookup { h, at, lo };
+        let (h, at, miss) = self.memory_access(lo, hi, 4 * dwords, false, None);
+        let lookup = Lookup { h, at, lo, miss };
         (self.raw_dwords(&lookup, 0, dwords), lookup)
     }
 
@@ -318,16 +332,19 @@ impl Lower<'_> {
     /// the dwords are read through its lookup (the same view, its offset
     /// plus `offset`; a miss there is marked already): only lanes whose node
     /// crosses into the next page look up again.
-    fn raw_load_past(&mut self, address: V, head: Lookup, offset: u32, dwords: u32) -> Vec<V> {
+    fn raw_load_past(&mut self, address: V, head: Lookup, offset: u32, dwords: u32) -> (Vec<V>, V) {
         let c = self.cur;
         let (page, last) = (self.s.m.i32(0xFFFF), self.s.m.i32(0x1_0000 - offset));
         let x = self.s.m.bin(c, Bin::And, head.lo, page);
         let crosses = self.s.m.cmp(c, pred::IUGE, x, last);
         let reused = self.raw_dwords(&head, offset, dwords);
         let at = self.begin_guarded(Some(crosses));
-        let (own, _) = self.raw_load(address, offset, dwords);
-        let pairs: Vec<(V, V)> = own.into_iter().zip(reused).collect();
-        self.end_guarded(at, &pairs)
+        let (own, lookup) = self.raw_load(address, offset, dwords);
+        let mut pairs: Vec<(V, V)> = own.into_iter().zip(reused).collect();
+        pairs.push((lookup.miss, head.miss));
+        let mut values = self.end_guarded(at, &pairs);
+        let miss = values.pop().unwrap();
+        (values, miss)
     }
 
     /// `dwords` dwords at byte `offset` past a lookup's byte.

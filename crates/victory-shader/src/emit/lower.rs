@@ -5426,6 +5426,18 @@ impl<'a> Lower<'a> {
         write: bool,
         active: Option<V>,
     ) -> (V, V) {
+        let (handle, offset, _) = self.memory_access(lo, hi, bytes, write, active);
+        (handle, offset)
+    }
+
+    fn memory_access(
+        &mut self,
+        lo: V,
+        hi: V,
+        bytes: u32,
+        write: bool,
+        active: Option<V>,
+    ) -> (V, V, V) {
         let e = self.memory_entry(lo, hi, write);
         let c = self.cur;
         // Writes always mark (written or missed pages), reads only misses.
@@ -5472,7 +5484,7 @@ impl<'a> Lower<'a> {
             self.end_guarded(at, &[]);
         }
         self.memory_offsets.insert(e.offset);
-        (e.handle, e.offset)
+        (e.handle, e.offset, e.miss)
     }
 
     /// Bitmap bit for a page-table lookup: `l1` in block 0 when the 256 MiB
