@@ -551,8 +551,11 @@ impl<'a> Tracer<'a> {
 
     /// The value holding dword `dword` of root parameter `param`.
     fn param_word(&self, param: usize, dword: u32) -> Option<Value> {
-        if self.layout[param].user_data >= 16 && self.stage == HwStage::Cs {
-            return self.first_spilled.get(&(param, dword)).copied();
+        if self.layout[param].user_data >= 16
+            && self.stage == HwStage::Cs
+            && let Some(&v) = self.first_spilled.get(&(param, dword))
+        {
+            return Some(v);
         }
         let reg = Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + dword as u8);
         self.p.inputs.iter().find(|i| i.0 == reg).map(|i| i.1)
