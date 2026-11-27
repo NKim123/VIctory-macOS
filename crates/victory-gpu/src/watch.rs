@@ -180,7 +180,7 @@ mod write_sites {
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
     use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, EXCEPTION_POINTERS};
 
-    use super::PAGE;
+    use super::{GuardRegion, PAGE};
 
     const SLOTS: usize = 4096;
     static GUARDED: [AtomicUsize; SLOTS] = [const { AtomicUsize::new(0) }; SLOTS];
@@ -198,13 +198,12 @@ mod write_sites {
         let _ = OBSERVER.set(observer);
     }
 
-    pub(super) fn publish(pages: &[usize], ends: &[usize]) {
+    pub(super) fn publish(pages: &[usize], regions: &[GuardRegion]) {
         if OBSERVER.get().is_none() {
             return;
         }
-        for (&page, &end) in pages.iter().zip(ends) {
-            // An unknown end also occurs on a previously guarded page.
-            if end == usize::MAX {
+        for (&page, region) in pages.iter().zip(regions) {
+            if region.write_watched {
                 GUARDED[page % SLOTS].store(page * PAGE, Relaxed);
             }
         }
@@ -584,15 +583,15 @@ impl Protected {
             .collect()
     }
 
-    fn insert(&self, pages: &[usize], ends: &[usize]) {
+    fn insert(&self, pages: &[usize], regions: &[GuardRegion]) {
         let mut protected = self.0.write().unwrap_or_else(|e| e.into_inner());
         let end = pages.last().unwrap() + 1;
         protected.extend(
             pages
                 .iter()
                 .copied()
-                .zip(ends.iter().map(|&region_end| Protection {
-                    watched: page_parts() && region_end == usize::MAX,
+                .zip(regions.iter().map(|region| Protection {
+                    watched: page_parts() && region.write_watched,
                     end,
                 })),
         );
@@ -1476,11 +1475,12 @@ fn protect_noting(g: &Guards, pages: &[usize], unmapped_pages: &mut Vec<usize>) 
     // takes one view at a time under Wine, so a run that crossed two views
     // (the runtime's page mappings make one per page) failed and was then
     // guarded page by page, one call more than needed.
-    let (pages, ends) = filter_runtime_pages(
+    let (pages, regions) = filter_runtime_pages(
         &pages,
-        |page| g.protected.contains(&page).then_some(usize::MAX).or_else(|| {
-            (port_guard() && g.alias_of.contains_key(&page)).then_some(page + 1)
-        }),
+        |page| {
+            (g.protected.contains(&page) || port_guard() && g.alias_of.contains_key(&page))
+                .then_some(page + 1)
+        },
         |first, count| write_watched_range(first * PAGE, count * PAGE),
         query_runtime_region,
     );
@@ -1495,27 +1495,27 @@ fn protect_noting(g: &Guards, pages: &[usize], unmapped_pages: &mut Vec<usize>) 
         let first = i;
         while i + 1 < pages.len()
             && pages[i + 1] == pages[i] + 1
-            && pages[i + 1] < ends[first]
+            && pages[i + 1] < regions[first].end
             && !g.protected.contains(&pages[i + 1])
         {
             i += 1;
         }
         let run = &pages[first..=i];
-        let run_ends = &ends[first..=i];
+        let run_regions = &regions[first..=i];
         i += 1;
         if set(run[0], run[run.len() - 1] + 1) {
             #[cfg(target_arch = "x86_64")]
             // An allocation under the lock can fault and open a page again.
-            write_sites::publish(run, run_ends);
-            g.protected.insert(run, run_ends);
+            write_sites::publish(run, run_regions);
+            g.protected.insert(run, run_regions);
             taken.extend(run);
             continue;
         }
-        for (&page, &end) in run.iter().zip(run_ends) {
+        for (&page, region) in run.iter().zip(run_regions) {
             if (!port_guard() || run.len() > 1) && set(page, page + 1) {
                 #[cfg(target_arch = "x86_64")]
-                write_sites::publish(&[page], std::slice::from_ref(&end));
-                g.protected.insert(&[page], &[end]);
+                write_sites::publish(&[page], std::slice::from_ref(region));
+                g.protected.insert(&[page], std::slice::from_ref(region));
                 taken.push(page);
             } else if unmapped(page) {
                 taken.push(page);
@@ -1549,9 +1549,15 @@ fn query_runtime_region(page: usize) -> Option<(usize, usize, bool)> {
     Some((a, b, yes))
 }
 
+/// The bound on a protection run and whether it is in a write-watched pool.
+#[derive(Clone, Copy)]
+struct GuardRegion {
+    end: usize,
+    write_watched: bool,
+}
+
 /// Filters `pages` to those already guarded or in the runtime's GPU memory,
-/// returning each kept page together with the exclusive end of its known
-/// region.
+/// retaining the region information for each kept page.
 ///
 /// Contiguous unprotected runs are probed as a whole with `watched_range`
 /// (one `GetWriteWatch` call for an entire write-watched pool run instead of
@@ -1563,15 +1569,18 @@ fn filter_runtime_pages(
     known_end: impl Fn(usize) -> Option<usize>,
     mut watched_range: impl FnMut(usize, usize) -> bool,
     mut query_region: impl FnMut(usize) -> Option<(usize, usize, bool)>,
-) -> (Vec<usize>, Vec<usize>) {
+) -> (Vec<usize>, Vec<GuardRegion>) {
     let mut out_pages = Vec::with_capacity(pages.len());
-    let mut out_ends = Vec::with_capacity(pages.len());
+    let mut regions = Vec::with_capacity(pages.len());
     let mut last: Option<(usize, usize, bool)> = None;
     let mut i = 0;
     while i < pages.len() {
         if let Some(end) = known_end(pages[i]) {
             out_pages.push(pages[i]);
-            out_ends.push(end);
+            regions.push(GuardRegion {
+                end,
+                write_watched: false,
+            });
             i += 1;
             continue;
         }
@@ -1594,7 +1603,13 @@ fn filter_runtime_pages(
                 let take = (b - p).min(rem);
                 if yes {
                     out_pages.extend_from_slice(&run[k..k + take]);
-                    out_ends.extend(std::iter::repeat_n(b, take));
+                    regions.extend(std::iter::repeat_n(
+                        GuardRegion {
+                            end: b,
+                            write_watched: false,
+                        },
+                        take,
+                    ));
                 }
                 k += take;
                 continue;
@@ -1603,8 +1618,13 @@ fn filter_runtime_pages(
             if watched_range(p, rem) {
                 let end = p + rem;
                 out_pages.extend_from_slice(&run[k..]);
-                out_ends.extend(std::iter::repeat_n(end, rem));
-                last = Some((p, end, true));
+                regions.extend(std::iter::repeat_n(
+                    GuardRegion {
+                        end,
+                        write_watched: true,
+                    },
+                    rem,
+                ));
                 break;
             }
             // If the run starts in a write-watched pool and crosses a boundary,
@@ -1627,7 +1647,13 @@ fn filter_runtime_pages(
                 }
                 let end = p + lo;
                 out_pages.extend_from_slice(&run[k..k + lo]);
-                out_ends.extend(std::iter::repeat_n(end, lo));
+                regions.extend(std::iter::repeat_n(
+                    GuardRegion {
+                        end,
+                        write_watched: true,
+                    },
+                    lo,
+                ));
                 k += lo;
                 continue;
             }
@@ -1636,7 +1662,13 @@ fn filter_runtime_pages(
                 let take = b.saturating_sub(p).max(1).min(rem);
                 if yes {
                     out_pages.extend_from_slice(&run[k..k + take]);
-                    out_ends.extend(std::iter::repeat_n(b, take));
+                    regions.extend(std::iter::repeat_n(
+                        GuardRegion {
+                            end: b,
+                            write_watched: false,
+                        },
+                        take,
+                    ));
                 }
                 k += take;
             } else {
@@ -1644,7 +1676,7 @@ fn filter_runtime_pages(
             }
         }
     }
-    (out_pages, out_ends)
+    (out_pages, regions)
 }
 
 /// Pages `[first, last)` changed, and so the pages showing the same memory
@@ -3883,7 +3915,7 @@ pub(crate) mod tests {
         // Single pool of 4096 pages: 1 watched_range call, 0 query_region calls.
         let pages: Vec<usize> = (100..4196).collect();
         let (mut watch_calls, mut query_calls) = (0usize, 0usize);
-        let (kept, ends) = filter_runtime_pages(
+        let (kept, regions) = filter_runtime_pages(
             &pages,
             |_| None,
             |first, count| {
@@ -3898,12 +3930,12 @@ pub(crate) mod tests {
         assert_eq!(watch_calls, 1);
         assert_eq!(query_calls, 0);
         assert_eq!(kept, pages);
-        assert!(ends.iter().all(|&e| e == 4196));
+        assert!(regions.iter().all(|r| r.end == 4196 && r.write_watched));
 
         // Mixed run: pool A [0..1000), plain private [1000..1500), view [1500..2000).
         let mixed: Vec<usize> = (0..2000).collect();
         let (mut watch_calls, mut query_calls) = (0usize, 0usize);
-        let (kept, ends) = filter_runtime_pages(
+        let (kept, regions) = filter_runtime_pages(
             &mixed,
             |_| None,
             |first, count| {
@@ -3925,7 +3957,15 @@ pub(crate) mod tests {
         assert_eq!(query_calls, 2, "one query per non-pool region");
         let expected: Vec<usize> = (0..1000).chain(1500..2000).collect();
         assert_eq!(kept, expected);
-        assert!(ends[..1000].iter().all(|&e| e == 1000));
-        assert!(ends[1000..].iter().all(|&e| e == 2000));
+        assert!(
+            regions[..1000]
+                .iter()
+                .all(|r| r.end == 1000 && r.write_watched)
+        );
+        assert!(
+            regions[1000..]
+                .iter()
+                .all(|r| r.end == 2000 && !r.write_watched)
+        );
     }
 }
