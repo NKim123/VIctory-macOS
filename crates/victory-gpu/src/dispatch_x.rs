@@ -47,7 +47,7 @@ impl Dispatch {
 #[cfg(windows)]
 const USER_GROUP_BASE: u32 = 0x104;
 #[cfg(windows)]
-const USER_DISPATCH_THREADS_X: u32 = 0x106;
+use victory_shader::emit::USER_DISPATCH_THREADS_X;
 
 #[cfg(windows)]
 pub(crate) fn uses_root_word(root: victory_shader::RootType) -> bool {

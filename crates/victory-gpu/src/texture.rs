@@ -939,13 +939,13 @@ impl Staging {
         read: &impl Fn(usize, &mut [u8]) -> bool,
     ) -> (Vec<Sub>, usize) {
         let count = self.footprints.len();
-        let size = self.layout.size as usize;
+        let size = self.layout.bytes_from(self.first) as usize;
         if let Some(runs) = runs {
             last.states.clear();
             let fresh = (0..count)
                 .filter(|&i| {
                     let (a, b) = self.spans.get(i).copied().unwrap_or((0, size));
-                    touches(&runs, a, b)
+                    touches(&runs, a, b.min(size))
                 })
                 .map(|i| (i as u32, None))
                 .collect();
@@ -963,6 +963,7 @@ impl Staging {
         for mip in (0..mips).rev() {
             for i in (mip..self.spans.len()).step_by(mips) {
                 let (a, b) = self.spans[i];
+                let b = b.min(last.read.len());
                 if a >= b {
                     continue;
                 }
