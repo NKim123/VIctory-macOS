@@ -76,6 +76,7 @@ pub(crate) struct Host {
     split_marks: Mutex<Option<Vec<Mark>>>,
     /// Reusable global UAV barrier lists inserted between coalesced queue pieces.
     barrier_lists: Mutex<Option<Vec<BarrierList>>>,
+    replay_preludes: Mutex<Vec<Prelude>>,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -210,6 +211,124 @@ impl BarrierList {
     fn list(&self) -> Option<ID3D12CommandList> {
         self.list.cast().ok()
     }
+}
+
+struct Prelude {
+    allocator: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+}
+
+struct PreludePlan {
+    copies: Vec<(std::sync::Arc<crate::resource::HostTexture>, bool)>,
+    twin_states: std::collections::HashMap<usize, u32>,
+    moves: Vec<(ID3D12Resource, u32, u32)>,
+    uav_to_srv: bool,
+    clamp_budget: u64,
+    clamp_buffers: Vec<ID3D12Resource>,
+    clamps: Vec<crate::indirect::PendingClamp>,
+}
+
+impl Prelude {
+    fn new(host: &Host) -> windows::core::Result<Self> {
+        // SAFETY: a new allocator and its command list belong to this prelude.
+        unsafe {
+            let allocator = host
+                .device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+            let list: ID3D12GraphicsCommandList = host.device.CreateCommandList(
+                0,
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                &allocator,
+                None,
+            )?;
+            list.Close()?;
+            Ok(Self { allocator, list })
+        }
+    }
+
+    fn record(&self, plan: &PreludePlan) -> ID3D12CommandList {
+        let move_texture = |texture: &ID3D12Resource, from, to| {
+            transition(
+                texture,
+                D3D12_RESOURCE_STATES(from as i32),
+                D3D12_RESOURCE_STATES(to as i32),
+            )
+        };
+        // SAFETY: the previous submission has completed and this job owns
+        // its allocator and list. Resource states were resolved in list order.
+        unsafe {
+            let recorded = self.allocator.Reset().and_then(|()| {
+                self.list.Reset(&self.allocator, None)?;
+                for (depth, to_depth) in &plan.copies {
+                    let Some(Some(twin)) = depth.twin.get() else {
+                        continue;
+                    };
+                    let mut back = Vec::new();
+                    twin.copy(&self.list, depth, *to_depth, &mut |texture, wanted| {
+                        let real = plan.twin_states[&(std::sync::Arc::as_ptr(texture) as usize)];
+                        let wanted = texture.legal_state(wanted);
+                        (real != wanted).then(|| {
+                            let forward = move_texture(&texture.texture, real, wanted);
+                            back.push(move_texture(&texture.texture, wanted, real));
+                            forward
+                        })
+                    });
+                    if !back.is_empty() {
+                        self.list.ResourceBarrier(&back);
+                    }
+                }
+                let barriers: Vec<_> = plan
+                    .moves
+                    .iter()
+                    .map(|(texture, from, to)| move_texture(texture, *from, *to))
+                    .collect();
+                if !barriers.is_empty() {
+                    self.list.ResourceBarrier(&barriers);
+                }
+                if !plan.clamps.is_empty() {
+                    crate::indirect::record_batch(
+                        &self.list,
+                        plan.clamp_budget,
+                        &plan.clamp_buffers,
+                        &plan.clamps,
+                    );
+                }
+                self.list.Close()?;
+                self.list.cast()
+            });
+            recorded
+                .unwrap_or_else(|e| fail(format_args!("a host state prelude did not record ({e})")))
+        }
+    }
+}
+
+fn parallel_preludes(runs: &[&HostList], planned: &[Option<PreludePlan>]) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PARALLEL_PRELUDES").as_deref() == Ok("1"))
+        && runs.len() >= 4
+        && planned
+            .iter()
+            .flatten()
+            .map(|p| {
+                // Count moves with known barrier cost before recording. Twin
+                // conversions may add barriers depending on the copy route.
+                p.moves.len()
+                    + if p.clamps.is_empty() {
+                        0
+                    } else {
+                        2 * p.clamp_buffers.len()
+                            + p.clamps.iter().filter(|c| c.records > 0).count()
+                            + 1
+                    }
+            })
+            .sum::<usize>()
+            >= 256
+        && runs
+            .iter()
+            .map(|r| std::ptr::from_ref(*r))
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            >= 4
 }
 
 /// Submissions that did not run to their mark, and queues made since to
@@ -419,6 +538,7 @@ fn create() -> windows::core::Result<Host> {
             mark: OnceLock::new(),
             split_marks: Mutex::new(Some(Vec::new())),
             barrier_lists: Mutex::new(Some(Vec::new())),
+            replay_preludes: Mutex::default(),
             event,
             rtvs,
             rtv_size,
@@ -655,6 +775,7 @@ pub(crate) mod tests {
     }
 
     thread_local! {
+        pub(super) static PARALLEL_PRELUDES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         static NATIVE_CALLS: std::cell::RefCell<Option<NativeCallTrace>> =
             const { std::cell::RefCell::new(None) };
 
@@ -760,6 +881,96 @@ pub(crate) mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn repeated_lists_keep_distinct_preludes_in_one_submission() {
+        let Some(host) = host() else { return };
+        let memory = vec![0u32; 64 * 4];
+        let words = [3u32, 0, 0, 0, 1, 0, 1, 1 | (1 << 16), 28, 1, 0, 0x100, 0, 0];
+        let textures: Vec<_> = memory
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|storage| {
+                let resource =
+                    crate::resource::texture_at(storage.as_ptr() as u64, &words).unwrap();
+                crate::resource::host_copy(resource).unwrap()
+            })
+            .collect();
+        let (input, data) = host.shared_buffer(64).unwrap();
+        let mut outputs = Vec::new();
+        let mut lists = Vec::new();
+        for index in 0..4u32 {
+            let list = host.new_list().unwrap();
+            for texture in &textures {
+                assert!(
+                    list.move_texture(texture, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32)
+                        .is_none()
+                );
+                let barrier = list
+                    .move_texture(texture, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32)
+                    .unwrap();
+                // SAFETY: the list is open and the texture is retained.
+                unsafe { list.list.ResourceBarrier(&[barrier]) };
+            }
+            let args = [0, index + 1, 27, 33];
+            // SAFETY: each list reads a separate 16-byte record in our mapping.
+            unsafe { data.cast::<[u32; 4]>().add(index as usize).write(args) };
+            // SAFETY: the input buffer is live until after the submission.
+            let src_gpu = unsafe { input.GetGPUVirtualAddress() } + u64::from(index) * 16;
+            let output = list
+                .enqueue_hoisted_clamp(16, |dst_gpu| crate::indirect::PendingClamp {
+                    src_gpu,
+                    dst_gpu,
+                    count_gpu: None,
+                    kind: 0,
+                    stride: 16,
+                    records: 1,
+                })
+                .unwrap();
+            outputs.push((output, args));
+            list.close();
+            lists.push(list);
+        }
+        start_native_call_trace();
+        host.execute(&[&lists[0], &lists[1], &lists[2], &lists[3], &lists[0]]);
+        let calls = take_native_call_trace();
+        assert_eq!(
+            PARALLEL_PRELUDES.with(std::cell::Cell::get),
+            std::env::var("VICTORY_PARALLEL_PRELUDES").as_deref() == Ok("1"),
+        );
+        for ((buffer, offset), expected) in outputs {
+            let mut mapped = std::ptr::null_mut();
+            // SAFETY: the GPU completed and the 16-byte output belongs to
+            // this list's shared argument buffer.
+            unsafe {
+                buffer.Map(0, None, Some(&mut mapped)).unwrap();
+                let actual = mapped
+                    .cast::<u8>()
+                    .add(offset as usize)
+                    .cast::<[u32; 4]>()
+                    .read();
+                buffer.Unmap(0, None);
+                assert_eq!(actual, expected);
+            }
+        }
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].0.len(),
+            1,
+            "all five occurrences share a native call"
+        );
+        assert!(calls[0].0[0] >= 10, "each occurrence records a prelude");
+        assert!(calls[0].1, "the GPU completed the submission");
+        assert!(
+            textures
+                .iter()
+                .all(|t| t.state.load(Ordering::Relaxed)
+                    == D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32)
+        );
+        // SAFETY: plain device query after the fence.
+        unsafe { host.device.GetDeviceRemovedReason() }.unwrap();
+    }
 
     /// Shaders that use title memory mark their reads in their own bitmap:
     /// read marks of both bitmaps are taken, each slot once until it is
@@ -1434,7 +1645,7 @@ pub(crate) struct HostList {
     /// memory ([`HostList::writer_uses_memory`]).
     memory_writer: std::sync::atomic::AtomicBool,
     /// The list that runs those transitions just before this one.
-    prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
+    prelude: Prelude,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// Which list this is, for the name that tells it apart in device-removed
@@ -1927,16 +2138,7 @@ impl HostGpu for Host {
                 &allocator,
                 None,
             )?;
-            let prelude_allocator: ID3D12CommandAllocator = self
-                .device
-                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-            let prelude: ID3D12GraphicsCommandList = self.device.CreateCommandList(
-                0,
-                D3D12_COMMAND_LIST_TYPE_DIRECT,
-                &prelude_allocator,
-                None,
-            )?;
-            prelude.Close()?;
+
             let id = NEXT_LIST.fetch_add(1, Ordering::Relaxed);
             name(&list, || list_name(id));
             Ok(HostList {
@@ -1957,7 +2159,7 @@ impl HostGpu for Host {
                 widened_states: Mutex::default(),
                 ours: false.into(),
                 memory_writer: false.into(),
-                prelude: (prelude_allocator, prelude),
+                prelude: Prelude::new(self)?,
                 pipelines: Mutex::default(),
                 id,
                 budget: OnceLock::new(),
@@ -2122,8 +2324,59 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
-        for (idx, list) in runs.iter().enumerate() {
+        let mut planned = Vec::with_capacity(runs.len());
+        for list in runs {
             list.run_deferred(&mut batch);
+            planned.push(list.plan_prelude(split_preludes));
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut replays = 0;
+        let slots: Vec<_> = runs
+            .iter()
+            .zip(&planned)
+            .map(|(list, plan)| {
+                if plan.is_some() && !seen.insert(std::ptr::from_ref(*list)) {
+                    let slot = replays;
+                    replays += 1;
+                    Some(slot)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut pool = (replays != 0).then(|| {
+            self.replay_preludes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+        });
+        if let Some(pool) = &mut pool {
+            while pool.len() < replays {
+                pool.push(Prelude::new(self).unwrap_or_else(|e| {
+                    fail(format_args!("could not allocate a replay prelude ({e})"))
+                }));
+            }
+        }
+        let recorded: Vec<_> = (0..runs.len()).map(|_| OnceLock::new()).collect();
+        let record = |idx: usize| {
+            if let Some(plan) = &planned[idx] {
+                let prelude = slots[idx].map_or(&runs[idx].prelude, |slot| {
+                    &pool.as_deref().expect("replay prelude pool")[slot]
+                });
+                #[cfg(feature = "diagnostics")]
+                let _timed =
+                    crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
+                let _ = recorded[idx].set(prelude.record(plan));
+            }
+        };
+        let parallel_preludes = parallel_preludes(runs, &planned);
+        #[cfg(test)]
+        tests::PARALLEL_PRELUDES.with(|taken| taken.set(parallel_preludes));
+        if parallel_preludes {
+            crate::texture::in_parallel(runs.len(), record);
+        } else {
+            (0..runs.len()).for_each(record);
+        }
+        for (idx, list) in runs.iter().enumerate() {
             firsts.push(lists.len());
             let needs_barrier = idx
                 .checked_sub(uploads_offset)
@@ -2136,17 +2389,16 @@ impl Host {
                 lists.push(barrier.list());
                 barrier_cursor += 1;
             }
-            #[cfg(feature = "diagnostics")]
-            let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
-            if let Some((prelude, uav_to_srv)) = list.prelude(split_preludes) {
-                if uav_to_srv && !lists.is_empty() {
+            if let Some(prelude) = recorded[idx].get() {
+                if planned[idx].as_ref().is_some_and(|plan| plan.uav_to_srv) && !lists.is_empty() {
                     native_boundaries.push(lists.len());
                 }
-                lists.push(Some(prelude));
+                lists.push(Some(prelude.clone()));
             }
             lists.push(list.list.cast().ok());
         }
         drop(barrier_pool);
+        drop(pool);
         batch.flush();
         #[cfg(feature = "diagnostics")]
         batch.log_refreshes(*submitted + 1, runs.len());
@@ -2318,6 +2570,13 @@ impl Host {
             let _ = (i, started);
         }
         SUBMISSIONS_DONE.store(*submitted, Ordering::Release);
+        const REPLAY_PRELUDES_KEPT: usize = 8;
+        if replays > REPLAY_PRELUDES_KEPT {
+            self.replay_preludes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .truncate(REPLAY_PRELUDES_KEPT);
+        }
         // The GPU fence has completed: return worker-owned staging chunks now.
         if let Some(u) = &uploads {
             u.release_worker();
@@ -3445,97 +3704,53 @@ impl HostList {
     /// At submission: the list that moves each texture this list uses from
     /// its real state to the one the list starts with; the textures' real
     /// states become those the list ends with.
-    fn prelude(&self, detect_uav_to_srv: bool) -> Option<(ID3D12CommandList, bool)> {
-        // Depth textures and their twins first, from their real states and
-        // back: the side each first use needs, made newer.
+    fn plan_prelude(&self, detect_uav_to_srv: bool) -> Option<PreludePlan> {
         let twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         let copies = crate::twin::at_submission(twins.values());
         drop(twins);
-        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        // The copies start from the real states, then the list's moves from
-        // them; only after both do they become the states the list leaves.
-        let mut uav_to_srv = false;
-        let mut moves = || -> Vec<D3D12_RESOURCE_BARRIER> {
-            states
-                .values()
-                .filter_map(|(first, _, copy)| {
-                    let real = copy.state.load(Ordering::Relaxed);
-                    (real != *first).then(|| {
-                        uav_to_srv |= detect_uav_to_srv
-                            && real == D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32
-                            && *first & D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE.0 as u32 != 0;
-                        transition(&copy.texture, D3D12_RESOURCE_STATES(real as i32), D3D12_RESOURCE_STATES(*first as i32))
-                    })
-                })
-                .collect()
-        };
-        let left = || {
-            for (_, last, copy) in states.values() {
-                copy.state.store(*last, Ordering::Relaxed);
-            }
-        };
-        let (clamp_budget, clamp_buffers, pending_clamps) = {
-            let clamps = self.clamps.lock().unwrap_or_else(|e| e.into_inner());
-            if clamps.pending.is_empty() {
-                (0, Vec::new(), Vec::new())
-            } else {
-                (clamps.budget_gpu, clamps.touched_buffers(), clamps.pending.clone())
-            }
-        };
-        if copies.is_empty()
-            && pending_clamps.is_empty()
-            && states.values().all(|(first, _, copy)| copy.state.load(Ordering::Relaxed) == *first)
-        {
-            left();
-            return None;
-        }
-        let (allocator, list) = &self.prelude;
-        // SAFETY: the prelude is not executing (every submission is waited
-        // for); the textures are live.
-        let recorded = unsafe {
-            allocator.Reset().and_then(|()| {
-                list.Reset(allocator, None)?;
-                for (depth, to_depth) in &copies {
-                    let Some(Some(twin)) = depth.twin.get() else { continue };
-                    // From each texture's real state to the copy's and back.
-                    let mut back = Vec::new();
-                    twin.copy(list, depth, *to_depth, &mut |t, wanted| {
-                        let real = t.state.load(Ordering::Relaxed);
-                        let wanted = t.legal_state(wanted);
-                        (real != wanted).then(|| {
-                            let there = transition(&t.texture, D3D12_RESOURCE_STATES(real as i32), D3D12_RESOURCE_STATES(wanted as i32));
-                            back.push(transition(
-                                &t.texture,
-                                D3D12_RESOURCE_STATES(wanted as i32),
-                                D3D12_RESOURCE_STATES(real as i32),
-                            ));
-                            there
-                        })
-                    });
-                    if !back.is_empty() {
-                        list.ResourceBarrier(&back);
-                    }
-                }
-                let barriers = moves();
-                if !barriers.is_empty() {
-                    list.ResourceBarrier(&barriers);
-                }
-                if !pending_clamps.is_empty() {
-                    crate::indirect::record_batch(
-                        list,
-                        clamp_budget,
-                        &clamp_buffers,
-                        &pending_clamps,
+        let mut twin_states = std::collections::HashMap::new();
+        for (depth, _) in &copies {
+            if let Some(Some(twin)) = depth.twin.get() {
+                for texture in std::iter::once(depth).chain(&twin.planes) {
+                    twin_states.insert(
+                        std::sync::Arc::as_ptr(texture) as usize,
+                        texture.state.load(Ordering::Relaxed),
                     );
                 }
-                list.Close()
-            })
-        };
-        left();
-        if let Err(e) = recorded {
-            fail(format_args!("a host state prelude did not record ({e})"));
+            }
         }
-        list.cast().ok().map(|list| (list, uav_to_srv))
+        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        let mut uav_to_srv = false;
+        let moves: Vec<_> = states
+            .values()
+            .filter_map(|(first, last, copy)| {
+                let real = copy.state.swap(*last, Ordering::Relaxed);
+                if real == *first {
+                    return None;
+                }
+                uav_to_srv |= detect_uav_to_srv
+                    && real == D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32
+                    && *first & D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE.0 as u32 != 0;
+                Some((copy.texture.clone(), real, *first))
+            })
+            .collect();
+        let clamps = self.clamps.lock().unwrap_or_else(|e| e.into_inner());
+        if copies.is_empty() && moves.is_empty() && clamps.pending.is_empty() {
+            return None;
+        }
+        Some(PreludePlan {
+            copies,
+            twin_states,
+            moves,
+            uav_to_srv,
+            clamp_budget: clamps.budget_gpu,
+            clamp_buffers: if clamps.pending.is_empty() {
+                Vec::new()
+            } else {
+                clamps.touched_buffers()
+            },
+            clamps: clamps.pending.clone(),
+        })
     }
 
     /// Notes what the command about to be recorded does, as a marker
