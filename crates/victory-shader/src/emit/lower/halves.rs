@@ -309,6 +309,10 @@ impl Lower<'_> {
         let c = self.cur;
         let (i32t, zero) = (self.s.t.i32, self.s.m.i32(0));
         self.s.flags |= flags::WAVE_OPS;
+        let active = active.filter(|&guard| {
+            super::super::shader_opt() & super::super::bitcode::opt::FIRST == 0
+                || self.s.m.int_value(guard).is_none_or(|x| x == 0)
+        });
         let Some(active) = active else {
             let own = self
                 .s

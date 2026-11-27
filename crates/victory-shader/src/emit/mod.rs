@@ -333,6 +333,26 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
     }
 }
 
+/// The effective `VICTORY_SHADER_OPT` mask, in decimal or `0x` hex.
+/// Bits 1, 2, 4, 8 and 16 select dead-code elimination, folding,
+/// dominator reuse, branch facts and same-block load reuse, respectively.
+/// Bits 32 and 64 enable first-lane and wide-load lowering shortcuts.
+/// The shader cache includes this mask in its translation key.
+pub fn shader_opt() -> u32 {
+    static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
+}
+
+fn parse_shader_opt(value: Option<&str>) -> u32 {
+    value
+        .map(str::trim)
+        .and_then(|v| match v.strip_prefix("0x") {
+            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+            None => v.parse().ok(),
+        })
+        .map_or(bitcode::opt::DEFAULT, |n| n & bitcode::opt::ALL)
+}
+
 /// A translated shader and what the host binds for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostShader {

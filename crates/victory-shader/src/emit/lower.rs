@@ -26,6 +26,7 @@ mod atomics;
 mod bvh;
 mod halves;
 mod mesh;
+mod raw;
 use barriers::{in_step, split_wave_barriers};
 pub(crate) use mesh::KeptOutputs;
 use mesh::prune_signature;
@@ -1081,6 +1082,18 @@ impl<'a> Lower<'a> {
                 (Some(h), off)
             }
         };
+        if let (Some(h), None) = (h, sub)
+            && n > 1
+            && super::shader_opt() & super::bitcode::opt::WIDE != 0
+        {
+            let raw = self.raw_dword_group(h, off, n);
+            for k in 0..n {
+                let x = self.s.m.extract(self.cur, raw, k);
+                let x = self.as_int(x);
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            }
+            return Ok(());
+        }
         let c = self.cur;
         let dword = |l: &mut Self, byte: V| -> Result<V, Why> {
             match h {
@@ -4803,7 +4816,11 @@ impl<'a> Lower<'a> {
             let c = self.cur;
             // 7900XTX's wide scalar SRV loads. Each call stays within the
             // same console instruction and uses its four-byte alignment.
-            let width = if srv && !root_uav && super::wide_scalar_loads() {
+            let width = if srv
+                && !root_uav
+                && (super::wide_scalar_loads()
+                    || super::shader_opt() & super::bitcode::opt::WIDE != 0)
+            {
                 4
             } else {
                 1
@@ -4812,9 +4829,7 @@ impl<'a> Lower<'a> {
                 let dwords = (count - first).min(width);
                 let off = self.s.m.i32(4 * first);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
-                let mask = self.s.m.i8((1u8 << dwords) - 1);
-                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
-                let r = self.raw_buffer_load(c, &[h, a, u, mask, al]);
+                let r = self.raw_dword_group(h, a, dwords);
                 for k in 0..dwords {
                     let x = self.s.m.extract(c, r, k);
                     let x = self.as_int(x);

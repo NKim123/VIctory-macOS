@@ -111,6 +111,7 @@ fn build(wave32: bool) -> &'static [u8; 32] {
             wave32,
             victory_shader::emit::raw_root_cbvs(),
             victory_shader::emit::wide_scalar_loads(),
+            victory_shader::emit::shader_opt(),
         )
     })
 }
@@ -138,12 +139,14 @@ fn key(
     wave32: bool,
     raw_root_cbvs: bool,
     wide_scalar_loads: bool,
+    shader_opt: u32,
 ) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(translator.as_bytes());
     h.update(blake3::hash(encoding).as_bytes());
     h.update(&limit.to_le_bytes());
     h.update(&[u8::from(wave32), u8::from(raw_root_cbvs)]);
+    h.update(&shader_opt.to_le_bytes());
     if wide_scalar_loads {
         h.update(b"wide scalar loads");
     }
@@ -685,17 +688,23 @@ mod tests {
         let version = "0123456789abcdef";
         let encoding = b"encoding";
         let limit = 1 << 20;
-        let k = key(version, encoding, limit, false, false, false);
-        assert_eq!(k, key(version, encoding, limit, false, false, false));
+        let k = key(version, encoding, limit, false, false, false, 0);
+        assert_eq!(k, key(version, encoding, limit, false, false, false, 0));
         assert_ne!(
             k,
-            key("0123456789abcdee", encoding, limit, false, false, false)
+            key("0123456789abcdee", encoding, limit, false, false, false, 0)
         );
-        assert_ne!(k, key(version, b"encoding.", limit, false, false, false));
-        assert_ne!(k, key(version, encoding, limit / 2, false, false, false));
-        assert_ne!(k, key(version, encoding, limit, true, false, false));
-        assert_ne!(k, key(version, encoding, limit, false, true, false));
-        assert_ne!(k, key(version, encoding, limit, false, false, true));
+        assert_ne!(k, key(version, b"encoding.", limit, false, false, false, 0));
+        assert_ne!(k, key(version, encoding, limit / 2, false, false, false, 0));
+        assert_ne!(k, key(version, encoding, limit, true, false, false, 0));
+        assert_ne!(k, key(version, encoding, limit, false, true, false, 0));
+        assert_ne!(k, key(version, encoding, limit, false, false, true, 0));
+        for passes in [1, 2, 4, 8, 16, 32, 64] {
+            assert_ne!(
+                k,
+                key(version, encoding, limit, false, false, false, passes)
+            );
+        }
         assert_eq!(
             *build(host_wave32()),
             key(
@@ -705,6 +714,7 @@ mod tests {
                 host_wave32(),
                 victory_shader::emit::raw_root_cbvs(),
                 victory_shader::emit::wide_scalar_loads(),
+                victory_shader::emit::shader_opt(),
             )
         );
         // The encoding part is this file as built.
