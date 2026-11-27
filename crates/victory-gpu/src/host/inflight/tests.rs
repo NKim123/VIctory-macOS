@@ -402,15 +402,22 @@ fn texture_fill_is_published_only_after_its_fence() {
 }
 
 #[test]
-fn additive_mapping_can_proceed_while_a_destructive_edit_waits() {
+fn mapping_waits_for_labels_its_edit_can_affect() {
     let Some(host) = host_for_ring() else { return };
     host.present_boundary();
     let (out, data) = host.mapped_buffer(8, true).unwrap();
     let before = DRAINS[Boundary::Mapping as usize].load(Ordering::Relaxed);
+    let label = AtomicU32::new(0);
     let mut gate = Gate::new(host);
-    assert!(host.execute_title(&[record_copy(host, &out, 4, 0x1234)]));
+    let list = record_copy(host, &out, 4, 0x1234);
+    list.defer_write(label.as_ptr().cast(), crate::queue::Written::Value(1), 4);
+    assert!(host.execute_title(&[list]));
     crate::tiled::with_physical_mapping(
-        || false,
+        |labels| {
+            assert_eq!(labels.next(), Some((label.as_ptr() as usize, 4)));
+            assert_eq!(labels.next(), None);
+            false
+        },
         || {
             assert_eq!(
                 DRAINS[Boundary::Mapping as usize].load(Ordering::Relaxed),
@@ -424,10 +431,11 @@ fn additive_mapping_can_proceed_while_a_destructive_edit_waits() {
         gate.open();
     });
     crate::tiled::with_physical_mapping(
-        || true,
+        |labels| labels.next() == Some((label.as_ptr() as usize, 4)),
         || {
-            // SAFETY: the destructive boundary has fenced the GPU write.
+            // SAFETY: the mapping boundary has fenced the GPU write.
             assert_eq!(unsafe { data.cast::<u32>().add(1).read() }, 0x1234);
+            assert_eq!(label.load(Ordering::Acquire), 1);
         },
     );
     release.join().unwrap();

@@ -320,6 +320,15 @@ impl Submission {
         self.flights.iter().any(|f| !f.writes.is_empty())
     }
 
+    pub(super) fn bottom_write_ranges(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.flights.iter().flat_map(|flight| {
+            flight
+                .writes
+                .iter()
+                .map(|(write, _)| (write.address, write.bytes))
+        })
+    }
+
     pub(super) fn uses(&self, list: &HostList) -> bool {
         self.flights
             .iter()
