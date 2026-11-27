@@ -4819,6 +4819,7 @@ impl<'a> Lower<'a> {
             let width = if srv
                 && !root_uav
                 && (super::wide_scalar_loads()
+                    || table_constants && super::raw_root_cbvs()
                     || super::shader_opt() & super::bitcode::opt::WIDE != 0)
             {
                 4
@@ -10632,15 +10633,17 @@ impl<'a> Lower<'a> {
                     return Err("a buffer result");
                 };
                 let (h, byte) = self.raw_view(site, src, byte, 4 * count, (11, 0), false, guard)?;
-                for k in 0..count {
-                    let four = self.s.m.i32(4 * k);
-                    let a = self.s.m.bin(c, Bin::Add, byte, four);
-                    let (mask, al) = (self.s.m.i8(1), self.s.m.i32(4));
-                    let u = self.s.m.undef(self.s.t.i32);
-                    let r = self.raw_buffer_load(c, &[h, a, u, mask, al]);
-                    let x = self.s.m.extract(c, r, 0);
-                    let x = self.as_int(x);
-                    self.write(inst, Reg::V(reg + k as u8), x, guard);
+                let width = if super::raw_root_cbvs() { 4 } else { 1 };
+                for first in (0..count).step_by(width) {
+                    let dwords = (count - first).min(width as u32);
+                    let off = self.s.m.i32(4 * first);
+                    let address = self.s.m.bin(self.cur, Bin::Add, byte, off);
+                    let row = self.raw_dword_group(h, address, dwords);
+                    for k in 0..dwords {
+                        let value = self.s.m.extract(self.cur, row, k);
+                        let value = self.as_int(value);
+                        self.write(inst, Reg::V(reg + (first + k) as u8), value, guard);
+                    }
                 }
                 return Ok(());
             }

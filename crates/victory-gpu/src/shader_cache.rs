@@ -137,7 +137,7 @@ fn key(
     encoding: &[u8],
     limit: u32,
     wave32: bool,
-    raw_root_cbvs: bool,
+    port_cbv: bool,
     wide_scalar_loads: bool,
     shader_opt: u32,
 ) -> [u8; 32] {
@@ -145,7 +145,11 @@ fn key(
     h.update(translator.as_bytes());
     h.update(blake3::hash(encoding).as_bytes());
     h.update(&limit.to_le_bytes());
-    h.update(&[u8::from(wave32), u8::from(raw_root_cbvs)]);
+    h.update(&[u8::from(wave32), u8::from(port_cbv)]);
+    if port_cbv {
+        // The flag changes both root binding and table load lowering.
+        h.update(b"bounded root CBVs and grouped table CBV loads");
+    }
     h.update(&shader_opt.to_le_bytes());
     if wide_scalar_loads {
         h.update(b"wide scalar loads");

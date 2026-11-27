@@ -3959,18 +3959,34 @@ fn make_with_texture_cache(
                 .cloned()
                 .or_else(|| crate::shadow::find(address, u64::from(size)))?;
             let bytes = u64::from(size).min(shadow.left(address));
+            let offset = shadow.offset(address);
+            let direct = victory_shader::emit::raw_root_cbvs()
+                && (shadow.is_aliased() || shadow.is_tiled())
+                && offset.is_multiple_of(u64::from(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT))
+                && bytes >= 4;
             let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
                 Format: DXGI_FORMAT_R32_TYPELESS,
                 ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
                 Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
                 Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                     Buffer: D3D12_BUFFER_SRV {
+                        FirstElement: if direct { offset / 4 } else { 0 },
                         NumElements: (bytes / 4) as u32,
                         Flags: D3D12_BUFFER_SRV_FLAG_RAW,
                         ..Default::default()
                     },
                 },
             };
+            if direct {
+                // The entire view was resolved in a single alias, including
+                // the mapped tile coverage for a reserved buffer.
+                // SAFETY: a live buffer and a slot of our heap.
+                unsafe { device.CreateShaderResourceView(&shadow.buffer, Some(&desc), at) };
+                return Some(Some((
+                    shadow.buffer.clone(),
+                    Some(HeldSource::Shadow(shadow)),
+                )));
+            }
             buffer_srv(address, bytes, desc, at, backing)
         }
         View::Shader(resource, desc) => {
@@ -4081,7 +4097,7 @@ fn prepare(view: &View) -> Option<BufferView> {
         &View::Constant(address, size) => {
             let owner = crate::shadow::find(address, u64::from(size))?;
             let bytes = u64::from(size).min(owner.left(address));
-            let (shadow, _) = crate::shadow::for_view(address, bytes / 4 * 4, 4)?;
+            let (shadow, _) = crate::shadow::view_in(owner, address, bytes / 4 * 4, 4)?;
             Some((shadow, address, bytes))
         }
         View::Placed(..) if is_placed_texture(view) => {
@@ -4376,6 +4392,79 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn table_cbv_reads_a_bounded_raw_view_of_a_live_alias() {
+        use crate::compute::{Param, srv, uav};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        if !crate::watch::rosetta() {
+            eprintln!("skipping the mach_vm_remap test outside Rosetta");
+            return;
+        }
+        let host = host().expect("a D3DMetal device");
+        let len = crate::watch::PAGE;
+        // SAFETY: a private allocation with the alignment required for aliasing.
+        let data = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                len,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        }
+        .cast::<u8>();
+        assert!(!data.is_null());
+        assert!(crate::alias::alias_region(data as usize, len, false));
+        let base = data as u64;
+        let alias = crate::shadow::find(base, len as u64).unwrap();
+        assert!(alias.is_aliased());
+        // SAFETY: a live title mapping with space for the test values.
+        unsafe {
+            data.cast::<[u32; 8]>()
+                .write([100, 200, 300, 400, 10, 20, 30, 40])
+        };
+        let heap = HostHeap::new(false, 2).unwrap();
+        let view = View::Constant(base + 16, 12);
+        heap.make_at(0, &view);
+        if victory_shader::emit::raw_root_cbvs() {
+            assert!(Arc::ptr_eq(&heap.table_backing(0).unwrap(), &alias));
+        }
+        let (result, ptr) = host.shared_buffer(65536).unwrap();
+        heap.raw_view_at(1, Some(&result), 0, 16, true);
+        let (root, pso) = crate::compute::pipeline(
+            "ByteAddressBuffer src : register(t0);
+             RWByteAddressBuffer dst : register(u0);
+             [numthreads(1, 1, 1)] void main() {
+                 dst.Store4(0, uint4(src.Load(0), src.Load(4), src.Load(8), src.Load(12)));
+             }",
+            windows::core::s!("bounded aliased table CBV"),
+            0,
+            &[Param::Table(&[srv(0, 1)]), Param::Table(&[uav(0, 1)])],
+        )
+        .unwrap();
+        let list = host.new_list().unwrap();
+        // SAFETY: the host views are live; the title writes after the view
+        // is created and supplies no upload or refresh before the read.
+        unsafe {
+            data.add(16).cast::<u32>().write(77);
+            list.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetComputeRootDescriptorTable(0, heap.gpu(0));
+            list.list.SetComputeRootDescriptorTable(1, heap.gpu(1));
+            list.list.SetPipelineState(&pso);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: a mapped destination after the fence.
+        assert_eq!(unsafe { ptr.cast::<[u32; 4]>().read() }, [77, 20, 30, 0]);
+        drop((list, heap, alias));
+        assert!(crate::alias::unalias_region(base as usize));
+        // SAFETY: this test owns the allocation; the GPU read finished.
+        assert_ne!(unsafe { VirtualFree(data.cast(), 0, MEM_RELEASE) }, 0);
+    }
 
     /// Typed buffer views of integer formats carry their kind in the
     /// view-stride table; float, normalized, raw and structured ones none.
