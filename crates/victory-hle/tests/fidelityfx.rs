@@ -450,6 +450,12 @@ fn the_titles_upscaler_runs_on_the_host() {
     // Two frames: the first resets the history.
     for reset in [1, 0] {
         upscaling.reset = reset;
+        if reset == 1 {
+            let valid = upscaling.render;
+            upscaling.render[0] = upscale.max_render[0] + 1;
+            assert_eq!(dispatch(&mut context, &mut upscaling.header), 6);
+            upscaling.render = valid;
+        }
         assert_eq!(dispatch(&mut context, &mut upscaling.header), 0);
     }
 

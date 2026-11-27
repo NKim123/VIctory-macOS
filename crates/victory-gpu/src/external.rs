@@ -31,6 +31,32 @@ pub fn host_texture(
     Some((texture, state))
 }
 
+/// Sync a title input's host copy from its GPU alias or title memory.
+/// `host_texture` subsequently routes depth-twin reads during its transition.
+pub fn prepare_input(list: *const Object, resource: *const Object) -> Option<()> {
+    let list = crate::list::host_list(list)?;
+    let copy = crate::resource::host_copy(resource)?;
+    let aliased = crate::resource::alias_source(resource)
+        .is_some_and(|source| crate::texture::alias_copy(list, source.get(), resource));
+    if !aliased && copy.title_written() {
+        crate::texture::upload(list, resource, &copy.texture);
+    }
+    Some(())
+}
+
+/// Mark the provider's output as host-authored when its list is submitted.
+pub fn output_written(list: *const Object, resource: *const Object) {
+    if let Some(list) = crate::list::host_list(list) {
+        crate::texture::host_writes(list, resource);
+    }
+}
+
+/// Wait for the native submissions being pumped by the title queues.
+/// This backend completes the host fence synchronously inside the queue pump.
+pub fn finish_submitted() {
+    crate::queue::pump_held(crate::queue::Why::Fence);
+}
+
 /// Runs `f` with the host list behind the title list `list` (open for
 /// recording); `None` without one. What `f` binds (descriptor heaps, root
 /// signatures, pipeline) is replaced before the list's next draw or
