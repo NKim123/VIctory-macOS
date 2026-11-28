@@ -68,6 +68,19 @@ std::arch::global_asm!(
     "sete al",
     "victory_match_failed:",
     "ret",
+    ".globl victory_read_header, victory_read_tag, victory_read_key, victory_read_failed",
+    "victory_read_header:",
+    "victory_read_tag:",
+    "mov eax, dword ptr [rcx]",
+    "victory_read_key:",
+    "mov r8, qword ptr [rcx + 4]",
+    "mov dword ptr [rdx], eax",
+    "mov qword ptr [rdx + 4], r8",
+    "mov eax, 1",
+    "ret",
+    "victory_read_failed:",
+    "xor eax, eax",
+    "ret",
     tag = const VIEW_TAG,
 );
 
@@ -87,6 +100,10 @@ unsafe extern "system" {
     fn victory_match_tag();
     fn victory_match_key();
     fn victory_match_failed();
+    fn victory_read_header(source: *const u8, out: *mut [u32; 3]) -> u32;
+    fn victory_read_tag();
+    fn victory_read_key();
+    fn victory_read_failed();
 }
 
 unsafe extern "system" fn fault(info: *mut EXCEPTION_POINTERS) -> i32 {
@@ -110,6 +127,10 @@ unsafe extern "system" fn fault(info: *mut EXCEPTION_POINTERS) -> i32 {
         .contains(&at)
         {
             context.Rip = victory_match_failed as *const () as u64;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        if [victory_read_tag as *const (), victory_read_key as *const ()].contains(&at) {
+            context.Rip = victory_read_failed as *const () as u64;
             return EXCEPTION_CONTINUE_EXECUTION;
         }
     }
@@ -137,6 +158,16 @@ pub(super) fn matches(source: *const u8, [tag, index, generation]: [u32; 3]) -> 
     // SAFETY: the installed handler covers both reads before the function
     // changes any stack or nonvolatile registers. A fault returns zero.
     unsafe { victory_match_header(source, tag, key) != 0 }
+}
+
+/// Capture all three words for a table slot, including an unpublished slot.
+pub(super) fn read(source: *const u8) -> Option<[u32; 3]> {
+    debug_assert!(on());
+    let mut record = [0; 3];
+    // SAFETY: the handler covers both source loads. The leaf writes the
+    // entire output only after both loads succeed.
+    let readable = unsafe { victory_read_header(source, &mut record) != 0 };
+    readable.then_some(record)
 }
 
 pub(super) fn changed(
@@ -209,6 +240,9 @@ mod tests {
         let record = [VIEW_TAG, 17, 3];
         let at = record.as_ptr().cast();
         assert!(matches(at, record));
+        assert_eq!(read(at), Some(record));
+        assert_eq!(read([0u32; 3].as_ptr().cast()), Some([0; 3]));
+        assert_eq!(read(std::ptr::null()), None);
         assert!(!matches(at, [0, 17, 3]));
         assert!(!matches(at, [VIEW_TAG, 17, 4]));
         assert!(!matches(std::ptr::null(), record));
@@ -226,6 +260,7 @@ mod tests {
             end.write(VIEW_TAG);
         };
         assert!(!matches(end.cast(), record));
+        assert_eq!(read(end.cast()), None);
         crate::watch::tests::free(base);
     }
 }

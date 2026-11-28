@@ -48,22 +48,13 @@ fn read_header(address: u64) -> Option<[u32; 3]> {
         .then(|| bytes.map(u32::from_le_bytes))
 }
 
-fn read_table_header(address: u64, ready: u64) -> Option<[u32; 3]> {
-    // Most table slots are already mirrored. Validate those headers
-    // without a kernel call on hosts with guarded reads.
+fn capture_header(address: u64) -> Option<[u32; 3]> {
     #[cfg(target_arch = "x86_64")]
-    if super::scan::on() {
-        let expected = if ready == 0 {
-            [0; 3]
-        } else {
-            [VIEW_TAG, ready as u32, (ready >> 32) as u32]
-        };
-        if super::scan::matches(address as *const u8, expected) {
-            return Some(expected);
-        }
+    if super::scan::on()
+        && let Some(record) = super::scan::read(address as *const u8)
+    {
+        return Some(record);
     }
-    #[cfg(not(target_arch = "x86_64"))]
-    let _ = ready;
     read_header(address)
 }
 
@@ -3027,16 +3018,9 @@ impl HostHeap {
                 // Re-read live title memory under `self.made`: if a title
                 // thread overwrote the slot since the page snapshot (including
                 // during `prepare`), defer to `mirror` after dropping locks.
-                // SAFETY: the caller holds the heap alive until the sync completes.
-                let mut raw = [0u8; 12];
-                if !crate::host::read_into(addr as *const u8, &mut raw) {
+                let Some(live) = capture_header(addr) else {
                     continue;
-                }
-                let live = [
-                    u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]),
-                    u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]),
-                    u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]),
-                ];
+                };
                 if live != snapshot {
                     again.push(index);
                     continue;
@@ -3644,8 +3628,9 @@ impl HostHeap {
         {
             for &index in tables.range(..self.count) {
                 let handle = start + u64::from(index) * step;
-                let ready = self.ready[index as usize].load(Ordering::Acquire);
-                let Some(record @ [tag, view, generation]) = read_table_header(handle, ready)
+                // Preserve the acquire before reading the title header.
+                let _ = self.ready[index as usize].load(Ordering::Acquire);
+                let Some(record @ [tag, view, generation]) = capture_header(handle)
                 else {
                     continue;
                 };
