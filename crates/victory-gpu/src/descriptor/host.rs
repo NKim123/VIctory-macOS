@@ -23,6 +23,8 @@ use crate::resource::HostTexture;
 
 mod templates;
 use templates::Templates;
+#[cfg(feature = "diagnostics")]
+pub(crate) use templates::log as log_staging_templates;
 
 /// Opt-in. Use null SRVs in shared title slots until the first upload runs.
 pub(crate) fn show_after() -> bool {
@@ -186,6 +188,8 @@ impl ViewStaging {
         slot: usize,
         view: &'a ViewPin,
         direct: bool,
+        revalidate: bool,
+        stats: &mut templates::StageStats,
     ) -> Option<StagedView<'a>> {
         let mut at = D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: self.cpu + slot * self.step,
@@ -210,7 +214,8 @@ impl ViewStaging {
                 if direct {
                     at = self.templates.slot(self.templates.bucket(view.key));
                 }
-                let (held, backing, mark) = if let Some(hit) = self.templates.get(view.key, epoch) {
+                let cached = self.templates.get_for_stage(view, epoch, revalidate, stats);
+                let (held, backing, mark) = if let Some(hit) = cached {
                     if let Some(scratch) = scratch {
                         templates::copy(false, scratch, hit.at);
                     }
@@ -459,6 +464,7 @@ fn stage_views<'a>(
     let active: Vec<_> = (0..STAGING_WORKERS)
         .filter(|&i| !jobs[i].is_empty())
         .collect();
+    let revalidate = templates::revalidation_enabled();
     crate::texture::in_parallel(active.len(), |worker| {
         let i = active[worker];
         let mut staging = workers[i].lock().unwrap_or_else(|e| e.into_inner());
@@ -484,14 +490,22 @@ fn stage_views<'a>(
         } else {
             Vec::new()
         };
+        let mut stats = templates::StageStats::default();
         *results[i].lock().unwrap_or_else(|e| e.into_inner()) = jobs[i]
             .iter()
             .copied()
             .enumerate()
             .filter_map(|(slot, view)| {
-                staging.stage(slot, view, direct_slots.get(slot).copied().unwrap_or(false))
+                staging.stage(
+                    slot,
+                    view,
+                    direct_slots.get(slot).copied().unwrap_or(false),
+                    revalidate,
+                    &mut stats,
+                )
             })
             .collect();
+        stats.merge(direct);
     });
     let epoch = crate::shadow::lookup_epoch();
     if before != epoch {
@@ -7244,6 +7258,100 @@ void main() {
         crate::shadow::unregister(allocation + 1, address);
         crate::shadow::unregister(allocation, base);
         drop((staged, heap, original, replacement));
+        crate::watch::tests::free(allocation);
+    }
+
+    #[test]
+    fn staging_template_reuse_checks_shadow_and_alias_replacements() {
+        if host().is_none() {
+            return;
+        }
+        let page = crate::watch::PAGE;
+        let allocation = crate::watch::tests::pool(3);
+        let base = allocation as u64;
+        let unrelated = allocation + 2 * page;
+        crate::shadow::register(allocation, base, (2 * page) as u64);
+        let address = base + 256;
+        let original = crate::shadow::find(address, 256).unwrap();
+        let mut slot = [0u64; 4];
+        let at = slot.as_mut_ptr() as u64;
+        super::super::record(at, View::Constant(address, 256));
+        let records = [ChangedRecord {
+            index: 0,
+            record: record_at(at),
+            previous: 0,
+            clear: false,
+        }];
+        let key = record_key(records[0].record);
+        let pins = pin_changed_views(&records);
+        let view = &pins[&key];
+
+        for direct in [false, true] {
+            let mut staging = ViewStaging::new().unwrap();
+            let mut stats = templates::StageStats::default();
+            let first = staging.stage(0, view, direct, true, &mut stats).unwrap();
+            let old_epoch = crate::shadow::lookup_epoch();
+            assert!(staging.templates.get(key, old_epoch).is_some());
+
+            crate::shadow::register(unrelated, unrelated as u64, page as u64);
+            let epoch = crate::shadow::lookup_epoch();
+            assert!(staging.templates.get(key, epoch).is_none());
+            let recovered = staging.stage(1, view, direct, true, &mut stats).unwrap();
+            assert!(staging.templates.get(key, epoch).is_some());
+            assert!(Arc::ptr_eq(
+                recovered
+                    .hit(epoch)
+                    .unwrap()
+                    .held
+                    .as_ref()
+                    .and_then(held_backing)
+                    .unwrap(),
+                &original
+            ));
+            assert_eq!(first.at.ptr == recovered.at.ptr, direct);
+
+            let (buffer, data) = host().unwrap().shared_buffer(page as u64).unwrap();
+            // SAFETY: the alias owns the live native buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let alias = crate::shadow::Shadow::new_aliased(buffer, data, gpu, base, page as u64);
+            crate::shadow::register_aliased(alias.clone());
+            let epoch = crate::shadow::lookup_epoch();
+            assert!(
+                staging
+                    .templates
+                    .get_for_stage(view, epoch, true, &mut stats)
+                    .is_none()
+            );
+            let replaced = staging.stage(2, view, direct, true, &mut stats).unwrap();
+            let held = replaced.hit(epoch).unwrap().held.unwrap();
+            assert!(Arc::ptr_eq(held_backing(&held).unwrap(), &alias));
+            assert!(crate::shadow::unregister_aliased(base));
+            assert!(
+                staging
+                    .templates
+                    .get_for_stage(view, crate::shadow::lookup_epoch(), true, &mut stats)
+                    .is_none()
+            );
+
+            staging.stage(0, view, direct, true, &mut stats).unwrap();
+
+            // A newly registered inner ordinary buffer wins even before it
+            // has a host copy. Materialize it so the rejection is exercised
+            // in a stable epoch as well.
+            crate::shadow::register(address as usize, address, 4096);
+            let replacement = crate::shadow::find(address, 256).unwrap();
+            assert!(!Arc::ptr_eq(&original, &replacement));
+            assert!(
+                staging
+                    .templates
+                    .get_for_stage(view, crate::shadow::lookup_epoch(), true, &mut stats)
+                    .is_none()
+            );
+            crate::shadow::unregister(address as usize, address);
+            crate::shadow::unregister(unrelated, unrelated as u64);
+        }
+        crate::shadow::unregister(allocation, base);
+        drop(original);
         crate::watch::tests::free(allocation);
     }
 

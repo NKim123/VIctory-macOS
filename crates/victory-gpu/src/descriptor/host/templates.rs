@@ -9,6 +9,65 @@ pub(super) fn enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_DESCRIPTOR_CACHE").is_none_or(|v| v != "0"))
 }
 
+// Counts are accumulated under the worker lock and merged once per shard batch.
+#[derive(Default)]
+pub(super) struct StageStats {
+    hits: u64,
+    empty: u64,
+    collisions: u64,
+    epoch_misses: u64,
+    recovered: u64,
+    expired: u64,
+}
+
+#[cfg(feature = "diagnostics")]
+static STAGE_STATS: [[AtomicU64; 6]; 2] = [const { [const { AtomicU64::new(0) }; 6] }; 2];
+
+impl StageStats {
+    pub(super) fn merge(self, direct: bool) {
+        #[cfg(feature = "diagnostics")]
+        for (total, count) in STAGE_STATS[usize::from(direct)].iter().zip([
+            self.hits,
+            self.empty,
+            self.collisions,
+            self.epoch_misses,
+            self.recovered,
+            self.expired,
+        ]) {
+            total.fetch_add(count, Ordering::Relaxed);
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = (self, direct);
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn log(frames: f64) {
+    for (direct, totals) in STAGE_STATS.iter().enumerate() {
+        let [hits, empty, collisions, epoch_misses, recovered, expired] = totals
+            .each_ref()
+            .map(|total| total.swap(0, Ordering::Relaxed));
+        if hits + empty + collisions + epoch_misses + expired != 0 {
+            tracing::info!(
+                direct = direct != 0,
+                frames,
+                hits,
+                empty,
+                collisions,
+                epoch_misses,
+                recovered,
+                expired,
+                "descriptor staging templates"
+            );
+        }
+    }
+}
+
+pub(super) fn revalidation_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_DESCRIPTOR_REVALIDATE"))
+}
+
 fn kind(sampler: bool) -> D3D12_DESCRIPTOR_HEAP_TYPE {
     if sampler {
         D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
@@ -125,6 +184,63 @@ impl Templates {
         if entry.key != key || (!self.sampler && entry.epoch != epoch) {
             return None;
         }
+        self.hit(bucket)
+    }
+
+    /// Only staging calls this: resolving a view can materialize its shadow
+    /// and must run outside the mirror lock. The worker owns the cache slot
+    /// throughout, and the pinned view supplies the complete record key.
+    pub(super) fn get_for_stage(
+        &mut self,
+        view: &ViewPin,
+        epoch: u64,
+        revalidate: bool,
+        stats: &mut StageStats,
+    ) -> Option<Hit> {
+        let bucket = self.bucket(view.key);
+        let Some(entry) = self.entries[bucket].as_ref() else {
+            stats.empty += 1;
+            return None;
+        };
+        if entry.key != view.key {
+            stats.collisions += 1;
+            return None;
+        }
+        if entry.epoch == epoch {
+            let hit = self.hit(bucket);
+            if hit.is_some() {
+                stats.hits += 1;
+            } else {
+                stats.expired += 1;
+            }
+            return hit;
+        }
+        stats.epoch_misses += 1;
+        if !revalidate || crate::shadow::lookup_epoch() != epoch {
+            return None;
+        }
+
+        let hit = self.hit(bucket)?;
+        let (shadow, address, len) = hit.backing.as_ref()?;
+        let (current, start, bytes) = prepare(view)?;
+        // Shadow and widened leases each own an immutable native resource.
+        // Holding the widened lease also keeps its canonical entry in the
+        // current shadow's widened cache alive.
+        if !Arc::ptr_eq(shadow, &current)
+            || (*address, *len) != (start, bytes)
+            || (matches!(**view, View::Unordered(..) | View::Placed(true, ..))
+                && hit.mark != current.mark_entry(start))
+            || crate::shadow::lookup_epoch() != epoch
+        {
+            return None;
+        }
+        self.entries[bucket].as_mut()?.epoch = epoch;
+        stats.recovered += 1;
+        Some(hit)
+    }
+
+    fn hit(&self, bucket: usize) -> Option<Hit> {
+        let entry = self.entries[bucket].as_ref()?;
         let (held, backing) = if let Some(buffer) = &entry.buffer {
             let shadow = buffer.shadow.upgrade()?;
             let (resource, source) = match &buffer.widened {
