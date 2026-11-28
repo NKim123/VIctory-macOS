@@ -24,7 +24,7 @@ If you want to see GTA VI on a Mac, please star the repo and read <a href="CONTR
 > If you would like to help, a sponsored Claude Pro or Max subscription or some Anthropic API credits would let me keep up with the project at its current pace. I would be very grateful for either. Please reach out on email if you can help: pragyaangaur12@gmail.com
 
 > [!IMPORTANT]
-> **This fork reaches interactive tutorial gameplay on an M5 Pro at about 7 fps.** On a 64 GB Mac with patched CrossOver Wine and D3DMetal 4.0 beta 3, movement and camera controls worked through the cellmate and guard objectives. The corridor into the occupied common room averaged 6.98 fps over 98 seconds, with a 196 ms 95th-percentile frame time. The playability target is 30 fps (33.3 ms per frame).
+> **This fork reaches interactive tutorial gameplay on an M5 Pro at about 8 fps.** On a 64 GB Mac with patched CrossOver Wine and D3DMetal 4.0 beta 3, the warmed tutorial player averaged 8.10 fps over 79 seconds of walking and turning from the corridor into the occupied common room. Its 95th-percentile frame time was 197 ms. The 30 fps playability target requires 33.3 ms per frame.
 >
 > Select the `m5-pro-tutorial` preset for 720p output and half render scale. You need your own game files. [macOS setup and switches](docs/macos.md)
 
