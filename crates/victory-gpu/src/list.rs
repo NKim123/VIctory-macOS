@@ -743,6 +743,7 @@ extern "system" fn close(this: This) -> HRESULT {
     let _timer = crate::queue::CpuTimer::new(crate::queue::CpuPhase::ListLifecycle);
     #[cfg(windows)]
     if let Some(list) = title_list(this) {
+        let _close = crate::queue::CpuTimer::new(crate::queue::CpuPhase::ListClose);
         thin::close(this, list);
     }
     S_OK

@@ -161,9 +161,23 @@ struct Pending {
 
 impl Lane {
     fn wait(&self) {
+        self.drain(lock(&self.pending));
+    }
+
+    fn join_close(&self) {
+        use crate::queue::{CpuPhase, CpuTimer};
+        let _join = CpuTimer::new(CpuPhase::ThinCloseJoin);
+        let pending = lock(&self.pending);
+        if pending.scheduled {
+            let _wait = CpuTimer::new(CpuPhase::ThinCloseWait);
+            self.drain(pending);
+        }
+    }
+
+    fn drain(&self, pending: std::sync::MutexGuard<'_, Pending>) {
         drop(
             self.changed
-                .wait_while(lock(&self.pending), |p| p.scheduled)
+                .wait_while(pending, |p| p.scheduled)
                 .unwrap_or_else(|error| error.into_inner()),
         );
     }
@@ -321,11 +335,14 @@ fn close_recording(this: This) {
 }
 
 pub(super) fn close(this: This, list: &List) {
+    use crate::queue::{CpuPhase, CpuTimer};
     if let Some(front) = &list.thin {
+        let enqueue = CpuTimer::new(CpuPhase::ThinCloseEnqueue);
         let mut front = lock(front);
         front.put(this, Op::Close, &[], |_| {});
         front.schedule(this);
-        front.lane.wait();
+        drop(enqueue);
+        front.lane.join_close();
     } else {
         close_recording(this);
     }

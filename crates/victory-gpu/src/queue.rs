@@ -490,6 +490,10 @@ pub(crate) enum CpuPhase {
     SubmitRetire,
     ReaperRetire,
     FlightFeedback,
+    ListClose,
+    ThinCloseEnqueue,
+    ThinCloseJoin,
+    ThinCloseWait,
     DescriptorSync,
     DescriptorPins,
     DescriptorTemplates,
@@ -546,7 +550,7 @@ impl Drop for CpuTimer {
         if let Some((phase, start)) = self.0 {
             CPU_PHASE_NS[phase as usize]
                 .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            if (CpuPhase::DescriptorSync as usize..=CpuPhase::DescriptorPublish as usize)
+            if (CpuPhase::ListClose as usize..=CpuPhase::DescriptorPublish as usize)
                 .contains(&(phase as usize))
             {
                 CPU_PHASE_CALLS[phase as usize].fetch_add(1, Ordering::Relaxed);
@@ -601,6 +605,18 @@ pub(crate) fn log_cpu_phases(frames: f64) {
         "host submission wall time per frame"
     );
     let calls = |phase: CpuPhase| CPU_PHASE_CALLS[phase as usize].swap(0, Ordering::Relaxed);
+    tracing::info!(
+        frames,
+        close_ms = ms(CpuPhase::ListClose),
+        close_calls = calls(CpuPhase::ListClose),
+        enqueue_ms = ms(CpuPhase::ThinCloseEnqueue),
+        enqueue_calls = calls(CpuPhase::ThinCloseEnqueue),
+        join_ms = ms(CpuPhase::ThinCloseJoin),
+        join_calls = calls(CpuPhase::ThinCloseJoin),
+        pending_ms = ms(CpuPhase::ThinCloseWait),
+        pending_calls = calls(CpuPhase::ThinCloseWait),
+        "command list Close wall time per frame"
+    );
     tracing::info!(
         frames,
         sync_ms = ms(CpuPhase::DescriptorSync),
