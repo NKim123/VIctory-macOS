@@ -1054,8 +1054,14 @@ fn texture_upload_distinguishes_physical_alias_pages() {
             let deadline = Instant::now() + Duration::from_secs(4);
             while DRAINS[Boundary::TextureUploadLabel as usize].load(Ordering::Relaxed) == before
                 && Instant::now() < deadline
-                && release.recv_timeout(Duration::from_millis(1)).is_err()
-            {}
+            {
+                if !matches!(
+                    release.recv_timeout(Duration::from_millis(1)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    break;
+                }
+            }
             drop(gate);
         });
         let waited = wait();
