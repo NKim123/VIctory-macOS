@@ -2291,7 +2291,24 @@ fn evict(frame: u64, now: u64, over: u64) -> (u64, u64) {
     // reported as new only once, so its first read alone stamped it; run
     // evict1 gave up and made again hundreds of textures a frame).
     let read = crate::descriptor::read_textures(&crate::shadow::reads_since());
-    evict_among(&candidates(), &read, frame, now, over)
+    let owners = candidates(|t| {
+        if over != 0 {
+            return true;
+        }
+        if read.contains(&(windows::core::Interface::as_raw(&t.texture) as usize)) {
+            t.stamp_at(frame, now);
+            return false;
+        }
+        // With room in both budgets only idle textures can be reclaimed.
+        // Group the owners of those textures, then recheck their use after
+        // the walk in case a recording thread stamped one meanwhile.
+        let [last_frame, last_ms] = t
+            .last
+            .each_ref()
+            .map(|last| last.load(std::sync::atomic::Ordering::Relaxed));
+        idle_texture(last_frame, last_ms, frame, now)
+    });
+    evict_among(&owners, &read, frame, now, over)
 }
 
 /// [`evict`] among `candidates`, with `read` (raw pointers) the host
@@ -2320,15 +2337,20 @@ pub(crate) fn evict_among(
 /// The host textures that may be given up ([`evictable`]), each with the
 /// title textures holding it.
 #[cfg(windows)]
-fn candidates() -> Vec<Owned> {
+fn candidates(include: impl Fn(&HostTexture) -> bool) -> Vec<Owned> {
     let at = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
     let mut by: std::collections::HashMap<usize, Owned> = std::collections::HashMap::new();
     for &r in at.values().flatten() {
-        if let Some(t) = made(resource(r as This)).filter(|t| evictable(t)) {
+        if let Some(t) = made(resource(r as This)).filter(|t| evictable(t) && include(t)) {
             by.entry(std::sync::Arc::as_ptr(&t) as usize).or_insert_with(|| (t, Vec::new())).1.push(r);
         }
     }
     by.into_values().collect()
+}
+
+#[cfg(windows)]
+fn idle_texture(last_frame: u64, last_ms: u64, frame: u64, now: u64) -> bool {
+    frame.saturating_sub(last_frame) >= IDLE_FRAMES && now.saturating_sub(last_ms) >= IDLE_MS
 }
 
 /// Of textures last used at (frame, ms) taking (bytes) each, those to give
@@ -2341,9 +2363,12 @@ fn candidates() -> Vec<Owned> {
 /// picture flickered), and the card's use stays where it was.
 #[cfg(windows)]
 fn choose(uses: &[(u64, u64, u64)], frame: u64, now: u64, over: u64) -> Vec<usize> {
-    let idle = |&(f, ms, _): &(u64, u64, u64)| frame.saturating_sub(f) >= IDLE_FRAMES && now.saturating_sub(ms) >= IDLE_MS;
+    let idle = |&(f, ms, _): &(u64, u64, u64)| idle_texture(f, ms, frame, now);
     let (mut gone, mut rest): (Vec<usize>, Vec<usize>) = (0..uses.len()).partition(|&i| idle(&uses[i]));
     let mut over = over.saturating_sub(gone.iter().map(|&i| uses[i].2).sum());
+    if over == 0 {
+        return gone;
+    }
     rest.retain(|&i| frame.saturating_sub(uses[i].0) > SOON_FRAMES);
     rest.sort_by_key(|&i| uses[i].1);
     for i in rest {
@@ -2415,7 +2440,7 @@ pub(crate) fn give_up_now(this: This) -> bool {
 #[cfg(all(windows, test))]
 pub(crate) fn owned(this: This) -> Option<Owned> {
     let t = made(resource(this))?;
-    candidates().into_iter().find(|(c, _)| std::sync::Arc::ptr_eq(c, &t))
+    candidates(|_| true).into_iter().find(|(c, _)| std::sync::Arc::ptr_eq(c, &t))
 }
 
 // The creation methods' own arguments, passed on.
@@ -3353,7 +3378,7 @@ mod tests {
         let (r, t) = (host_copy(read).unwrap(), host_copy(target).unwrap());
         assert!(owned(target).is_some(), "a render target nothing wrote yet");
         t.note_state(0x4);
-        let listed = candidates();
+        let listed = candidates(|_| true);
         assert!(listed.iter().any(|(c, _)| std::sync::Arc::ptr_eq(c, &r)), "fed from title memory");
         assert!(!listed.iter().any(|(c, _)| std::sync::Arc::ptr_eq(c, &t)), "the GPU wrote it");
         assert!(host_copy(unwritten).is_some());
