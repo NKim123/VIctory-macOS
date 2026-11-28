@@ -23,7 +23,6 @@ use crate::resource::HostTexture;
 
 mod templates;
 use templates::Templates;
-#[cfg(feature = "diagnostics")]
 pub(crate) use templates::log as log_staging_templates;
 
 /// Opt-in. Use null SRVs in shared title slots until the first upload runs.

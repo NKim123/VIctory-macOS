@@ -20,12 +20,13 @@ pub(super) struct StageStats {
     expired: u64,
 }
 
-#[cfg(feature = "diagnostics")]
 static STAGE_STATS: [[AtomicU64; 6]; 2] = [const { [const { AtomicU64::new(0) }; 6] }; 2];
 
 impl StageStats {
     pub(super) fn merge(self, direct: bool) {
-        #[cfg(feature = "diagnostics")]
+        if !cfg!(feature = "diagnostics") && !crate::queue::cpu_phases_enabled() {
+            return;
+        }
         for (total, count) in STAGE_STATS[usize::from(direct)].iter().zip([
             self.hits,
             self.empty,
@@ -36,13 +37,13 @@ impl StageStats {
         ]) {
             total.fetch_add(count, Ordering::Relaxed);
         }
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = (self, direct);
     }
 }
 
-#[cfg(feature = "diagnostics")]
 pub(crate) fn log(frames: f64) {
+    if !cfg!(feature = "diagnostics") && !crate::queue::cpu_phases_enabled() {
+        return;
+    }
     for (direct, totals) in STAGE_STATS.iter().enumerate() {
         let [hits, empty, collisions, epoch_misses, recovered, expired] = totals
             .each_ref()

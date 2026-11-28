@@ -7268,6 +7268,7 @@ impl Meter {
             submission_profile::log(report_frames);
             inflight::log(report_frames);
             crate::queue::log_cpu_phases(report_frames);
+            crate::descriptor::host::log_staging_templates(report_frames);
             rec::report(report_frames);
             crate::indirect::report_batches(report_frames);
             let [boundary_ms, swap_copy_ms, dxgi_ms] = PRESENT_US
@@ -7378,7 +7379,6 @@ impl Meter {
                 crate::heap_worker::log(report_frames);
                 crate::shadow::log_views(report_frames);
                 crate::shadow::log_lookups(report_frames);
-                crate::descriptor::host::log_staging_templates(report_frames);
                 let [n, bytes] = [0, 1].map(|i| crate::list::READ_BACKS[i].swap(0, Ordering::Relaxed));
                 if n > 0 {
                     tracing::info!(

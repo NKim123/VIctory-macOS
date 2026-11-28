@@ -556,7 +556,7 @@ impl Drop for CpuTimer {
 }
 
 #[cfg(windows)]
-fn cpu_phases_enabled() -> bool {
+pub(crate) fn cpu_phases_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::switch::on("VICTORY_CPU_PHASES"))
 }
