@@ -19,6 +19,13 @@ pub(super) fn limit() -> usize {
     })
 }
 
+fn exact_upload_aliases() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("VICTORY_EXACT_UPLOAD_ALIASES").is_some_and(|value| value == "1")
+    })
+}
+
 fn parse_limit(value: &str) -> usize {
     match value.trim().parse::<usize>() {
         Ok(1) => 4,
@@ -422,23 +429,38 @@ impl Host {
         if sources.is_empty() || !s.busy() {
             return false;
         }
-        let ranges = || {
-            sources
-                .iter()
-                .map(|(staging, _)| staging.source_range())
-                .filter(|&(_, len)| len != 0)
-        };
+        if !s.flights.iter().any(|flight| {
+            flight.indirect_gpu_writes
+                || flight.gpu_writes.iter().next().is_some()
+                || !flight.writes.is_empty()
+        }) {
+            return false;
+        }
+        let exact = exact_upload_aliases();
+        let mut ranges = crate::ranges::Ranges::default();
+        for (staging, _) in sources {
+            let (at, len) = staging.source_range();
+            ranges.insert(at, at.saturating_add(len), 0);
+        }
+        // XMem mapping edits take the submission lock. Resolve the links
+        // here, since additive views can have appeared since enqueue.
+        let aliases = std::cell::OnceCell::new();
+        let source_aliases =
+            || aliases.get_or_init(|| crate::watch::upload_source_aliases(&ranges));
         let mut physical_alias = None;
         let mut gpu_mapping = None;
         let mut has_physical_alias = || {
-            *physical_alias
-                .get_or_insert_with(|| ranges().any(|(at, len)| crate::watch::aliased(at, len)))
+            *physical_alias.get_or_insert_with(|| {
+                ranges
+                    .iter()
+                    .any(|(from, to)| crate::watch::aliased(from, to - from))
+            })
         };
         let mut touches_gpu_mapping = || {
             *gpu_mapping.get_or_insert_with(|| {
-                ranges().any(|(at, len)| {
-                    crate::shadow::has_aliased_overlap(at as u64, at.saturating_add(len) as u64)
-                })
+                ranges
+                    .iter()
+                    .any(|(from, to)| crate::shadow::has_aliased_overlap(from as u64, to as u64))
             })
         };
         let pending = s.flights.iter().rev().find_map(|flight| {
@@ -447,8 +469,12 @@ impl Host {
             // at an address only the shader knows until it completes.
             if flight.indirect_gpu_writes && (touches_gpu_mapping() || has_physical_alias())
                 || flight.gpu_writes.iter().any(|(from, to)| {
-                    ranges().any(|(at, len)| at < to && from < at.saturating_add(len))
-                        || has_physical_alias() && crate::watch::aliased(from, to - from)
+                    ranges.overlaps(from, to)
+                        || if exact {
+                            source_aliases().overlaps(from, to)
+                        } else {
+                            has_physical_alias() && crate::watch::aliased(from, to - from)
+                        }
                 })
             {
                 return Some((flight.value, Boundary::TextureUploadGpuWrite));
@@ -457,8 +483,14 @@ impl Host {
                 .writes
                 .iter()
                 .any(|(write, aliased)| {
-                    ranges().any(|(at, len)| write.overlaps(at, len))
-                        || *aliased && has_physical_alias()
+                    let from = write.address;
+                    let to = from.saturating_add(write.bytes);
+                    ranges.overlaps(from, to)
+                        || if exact {
+                            source_aliases().overlaps(from, to)
+                        } else {
+                            *aliased && has_physical_alias()
+                        }
                 })
                 .then_some((flight.value, Boundary::TextureUploadLabel))
         });

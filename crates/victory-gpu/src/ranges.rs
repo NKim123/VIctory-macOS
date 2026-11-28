@@ -19,6 +19,14 @@ impl Ranges {
         self.0.iter().copied()
     }
 
+    #[cfg(windows)]
+    pub(crate) fn overlaps(&self, from: usize, to: usize) -> bool {
+        from < to
+            && self.0[self.0.partition_point(|&(_, end)| end <= from)..]
+                .first()
+                .is_some_and(|&(start, _)| start < to)
+    }
+
     /// Adds `[from, to)`, joined with the ranges that overlap it or lie
     /// within `gap` bytes of it (the bytes between are then in the set).
     pub(crate) fn insert(&mut self, from: usize, to: usize, gap: usize) {

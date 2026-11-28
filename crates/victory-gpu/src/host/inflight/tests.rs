@@ -1020,6 +1020,72 @@ fn upload_test_texture(memory: usize) -> This {
 }
 
 #[test]
+fn texture_upload_distinguishes_physical_alias_pages() {
+    if !exact_upload_aliases() {
+        return;
+    }
+    let Some(host) = host_for_ring() else { return };
+    host.present_boundary();
+    let (memory, alias) = crate::watch::tests::twin_views(2);
+    let page = crate::watch::PAGE;
+    let texture = upload_test_texture(memory);
+    let copy = crate::resource::host_copy(texture).unwrap();
+    let staging = crate::texture::staging(texture, &copy).unwrap();
+    assert!(staging.source_range().1 <= page);
+    let sources = [(staging, copy)];
+    let (out, _) = host.mapped_buffer(8, true).unwrap();
+    for (address, overlaps) in [(alias + page, false), (alias, true)] {
+        let gate = Gate::new(host);
+        let before = DRAINS[Boundary::TextureUploadLabel as usize].load(Ordering::Relaxed);
+        let producer = record_copy(host, &out, 4, 1);
+        producer.defer_write(
+            address as *mut u8,
+            crate::queue::Written::Value(0x44332211),
+            8,
+        );
+        assert!(host.execute_title(&[producer]));
+        let wait = || {
+            let mut submission = host.submitted.lock().unwrap();
+            let _holding = Holding::enter();
+            host.wait_texture_upload_sources(&mut submission, &sources)
+        };
+        let (finished, release) = std::sync::mpsc::channel();
+        let opener = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(4);
+            while DRAINS[Boundary::TextureUploadLabel as usize].load(Ordering::Relaxed) == before
+                && Instant::now() < deadline
+                && release.recv_timeout(Duration::from_millis(1)).is_err()
+            {}
+            drop(gate);
+        });
+        let waited = wait();
+        let _ = finished.send(());
+        opener.join().unwrap();
+        assert_eq!(waited, overlaps);
+        if overlaps {
+            // SAFETY: the label at the twin address has reached this live view.
+            assert_eq!(unsafe { (memory as *const u64).read() }, 0x44332211);
+        }
+        host.present_boundary();
+    }
+    drop(sources);
+    crate::object::release_ref(texture);
+    for view in [memory, alias] {
+        crate::watch::title_memory_remapped(view, 2 * page);
+        // SAFETY: these test-owned views are no longer used by the queue.
+        unsafe {
+            use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+            assert_ne!(
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: view as *mut _
+                }),
+                0
+            );
+        }
+    }
+}
+
+#[test]
 fn texture_upload_waits_only_for_an_overlapping_label() {
     let Some(host) = host_for_ring() else { return };
     host.present_boundary();

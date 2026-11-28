@@ -2438,6 +2438,28 @@ pub(crate) fn aliased(at: usize, len: usize) -> bool {
     guards().alias_of.range(first..last).next().is_some()
 }
 
+/// Project source pages into their other title mappings. Whole pages are
+/// intentional: an upload's tracked refresh may expand to page boundaries.
+pub(crate) fn upload_source_aliases(sources: &crate::ranges::Ranges) -> crate::ranges::Ranges {
+    let mut pages = Vec::new();
+    {
+        let g = guards();
+        for (start, end) in sources.iter() {
+            for (_, others) in g.alias_of.range(start / PAGE..end.div_ceil(PAGE)) {
+                pages.extend_from_slice(others);
+            }
+        }
+    }
+    pages.sort_unstable();
+    pages.dedup();
+    let mut aliases = crate::ranges::Ranges::default();
+    for page in pages {
+        let start = page * PAGE;
+        aliases.insert(start, start.saturating_add(PAGE), 0);
+    }
+    aliases
+}
+
 /// Open ahead only within an already guarded pool run, and only for
 /// texture staging. Every opened block is marked before it becomes writable.
 const TEXTURE_FAULT_BLOCKS: usize = 4;
