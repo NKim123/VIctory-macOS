@@ -1163,8 +1163,27 @@ mod tests {
         let (bytes, _) = crate::resource::buffer_bytes(output).unwrap();
         // SAFETY: the readback has completed and the first pixel is in the buffer.
         assert_eq!(unsafe { bytes.cast::<[u8; 4]>().read() }, [255, 0, 0, 255]);
-        for object in [list, allocator, target, replacement, output] {
-            assert_eq!(crate::object::release_ref(object), 0);
+
+        // A replaced host list may retain its recording pins through the
+        // recycling window even though the GPU readback has finished.
+        let lag = crate::host::bury_lag();
+        if crate::host::inflight_enabled() && lag != 0 {
+            let spare = host.new_list().unwrap();
+            spare.close();
+            let deadline = crate::host::submissions_done().saturating_add(lag);
+            while crate::host::submissions_done() < deadline {
+                host.execute(&[&spare]);
+            }
+            super::super::trim_idle();
+        }
+        for (name, object) in [
+            ("list", list),
+            ("allocator", allocator),
+            ("target", target),
+            ("replacement", replacement),
+            ("output", output),
+        ] {
+            assert_eq!(crate::object::release_ref(object), 0, "releasing {name}");
         }
     }
 
