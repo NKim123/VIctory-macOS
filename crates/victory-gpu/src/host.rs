@@ -2401,6 +2401,9 @@ type MissedCheck = Box<dyn Fn(&crate::memory::ComputedBaselines) -> bool + Send>
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
+    /// Indices of the heap and texture requests in the append-only steps.
+    /// The submission gathers these before it runs the deferred steps.
+    upload_steps: Vec<usize>,
     uploads: Vec<ID3D12Resource>,
     /// Host objects whose contents or descriptors can depend on title work.
     kept: Vec<windows::core::IUnknown>,
@@ -2469,6 +2472,11 @@ struct Deferred {
 const DEFERRED_CACHE_ENTRIES: usize = 1024;
 
 impl Deferred {
+    fn push_upload_step(&mut self, step: Step) {
+        self.upload_steps.push(self.copies.len());
+        self.copies.push(step);
+    }
+
     fn has_computed_feedback(&self) -> bool {
         self.after
             .iter()
@@ -3388,21 +3396,24 @@ impl Host {
         let mut textures = Vec::new();
         let mut demand = crate::descriptor::TableTextureSlots::new();
         for list in runs.iter().filter(|_| !host_only) {
-            for step in &list.deferred().copies {
-                match step {
+            let deferred = list.deferred();
+            for &index in &deferred.upload_steps {
+                match &deferred.copies[index] {
                     Step::Heap(viewed) => {
                         if !heaps.iter().any(|heap| Arc::ptr_eq(heap, viewed)) {
                             heaps.push(viewed.clone());
                         }
                     }
                     Step::Texture(staging, copy) => textures.push((staging.clone(), copy.clone())),
-                    Step::TextureSlot(viewed, index) if show_after => {
-                        demand
-                            .entry(Arc::as_ptr(viewed) as usize)
-                            .or_default()
-                            .insert(*index);
+                    Step::TextureSlot(viewed, index) => {
+                        if show_after {
+                            demand
+                                .entry(Arc::as_ptr(viewed) as usize)
+                                .or_default()
+                                .insert(*index);
+                        }
                     }
-                    _ => {}
+                    _ => unreachable!("only heap and texture steps are indexed"),
                 }
             }
         }
@@ -5228,9 +5239,7 @@ impl HostList {
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(viewed) as usize, index);
         if deferred.texture_slots.insert(key) {
-            deferred
-                .copies
-                .push(Step::TextureSlot(viewed.clone(), index));
+            deferred.push_upload_step(Step::TextureSlot(viewed.clone(), index));
         }
     }
 
@@ -5281,7 +5290,7 @@ impl HostList {
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(viewed) as usize, usize::MAX, 0);
         if deferred.refreshed.insert(key) {
-            deferred.copies.push(Step::Heap(viewed.clone()));
+            deferred.push_upload_step(Step::Heap(viewed.clone()));
         }
     }
 
@@ -6068,7 +6077,7 @@ impl HostList {
         staging: std::sync::Arc<crate::texture::Staging>,
         copy: std::sync::Arc<crate::resource::HostTexture>,
     ) {
-        self.deferred().copies.push(Step::Texture(staging, copy));
+        self.deferred().push_upload_step(Step::Texture(staging, copy));
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
