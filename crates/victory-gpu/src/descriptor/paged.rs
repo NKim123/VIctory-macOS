@@ -46,6 +46,7 @@ impl<T> Paged<T> {
 
     /// The slots that hold something, in order, with their indices: the
     /// pages made are walked, the others skipped.
+    #[cfg(feature = "diagnostics")]
     pub(crate) fn iter(&self) -> impl Iterator<Item = (usize, &T)> {
         self.pages.iter().enumerate().flat_map(|(p, page)| {
             page.iter()
@@ -75,10 +76,58 @@ impl<T> Paged<T> {
     }
 }
 
+/// One bit per title slot eligible for texture eviction. Dynamic descriptors
+/// have no title record to recreate them from and have no bit in this mask.
+pub(super) struct SlotMask(Box<[u64]>);
+
+impl SlotMask {
+    pub(super) fn new(count: usize) -> Self {
+        Self(vec![0; count.div_ceil(64)].into_boxed_slice())
+    }
+
+    pub(super) fn set(&mut self, index: usize, enabled: bool) {
+        let word = &mut self.0[index / 64];
+        let mask = 1u64 << (index % 64);
+        if enabled {
+            *word |= mask;
+        } else {
+            *word &= !mask;
+        }
+    }
+
+    pub(super) fn indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.0.iter().enumerate().flat_map(|(i, &word)| {
+            let mut bits = word;
+            std::iter::from_fn(move || {
+                if bits == 0 {
+                    return None;
+                }
+                let bit = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                Some(i * 64 + bit)
+            })
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn texture_slot_mask_tracks_rewrites_across_word_and_page_boundaries() {
+        let mut mask = SlotMask::new(516);
+        for i in [511, 515, 0, 256, 63, 64, 255] {
+            mask.set(i, true);
+        }
+        for i in [64, 515, 0] {
+            mask.set(i, false);
+        }
+        mask.set(64, true);
+        assert_eq!(mask.indices().collect::<Vec<_>>(), [63, 64, 255, 256, 511]);
+        assert_eq!(SlotMask::new(0).indices().count(), 0);
+    }
 
     fn made<T>(table: &Paged<T>) -> usize {
         table.pages.iter().flatten().count()

@@ -1108,7 +1108,7 @@ pub(crate) struct HostHeap {
     /// With it the view's own copy of title memory, if it has one. Paged:
     /// the title views through a fraction of the slots, and a dense table
     /// of them all was 37.7 MB, written when the heap was made.
-    kept: Mutex<Paged<Held>>,
+    kept: Mutex<KeptSlots>,
     /// Write-back observers of shared slots. A descriptor rewrite retires
     /// its observer before changing the GPU-visible descriptor.
     texture_bindings:
@@ -1435,7 +1435,10 @@ impl HostHeap {
                 .collect(),
             ready: (0..count).map(|_| AtomicU64::new(0)).collect(),
             staging: std::sync::OnceLock::new(),
-            kept: Mutex::new(Paged::new((count + extra) as usize)),
+            kept: Mutex::new(KeptSlots {
+                values: Paged::new((count + extra) as usize),
+                textures: super::paged::SlotMask::new(if sampler { 0 } else { count as usize }),
+            }),
             texture_bindings: Mutex::default(),
             has_texture_bindings: AtomicBool::new(false),
             ambient_watched: AtomicBool::new(false),
@@ -1745,7 +1748,7 @@ impl HostHeap {
             let retired: Vec<_> = if unreachable < limit {
                 let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
                 (unreachable..limit)
-                    .filter_map(|index| kept.slot(index, false)?.take())
+                    .filter_map(|index| kept.values.slot(index, false)?.take())
                     .collect()
             } else {
                 Vec::new()
@@ -2033,9 +2036,9 @@ impl HostHeap {
         }
     }
 
-    fn keep_slot(&self, kept: &mut Paged<Held>, index: u32, resource: Kept) -> Kept {
+    fn keep_slot(&self, kept: &mut KeptSlots, index: u32, resource: Kept) -> Kept {
         // A slot that held nothing and gets nothing is left alone (no page).
-        let slot = kept.slot(index as usize, resource.is_some())?;
+        let slot = kept.values.slot(index as usize, resource.is_some())?;
         if let (Some((old, old_source)), Some((new, new_source))) =
             (slot.as_ref(), resource.as_ref())
             && windows::core::Interface::as_raw(old) == windows::core::Interface::as_raw(new)
@@ -2048,6 +2051,15 @@ impl HostHeap {
             _ => None,
         };
         let old = std::mem::replace(slot, resource);
+        // Eviction only clears title slots. A bitmap records which slots
+        // could hold an evictable texture, under the same lock as the value.
+        if index < self.count && !self.sampler {
+            let was = old.as_ref().is_some_and(evictable_backing);
+            let now = slot.as_ref().is_some_and(evictable_backing);
+            if was != now {
+                kept.textures.set(index as usize, now);
+            }
+        }
         self.note_widened(widened(&old).as_ref(), false);
         self.note_widened(widened(slot).as_ref(), true);
         #[cfg(feature = "diagnostics")]
@@ -2246,7 +2258,7 @@ impl HostHeap {
             (index < self.count).then(|| self.made.lock().unwrap_or_else(|e| e.into_inner()));
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         let (resource, Some(HeldSource::Ambient(view))) =
-            kept.slot(index as usize, false)?.as_mut()?
+            kept.values.slot(index as usize, false)?.as_mut()?
         else {
             return None;
         };
@@ -3985,24 +3997,23 @@ impl HostHeap {
     /// mark, cleared) makes it again. Slots past `count` stay made: recorded
     /// lists and host copies already name them, and there is no title record
     /// from which to make them again.
-    /// The slots are found by a walk of the heap, once per pass that gives
-    /// textures up: a map of each texture's slots, kept at every slot the
-    /// title rewrote, cost ~25 us a slot (a texture viewed in thousands of
-    /// slots had its list searched each time; 62,000 slots a frame, run
-    /// evict3).
+    /// Walk only slots that can hold textures. A rewrite changes a bit
+    /// when its backing changes class, independent of the number of views
+    /// of the same texture.
     pub(crate) fn evict(&self, textures: &std::collections::HashSet<usize>) {
         // Keep a title slot from being rebound between testing its held texture
         // and clearing the descriptor. Mirroring takes made before kept as well.
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let slots: Vec<u32> = {
             let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-            kept.iter()
-                .filter(|&(i, k)| {
-                    i < self.count as usize
-                        && matches!(k.1, None | Some(HeldSource::Ambient(_)))
-                        && textures.contains(&(windows::core::Interface::as_raw(&k.0) as usize))
+            kept.textures
+                .indices()
+                .filter(|&i| {
+                    kept.get(i).is_some_and(|k| {
+                        textures.contains(&(windows::core::Interface::as_raw(&k.0) as usize))
+                    })
                 })
-                .map(|(i, _)| i as u32)
+                .map(|i| i as u32)
                 .collect()
         };
         made.pending.retain(|&index, pending| {
@@ -4071,7 +4082,7 @@ impl HostHeap {
             .iter()
             .filter_map(|&i| {
                 kept.get(i as usize)
-                    .filter(|k| matches!(k.1, None | Some(HeldSource::Ambient(_))))
+                    .filter(|k| evictable_backing(k))
             })
             .map(|k| windows::core::Interface::as_raw(&k.0) as usize)
             .collect()
@@ -4801,6 +4812,21 @@ impl TextureView {
 
 /// What a slot made by [`make`] holds, if anything.
 type Kept = Option<Held>;
+
+struct KeptSlots {
+    values: Paged<Held>,
+    textures: super::paged::SlotMask,
+}
+
+impl KeptSlots {
+    fn get(&self, index: usize) -> Option<&Held> {
+        self.values.get(index)
+    }
+}
+
+fn evictable_backing(held: &Held) -> bool {
+    matches!(held.1, None | Some(HeldSource::Ambient(_)))
+}
 
 /// Buffer views refused so far (diagnostics: the first are logged).
 #[cfg(feature = "diagnostics")]
@@ -6158,6 +6184,36 @@ void main() {
             Some(&View::Shader(0, Some(desc))),
         );
         assert_eq!(words, [0xabcd_1234, 0xa321, 0, 0]);
+    }
+
+    #[test]
+    fn eviction_tracks_replaced_slot_backing_and_spares_dynamic_slots() {
+        use windows::core::Interface;
+        let Some(heap) = HostHeap::new(false, 65) else {
+            return;
+        };
+        let page = crate::watch::PAGE;
+        let address = crate::watch::tests::pool(1);
+        crate::shadow::register(address, address as u64, page as u64);
+        let shadow = crate::shadow::find(address as u64, page as u64).unwrap();
+        let raw = shadow.buffer.as_raw() as usize;
+        let plain = || Some((shadow.buffer.clone(), None));
+        let tracked = || Some((shadow.buffer.clone(), Some(HeldSource::Shadow(shadow.clone()))));
+
+        heap.keep(0, plain());
+        heap.keep(0, tracked());
+        heap.keep(64, tracked());
+        heap.keep(64, plain());
+        heap.keep(heap.count, plain());
+        heap.evict(&HashSet::from([raw]));
+        assert!(heap.kept(0));
+        assert!(!heap.kept(64));
+        assert!(heap.kept(heap.count));
+
+        drop(heap);
+        drop(shadow);
+        crate::shadow::unregister(address, address as u64);
+        crate::watch::tests::free(address);
     }
 
     #[test]
