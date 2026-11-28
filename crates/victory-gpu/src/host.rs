@@ -3291,6 +3291,8 @@ impl Host {
         synchronous: Boundary,
         barriers: &[bool],
     ) -> Option<(u64, Vec<(usize, String)>)> {
+        use crate::queue::{CpuPhase, CpuTimer};
+
         let remaps = (!host_only).then(crate::watch::track_submission);
         let landing = if host_only {
             None
@@ -3348,14 +3350,20 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ExecuteLists, runs.len() as u64);
         if !host_only {
+            let order = CpuTimer::new(CpuPhase::SubmitOrder);
             // Older copied GPU output can land in title memory read below.
             self.wait_ordered_completion(submission, |work| work.title_memory);
+            drop(order);
+            let trim = CpuTimer::new(CpuPhase::SubmitTrim);
             // Host textures the title has not used for a while (or past the
             // card's budget) are given up first: the last submission has run.
             crate::list::trim_idle();
+            drop(trim);
             if !submission.busy() {
+                let _evict = CpuTimer::new(CpuPhase::SubmitEvict);
                 crate::resource::evict_unused();
             }
+            let _heap_sync = CpuTimer::new(CpuPhase::SubmitHeapSync);
             // The first shader writing through a heap may run in this
             // submission: unordered views left null are made again first.
             if crate::bindless::take_remake() {
@@ -3375,6 +3383,7 @@ impl Host {
         // Textures heap-indexing shaders may read, uploaded first by a list
         // of ours where their title memory changed.
         // And textures read through tables, uploaded by the same list.
+        let gather = CpuTimer::new(CpuPhase::SubmitGather);
         let mut heaps = Vec::new();
         let mut textures = Vec::new();
         let mut demand = crate::descriptor::TableTextureSlots::new();
@@ -3397,9 +3406,11 @@ impl Host {
                 }
             }
         }
+        drop(gather);
         // Pending shared SRVs can upload unrelated title memory. The
         // submit-ahead worker only runs lists that have no such dependencies.
         if show_after {
+            let _demand = CpuTimer::new(CpuPhase::SubmitDemand);
             self.wait_ordered_completion(submission, |work| work.descriptors);
             crate::descriptor::service_pending(&demand, &heaps, pending_pins, Some(&mut textures));
             #[cfg(test)]
@@ -3415,6 +3426,7 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         let uploading =
             crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
+        let upload_phase = CpuTimer::new(CpuPhase::SubmitUploads);
         let mut uploads = (!host_only)
             .then(|| {
                 let private =
@@ -3437,6 +3449,7 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         drop(uploading);
+        drop(upload_phase);
         let has_uploads = uploads.is_some();
         let runs: Vec<&HostList> = uploads
             .as_ref()
@@ -3462,6 +3475,7 @@ impl Host {
                 }
             }
         }
+        let plan = CpuTimer::new(CpuPhase::SubmitPlan);
         let split_preludes = !gpu_timing && split_uav_srv_prelude();
         let mut native_boundaries = Vec::new();
         let mut barrier_lists = CoalescingBarriers::new(self);
@@ -3517,6 +3531,8 @@ impl Host {
             }
             planned.push(list.plan_prelude(split_preludes));
         }
+        drop(plan);
+        let preludes = CpuTimer::new(CpuPhase::SubmitPreludes);
         let recorded = self.record_preludes(runs, &planned);
         for (i, list) in runs.iter().enumerate() {
             firsts.push(lists.len());
@@ -3539,6 +3555,8 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
+        drop(preludes);
+        let flush = CpuTimer::new(CpuPhase::SubmitFlush);
         self.order_shared_bottom_writes(submission);
         // A flight with CPU copy-back or descriptor publication must land
         // before another native list starts. Overlap the preparation above
@@ -3548,6 +3566,8 @@ impl Host {
             self.drain_inflight(submission, Boundary::CpuAccess);
         }
         batch.flush();
+        drop(flush);
+        let baselines = CpuTimer::new(CpuPhase::SubmitBaselines);
         let mut computed = crate::memory::ComputedBaselines::default();
         if landing.is_some() || owned.is_some() {
             for list in runs {
@@ -3571,6 +3591,7 @@ impl Host {
                 }
             }
         }
+        drop(baselines);
         #[cfg(feature = "diagnostics")]
         batch.log_refreshes(submission.value + 1, runs.len());
         let prepared = std::time::Instant::now();
@@ -3599,9 +3620,11 @@ impl Host {
                     show_after,
                     ..Default::default()
                 };
+                let writeback = CpuTimer::new(CpuPhase::SubmitWriteback);
                 for list in runs {
                     list.note_ordered_completion(&computed, &mut ordered);
                 }
+                drop(writeback);
                 let ordered = ordered.reason().map(|_| ordered);
                 let needs_feedback = ordered.is_none()
                     && runs

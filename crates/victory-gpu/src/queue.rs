@@ -476,7 +476,7 @@ fn synchronous_boundary() -> Option<std::sync::MutexGuard<'static, ()>> {
     Some(ordered)
 }
 
-/// Optional aggregate call durations for CPU work outside host submission.
+/// Optional aggregate wall-clock durations for CPU work and submission.
 #[cfg(windows)]
 #[derive(Clone, Copy)]
 pub(crate) enum CpuPhase {
@@ -497,15 +497,27 @@ pub(crate) enum CpuPhase {
     DescriptorFallback,
     DescriptorDemand,
     DescriptorPublish,
+    SubmitOrder,
+    SubmitTrim,
+    SubmitEvict,
+    SubmitHeapSync,
+    SubmitGather,
+    SubmitDemand,
+    SubmitUploads,
+    SubmitPlan,
+    SubmitPreludes,
+    SubmitFlush,
+    SubmitBaselines,
+    SubmitWriteback,
 }
 
 #[cfg(windows)]
-static CPU_PHASE_NS: [AtomicU64; CpuPhase::DescriptorPublish as usize + 1] =
-    [const { AtomicU64::new(0) }; CpuPhase::DescriptorPublish as usize + 1];
+static CPU_PHASE_NS: [AtomicU64; CpuPhase::SubmitWriteback as usize + 1] =
+    [const { AtomicU64::new(0) }; CpuPhase::SubmitWriteback as usize + 1];
 
 #[cfg(windows)]
-static CPU_PHASE_CALLS: [AtomicU64; CpuPhase::DescriptorPublish as usize + 1] =
-    [const { AtomicU64::new(0) }; CpuPhase::DescriptorPublish as usize + 1];
+static CPU_PHASE_CALLS: [AtomicU64; CpuPhase::SubmitWriteback as usize + 1] =
+    [const { AtomicU64::new(0) }; CpuPhase::SubmitWriteback as usize + 1];
 
 #[cfg(windows)]
 static TABLE_PINS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -534,7 +546,9 @@ impl Drop for CpuTimer {
         if let Some((phase, start)) = self.0 {
             CPU_PHASE_NS[phase as usize]
                 .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            if phase as usize >= CpuPhase::DescriptorSync as usize {
+            if (CpuPhase::DescriptorSync as usize..=CpuPhase::DescriptorPublish as usize)
+                .contains(&(phase as usize))
+            {
                 CPU_PHASE_CALLS[phase as usize].fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -568,6 +582,23 @@ pub(crate) fn log_cpu_phases(frames: f64) {
         reaper_retire_ms = ms(CpuPhase::ReaperRetire),
         flight_feedback_ms = ms(CpuPhase::FlightFeedback),
         "title CPU calls per frame"
+    );
+    // Submit scopes can include waits and nest descriptor scopes.
+    tracing::info!(
+        frames,
+        order_ms = ms(CpuPhase::SubmitOrder),
+        trim_ms = ms(CpuPhase::SubmitTrim),
+        evict_ms = ms(CpuPhase::SubmitEvict),
+        heap_sync_ms = ms(CpuPhase::SubmitHeapSync),
+        gather_ms = ms(CpuPhase::SubmitGather),
+        demand_ms = ms(CpuPhase::SubmitDemand),
+        uploads_ms = ms(CpuPhase::SubmitUploads),
+        plan_ms = ms(CpuPhase::SubmitPlan),
+        preludes_ms = ms(CpuPhase::SubmitPreludes),
+        flush_ms = ms(CpuPhase::SubmitFlush),
+        baselines_ms = ms(CpuPhase::SubmitBaselines),
+        writeback_ms = ms(CpuPhase::SubmitWriteback),
+        "host submission wall time per frame"
     );
     let calls = |phase: CpuPhase| {
         CPU_PHASE_CALLS[phase as usize].swap(0, Ordering::Relaxed)
