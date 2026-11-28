@@ -3704,8 +3704,7 @@ impl HostHeap {
                 let handle = start + u64::from(index) * step;
                 // Preserve the acquire before reading the title header.
                 let _ = self.ready[index as usize].load(Ordering::Acquire);
-                let Some(record @ [tag, view, generation]) = capture_header(handle)
-                else {
+                let Some(record @ [tag, view, generation]) = capture_header(handle) else {
                     continue;
                 };
                 if tag == VIEW_TAG
@@ -4125,10 +4124,7 @@ impl HostHeap {
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         slots
             .iter()
-            .filter_map(|&i| {
-                kept.get(i as usize)
-                    .filter(|k| evictable_backing(k))
-            })
+            .filter_map(|&i| kept.get(i as usize).filter(|k| evictable_backing(k)))
             .map(|k| windows::core::Interface::as_raw(&k.0) as usize)
             .collect()
     }
@@ -6243,7 +6239,12 @@ void main() {
         let shadow = crate::shadow::find(address as u64, page as u64).unwrap();
         let raw = shadow.buffer.as_raw() as usize;
         let plain = || Some((shadow.buffer.clone(), None));
-        let tracked = || Some((shadow.buffer.clone(), Some(HeldSource::Shadow(shadow.clone()))));
+        let tracked = || {
+            Some((
+                shadow.buffer.clone(),
+                Some(HeldSource::Shadow(shadow.clone())),
+            ))
+        };
 
         heap.keep(0, plain());
         heap.keep(0, tracked());

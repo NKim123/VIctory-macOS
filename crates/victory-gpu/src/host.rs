@@ -6077,7 +6077,8 @@ impl HostList {
         staging: std::sync::Arc<crate::texture::Staging>,
         copy: std::sync::Arc<crate::resource::HostTexture>,
     ) {
-        self.deferred().push_upload_step(Step::Texture(staging, copy));
+        self.deferred()
+            .push_upload_step(Step::Texture(staging, copy));
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`

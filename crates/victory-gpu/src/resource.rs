@@ -2364,7 +2364,8 @@ fn idle_texture(last_frame: u64, last_ms: u64, frame: u64, now: u64) -> bool {
 #[cfg(windows)]
 fn choose(uses: &[(u64, u64, u64)], frame: u64, now: u64, over: u64) -> Vec<usize> {
     let idle = |&(f, ms, _): &(u64, u64, u64)| idle_texture(f, ms, frame, now);
-    let (mut gone, mut rest): (Vec<usize>, Vec<usize>) = (0..uses.len()).partition(|&i| idle(&uses[i]));
+    let (mut gone, mut rest): (Vec<usize>, Vec<usize>) =
+        (0..uses.len()).partition(|&i| idle(&uses[i]));
     let mut over = over.saturating_sub(gone.iter().map(|&i| uses[i].2).sum());
     if over == 0 {
         return gone;
@@ -2440,7 +2441,9 @@ pub(crate) fn give_up_now(this: This) -> bool {
 #[cfg(all(windows, test))]
 pub(crate) fn owned(this: This) -> Option<Owned> {
     let t = made(resource(this))?;
-    candidates(|_| true).into_iter().find(|(c, _)| std::sync::Arc::ptr_eq(c, &t))
+    candidates(|_| true)
+        .into_iter()
+        .find(|(c, _)| std::sync::Arc::ptr_eq(c, &t))
 }
 
 // The creation methods' own arguments, passed on.

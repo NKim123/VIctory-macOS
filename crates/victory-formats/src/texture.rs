@@ -1060,7 +1060,12 @@ pub fn changed_runs(at: usize, kept: &mut [u8], fresh: &[u8], runs: &mut Vec<(us
         let end = (start + BLOCK).min(fresh.len());
         if kept[start..end] == fresh[start..end] {
             if let Some(first) = dirty.take() {
-                walk_changed(at + first, &mut kept[first..start], &fresh[first..start], runs);
+                walk_changed(
+                    at + first,
+                    &mut kept[first..start],
+                    &fresh[first..start],
+                    runs,
+                );
             }
         } else {
             dirty.get_or_insert(start);
@@ -1787,9 +1792,8 @@ mod tests {
                     let rows: Vec<_> = (0..m.depth)
                         .flat_map(|z| (0..m.height).map(move |y| (z, y)))
                         .map(|(z, y)| {
-                            let offsets = (0..m.width).map(|x| {
-                                l.offset(mip as u32, x, y, slice + z).unwrap() as usize
-                            });
+                            let offsets = (0..m.width)
+                                .map(|x| l.offset(mip as u32, x, y, slice + z).unwrap() as usize);
                             let lo = offsets.clone().min().unwrap();
                             let hi = offsets.max().unwrap() + element_bytes as usize;
                             (y, lo, hi)

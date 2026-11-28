@@ -600,9 +600,7 @@ pub(crate) fn log_cpu_phases(frames: f64) {
         writeback_ms = ms(CpuPhase::SubmitWriteback),
         "host submission wall time per frame"
     );
-    let calls = |phase: CpuPhase| {
-        CPU_PHASE_CALLS[phase as usize].swap(0, Ordering::Relaxed)
-    };
+    let calls = |phase: CpuPhase| CPU_PHASE_CALLS[phase as usize].swap(0, Ordering::Relaxed);
     tracing::info!(
         frames,
         sync_ms = ms(CpuPhase::DescriptorSync),

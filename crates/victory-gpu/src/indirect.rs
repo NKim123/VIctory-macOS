@@ -198,7 +198,9 @@ impl Batch {
                 #[cfg(victory_dxc_clamp)]
                 match precompiled_batch() {
                     Ok(clamp) => {
-                        tracing::info!("batched argument clamp: using precompiled 32-thread shader");
+                        tracing::info!(
+                            "batched argument clamp: using precompiled 32-thread shader"
+                        );
                         return Some(clamp);
                     }
                     Err(error) => tracing::warn!(%error, "precompiled batch clamp unavailable"),
@@ -458,12 +460,18 @@ fn with_indirect_rest<R>(rest: bool, f: impl FnOnce() -> R) -> R {
 /// #4). So both are checked here and set when they are zero.
 #[cfg(victory_dxc_clamp)]
 fn precompiled() -> windows::core::Result<Clamp> {
-    precompiled_from(include_bytes!(concat!(env!("OUT_DIR"), "/indirect-clamp.dxil")))
+    precompiled_from(include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/indirect-clamp.dxil"
+    )))
 }
 
 #[cfg(victory_dxc_clamp)]
 fn precompiled_batch() -> windows::core::Result<Clamp> {
-    let mut clamp = precompiled_from(include_bytes!(concat!(env!("OUT_DIR"), "/indirect-batch.dxil")))?;
+    let mut clamp = precompiled_from(include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/indirect-batch.dxil"
+    )))?;
     clamp.words = true;
     Ok(clamp)
 }

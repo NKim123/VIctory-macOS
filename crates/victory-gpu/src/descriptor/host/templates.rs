@@ -69,7 +69,11 @@ impl Templates {
     pub(super) fn new(sampler: bool) -> Option<Self> {
         let device = &host()?.device;
         let kind = kind(sampler);
-        let count = if sampler { 256 } else { RESOURCE_BUCKETS as u32 };
+        let count = if sampler {
+            256
+        } else {
+            RESOURCE_BUCKETS as u32
+        };
         // SAFETY: a CPU-only heap of a supported descriptor type.
         let (heap, cpu, step) = unsafe {
             let heap: ID3D12DescriptorHeap = device
