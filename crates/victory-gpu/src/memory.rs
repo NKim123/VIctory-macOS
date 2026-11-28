@@ -47,6 +47,15 @@ use crate::shadow::Shadow;
 const BITMAP_BITS: usize = (CAPACITY + 1) * BLOCK;
 /// 32-bit words in a dirty-page bitmap.
 const BITMAP_WORDS: usize = BITMAP_BITS / 32;
+/// Largest page-table prefix ever published, including block zero for misses.
+/// A recording can still hold an older table after its heap is released.
+static ACTIVE_BITMAP_WORDS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(BLOCK / 32);
+
+fn active_bitmap_words() -> usize {
+    ACTIVE_BITMAP_WORDS.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Byte size of a dirty-page bitmap buffer (256-byte aligned).
 const BITMAP_BYTES: u64 = (BITMAP_BITS / 8).next_multiple_of(256) as u64;
 /// Maximum number of dirty-page bitmaps kept in [`BITMAP_POOL`].
@@ -486,6 +495,10 @@ impl Shared {
         let built = self
             .scratch
             .build_with_aliases(&ranges, &slots, self.null, &mut out, &aliases);
+        ACTIVE_BITMAP_WORDS.fetch_max(
+            built.blocks.len() * (BLOCK / 32),
+            std::sync::atomic::Ordering::Release,
+        );
         // SAFETY: the mapping has room for `CAPACITY` blocks, which the
         // builder keeps to; no submission runs.
         unsafe { std::ptr::copy_nonoverlapping(built.dwords.as_ptr(), self.data as *mut u32, built.dwords.len()) };
@@ -696,9 +709,24 @@ pub(crate) fn prepare(
     !blocked
 }
 
+/// Enumerates only marked words while preserving their original order and indices.
+fn marked_words(marks: &[u32]) -> impl Iterator<Item = (usize, u32)> + '_ {
+    marks
+        .chunks(4)
+        .enumerate()
+        .filter(|(_, chunk)| chunk.iter().copied().fold(0, |mask, word| mask | word) != 0)
+        .flat_map(|(chunk, words)| {
+            words
+                .iter()
+                .copied()
+                .enumerate()
+                .filter_map(move |(offset, word)| (word != 0).then_some((chunk * 4 + offset, word)))
+        })
+}
+
 /// Whether any marked page in `marks` fell outside a valid copy in `l`.
 fn has_missed(marks: &[u32], l: &Layout) -> bool {
-    for (w, &mark) in marks.iter().enumerate() {
+    for (w, mark) in marked_words(marks) {
         let mut bits = mark;
         while bits != 0 {
             let entry = w * 32 + bits.trailing_zeros() as usize;
@@ -742,17 +770,19 @@ impl Feedback {
     pub(crate) fn missed(&self, baselines: &ComputedBaselines) -> bool {
         let layout = baselines.layout(self.key);
         // SAFETY: the mapping belongs to this recording and its fence completed.
-        let marks =
-            unsafe { std::slice::from_raw_parts(self.bitmap.data() as *const u32, BITMAP_WORDS) };
+        let marks = unsafe {
+            std::slice::from_raw_parts(self.bitmap.data() as *const u32, active_bitmap_words())
+        };
         has_missed(marks, &layout)
     }
 
     pub(crate) fn plan_ownership(&self, baselines: &mut ComputedBaselines) {
         let l = baselines.layout(self.key);
         // SAFETY: the GPU fence has completed and the bitmap is still live.
-        let marks =
-            unsafe { std::slice::from_raw_parts(self.bitmap.data() as *const u32, BITMAP_WORDS) };
-        for (word, &mark) in marks.iter().enumerate() {
+        let marks = unsafe {
+            std::slice::from_raw_parts(self.bitmap.data() as *const u32, active_bitmap_words())
+        };
+        for (word, mark) in marked_words(marks) {
             let mut bits = mark;
             while bits != 0 {
                 let entry = word * 32 + bits.trailing_zeros() as usize;
@@ -782,37 +812,50 @@ impl Feedback {
         } = &*baselines.layout(self.key);
         let precise = self.precise.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the bitmap is mapped and the list's run is over.
-        let marks =
-            unsafe { std::slice::from_raw_parts_mut(self.bitmap.data() as *mut u32, BITMAP_WORDS) };
+        let marks = unsafe {
+            std::slice::from_raw_parts_mut(self.bitmap.data() as *mut u32, active_bitmap_words())
+        };
         let (mut pages, mut regions, mut missed) = (0, 0, Vec::new());
         let mut writes = Vec::new();
-        for (w, mark) in marks.iter_mut().enumerate() {
-            // Most words are 0: write back only the ones that are not.
-            if *mark == 0 {
+        let (chunks, tail) = marks.as_chunks_mut::<4>();
+        debug_assert!(tail.is_empty());
+        for (chunk_index, chunk) in chunks.iter_mut().enumerate() {
+            if (chunk[0] | chunk[1] | chunk[2] | chunk[3]) == 0 {
                 continue;
             }
-            let mut bits = std::mem::take(mark);
-            while bits != 0 {
-                let entry = w * 32 + bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-                let (block, page) = (entry / BLOCK, entry % BLOCK);
-                // Block 0's bits are 256 MiB regions with no block.
-                let Some(&l1) = blocks.get(block).filter(|_| block != 0) else {
-                    regions += 1;
-                    missed.push((entry as u64) << 28);
+            for (offset, mark) in chunk.iter_mut().enumerate() {
+                let w = chunk_index * 4 + offset;
+                // Most words are 0: write back only the ones that are not.
+                if *mark == 0 {
                     continue;
-                };
-                let at = (l1 << 28 | page << 16) as u64;
-                let entry_owner = owner.get(entry);
-                let owned = entry_owner
-                    .and_then(|&k| k)
-                    .is_some_and(|k| baselines.owns(&copies[k], at as usize));
-                match entry_owner {
-                    Some(_) if !owned && precise.iter().any(|&(a, n)| a < at + (1 << 16) && at < a + n) => {}
-                    Some(&Some(k)) => writes.push((k, at)),
-                    _ => {
-                        pages += 1;
-                        missed.push(at);
+                }
+                let mut bits = std::mem::take(mark);
+                while bits != 0 {
+                    let entry = w * 32 + bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    let (block, page) = (entry / BLOCK, entry % BLOCK);
+                    // Block 0's bits are 256 MiB regions with no block.
+                    let Some(&l1) = blocks.get(block).filter(|_| block != 0) else {
+                        regions += 1;
+                        missed.push((entry as u64) << 28);
+                        continue;
+                    };
+                    let at = (l1 << 28 | page << 16) as u64;
+                    let entry_owner = owner.get(entry);
+                    let owned = entry_owner
+                        .and_then(|&k| k)
+                        .is_some_and(|k| baselines.owns(&copies[k], at as usize));
+                    match entry_owner {
+                        Some(_)
+                            if !owned
+                                && precise
+                                    .iter()
+                                    .any(|&(a, n)| a < at + (1 << 16) && at < a + n) => {}
+                        Some(&Some(k)) => writes.push((k, at)),
+                        _ => {
+                            pages += 1;
+                            missed.push(at);
+                        }
                     }
                 }
             }
