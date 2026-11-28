@@ -490,11 +490,22 @@ pub(crate) enum CpuPhase {
     SubmitRetire,
     ReaperRetire,
     FlightFeedback,
+    DescriptorSync,
+    DescriptorPins,
+    DescriptorTemplates,
+    DescriptorStage,
+    DescriptorFallback,
+    DescriptorDemand,
+    DescriptorPublish,
 }
 
 #[cfg(windows)]
-static CPU_PHASE_NS: [AtomicU64; CpuPhase::FlightFeedback as usize + 1] =
-    [const { AtomicU64::new(0) }; CpuPhase::FlightFeedback as usize + 1];
+static CPU_PHASE_NS: [AtomicU64; CpuPhase::DescriptorPublish as usize + 1] =
+    [const { AtomicU64::new(0) }; CpuPhase::DescriptorPublish as usize + 1];
+
+#[cfg(windows)]
+static CPU_PHASE_CALLS: [AtomicU64; CpuPhase::DescriptorPublish as usize + 1] =
+    [const { AtomicU64::new(0) }; CpuPhase::DescriptorPublish as usize + 1];
 
 #[cfg(windows)]
 pub(crate) struct CpuTimer(Option<(CpuPhase, std::time::Instant)>);
@@ -512,6 +523,9 @@ impl Drop for CpuTimer {
         if let Some((phase, start)) = self.0 {
             CPU_PHASE_NS[phase as usize]
                 .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            if phase as usize >= CpuPhase::DescriptorSync as usize {
+                CPU_PHASE_CALLS[phase as usize].fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -543,6 +557,27 @@ pub(crate) fn log_cpu_phases(frames: f64) {
         reaper_retire_ms = ms(CpuPhase::ReaperRetire),
         flight_feedback_ms = ms(CpuPhase::FlightFeedback),
         "title CPU calls per frame"
+    );
+    let calls = |phase: CpuPhase| {
+        CPU_PHASE_CALLS[phase as usize].swap(0, Ordering::Relaxed)
+    };
+    tracing::info!(
+        frames,
+        sync_ms = ms(CpuPhase::DescriptorSync),
+        sync_calls = calls(CpuPhase::DescriptorSync),
+        pins_ms = ms(CpuPhase::DescriptorPins),
+        pins_calls = calls(CpuPhase::DescriptorPins),
+        templates_ms = ms(CpuPhase::DescriptorTemplates),
+        template_passes = calls(CpuPhase::DescriptorTemplates),
+        staging_ms = ms(CpuPhase::DescriptorStage),
+        staging_batches = calls(CpuPhase::DescriptorStage),
+        fallback_ms = ms(CpuPhase::DescriptorFallback),
+        fallback_batches = calls(CpuPhase::DescriptorFallback),
+        demand_ms = ms(CpuPhase::DescriptorDemand),
+        demand_calls = calls(CpuPhase::DescriptorDemand),
+        publish_ms = ms(CpuPhase::DescriptorPublish),
+        publish_calls = calls(CpuPhase::DescriptorPublish),
+        "descriptor CPU phases"
     );
 }
 

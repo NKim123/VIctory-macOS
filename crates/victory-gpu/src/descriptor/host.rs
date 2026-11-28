@@ -2552,6 +2552,7 @@ impl HostHeap {
     }
 
     fn publish_records(&self, records: &[ChangedRecord], start: u64, step: u64) {
+        use crate::queue::{CpuPhase, CpuTimer};
         let mut misses = Vec::new();
         let cache = templates::enabled();
         if !cache && fast_heap_sync() && !show_after() {
@@ -2560,7 +2561,9 @@ impl HostHeap {
             return;
         }
         if cache {
+            let pinning = CpuTimer::new(CpuPhase::DescriptorPins);
             let pins = pin_changed_views(records);
+            drop(pinning);
             let mut batch = PublishBatch::default();
             self.publish_templates(records, start, step, (&pins, None), &mut batch, &mut misses);
             if !self.sampler && misses.len() >= MIN_STAGED_RECORDS {
@@ -2571,9 +2574,11 @@ impl HostHeap {
                     // A worker temporarily owns this heap's template shard.
                     // Later frames can hit the cache without another worker
                     // round, while scratch sources stay live through the copy.
+                    let staging = CpuTimer::new(CpuPhase::DescriptorStage);
                     self.swap_templates(workers);
                     let staged = stage_views(workers, &misses, &pins);
                     self.swap_templates(workers);
+                    drop(staging);
                     let mut remaining = Vec::new();
                     self.publish_templates(
                         &misses,
@@ -2600,6 +2605,10 @@ impl HostHeap {
             }
         }
         let records = if cache { &misses } else { records };
+        if records.is_empty() {
+            return;
+        }
+        let _fallback = CpuTimer::new(CpuPhase::DescriptorFallback);
         for &ChangedRecord {
             index,
             record,
@@ -2637,6 +2646,7 @@ impl HostHeap {
         batch: &mut PublishBatch,
         misses: &mut Vec<ChangedRecord>,
     ) {
+        let _timer = crate::queue::CpuTimer::new(crate::queue::CpuPhase::DescriptorTemplates);
         // Give recording and live descriptor writes a chance to take the
         // mirror lock between bounded publication batches.
         const RECORDS_PER_BATCH: usize = 2048;

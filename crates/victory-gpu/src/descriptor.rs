@@ -424,6 +424,7 @@ fn take_heap_writes(mut budget: usize, _audit: bool) -> Vec<HeapWrites> {
 /// heap at indices in their data, where a slot never mirrored reads nothing.
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
+    let _timer = crate::queue::CpuTimer::new(crate::queue::CpuPhase::DescriptorSync);
     let work = if let Some(Some(requests)) = HEAP_REQUESTS.get() {
         let mut ready = requests.ready.lock().unwrap_or_else(|e| e.into_inner());
         let mut work = std::mem::take(&mut *ready);
@@ -644,6 +645,12 @@ pub(crate) fn service_pending(
     pins: &mut Vec<ViewPin>,
     uploads: Option<&mut Vec<crate::texture::UploadSource>>,
 ) {
+    use crate::queue::{CpuPhase, CpuTimer};
+    let _timer = CpuTimer::new(if uploads.is_some() {
+        CpuPhase::DescriptorDemand
+    } else {
+        CpuPhase::DescriptorPublish
+    });
     #[cfg(not(test))]
     let mut budget = PENDING_STAGING_BYTES;
     #[cfg(test)]
