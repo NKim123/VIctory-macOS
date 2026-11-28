@@ -5,9 +5,11 @@
 use super::*;
 use crate::descriptor::{RtvRecord, ViewPin};
 use crate::draw::{IndexView, VertexView};
+use crate::queue::{CpuPhase, CpuTimer, ThinEvent, cpu_phases_enabled};
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::mem::MaybeUninit;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -15,6 +17,17 @@ use windows::Win32::Graphics::Direct3D12::*;
 const CHUNK_WORDS: usize = 1024;
 const QUEUED_CHUNKS: usize = 3;
 const WORKERS: usize = 8;
+
+fn first_chunk_words() -> usize {
+    static WORDS: OnceLock<usize> = OnceLock::new();
+    *WORDS.get_or_init(|| {
+        std::env::var("VICTORY_THIN_EARLY_WORDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|words| (1..CHUNK_WORDS).contains(words))
+            .unwrap_or(CHUNK_WORDS)
+    })
+}
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|error| error.into_inner())
@@ -138,18 +151,31 @@ impl<'a> Packet<'a> {
     }
 }
 
-#[derive(Default)]
 pub(super) struct Front {
     chunk: Chunk,
+    chunk_words: usize,
     lane: Arc<Lane>,
     pub(super) pins: Pins,
     calling_thread: bool,
+}
+
+impl Default for Front {
+    fn default() -> Self {
+        Self {
+            chunk: Chunk::default(),
+            chunk_words: first_chunk_words(),
+            lane: Arc::default(),
+            pins: Pins::default(),
+            calling_thread: false,
+        }
+    }
 }
 
 #[derive(Default)]
 struct Lane {
     pending: Mutex<Pending>,
     changed: Condvar,
+    worker_started: AtomicBool,
 }
 
 #[derive(Default)]
@@ -165,7 +191,6 @@ impl Lane {
     }
 
     fn join_close(&self) {
-        use crate::queue::{CpuPhase, CpuTimer};
         let _join = CpuTimer::new(CpuPhase::ThinCloseJoin);
         let pending = lock(&self.pending);
         if pending.scheduled {
@@ -184,6 +209,9 @@ impl Lane {
 
     fn replay(&self, this: This) {
         let mut pending = lock(&self.pending);
+        if cpu_phases_enabled() {
+            self.worker_started.store(true, Ordering::Release);
+        }
         while let Some(mut chunk) = pending.chunks.pop_front() {
             self.changed.notify_all();
             drop(pending);
@@ -239,13 +267,18 @@ impl Front {
         if self.chunk.words.is_empty() {
             return;
         }
-        let mut pending = self
-            .lane
-            .changed
-            .wait_while(lock(&self.lane.pending), |p| {
-                p.chunks.len() == QUEUED_CHUNKS
-            })
-            .unwrap_or_else(|error| error.into_inner());
+        let pending = lock(&self.lane.pending);
+        let mut pending = if pending.chunks.len() == QUEUED_CHUNKS {
+            let _wait = CpuTimer::new(CpuPhase::ThinQueueWait);
+            self.lane
+                .changed
+                .wait_while(pending, |p| p.chunks.len() == QUEUED_CHUNKS)
+                .unwrap_or_else(|error| error.into_inner())
+        } else {
+            pending
+        };
+        self.chunk_words = CHUNK_WORDS;
+        ThinEvent::Chunks.note();
         let spare = pending.spare.take().unwrap_or_default();
         pending
             .chunks
@@ -270,7 +303,13 @@ impl Front {
             self.chunk.replay(this);
             self.chunk.words.clear();
             self.chunk.views.clear();
-        } else if self.chunk.words.len() >= CHUNK_WORDS {
+        } else if self.chunk.words.len() >= self.chunk_words {
+            if self.chunk_words < CHUNK_WORDS
+                && self.chunk.words.len() < CHUNK_WORDS
+                && !matches!(op, Op::Close)
+            {
+                ThinEvent::EarlyChunks.note();
+            }
             self.schedule(this);
         }
     }
@@ -301,6 +340,8 @@ pub(super) fn discard(list: &List) -> Pins {
     front.lane.wait();
     front.chunk.words.clear();
     front.chunk.views.clear();
+    front.chunk_words = first_chunk_words();
+    front.lane.worker_started.store(false, Ordering::Release);
     std::mem::take(&mut front.pins)
 }
 
@@ -335,10 +376,15 @@ fn close_recording(this: This) {
 }
 
 pub(super) fn close(this: This, list: &List) {
-    use crate::queue::{CpuPhase, CpuTimer};
     if let Some(front) = &list.thin {
         let enqueue = CpuTimer::new(CpuPhase::ThinCloseEnqueue);
         let mut front = lock(front);
+        if front.lane.worker_started.load(Ordering::Acquire) {
+            ThinEvent::WorkerBeforeClose.note();
+        }
+        if front.calling_thread {
+            ThinEvent::InlineLists.note();
+        }
         front.put(this, Op::Close, &[], |_| {});
         front.schedule(this);
         drop(enqueue);
@@ -352,6 +398,7 @@ pub(super) fn close(this: This, list: &List) {
 // replay. The opt-in table and the normal table share the replay methods.
 macro_rules! commands {
     ($( $op:ident $slot:literal $front:ident => $back:path, ( $( $arg:ident: $ty:ty ),* ) $(pin [$($pin:ident),*])?; )*) => {
+        #[derive(Clone, Copy)]
         #[repr(u8)]
         enum Op {
             $($op,)*
@@ -943,6 +990,30 @@ mod tests {
     }
 
     #[test]
+    fn thin_short_first_chunk_returns_to_full_chunks() {
+        const FIRST_WORDS: usize = 128;
+        const PACKET_WORDS: usize = 4;
+        let mut front = Front {
+            chunk_words: FIRST_WORDS,
+            ..Front::default()
+        };
+        let this = std::ptr::null();
+        for _ in 0..(FIRST_WORDS / PACKET_WORDS) {
+            front.put(this, Op::ComputeConstant, &[0, 0, 0], |_| {});
+        }
+        assert!(front.chunk.words.is_empty());
+        assert_eq!(front.chunk_words, CHUNK_WORDS);
+
+        for _ in 0..(CHUNK_WORDS / PACKET_WORDS - 1) {
+            front.put(this, Op::ComputeConstant, &[0, 0, 0], |_| {});
+        }
+        assert_eq!(front.chunk.words.len(), CHUNK_WORDS - PACKET_WORDS);
+        front.put(this, Op::ComputeConstant, &[0, 0, 0], |_| {});
+        assert!(front.chunk.words.is_empty());
+        front.lane.wait();
+    }
+
+    #[test]
     fn thin_recording_copies_arguments_and_drains_at_close() {
         let Some(_) = crate::host::host() else { return };
         let null = std::ptr::null();
@@ -969,7 +1040,7 @@ mod tests {
                     .as_ref()
                     .expect("opt-in table"),
             );
-            assert!(!front.chunk.words.is_empty() && front.chunk.words.len() < CHUNK_WORDS);
+            assert!(front.chunk.words.len() < CHUNK_WORDS);
         }
         assert_eq!(super::super::close(list), S_OK);
         let recording = title_list(list).unwrap();

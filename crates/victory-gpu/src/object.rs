@@ -574,7 +574,11 @@ mod tests {
                     start.wait();
                     let count = release_boxed_with(address as This, |recording: &Recording| {
                         joining.send(()).unwrap();
-                        worker_pending.lock().unwrap().recv_timeout(timeout).unwrap();
+                        worker_pending
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(timeout)
+                            .unwrap();
                         assert!(!recording.dropped.load(Ordering::Acquire));
                     });
                     returned.send(count).unwrap();

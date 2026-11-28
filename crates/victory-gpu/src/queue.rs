@@ -494,6 +494,7 @@ pub(crate) enum CpuPhase {
     ThinCloseEnqueue,
     ThinCloseJoin,
     ThinCloseWait,
+    ThinQueueWait,
     DescriptorSync,
     DescriptorPins,
     DescriptorTemplates,
@@ -522,6 +523,31 @@ static CPU_PHASE_NS: [AtomicU64; CpuPhase::SubmitWriteback as usize + 1] =
 #[cfg(windows)]
 static CPU_PHASE_CALLS: [AtomicU64; CpuPhase::SubmitWriteback as usize + 1] =
     [const { AtomicU64::new(0) }; CpuPhase::SubmitWriteback as usize + 1];
+
+#[cfg(windows)]
+pub(crate) enum ThinEvent {
+    Chunks,
+    EarlyChunks,
+    WorkerBeforeClose,
+    InlineLists,
+}
+
+#[cfg(windows)]
+static THIN_EVENTS: [AtomicU64; ThinEvent::InlineLists as usize + 1] =
+    [const { AtomicU64::new(0) }; ThinEvent::InlineLists as usize + 1];
+
+#[cfg(windows)]
+impl ThinEvent {
+    pub(crate) fn note(self) {
+        if cpu_phases_enabled() {
+            THIN_EVENTS[self as usize].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn take(self) -> u64 {
+        THIN_EVENTS[self as usize].swap(0, Ordering::Relaxed)
+    }
+}
 
 #[cfg(windows)]
 static TABLE_PINS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -615,6 +641,12 @@ pub(crate) fn log_cpu_phases(frames: f64) {
         join_calls = calls(CpuPhase::ThinCloseJoin),
         pending_ms = ms(CpuPhase::ThinCloseWait),
         pending_calls = calls(CpuPhase::ThinCloseWait),
+        worker_before_close = ThinEvent::WorkerBeforeClose.take(),
+        early_chunks = ThinEvent::EarlyChunks.take(),
+        chunks = ThinEvent::Chunks.take(),
+        inline_lists = ThinEvent::InlineLists.take(),
+        backpressure_ms = ms(CpuPhase::ThinQueueWait),
+        backpressure_calls = calls(CpuPhase::ThinQueueWait),
         "command list Close wall time per frame"
     );
     tracing::info!(

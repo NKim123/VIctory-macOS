@@ -448,15 +448,18 @@ By default, command recording is immediate and ready submissions run
 synchronously. Each switch below is opt-in for Windows builds, including
 those running on macOS under Wine.
 
-- `VICTORY_THIN=1` records fixed-function state, root arguments, and
-  color clears in a bounded stream. A recording worker translates chunks
-  of 32 commands and finishes short streams when the list closes. If the
-  worker queue is full, the calling thread translates the chunk. Color
-  clears keep the host texture and copy the view description, color, and
-  rectangles at the call. Clear recording reserves one CPU descriptor
-  until D3D12 consumes it. Draws, dispatches and other operations that need
-  live descriptors or title memory flush the stream first. Submission
-  waits until the list has closed.
+- `VICTORY_THIN=1` captures command arguments and pins referenced objects
+  while recording workers translate chunks onto the native list. Chunks
+  are queued at 1,024 64-bit words, finishing the current packet first.
+  The producer waits if its chunk queue fills. Color clears capture the
+  view and retain its pin. Close queues the remaining packets and waits
+  for replay and native Close. APIs that need the open native list drain
+  pending replay first.
+- With THIN enabled, `VICTORY_THIN_EARLY_WORDS=128` queues the first chunk
+  of each recording at 128 words to give the worker a head start.
+  Values from 1 through 1,023 set this first cutoff. Zero or unset uses
+  1,024 words throughout. `VICTORY_CPU_PHASES=1` reports worker starts
+  before Close, early chunks, and producer and Close waits.
 - `VICTORY_ASYNC_SUBMIT=1` lets title threads continue recording while one
   submission worker builds host state transitions, submits and waits for
   self-contained work. The worker holds up to four host lists including
