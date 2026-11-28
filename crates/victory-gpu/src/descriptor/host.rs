@@ -181,8 +181,13 @@ impl ViewStaging {
         })
     }
 
-    fn stage<'a>(&mut self, slot: usize, view: &'a ViewPin) -> Option<StagedView<'a>> {
-        let at = D3D12_CPU_DESCRIPTOR_HANDLE {
+    fn stage<'a>(
+        &mut self,
+        slot: usize,
+        view: &'a ViewPin,
+        direct: bool,
+    ) -> Option<StagedView<'a>> {
+        let mut at = D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: self.cpu + slot * self.step,
         };
         if is_placed_texture(view) {
@@ -201,14 +206,20 @@ impl ViewStaging {
         let epoch = crate::shadow::lookup_epoch();
         let (held, mark, source) =
             if matches!(**view, View::Constant(..)) || buffer_range(view).is_some() {
+                let scratch = (!direct).then_some(at);
+                if direct {
+                    at = self.templates.slot(self.templates.bucket(view.key));
+                }
                 let (held, backing, mark) = if let Some(hit) = self.templates.get(view.key, epoch) {
-                    templates::copy(false, at, hit.at);
+                    if let Some(scratch) = scratch {
+                        templates::copy(false, scratch, hit.at);
+                    }
                     (hit.held, hit.backing?, hit.mark)
                 } else {
                     let backing = prepare(view)?;
                     let (held, mark) =
                         self.templates
-                            .make(at, view.key, epoch, view, Some(&backing));
+                            .make(scratch, view.key, epoch, view, Some(&backing));
                     (held?, backing, mark)
                 };
                 (
@@ -428,6 +439,7 @@ fn stage_views<'a>(
     workers: &StagingWorkers,
     records: &[ChangedRecord],
     pins: &'a HashMap<u64, ViewPin>,
+    direct: bool,
 ) -> StagedViews<'a> {
     let mut seen = HashSet::new();
     let mut jobs: [_; STAGING_WORKERS] = std::array::from_fn(|_| Vec::new());
@@ -450,11 +462,35 @@ fn stage_views<'a>(
     crate::texture::in_parallel(active.len(), |worker| {
         let i = active[worker];
         let mut staging = workers[i].lock().unwrap_or_else(|e| e.into_inner());
+        let direct_slots = if direct {
+            // Last use of a bucket can publish from the template itself.
+            // An earlier job must keep a scratch copy even if a later
+            // colliding job ultimately fails to produce a descriptor.
+            let mut buckets = [0u64; templates::RESOURCE_BUCKETS / 64];
+            let mut slots: Vec<_> = jobs[i]
+                .iter()
+                .rev()
+                .map(|view| {
+                    let bucket = staging.templates.bucket(view.key);
+                    let bit = 1 << (bucket % 64);
+                    let word = &mut buckets[bucket / 64];
+                    let direct = *word & bit == 0;
+                    *word |= bit;
+                    direct
+                })
+                .collect();
+            slots.reverse();
+            slots
+        } else {
+            Vec::new()
+        };
         *results[i].lock().unwrap_or_else(|e| e.into_inner()) = jobs[i]
             .iter()
             .copied()
             .enumerate()
-            .filter_map(|(slot, view)| staging.stage(slot, view))
+            .filter_map(|(slot, view)| {
+                staging.stage(slot, view, direct_slots.get(slot).copied().unwrap_or(false))
+            })
             .collect();
     });
     let epoch = crate::shadow::lookup_epoch();
@@ -2587,9 +2623,13 @@ impl HostHeap {
                     // Later frames can hit the cache without another worker
                     // round, while scratch sources stay live through the copy.
                     let staging_timer = CpuTimer::new(CpuPhase::DescriptorStage);
+                    static DIRECT: OnceLock<bool> = OnceLock::new();
+                    let direct = *DIRECT.get_or_init(|| crate::switch::on("VICTORY_DIRECT_STAGE"));
                     self.swap_templates(workers);
-                    let staged = stage_views(workers, &misses, &pins);
-                    self.swap_templates(workers);
+                    let staged = stage_views(workers, &misses, &pins, direct);
+                    if !direct {
+                        self.swap_templates(workers);
+                    }
                     drop(staging_timer);
                     let mut remaining = Vec::new();
                     self.publish_templates(
@@ -2612,6 +2652,11 @@ impl HostHeap {
                         );
                     } else {
                         misses = remaining;
+                    }
+                    if direct {
+                        // All queued CopyDescriptors calls have consumed their
+                        // sources. Only now can a live write change these heaps.
+                        self.swap_templates(workers);
                     }
                 }
             }
@@ -3523,7 +3568,7 @@ impl HostHeap {
                     let templates = &mut made.templates[self.template_shard(key)];
                     templates.get_or_init(|| Templates::new(self.sampler));
                     if let Some(templates) = templates.get_mut().and_then(Option::as_mut) {
-                        templates.make(dst, key, epoch, &view, backing.as_ref())
+                        templates.make(Some(dst), key, epoch, &view, backing.as_ref())
                     } else {
                         make_marked_with_backing(&view, dst, backing.as_ref().map(|b| &b.0))
                     }
@@ -7158,7 +7203,7 @@ void main() {
             clear: false,
         });
         let pins = pin_changed_views(&records);
-        let staged = stage_views(&workers, &records, &pins);
+        let staged = stage_views(&workers, &records, &pins, true);
         assert_eq!(staged.views.len(), 1);
         let mut batch = PublishBatch::default();
         slots[0] = [0; 4];
@@ -7222,7 +7267,7 @@ void main() {
         });
         let before = crate::shadow::lookup_epoch();
         let pins = pin_changed_views(&records);
-        let staged = stage_views(&workers, &records, &pins);
+        let staged = stage_views(&workers, &records, &pins, true);
         let after = crate::shadow::lookup_epoch();
         assert_ne!(before, after, "staging materializes the two shadows");
         for record in &records {
@@ -7391,7 +7436,7 @@ void main() {
             clear: false,
         });
         let pins = pin_changed_views(&records);
-        let staged = stage_views(&workers, &records, &pins);
+        let staged = stage_views(&workers, &records, &pins, true);
         assert!(staged.views.contains_key(&srv_key));
         assert!(staged.views.contains_key(&uav_key));
         old.evicted.store(true, Ordering::Release);

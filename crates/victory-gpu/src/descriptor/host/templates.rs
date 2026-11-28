@@ -63,11 +63,13 @@ pub(super) struct Hit {
     pub(super) backing: Option<BufferView>,
 }
 
+pub(super) const RESOURCE_BUCKETS: usize = 16_384;
+
 impl Templates {
     pub(super) fn new(sampler: bool) -> Option<Self> {
         let device = &host()?.device;
         let kind = kind(sampler);
-        let count = if sampler { 256 } else { 16_384 };
+        let count = if sampler { 256 } else { RESOURCE_BUCKETS as u32 };
         // SAFETY: a CPU-only heap of a supported descriptor type.
         let (heap, cpu, step) = unsafe {
             let heap: ID3D12DescriptorHeap = device
@@ -98,12 +100,12 @@ impl Templates {
         Some(templates)
     }
 
-    fn bucket(&self, key: u64) -> usize {
+    pub(super) fn bucket(&self, key: u64) -> usize {
         ((key ^ key.rotate_left(32)).wrapping_mul(0x9e37_79b9_7f4a_7c15)
             >> (64 - self.entries.len().trailing_zeros())) as usize
     }
 
-    fn slot(&self, bucket: usize) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+    pub(super) fn slot(&self, bucket: usize) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: self.cpu + bucket * self.step,
         }
@@ -148,7 +150,7 @@ impl Templates {
 
     pub(super) fn make(
         &mut self,
-        dst: D3D12_CPU_DESCRIPTOR_HANDLE,
+        dst: Option<D3D12_CPU_DESCRIPTOR_HANDLE>,
         key: u64,
         epoch: u64,
         view: &View,
@@ -158,7 +160,7 @@ impl Templates {
         let at = self.slot(bucket);
         self.entries[bucket] = None;
         let (kept, mark) = make_marked_with_backing(view, at, backing.map(|b| &b.0));
-        if kept.is_some() {
+        if let Some(dst) = dst.filter(|_| kept.is_some()) {
             copy(self.sampler, dst, at);
         }
         let buffer = match (kept.as_ref(), backing) {
