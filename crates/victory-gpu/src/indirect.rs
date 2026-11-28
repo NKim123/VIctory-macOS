@@ -195,6 +195,14 @@ impl Batch {
         static CLAMP: OnceLock<Option<Clamp>> = OnceLock::new();
         let clamp = CLAMP
             .get_or_init(|| {
+                #[cfg(victory_dxc_clamp)]
+                match precompiled_batch() {
+                    Ok(clamp) => {
+                        tracing::info!("batched argument clamp: using precompiled 32-thread shader");
+                        return Some(clamp);
+                    }
+                    Err(error) => tracing::warn!(%error, "precompiled batch clamp unavailable"),
+                }
                 use crate::compute::Param;
                 let params = [
                     Param::Constants {
@@ -450,7 +458,19 @@ fn with_indirect_rest<R>(rest: bool, f: impl FnOnce() -> R) -> R {
 /// #4). So both are checked here and set when they are zero.
 #[cfg(victory_dxc_clamp)]
 fn precompiled() -> windows::core::Result<Clamp> {
-    let mut bytes = include_bytes!(concat!(env!("OUT_DIR"), "/indirect-clamp.dxil")).to_vec();
+    precompiled_from(include_bytes!(concat!(env!("OUT_DIR"), "/indirect-clamp.dxil")))
+}
+
+#[cfg(victory_dxc_clamp)]
+fn precompiled_batch() -> windows::core::Result<Clamp> {
+    let mut clamp = precompiled_from(include_bytes!(concat!(env!("OUT_DIR"), "/indirect-batch.dxil")))?;
+    clamp.words = true;
+    Ok(clamp)
+}
+
+#[cfg(victory_dxc_clamp)]
+fn precompiled_from(source: &[u8]) -> windows::core::Result<Clamp> {
+    let mut bytes = source.to_vec();
     match victory_shader::emit::sign_container(&mut bytes) {
         Ok(true) => tracing::info!("argument clamp: the compiled shader was unsigned, its digests are set"),
         Ok(false) => {}
@@ -1124,6 +1144,8 @@ void main(uint3 group : SV_GroupID) { dst.Store(group.x * 4, 7); }
     #[test]
     fn batched_clamp_preserves_record_order_and_budget_across_passes() {
         let Some(host) = super::host() else { return };
+        #[cfg(victory_dxc_clamp)]
+        super::precompiled_batch().expect("accept the precompiled batch shader");
         let (source, data) = host.shared_buffer(256).unwrap();
         let list = host.new_list().unwrap();
         let (readback, read) = list.readback(host, 256).unwrap();
@@ -1146,10 +1168,16 @@ void main(uint3 group : SV_GroupID) { dst.Store(group.x * 4, 7); }
                 std::ptr::copy_nonoverlapping(words.as_ptr(), data.add(i * 32).cast(), words.len());
             }
             let mut first = super::Batch::open(&list, gpu).expect("compile the batched clamp");
+            // Fill a complete tile before the mixed jobs. These repeated draws
+            // still leave enough budget for the first large draw.
+            for i in 0..32 {
+                let (_, at) = first.place(gpu, 0, 0).unwrap();
+                assert_eq!(at, i * 32);
+            }
             let mut out = None;
             for (i, (kind, _, _)) in jobs[..4].iter().enumerate() {
                 let (buffer, at) = first.place(gpu, i as u64 * 32, *kind).unwrap();
-                assert_eq!(at, i as u64 * 32);
+                assert_eq!(at, (32 + i as u64) * 32);
                 out = Some(buffer);
             }
             let out = out.unwrap();
@@ -1157,7 +1185,7 @@ void main(uint3 group : SV_GroupID) { dst.Store(group.x * 4, 7); }
             let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
             let l = &list.list;
             l.ResourceBarrier(&[super::transition(&out, indirect, copy)]);
-            l.CopyBufferRegion(&readback, 0, &out, 0, 128);
+            l.CopyBufferRegion(&readback, 0, &out, 32 * 32, 128);
             l.ResourceBarrier(&[super::transition(&out, copy, indirect)]);
             let mut second = super::Batch::open(&list, gpu).unwrap();
             for (i, (kind, _, _)) in jobs[4..].iter().enumerate() {
