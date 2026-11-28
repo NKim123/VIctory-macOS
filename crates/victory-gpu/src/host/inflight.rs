@@ -437,39 +437,56 @@ impl Host {
             return false;
         }
         let exact = exact_upload_aliases();
-        let mut ranges = crate::ranges::Ranges::default();
-        for (staging, _) in sources {
-            let (at, len) = staging.source_range();
-            ranges.insert(at, at.saturating_add(len), 0);
-        }
+        let normalized = std::cell::OnceCell::new();
+        let ranges = || {
+            normalized.get_or_init(|| {
+                let mut ranges = crate::ranges::Ranges::default();
+                for (staging, _) in sources {
+                    let (at, len) = staging.source_range();
+                    ranges.insert(at, at.saturating_add(len), 0);
+                }
+                ranges
+            })
+        };
         // XMem mapping edits take the submission lock. Resolve the links
         // here, since additive views can have appeared since enqueue.
         let aliases = std::cell::OnceCell::new();
         let source_aliases =
-            || aliases.get_or_init(|| crate::watch::upload_source_aliases(&ranges));
+            || aliases.get_or_init(|| crate::watch::upload_source_aliases(ranges()));
         let mut physical_alias = None;
-        let mut gpu_mapping = None;
         let mut has_physical_alias = || {
             *physical_alias.get_or_insert_with(|| {
-                ranges
+                ranges()
                     .iter()
                     .any(|(from, to)| crate::watch::aliased(from, to - from))
             })
         };
-        let mut touches_gpu_mapping = || {
-            *gpu_mapping.get_or_insert_with(|| {
-                ranges
-                    .iter()
-                    .any(|(from, to)| crate::shadow::has_aliased_overlap(from as u64, to as u64))
-            })
-        };
+        let mut indirect_overlap = None;
         let pending = s.flights.iter().rev().find_map(|flight| {
             // Copied title-memory outputs are ordered before preparation.
             // Bindless and computed writes can target a mapped GPU buffer
             // at an address only the shader knows until it completes.
-            if flight.indirect_gpu_writes && (touches_gpu_mapping() || has_physical_alias())
+            if flight.indirect_gpu_writes
+                && *indirect_overlap.get_or_insert_with(|| {
+                    // A single mapped source suffices for an unknown write.
+                    // Bound the extra lookups on a miss and keep the merged
+                    // scan for batches with repeated or adjacent sources.
+                    if normalized.get().is_none() && sources.len() >= 8 {
+                        let (at, len) = sources[0].0.source_range();
+                        let end = at.saturating_add(len);
+                        if at < end
+                            && (crate::shadow::has_aliased_overlap(at as u64, end as u64)
+                                || crate::watch::aliased(at, end - at))
+                        {
+                            return true;
+                        }
+                    }
+                    ranges().iter().any(|(from, to)| {
+                        crate::shadow::has_aliased_overlap(from as u64, to as u64)
+                    }) || has_physical_alias()
+                })
                 || flight.gpu_writes.iter().any(|(from, to)| {
-                    ranges.overlaps(from, to)
+                    ranges().overlaps(from, to)
                         || if exact {
                             source_aliases().overlaps(from, to)
                         } else {
@@ -485,7 +502,7 @@ impl Host {
                 .any(|(write, aliased)| {
                     let from = write.address;
                     let to = from.saturating_add(write.bytes);
-                    ranges.overlaps(from, to)
+                    ranges().overlaps(from, to)
                         || if exact {
                             source_aliases().overlaps(from, to)
                         } else {

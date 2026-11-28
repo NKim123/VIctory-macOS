@@ -1020,10 +1020,7 @@ fn upload_test_texture(memory: usize) -> This {
 }
 
 #[test]
-fn texture_upload_distinguishes_physical_alias_pages() {
-    if !exact_upload_aliases() {
-        return;
-    }
+fn texture_upload_waits_for_mapped_sources() {
     let Some(host) = host_for_ring() else { return };
     host.present_boundary();
     let (memory, alias) = crate::watch::tests::twin_views(2);
@@ -1032,11 +1029,23 @@ fn texture_upload_distinguishes_physical_alias_pages() {
     let copy = crate::resource::host_copy(texture).unwrap();
     let staging = crate::texture::staging(texture, &copy).unwrap();
     assert!(staging.source_range().1 <= page);
-    let sources = [(staging, copy)];
+    let sources = vec![(staging, copy); 8];
     let (out, _) = host.mapped_buffer(8, true).unwrap();
-    for (address, overlaps) in [(alias + page, false), (alias, true)] {
+    for (address, indirect, overlaps) in [
+        (alias + page, false, false),
+        (alias, false, true),
+        (alias + page, true, true),
+    ] {
+        if !indirect && !exact_upload_aliases() {
+            continue;
+        }
+        let boundary = if indirect {
+            Boundary::TextureUploadGpuWrite
+        } else {
+            Boundary::TextureUploadLabel
+        };
         let gate = Gate::new(host);
-        let before = DRAINS[Boundary::TextureUploadLabel as usize].load(Ordering::Relaxed);
+        let before = DRAINS[boundary as usize].load(Ordering::Relaxed);
         let producer = record_copy(host, &out, 4, 1);
         producer.defer_write(
             address as *mut u8,
@@ -1047,12 +1056,13 @@ fn texture_upload_distinguishes_physical_alias_pages() {
         let wait = || {
             let mut submission = host.submitted.lock().unwrap();
             let _holding = Holding::enter();
+            submission.flights.back_mut().unwrap().indirect_gpu_writes = indirect;
             host.wait_texture_upload_sources(&mut submission, &sources)
         };
         let (finished, release) = std::sync::mpsc::channel();
         let opener = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(4);
-            while DRAINS[Boundary::TextureUploadLabel as usize].load(Ordering::Relaxed) == before
+            while DRAINS[boundary as usize].load(Ordering::Relaxed) == before
                 && Instant::now() < deadline
             {
                 if !matches!(
@@ -1069,6 +1079,9 @@ fn texture_upload_distinguishes_physical_alias_pages() {
         opener.join().unwrap();
         assert_eq!(waited, overlaps);
         if overlaps {
+            assert!(DRAINS[boundary as usize].load(Ordering::Relaxed) > before);
+        }
+        if overlaps && !indirect {
             // SAFETY: the label at the twin address has reached this live view.
             assert_eq!(unsafe { (memory as *const u64).read() }, 0x44332211);
         }
