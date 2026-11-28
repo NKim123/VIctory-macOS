@@ -162,10 +162,18 @@ pub(crate) fn hand_out<T>(
 
 /// Release for objects made by [`hand_out`]: the last reference frees it.
 pub(crate) fn release_boxed<T>(this: This) -> u32 {
+    release_boxed_with::<T, _>(this, |_| ())
+}
+
+/// Runs cleanup on the final release while the object is still live.
+pub(crate) fn release_boxed_with<T, R>(this: This, cleanup: impl FnOnce(&T) -> R) -> u32 {
     // SAFETY: `this` is the header of a boxed `T`.
     let refs = &unsafe { &*this }.refs;
     match refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)) {
         Ok(1) => {
+            // SAFETY: the final releaser owns destruction. Cleanup can join
+            // workers that still share the object before its memory is freed.
+            let retained = cleanup(unsafe { &*this.cast::<T>() });
             let address = this as usize;
             let keys = (address, [u8::MIN; 16])..=(address, [u8::MAX; 16]);
             {
@@ -178,6 +186,7 @@ pub(crate) fn release_boxed<T>(this: This) -> u32 {
             }
             // SAFETY: that was the last reference to a `Box<T>`.
             drop(unsafe { Box::from_raw(this.cast_mut().cast::<T>()) });
+            drop(retained);
             0
         }
         Ok(n) => n - 1,
@@ -512,6 +521,78 @@ mod tests {
         assert_eq!(get(second, &TAG, &mut size, data.as_mut_ptr()), S_OK);
         assert_eq!(&data[..size as usize], b"bc");
         assert_eq!(release(second), 0);
+    }
+
+    #[test]
+    fn concurrent_final_release_keeps_object_live_while_cleanup_waits() {
+        use std::sync::{Arc, Barrier, mpsc};
+        use std::time::Duration;
+
+        #[repr(C)]
+        struct Recording {
+            header: Object,
+            dropped: Arc<AtomicBool>,
+        }
+
+        impl Drop for Recording {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::Release);
+            }
+        }
+
+        static TABLE: Table<3> = Table(missing_table::<DEVICE, 3>());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut this = std::ptr::null();
+        assert_eq!(
+            hand_out(
+                DEVICE,
+                Box::new(Recording {
+                    header: Object::new(&TABLE),
+                    dropped: dropped.clone(),
+                }),
+                &TAG,
+                &[TAG],
+                &mut this,
+            ),
+            S_OK
+        );
+        assert_eq!(add_ref(this), 2);
+        let address = this as usize;
+        let start = Barrier::new(3);
+        let (worker_finished, worker_pending) = mpsc::channel();
+        let worker_pending = Mutex::new(worker_pending);
+        let timeout = Duration::from_secs(5);
+        std::thread::scope(|scope| {
+            let (joining, final_started) = mpsc::channel();
+            let (returned, releases) = mpsc::channel();
+            for _ in 0..2 {
+                let joining = joining.clone();
+                let returned = returned.clone();
+                let start = &start;
+                let worker_pending = &worker_pending;
+                scope.spawn(move || {
+                    start.wait();
+                    let count = release_boxed_with(address as This, |recording: &Recording| {
+                        joining.send(()).unwrap();
+                        worker_pending.lock().unwrap().recv_timeout(timeout).unwrap();
+                        assert!(!recording.dropped.load(Ordering::Acquire));
+                    });
+                    returned.send(count).unwrap();
+                });
+            }
+            start.wait();
+            let first = releases.recv_timeout(timeout);
+            let started = final_started.recv_timeout(timeout);
+            let was_live = !dropped.load(Ordering::Acquire);
+            worker_finished.send(()).unwrap();
+            let last = releases.recv_timeout(timeout);
+            assert_eq!(first, Ok(1));
+            assert_eq!(started, Ok(()));
+            assert!(was_live);
+            assert_eq!(last, Ok(0));
+            assert!(dropped.load(Ordering::Acquire));
+            assert!(final_started.try_recv().is_err());
+        });
     }
 
     #[test]

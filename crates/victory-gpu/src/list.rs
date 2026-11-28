@@ -706,33 +706,33 @@ extern "system" fn list_query(this: This, iid: *const Iid, out: *mut This) -> HR
     object::answer(LIST, iid, object::is(iid, &LIST_IIDS).then_some(this), out)
 }
 extern "system" fn list_release(this: This) -> u32 {
-    // A queue may still hold some of its host lists; they are its own, and
-    // the last of them takes what the list owned.
     #[cfg(windows)]
-    if !this.is_null() && object::refs(this) == 1 {
-        // SAFETY: the title passes one of our lists.
-        let list = unsafe { &*this.cast::<List>() };
-        let pins = thin::discard(list);
-        let held = list
-            .hosts
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .rfind(|h| std::sync::Arc::strong_count(h) > 1)
-            .cloned();
-        if held.is_some() {
-            EARLY_RESETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            tracing::debug!("a list released while a queue still holds part of it: that part runs on its own");
-            let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
-            let state = std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner()));
-            leave(held, uploads, state, pins);
-        } else {
-            let refs = object::release_boxed::<List>(this);
-            drop(pins);
-            return refs;
-        }
-    }
+    return object::release_boxed_with(this, finish_list_release);
+    #[cfg(not(windows))]
     object::release_boxed::<List>(this)
+}
+
+#[cfg(windows)]
+fn finish_list_release(list: &List) -> thin::Pins {
+    let pins = thin::discard(list);
+    // A queue may still hold host lists. The last held list takes what
+    // this recording owned and can keep running after this object is freed.
+    let held = list
+        .hosts
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .rfind(|h| std::sync::Arc::strong_count(h) > 1)
+        .cloned();
+    if held.is_none() {
+        return pins;
+    }
+    EARLY_RESETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    tracing::debug!("a list released while a queue still holds part of it: that part runs on its own");
+    let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
+    let state = std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner()));
+    leave(held, uploads, state, pins);
+    thin::Pins::default()
 }
 extern "system" fn list_type(this: This) -> u32 {
     // SAFETY: `this` is one of our lists.
