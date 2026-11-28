@@ -508,6 +508,17 @@ static CPU_PHASE_CALLS: [AtomicU64; CpuPhase::DescriptorPublish as usize + 1] =
     [const { AtomicU64::new(0) }; CpuPhase::DescriptorPublish as usize + 1];
 
 #[cfg(windows)]
+static TABLE_PINS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+#[cfg(windows)]
+pub(crate) fn note_table_pins(ready: u64, reused: u64) {
+    if ready != 0 && cpu_phases_enabled() {
+        TABLE_PINS[0].fetch_add(ready, Ordering::Relaxed);
+        TABLE_PINS[1].fetch_add(reused, Ordering::Relaxed);
+    }
+}
+
+#[cfg(windows)]
 pub(crate) struct CpuTimer(Option<(CpuPhase, std::time::Instant)>);
 
 #[cfg(windows)]
@@ -575,6 +586,8 @@ pub(crate) fn log_cpu_phases(frames: f64) {
         fallback_batches = calls(CpuPhase::DescriptorFallback),
         demand_ms = ms(CpuPhase::DescriptorDemand),
         demand_calls = calls(CpuPhase::DescriptorDemand),
+        table_ready_visits = TABLE_PINS[0].swap(0, Ordering::Relaxed),
+        table_pins_reused = TABLE_PINS[1].swap(0, Ordering::Relaxed),
         publish_ms = ms(CpuPhase::DescriptorPublish),
         publish_calls = calls(CpuPhase::DescriptorPublish),
         "descriptor CPU phases"

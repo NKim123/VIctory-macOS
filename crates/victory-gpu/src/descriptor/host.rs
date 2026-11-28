@@ -2574,11 +2574,11 @@ impl HostHeap {
                     // A worker temporarily owns this heap's template shard.
                     // Later frames can hit the cache without another worker
                     // round, while scratch sources stay live through the copy.
-                    let staging = CpuTimer::new(CpuPhase::DescriptorStage);
+                    let staging_timer = CpuTimer::new(CpuPhase::DescriptorStage);
                     self.swap_templates(workers);
                     let staged = stage_views(workers, &misses, &pins);
                     self.swap_templates(workers);
-                    drop(staging);
+                    drop(staging_timer);
                     let mut remaining = Vec::new();
                     self.publish_templates(
                         &misses,
@@ -3636,6 +3636,13 @@ impl HostHeap {
         if upload.is_some()
             && let Some(tables) = tables
         {
+            static REUSE: OnceLock<bool> = OnceLock::new();
+            let reuse = *REUSE.get_or_init(|| crate::switch::on("VICTORY_REUSE_TABLE_PINS"));
+            // A collision only loses reuse. Each entry names a pin still
+            // held in pins, and a live descriptor generation is nonzero.
+            let mut pinned = [0u64; 512];
+            let mut ready_visits = 0;
+            let mut reused = 0;
             for &index in tables.range(..self.count) {
                 let handle = start + u64::from(index) * step;
                 // Preserve the acquire before reading the title header.
@@ -3646,14 +3653,26 @@ impl HostHeap {
                 };
                 if tag == VIEW_TAG
                     && self.ready[index as usize].load(Ordering::Acquire) == record_key(record)
-                    && let Some(pin) = view_at(view, generation)
                 {
-                    // A placed view can move to a replacement host texture
-                    // while the title's descriptor record stays the same.
-                    let remake = is_placed_texture(&pin) && self.needs_remake(index, &pin, true);
-                    pins.push(pin);
-                    if !remake {
+                    let key = record_key(record);
+                    ready_visits += 1;
+                    // The first occurrence stays pinned through submission.
+                    // Placed views still need a per-slot replacement check.
+                    let cached = (view ^ generation.rotate_left(7)) as usize % pinned.len();
+                    if reuse && key != 0 && pinned[cached] == key {
+                        reused += 1;
                         continue;
+                    }
+                    if let Some(pin) = view_at(view, generation) {
+                        let placed = is_placed_texture(&pin);
+                        let remake = placed && self.needs_remake(index, &pin, true);
+                        if reuse && !placed {
+                            pinned[cached] = key;
+                        }
+                        pins.push(pin);
+                        if !remake {
+                            continue;
+                        }
                     }
                 }
                 let previous =
@@ -3666,6 +3685,7 @@ impl HostHeap {
                     pins.push(pin);
                 }
             }
+            crate::queue::note_table_pins(ready_visits, reused);
         }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let Mirrored { keys, pending, .. } = &mut *made;
